@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Personal data — never upload
+TV Recordings/
+*.ts
+*.mp4
+*.mkv
