@@ -21,7 +21,6 @@ DEFAULTS = {
     "vod_countries_configured": False,
     "series_enabled_countries": [],   # Series country/group filter
     "series_countries_configured": False,
-    "caption_sync_offset": 0.0,   # manual caption delay, seconds (>= 0)
     "dvr_enabled": False,         # user's last DVR preference (never auto-start)
     "dvr_max_minutes": 30,        # rolling DVR buffer window
     "record_folder": "",          # where permanent recordings are saved
@@ -39,25 +38,11 @@ DEFAULTS = {
     # (Settings ▸ Playback controls…).
     "control_buttons": {
         "back60": True, "back10": True, "play": True, "fwd10": True,
-        "begin": True, "live": True, "dvr": True, "rec": True, "cc": True,
-        "scale": True, "speed": True, "mute": True, "volume": True,
-        "timebar": True,
+        "begin": True, "live": True, "dvr": True, "rec": True,
+        "cc": True, "scale": True, "speed": True, "mute": True,
+        "volume": True, "timebar": True,
     },
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
-    # Auto-caption appearance (Settings live in the CC popup).
-    "subtitle_style": {
-        "font_family": "Segoe UI",
-        "font_size": 18,            # pt
-        "text_color": "#ffffff",
-        "bg_enabled": True,
-        "bg_color": "#000000",
-        "bg_opacity": 70,           # %
-        "outline_enabled": False,   # outline INSTEAD of the background box
-        "outline_color": "#000000",
-        "outline_width": 3,         # px
-        "pos_x": None,              # widget-center as fraction of video width
-        "pos_y": None,              # ... and height; None = default position
-    },
 }
 
 BUTTON_KEYS = (
@@ -260,21 +245,6 @@ class Config:
     def series_countries_configured(self, value: bool) -> None:
         self.data["series_countries_configured"] = bool(value)
 
-    @property
-    def caption_sync_offset(self) -> float:
-        try:
-            return max(0.0, min(60.0, float(
-                self.data.get("caption_sync_offset", 0.0))))
-        except (TypeError, ValueError):
-            return 0.0
-
-    @caption_sync_offset.setter
-    def caption_sync_offset(self, value: float) -> None:
-        try:
-            self.data["caption_sync_offset"] = max(
-                0.0, min(60.0, float(value)))
-        except (TypeError, ValueError):
-            self.data["caption_sync_offset"] = 0.0
 
     @property
     def window_geometry(self):
@@ -335,27 +305,6 @@ class Config:
         self.data["scale_mode"] = value if value in ("fit", "stretch", "crop") \
             else "fit"
 
-    def _sub_defaults(self) -> dict:
-        return dict(DEFAULTS["subtitle_style"])
-
-    @property
-    def subtitle_style(self) -> dict:
-        stored = self.data.get("subtitle_style") or {}
-        merged = self._sub_defaults()
-        if isinstance(stored, dict):
-            for k in merged:
-                if k in stored:
-                    merged[k] = stored[k]
-        return merged
-
-    @subtitle_style.setter
-    def subtitle_style(self, value) -> None:
-        clean = self._sub_defaults()
-        if isinstance(value, dict):
-            for k in clean:
-                if k in value:
-                    clean[k] = value[k]
-        self.data["subtitle_style"] = clean
 
     @property
     def dvr_enabled(self) -> bool:

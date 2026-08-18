@@ -201,15 +201,17 @@ def rec(on):
     return _icon("rec" + ("on" if on else "off"), draw)
 
 
-# ---- captions ----
-def cc():
+# ---- captions / subtitles ----
+def cc(on):
+    """Subtitles: a screen frame with 'CC' inside — blue while a track is
+    active (same state colouring as the DVR button)."""
     def draw(p, c):
-        _pen(p, c, 2.2)
+        col = BLUE if on else c
+        _pen(p, col, 2.2)
         p.setBrush(QtCore.Qt.NoBrush)
-        p.drawRoundedRect(QtCore.QRectF(3.2, 5.2, 17.6, 13.6), 3.2, 3.2)
-        _text(p, c, "CC", (3.2, 5.2, 17.6, 13.6), 8)
-    return _icon("cc", draw)
-
+        p.drawRoundedRect(QtCore.QRectF(3.2, 5.2, 17.6, 13.6), 2.4, 2.4)
+        _text(p, col, "CC", (3.2, 5.6, 17.6, 12.8), size=9)
+    return _icon("cc" + ("on" if on else "off"), draw)
 
 # ---- video scaling (two arrows stretching diagonally apart) ----
 def scale():

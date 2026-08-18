@@ -90,8 +90,32 @@ class VLCPlayer:
         try:
             self._apply_volume(self.player)
             self.player.audio_set_mute(1 if self._mute else 0)
+            self._unmute_late(self.player)
         except Exception:
             pass
+
+    def _unmute_late(self, player) -> None:
+        """Re-assert volume + mute ~1.2 s after they were first applied.
+
+        On Windows the audio device opens asynchronously around the
+        Playing event; a volume/mute value set before the device exists
+        can be silently discarded — one retry closes that window without
+        touching Qt (thread-safe libvlc audio calls only)."""
+        pl = player
+        try:
+            tid = self._unmute_tid = (self._unmute_tid or 0) + 1
+        except AttributeError:
+            tid = self._unmute_tid = 1
+
+        def _retry():
+            if tid != self._unmute_tid or pl is not self.player:
+                return
+            try:
+                self._apply_volume(pl)
+                pl.audio_set_mute(1 if self._mute else 0)
+            except Exception:
+                pass
+        threading.Timer(1.2, _retry).start()
 
     # ---- window attachment ----
     def set_window(self, window_id: int) -> None:
@@ -118,27 +142,22 @@ class VLCPlayer:
 
     # ---- playback ----
     def play_at(self, url: str, start_seconds: float = 0.0,
-                record_path: str = None, cap_path: str = None,
+                record_path: str = None,
                 append: bool = False) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
         flash of the beginning followed by a seek (that was the rewind jank).
 
-        ``record_path`` / ``cap_path`` attach extra outputs to the SAME
-        single connection through VLC stream-output duplication:
-        - ``record_path``: a kept MPEG-TS recording file,
-        - ``cap_path``: a 16 kHz mono wav fed to the local caption engine.
-          Because the fork taps the input stream, the wav is a sequential
-          LOG of the displayed audio — seeks, pauses and rate changes land
-          in it, which is what keeps auto-captions in sync.
+        ``record_path`` attaches a kept MPEG-TS recording file to the SAME
+        single connection through VLC stream-output duplication.
         """
         try:
             kind = "live" if url.startswith(("http://", "https://")) else "file"
-            log.info("display open kind=%s start=%.1fs rec=%s cap=%s "
+            log.info("display open kind=%s start=%.1fs rec=%s "
                      "append=%s (prev_state=%s busy=%s)",
                      kind, float(start_seconds), bool(record_path),
-                     bool(cap_path), bool(append), self.state_name(),
+                     bool(append), self.state_name(),
                      self.is_busy())
         except Exception:
             pass
@@ -161,18 +180,10 @@ class VLCPlayer:
                 except Exception:
                     pass
         branches = []
-        if record_path or cap_path:
-            # display first, then the extra outputs (see play_outputs note
-            # about the double-quoted transcode chain)
+        if record_path:
             branches.append("dst=display")
-            if record_path:
-                rec = record_path.replace("\\", "/")
-                branches.append(f"dst=std{{access=file,mux=ts,dst='{rec}'}}")
-            if cap_path:
-                cap = cap_path.replace("\\", "/")
-                branches.append(
-                    'dst="transcode{acodec=s16l,samplerate=16000,channels=1}'
-                    f":std{{access=file,mux=wav,dst='{cap}'}}{{select=audio}}\"")
+            rec = record_path.replace("\\", "/")
+            branches.append(f"dst=std{{access=file,mux=ts,dst='{rec}'}}")
             sout = "#duplicate{{{}}}".format(",".join(branches))
             self.media.add_option(f":sout={sout}")
             if append:
@@ -205,12 +216,11 @@ class VLCPlayer:
         self.play_at(url, 0.0, record_path=path, append=append)
 
     def play_outputs(self, url: str, record_path: str = None,
-                     append: bool = False, cap_path: str = None) -> None:
+                     append: bool = False) -> None:
         """Watch ``url`` on the display while forking extra outputs from the
         SAME single connection (kept for API compatibility — everything
         funnels into play_at now)."""
-        self.play_at(url, 0.0, record_path=record_path, cap_path=cap_path,
-                     append=append)
+        self.play_at(url, 0.0, record_path=record_path, append=append)
 
     def stop(self) -> None:
         """Stop playback. Never raises, never deadlocks the UI thread.
@@ -251,10 +261,13 @@ class VLCPlayer:
                 except Exception:
                     pass
             return
-        # Busy: mute instantly first (non-blocking) so a hung stop can never
-        # leave the old stream audible, then stop off the UI thread.
+        # Busy: pause instantly first (non-blocking) so a hung stop can
+        # never leave the old stream audible, then stop off the UI thread.
+        # (Pause, NOT mute/volume=0: those write audio-session state that
+        # outlives the player on Windows — a lost restore after a swap
+        # meant silence no click could undo.)
         try:
-            self.player.audio_set_volume(0)
+            self.player.set_pause(1)
         except Exception:
             pass
         old = self.player
@@ -294,6 +307,7 @@ class VLCPlayer:
                          daemon=True).start()
         if done.wait(_STOP_WAIT_S):
             self._apply_volume(self.player)   # undo the pre-stop mute
+            self._unmute_late(self.player)
             return
         swapped.set()
         try:
@@ -468,31 +482,28 @@ class VLCPlayer:
             return self._volume
 
     def toggle_mute(self) -> None:
-        self._mute = not self._mute
-        try:
-            self.player.audio_toggle_mute()
-        except Exception:
-            pass
+        """Absolute toggle off the DESIRED state — never off what VLC
+        happens to report mid-swap (a polled flip during a player swap
+        desynced the two and re-muted behind the user's back)."""
+        self.set_mute(not self._mute)
 
     def set_mute(self, on: bool) -> None:
         self._mute = bool(on)
         try:
             self.player.audio_set_mute(1 if on else 0)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("set_mute failed: %r", exc)
             except Exception:
                 pass
 
     def is_mute(self) -> bool:
-        try:
-            return self.player.audio_get_mute() != 0
-        except Exception as exc:
-            try:
-                log.debug("is_mute failed: %r", exc)
-            except Exception:
-                pass
-            return self._mute
+        """The user's DESIRED mute state — the single source of truth.
+
+        Querying the player instead made every stop/swap race observable:
+        the UI poll re-checked the mute button off a stale/true reading
+        and the next poke re-applied mute over the user's click."""
+        return self._mute
 
     # ---- playback rate ----
     def set_rate(self, rate: float) -> None:
@@ -511,32 +522,54 @@ class VLCPlayer:
         except Exception:
             return 1.0
 
-    # ---- subtitle tracks (embedded in the stream) ----
-    def spu_tracks(self):
-        """[(id, name), ...] of embedded subtitle tracks, decoded."""
+    # ---- subtitles (embedded stream tracks) ----
+    def spu_tracks(self) -> list:
+        """[(id, name), ...] subtitle tracks of the current media.
+
+        Empty until VLC has parsed the elementary streams — a remote MKV can
+        take a couple of seconds after Playing before the SRT tracks show up,
+        so callers should poll rather than trust one early read. python-vlc
+        hands the names back as bytes; they are decoded here, and VLC's
+        leading "Disable" pseudo-track (id 0) is dropped — the UI has its
+        own Off entry."""
         try:
-            raw = self.player.video_get_spu_description()
+            desc = self.player.video_get_spu_description() or []
             out = []
-            for item in raw or []:
-                tid = item[0]
-                name = item[1]
-                if isinstance(name, bytes):
-                    name = name.decode("utf-8", "replace")
-                out.append((int(tid), str(name)))
+            for track in desc:
+                try:
+                    name = track[1]
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", "replace")
+                    if not name or name.strip().lower() == "disable":
+                        continue
+                    out.append((int(track[0]), name))
+                except Exception:
+                    continue
             return out
         except Exception:
             return []
 
-    def set_spu(self, spu_id: int) -> None:
-        """Select an embedded subtitle track (-1 = subtitles off)."""
+    def active_spu(self) -> int:
+        """Currently selected subtitle track id, -1 when none (or unknown)."""
         try:
-            self.player.video_set_spu_integer(int(spu_id))
-        except Exception as exc:
+            return int(self.player.video_get_spu())
+        except Exception:
+            return -1
+
+    def set_spu(self, spu_id: int) -> None:
+        """Select a subtitle track by id (``-1`` disables subtitles).
+
+        Thin call only — the desired state is owned and re-asserted by the
+        UI (VLC re-selects a stream's own default track on media opens and
+        ES updates, and a fresh player after a hung-stop swap loses the
+        selection entirely, so a one-shot call is never enough)."""
+        try:
+            self.player.video_set_spu(int(spu_id))
+        except Exception as exc:  # noqa: BLE001
             try:
-                log.debug("set_spu failed: %r", exc)
+                log.debug("set_spu(%r) failed: %r", spu_id, exc)
             except Exception:
                 pass
-
 
     # ---- video ----
     def set_scale_mode(self, mode: str) -> None:

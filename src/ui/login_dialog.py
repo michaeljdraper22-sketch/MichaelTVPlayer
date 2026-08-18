@@ -10,7 +10,7 @@ class LoginDialog(QtWidgets.QDialog):
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config = config
-        self.setWindowTitle("MichaelTVPlayer — Account Setup")
+        self.setWindowTitle("MichaelTV — Account Setup")
         self.setMinimumWidth(480)
 
         self.runner = AsyncRunner()

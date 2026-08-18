@@ -12,11 +12,9 @@ import urllib.parse
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from .. import captions as capmod
 from ..dvr import VlcRecorder
 from ..player import VLCPlayer
 from . import icons as ic
-from .subtitles import CaptionWidget, SubtitlesSettingsDialog
 from .worker import AsyncRunner, FileDownloader
 
 log = logging.getLogger("mtp")
@@ -110,8 +108,6 @@ _OVERLAY_QSS = """
                                                   width: 16px; height: 16px;
                                                   margin: -6px 0;
                                                   border-radius: 8px; }
-#capLabel { background-color: rgba(0,0,0,165); color: #ffffff;
-            border-radius: 6px; padding: 4px 10px; font-size: 14px; }
 QMenu#ctlMenu { background-color: rgba(178,190,181,242); color: #17181a;
                 border-radius: 8px; padding: 5px; }
 QMenu#ctlMenu::item { padding: 5px 24px; border-radius: 5px; }
@@ -257,14 +253,7 @@ class PlayerView(QtWidgets.QWidget):
         self._last_raw = None         # previous raw VLC time (chase/VOD tracker)
         self._tick_t = None           # wall clock of the previous _tick
         self._live_paused = False     # paused in plain LIVE mode (timeshift)
-        self._cap_rate = None         # last caption feed rate applied
         self._scale_mode = config.scale_mode   # fit | stretch | crop
-        self._cap_mode = "off"        # "off" | "auto" | embedded spu track id
-        self._cap_final = ""          # last finished caption line
-        self._cap_partial = ""        # current partial caption line
-        self._cap_dir = None          # temp dir for the caption wav
-        self._cap_size = 0            # caption-wav growth watchdog (bytes)
-        self._cap_size_t = 0.0        # wall clock of the last wav growth
         self._downloading = False     # a VOD download is in flight
         self._compact_level = -1      # control-row compaction step (see _fit_ctl)
         self._compact_hidden = set()  # buttons hidden by compaction
@@ -272,7 +261,9 @@ class PlayerView(QtWidgets.QWidget):
         self._was_playing = False     # for the audio re-apply on transitions
         self._scrub_on = False        # scrubber row currently shown (VOD/chase)
         self._popup_open = False      # a ctl popup menu is open (don't hide)
-        self._last_cap = None
+        self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
+        self._spu_name = ""           # its name — re-matched after media opens
+        self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
         self.vlc = VLCPlayer(timeshift=config.timeshift, volume=config.volume,
@@ -289,7 +280,7 @@ class PlayerView(QtWidgets.QWidget):
         root.addWidget(self.surface, 1)
 
         # ALL on-video overlays (controls, corner buttons, info banner,
-        # captions) live in this ONE frameless translucent window that
+        # pill) live in this ONE frameless translucent window that
         # exactly covers the video surface and follows it around.  A
         # separate top-level is the only reliable way to float controls
         # over the video: the video surface is a native window and libvlc
@@ -408,7 +399,10 @@ class PlayerView(QtWidgets.QWidget):
                                "Record this channel to a file "
                                "(Settings > Recording folder)", checkable=True)
         self.sep2 = ctl_sep()
-        self.btn_cc = ctl_btn(ic.cc(), "Subtitles / captions")
+        # subtitles: opens the track menu (enabled once the stream's
+        # subtitle tracks are discovered — movies/series almost always carry
+        # SRT language tracks, live channels occasionally carry DVB ones)
+        self.btn_cc = ctl_btn(ic.cc(False), "Subtitles (C)")
         self.btn_scale = ctl_btn(ic.scale(), "Video scaling "
                                              "(fit / stretch / crop)")
         # a touch wider than the rest: the scale glyph is wide and its hit
@@ -442,13 +436,9 @@ class PlayerView(QtWidgets.QWidget):
         # rewinds / jump buttons / speed work in DVR (chase) mode and for
         # movies / series episodes (the whole file is already available)
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                  self.btn_begin, self.btn_live, self.btn_speed):
+                  self.btn_begin, self.btn_live, self.btn_speed,
+                  self.btn_cc):
             b.setEnabled(False)
-
-        # auto-caption overlay (sits above the controls) — a custom widget:
-        # wraps long transcriptions into a few lines, styleable + draggable
-        self.cap_label = CaptionWidget(self.overlay, config)
-        self.cap_label.moved.connect(lambda: self._layout_overlays())
 
         # DVR start-up pill ("DVR 12s / 20s buffered…"), centered on the
         # video while the chase buffer fills — the screen would otherwise
@@ -460,10 +450,13 @@ class PlayerView(QtWidgets.QWidget):
                                       True)
         self._dvr_status.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self._dvr_status.hide()
-        self.captioner = capmod.AutoCaptioner(self)
-        self.captioner.final.connect(self._on_cap_final)
-        self.captioner.partial.connect(self._on_cap_partial)
-        self.captioner.status.connect(self._on_cap_status)
+        # The overlay window is a ToolTip-style top-level: Windows keeps it
+        # above EVERYTHING (other apps included) even when the main window
+        # is minimized or buried. Suppress it whenever the app loses focus,
+        # so controls/captions can never float over other apps.
+        self._overlay_suppressed = False
+        QtWidgets.QApplication.instance().focusChanged.connect(
+            self._on_focus_changed)
 
         # wiring
         self.btn_back60.clicked.connect(lambda: self._seek_ms(-60000))
@@ -472,7 +465,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_play.clicked.connect(self._toggle_pause)
         self.btn_begin.clicked.connect(self._jump_begin)
         self.btn_live.clicked.connect(self._jump_live)
-        self.btn_cc.clicked.connect(self._cc_menu)
+        self.btn_cc.clicked.connect(self._subs_menu)
         self.btn_scale.clicked.connect(self._scale_menu)
         self.btn_speed.clicked.connect(self._speed_menu)
         self.btn_mute.toggled.connect(self._on_mute)
@@ -583,13 +576,6 @@ class PlayerView(QtWidgets.QWidget):
             self._dvr_status.move(g.left() + (g.width() - ss.width()) // 2,
                                   g.top() + (g.height() - ss.height()) // 2)
             self._dvr_status.raise_()
-        # caption box: centered by default, clear of the control bar
-        if self.cap_label.isVisible():
-            bottom = g.bottom() - 12
-            if self.ctl.isVisible():
-                bottom = min(bottom, self.ctl.y() - self.cap_label.height() - 8)
-            self.cap_label.place_in(g, bottom)
-            self.cap_label.raise_()
 
     def set_client(self, client):
         self.client = client
@@ -733,7 +719,8 @@ class PlayerView(QtWidgets.QWidget):
             epg = self._last_epg
         self.info_overlay.set_info(title, epg)
         self.info_overlay.show()
-        if not self._immersive and not self.overlay.isVisible():
+        if (not self._immersive and not self.overlay.isVisible()
+                and not self._overlay_suppressed):
             self.overlay.show()   # the info banner lives in the overlay window
         self._layout_overlays()
         self.info_timer.start()
@@ -788,7 +775,6 @@ class PlayerView(QtWidgets.QWidget):
         #   3) safe_stop() the recorder — its temp dir is deleted only now,
         #      after BOTH players are idle,
         #   4) only then open the new URL on the display player.
-        self._stop_captions()
         self._stop_recording(stopping=True)
         self.vlc.stop_and_release()
         self._ensure_dvr_stopped()
@@ -811,13 +797,15 @@ class PlayerView(QtWidgets.QWidget):
         self._vid_s = 0.0
         self._last_raw = None
         self._live_paused = False
-        self._cap_rate = None
         self._set_rate(1.0)
         self._update_control_state()
         self._apply_scale()
         self.vlc.play(playable.get("url", ""))
         self._poke_audio()
         self._wake()
+        # Subtitle choice is sticky across channels: _enforce_spu (via the
+        # tick) re-selects a track with the same NAME once the new media's
+        # tracks appear, and leaves subtitles off when it has none.
         if kind == "live" and self.client and playable.get("stream_id"):
             self.runner.run(self.client.short_epg, playable["stream_id"], 4)
 
@@ -861,14 +849,12 @@ class PlayerView(QtWidgets.QWidget):
             else:
                 self._chase_paused = True
                 self.vlc.pause()
-            self._sync_captions()
             return
         # Live / VOD: remember the paused state so the LIVE button can be
         # enabled to jump back to the edge (timeshift pause works here too)
         self._live_paused = not self._live_paused
         self.vlc.toggle_pause()
         self._update_control_state()
-        self._sync_captions()
 
     def toggle_pause(self):
         self._toggle_pause()
@@ -960,7 +946,6 @@ class PlayerView(QtWidgets.QWidget):
             return
         # Live / VOD: normal seek (works for VOD; live streams ignore it).
         self.vlc.seek_ms(ms)
-        self._sync_captions()
 
     def _jump_begin(self):
         """The inverse of LIVE: restart playback at the very beginning of
@@ -970,7 +955,6 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_seek(0.0, resume=True)
         elif self.vlc.get_length() > 0:
             self.vlc.set_time(0)
-            self._sync_captions()
 
     def _chase_seek(self, target_s: float, resume: bool = False):
         """Seek within the chase buffer — and revive a dead player.
@@ -995,7 +979,6 @@ class PlayerView(QtWidgets.QWidget):
             if resume and self._chase_paused:
                 self._chase_paused = False
                 self.vlc.resume()
-            self._sync_captions()
             return
         buf = self.dvr.buffer_file()
         if not buf:
@@ -1012,11 +995,9 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._last_reopen = time.time()
         self._vid_s = target
-        cap = self._cap_wav() if self._cap_mode == "auto" else None
-        self.vlc.play_at(buf, target, cap_path=cap)
+        self.vlc.play_at(buf, target)
         self._poke_audio()
         self._poke_rate()
-        self._sync_captions()
 
     def _poke_rate(self):
         """Re-apply the user's playback speed after a player swap (a fresh
@@ -1070,7 +1051,7 @@ class PlayerView(QtWidgets.QWidget):
         if down and self.current and self.current.get("url") \
                 and not self._is_vod():
             # long-paused past the provider's patience: reconnect at live
-            self._reopen_display(cap=True)
+            self._reopen_display()
             self._live_paused = False
             self._update_control_state()
             return
@@ -1079,7 +1060,6 @@ class PlayerView(QtWidgets.QWidget):
             self._live_paused = False
             self.vlc.resume()
             self._update_control_state()
-        self._sync_captions()
 
     def _on_volume(self, value):
         self.vlc.set_volume(value)
@@ -1115,7 +1095,6 @@ class PlayerView(QtWidgets.QWidget):
                 self._chase_seek(self.slider.value() / 1000.0)
             else:
                 self.vlc.set_time(self.slider.value())
-                self._sync_captions()
         finally:
             # ALWAYS clear the drag flag — a stuck True froze the scrubber
             # timestamps until the next successful drag.
@@ -1184,7 +1163,7 @@ class PlayerView(QtWidgets.QWidget):
         Safe order (ONE provider connection at all times): the display player
         stops first (it holds the buffer file handle), then the recorder and
         its temp dir go, and only then does the display player dial the live
-        URL again — with the caption fork attached when auto-captions are on.
+        URL again.
         """
         self._mode = "live"
         self._chase_paused = False
@@ -1195,28 +1174,20 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_started = False
         self._vid_s = 0.0
         self._last_raw = None
-        self._cap_rate = None
         self._set_dvr_status(None)
         self._set_rate(1.0)
         self._update_control_state()
         self.vlc.stop_and_release()
         self._ensure_dvr_stopped()
-        self._reopen_display(cap=True)
+        self._reopen_display()
 
-    def _reopen_display(self, cap: bool = False, at: float = None) -> bool:
+    def _reopen_display(self, at: float = None) -> bool:
         """(Re)open whatever the display player should be showing right now —
         the DVR buffer in chase mode, otherwise the current URL — with the
-        record output and caption fork attached when active.
-
-        The caption fork is the heart of auto-caption sync: VLC's stream
-        duplication taps the input stream, so the wav is a sequential LOG of
-        the displayed audio (seeks, pauses and rate changes included) and the
-        captioner just tails it. ``at`` re-enters a chase buffer at a content
-        position (used when captions are switched on mid-DVR so the playback
+        record output attached when active. ``at"
+        re-enters a chase buffer at a content position (so the playback
         position is preserved instead of jumping to live).
         """
-        cap_path = self._cap_wav() if (cap and self._cap_mode == "auto") \
-            else None
         rec = self._rec_path if (self._rec_path and self._is_vod()) else None
         if self._mode == "chase" and self.dvr:
             buf = self.dvr.buffer_file()
@@ -1226,21 +1197,19 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_started = False
             self._stall_ticks = 0
             self._last_reopen = time.time()
-            self.vlc.play_at(buf, target, cap_path=cap_path)
+            self.vlc.play_at(buf, target)
             self._vid_s = target
             self._poke_audio()
             self._poke_rate()
-            self._sync_captions()
             return True
         url = self.current.get("url", "") if self.current else ""
         if not url:
             return False
-        if cap_path or rec:
-            self.vlc.play_at(url, record_path=rec, cap_path=cap_path)
+        if rec:
+            self.vlc.play_at(url, record_path=rec)
         else:
             self.vlc.play(url)
         self._poke_audio()
-        self._sync_captions()
         return True
 
     def _restart_recorder(self, record: bool):
@@ -1306,7 +1275,10 @@ class PlayerView(QtWidgets.QWidget):
         if text:
             if self._dvr_status.text() != text:
                 self._dvr_status.setText(text)
-            if not self.overlay.isVisible():
+            # Only surface the overlay with the app in the foreground — the
+            # tick keeps updating this pill in the background, and the
+            # ToolTip-style overlay would paint it over other apps.
+            if not self.overlay.isVisible() and not self._overlay_suppressed:
                 self.overlay.show()
             self._dvr_status.show()
             self._dvr_status.raise_()
@@ -1368,7 +1340,7 @@ class PlayerView(QtWidgets.QWidget):
             self.btn_dvr.setIcon(ic.dvr(False))
             self.btn_dvr.blockSignals(False)
             self._update_control_state()
-            self._reopen_display(cap=True)
+            self._reopen_display()
 
     def _start_chase_now(self, gen: int):
         if gen != self._session:
@@ -1393,7 +1365,6 @@ class PlayerView(QtWidgets.QWidget):
                      delay, target, self._frontier_s())
         except Exception:
             pass
-        # _reopen_display keeps the caption fork attached when auto-captions
         # are on (the wav then logs the buffered audio as it is displayed)
         self._reopen_display(at=target)
 
@@ -1470,10 +1441,8 @@ class PlayerView(QtWidgets.QWidget):
                 self._wait_and_enter_chase(self._session)
             else:
                 # VOD: the main player watches AND records in one go.
-                cap = self._cap_wav() if self._cap_mode == "auto" else None
                 self.vlc.play_at(self.current["url"],
-                                 record_path=self._rec_path, cap_path=cap)
-                self._sync_captions()
+                                 record_path=self._rec_path)
         else:
             self._stop_recording()
 
@@ -1495,13 +1464,13 @@ class PlayerView(QtWidgets.QWidget):
                 self._restart_recorder(record=False)
             else:
                 # REC was the only reason for the chase pipeline — back to
-                # the plain live stream (caption fork stays attached if on).
+                # the plain live stream.
                 self._exit_chase_to_live()
         elif self.current and self.current.get("url") and self._mode == "live":
             # Plain live/VOD mode: the display player carried the record
             # output, restart it as a plain viewer (still one connection,
-            # caption fork stays attached if on).
-            self._reopen_display(cap=True)
+            #).
+            self._reopen_display()
         if self.btn_rec.isChecked():
             self.btn_rec.blockSignals(True)
             self.btn_rec.setChecked(False)
@@ -1656,6 +1625,12 @@ class PlayerView(QtWidgets.QWidget):
         the restore chevron follow the idle timer."""
         if self._closing:
             return
+        if self._overlay_suppressed:
+            # Another app has the foreground (see _on_focus_changed): the
+            # ToolTip-style overlay paints above OTHER apps' windows too, so
+            # a cursor passing over the app's exposed area behind them must
+            # not surface the controls over e.g. Chrome.
+            return
         self.unsetCursor()
         if not self.cursor_timer.isActive():
             self.cursor_timer.start()   # self-heal: stop() halts the poll
@@ -1699,7 +1674,7 @@ class PlayerView(QtWidgets.QWidget):
             self.setCursor(QtCore.Qt.BlankCursor)
         if not any(w.isVisible() for w in (
                 self._btn_panel, self._btn_ovfs, self._btn_showpanel,
-                self.info_overlay, self.cap_label, self._dvr_status)):
+                self.info_overlay, self._dvr_status)):
             self.overlay.hide()   # nothing left to show over the video
 
     def _cursor_on_controls(self) -> bool:
@@ -1730,6 +1705,12 @@ class PlayerView(QtWidgets.QWidget):
             return
         playing = self.vlc.is_playing()
         self.btn_play.setIcon(ic.pause() if playing else ic.play())
+        # Subtitles: enforce the user's choice every tick. VLC re-selects
+        # (and renders) a stream's own subtitle track on media opens and ES
+        # updates, a fresh player after a hung-stop swap loses the selection
+        # entirely, and remote MKVs only report their SRT tracks a couple of
+        # seconds after Playing — one-shot calls can cover none of that.
+        self._enforce_spu()
         mute = self.vlc.is_mute()
         if mute != self.btn_mute.isChecked():
             self.btn_mute.blockSignals(True)
@@ -1789,8 +1770,7 @@ class PlayerView(QtWidgets.QWidget):
                         pass
                     self._stall_ticks = 0
                     self._reopen_chase(gen)
-                self._pace_captions(playing)
-                return
+                    return
             self._stall_ticks = 0
             if not self._seeking:
                 self._set_scrub(int(frontier * 1000), int(current * 1000))
@@ -1811,8 +1791,6 @@ class PlayerView(QtWidgets.QWidget):
                 except Exception:
                     pass
                 self._set_rate(1.0)
-            # ---- captions: paced with the picture (see _pace_captions) ----
-            self._pace_captions(playing)
             return
 
         # Live / VOD: the scrubber only appears for VOD (known length) —
@@ -1851,53 +1829,8 @@ class PlayerView(QtWidgets.QWidget):
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None
             self._vid_s = 0.0
-        self._pace_captions(playing)
 
-    def _pace_captions(self, playing: bool):
-        """Keep the caption feed paced with the picture: paused video →
-        paused feed, speed changes → feed at that speed. The wav is a log
-        of the displayed audio (see _reopen_display), so pacing is the only
-        correction needed — plus a watchdog that re-attaches the wav fork
-        if it ever stops growing while playback runs."""
-        if self._cap_mode != "auto" or self._closing:
-            return
-        paused = (not playing
-                  or (self._mode == "chase" and self._chase_paused))
-        want = 0.0 if paused else self._rate
-        if want != self._cap_rate:
-            self._cap_rate = want
-            try:
-                self.captioner.set_rate(want)
-            except Exception:  # noqa: BLE001
-                pass
-        if not paused:
-            self._watch_cap_wav()
 
-    def _watch_cap_wav(self):
-        """Self-heal for the caption wav: if it stops growing while playback
-        runs (a sout branch died), re-open the display with the fork."""
-        if not self._cap_dir:
-            return
-        wav = os.path.join(self._cap_dir, "captions.wav")
-        try:
-            size = os.path.getsize(wav)
-        except OSError:
-            return
-        now = time.time()
-        if size > self._cap_size:
-            self._cap_size = size
-            self._cap_size_t = now
-            return
-        if self._cap_size > 0 and now - self._cap_size_t > 8.0:
-            try:
-                log.warning("caption wav stalled (%d bytes for %.1fs) — "
-                            "re-attaching the fork", self._cap_size,
-                            now - self._cap_size_t)
-            except Exception:
-                pass
-            self._cap_size = 0
-            self._cap_size_t = now
-            self._reopen_display(cap=True)
 
     def _set_scrub(self, maximum: int, value: int):
         """Only touch the scrubber when something actually changed — repeated
@@ -1941,7 +1874,9 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing:
             return
         try:
+            # BOTH: a volume-only restore can never clear a latched mute
             self.vlc.set_volume(self.vol_slider.value())
+            self.vlc.set_mute(self.btn_mute.isChecked())
         except Exception:  # noqa: BLE001
             pass
 
@@ -1969,6 +1904,7 @@ class PlayerView(QtWidgets.QWidget):
         self._apply_button_visibility()
         self._apply_scale()
         self._poke_audio()
+        self._refresh_spu_button()
 
     # ---- per-button visibility (Settings ▸ Playback controls…) ----
     def apply_button_visibility(self):
@@ -2016,7 +1952,7 @@ class PlayerView(QtWidgets.QWidget):
         self._set_scrub_visible(self._scrub_on)
         self._layout_overlays()
 
-    # ---- popup menus (speed / scale / captions) ----
+    # ---- popup menus (speed / scale) ----
     def _ctl_menu(self):
         m = QtWidgets.QMenu(self)
         m.setObjectName("ctlMenu")
@@ -2056,7 +1992,6 @@ class PlayerView(QtWidgets.QWidget):
             pass
         self.btn_speed.setToolTip(
             f"Playback speed — {rate:g}\u00d7 (DVR mode, movies & series)")
-        self._sync_captions()
 
     def _scale_menu(self):
         m = self._ctl_menu()
@@ -2085,316 +2020,170 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
 
-    # ---- captions ----
-    def _cc_menu(self):
-        m = self._ctl_menu()
-        off = m.addAction("Off")
-        off.setCheckable(True)
-        off.setChecked(self._cap_mode == "off")
-        off.triggered.connect(lambda: self._set_caption("off"))
-        tracks = []
+    # ---- subtitles (embedded stream tracks) ----
+    def _enforce_spu(self):
+        """Re-assert the user's subtitle choice against the CURRENT media.
+
+        Runs from every tick: VLC re-selects a stream's own subtitle track
+        on media opens and ES updates, player swaps lose the selection, and
+        remote MKVs report their tracks only seconds after Playing. The
+        choice is sticky by NAME — track ids differ between medias, so a
+        channel change re-selects e.g. "English" on the new stream when it
+        exists and quietly turns subtitles off when it doesn't."""
+        if self._closing:
+            return
+        try:
+            tracks = self.vlc.spu_tracks()
+            if self._spu_want == -1:
+                if self.vlc.active_spu() != -1:
+                    self.vlc.set_spu(-1)
+            elif self._spu_want not in [tid for tid, _ in tracks]:
+                # id unknown here (new media / DVR handoff): re-match by name
+                match = None
+                for tid, name in tracks:
+                    if name and name == self._spu_name:
+                        match = (tid, name)
+                        break
+                if match is None and self._spu_name:
+                    low = self._spu_name.lower()
+                    for tid, name in tracks:
+                        if name and low in name.lower():
+                            match = (tid, name)
+                            break
+                if match is None:
+                    self._spu_want = -1
+                    self._spu_name = ""
+                    if self.vlc.active_spu() != -1:
+                        self.vlc.set_spu(-1)
+                else:
+                    self._spu_want, self._spu_name = match
+                    self.vlc.set_spu(self._spu_want)
+            elif self.vlc.active_spu() != self._spu_want:
+                self.vlc.set_spu(self._spu_want)
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_spu_button()
+
+    def _refresh_spu_button(self):
+        """Paint the CC button only on state changes — this runs every tick
+        and repeated setIcon/tooltip writes repaint the overlay."""
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
+            tracks = []
+        enabled = bool(tracks)
+        on = self._spu_want != -1
+        state = (enabled, on, self._spu_name if on else "")
+        if state == self._spu_ui:
+            return
+        self._spu_ui = state
+        self.btn_cc.setEnabled(enabled)
+        self.btn_cc.setIcon(ic.cc(on))
+        label = self._spu_name if on else "Off"
+        self.btn_cc.setToolTip(
+            f"Subtitles — {label} (C)" if enabled
+            else "Subtitles — none on this stream")
+
+    def _select_spu(self, track_id: int, name: str = ""):
+        """User picked a track from the menu (or -1 for Off)."""
+        self._spu_want = int(track_id)
+        self._spu_name = name or ""
+        try:
+            self.vlc.set_spu(self._spu_want)
+        except Exception:  # noqa: BLE001
             pass
-        if tracks:
-            m.addSeparator()
-            for tid, name in tracks:
-                a = m.addAction(name or f"Track {tid}")
-                a.setCheckable(True)
-                a.setChecked(self._cap_mode == tid)
-                a.triggered.connect(lambda *_, t=tid: self._set_caption(t))
-        m.addSeparator()
-        auto = m.addAction("Auto-generated (English)")
-        auto.setCheckable(True)
-        auto.setChecked(self._cap_mode == "auto")
-        auto.setToolTip("Local speech-to-text (vosk) — free and offline")
-        auto.triggered.connect(lambda: self._set_caption("auto"))
-        m.addSeparator()
-        st = m.addAction("Subtitle settings\u2026")
-        st.triggered.connect(self._open_subtitle_settings)
+        self._refresh_spu_button()
+
+    def _cycle_spu(self):
+        """C key: Off -> track 1 -> track 2 -> ... -> Off."""
+        if self._closing:
+            return
+        try:
+            tracks = self.vlc.spu_tracks()
+        except Exception:  # noqa: BLE001
+            return
+        if not tracks:
+            return
+        ids = [-1] + [tid for tid, _ in tracks]
+        names = {tid: name for tid, name in tracks}
+        try:
+            idx = ids.index(self._spu_want)
+        except ValueError:
+            idx = 0
+        nxt = ids[(idx + 1) % len(ids)]
+        self._select_spu(nxt, names.get(nxt, ""))
+        self._flash_spu(nxt, names.get(nxt, ""))
+
+    def _subs_menu(self):
+        if not self.btn_cc.isEnabled():
+            return
+        try:
+            tracks = self.vlc.spu_tracks()
+        except Exception:  # noqa: BLE001
+            return
+        m = self._ctl_menu()
+        off = m.addAction("Off")
+        off.setCheckable(True)
+        off.setChecked(self._spu_want == -1)
+        off.triggered.connect(lambda *_, t=-1, n="": self._select_spu(t, n))
+        for tid, name in tracks:
+            a = m.addAction(name or f"Track {tid}")
+            a.setCheckable(True)
+            a.setChecked(tid == self._spu_want)
+            a.triggered.connect(lambda *_, t=tid, n=name:
+                                self._select_spu(t, n))
         self._popup_above(m, self.btn_cc)
 
-    def _open_subtitle_settings(self):
-        try:
-            dlg = SubtitlesSettingsDialog(self.config, self, self)
-            dlg.show()
-        except Exception as exc:  # noqa: BLE001
-            try:
-                log.warning("subtitle settings failed: %r", exc)
-            except Exception:
-                pass
+    def _flash_spu(self, track_id: int, name: str):
+        """Brief on-video confirmation while cycling with the keyboard."""
+        if self._closing or not self._dvr_status.isHidden():
+            return   # the pill is busy with DVR start-up info
+        text = name if track_id != -1 else "Off"
+        self._set_dvr_status(f"Subtitles: {text}")
+        QtCore.QTimer.singleShot(1200,
+                                 lambda: self._set_dvr_status("")
+                                 if self._dvr_status.text() ==
+                                 f"Subtitles: {text}" else None)
 
-    def _set_caption(self, mode):
-        if mode == "auto":
-            if self._cap_mode == "auto":
-                return
-            if not self._ensure_caption_stack():
-                return
-            self._enable_auto_captions()
-        else:
-            was_auto = self._cap_mode == "auto"
-            self._cap_mode = "off" if not isinstance(mode, int) else mode
-            try:
-                self.captioner.stop()
-            except Exception:  # noqa: BLE001
-                pass
-            self._cap_final = ""
-            self._cap_partial = ""
-            self._update_cap_label()
-            try:
-                self.vlc.set_spu(mode if isinstance(mode, int) else -1)
-            except Exception:  # noqa: BLE001
-                pass
-            if was_auto:
-                # drop the caption wav fork from the active pipeline (the
-                # display player reopens at its CURRENT position — no jump)
-                self._reopen_display()
 
-    def _cap_wav(self):
-        if not self._cap_dir:
-            self._cap_dir = tempfile.mkdtemp(prefix="mtp_cap_")
-        return os.path.join(self._cap_dir, "captions.wav")
 
-    def _enable_auto_captions(self):
-        """Turn on auto-captions from whatever moment is on screen right now.
 
-        The caption wav is forked off the DISPLAY player (VLC stream
-        duplication — still ONE provider connection): it logs the audio
-        exactly as it is shown, so captions begin at the current playback
-        moment, follow every seek/pause/speed change, and turning them on
-        never restarts the DVR recorder or jumps the video to live.
-        """
-        self._cap_mode = "auto"
-        self._cap_final = ""
-        self._cap_partial = ""
-        wav = self._cap_wav()
-        try:
-            os.remove(wav)   # fresh log per enable
-        except OSError:
-            pass
-        self._cap_size = 0
-        self._cap_size_t = time.time()
-        try:
-            self.captioner.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        if not self.captioner.start(wav):
-            self._cap_mode = "off"
+
+
+
+
+
+
+
+
+    def _on_focus_changed(self, _old, now):
+        """Hide the on-video overlays when the app loses focus (another app
+        took it, or the window was minimized): the ToolTip-style overlay
+        window would otherwise stay painted on top of OTHER apps."""
+        if self._closing:
             return
-        try:
-            self.captioner.set_backoff(self.config.caption_sync_offset)
-        except Exception:  # noqa: BLE001
-            pass
-        # attach the fork to whatever is playing now (chase buffer or URL);
-        # in chase mode this reopens AT the current position — the DVR
-        # position and everything buffered so far are preserved
-        self._wake()
-        if self.captioner._model is None:
-            # the speech model loads in the captioner's worker thread (the
-            # big one takes a while — never on the GUI thread); tell the
-            # user why captions won't appear immediately
-            self._set_dvr_status("Captions: loading speech model\u2026")
-            QtCore.QTimer.singleShot(
-                180_000, self._hide_cap_model_pill)
-        if not self._reopen_display(cap=True):
-            # buffer too young to reopen yet (first seconds of DVR) —
-            # retry shortly until the wav actually exists
-            QtCore.QTimer.singleShot(3000,
-                                     lambda: self._retry_cap_attach(10))
-
-    def _retry_cap_attach(self, tries: int):
-        if (self._cap_mode != "auto" or self._closing or tries <= 0
-                or os.path.exists(self._cap_wav())):
-            return
-        if not self._reopen_display(cap=True) and tries > 1:
-            QtCore.QTimer.singleShot(3000,
-                                     lambda: self._retry_cap_attach(tries - 1))
-
-    def _stop_captions(self):
-        """Stop auto-captions (embedded tracks are handled by VLC itself)."""
-        was_auto = self._cap_mode == "auto"
-        self._cap_mode = "off"
-        self._cap_rate = None
-        try:
-            self.captioner.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        self._cap_final = ""
-        self._cap_partial = ""
-        self._update_cap_label()
-        return was_auto
-
-    def _ensure_caption_stack(self) -> bool:
-        """vosk engine + speech model present? Offer to install/download."""
-        if not capmod.vosk_importable():
-            ret = QtWidgets.QMessageBox.question(
-                self, "Auto captions — speech engine",
-                "Auto-generated captions use vosk, a free, open-source "
-                "speech-recognition engine that runs completely offline on "
-                "this PC.\n\nInstall it now from PyPI? (small download)",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            if ret != QtWidgets.QMessageBox.Yes:
-                return False
-            loop = QtCore.QEventLoop()
-            dlg = QtWidgets.QProgressDialog(
-                "Installing vosk (pip)...", None, 0, 0, self)
-            dlg.setWindowModality(QtCore.Qt.WindowModal)
-            dlg.show()
-            proc = QtCore.QProcess(self)
-            proc.setProgram(sys.executable)
-            proc.setArguments(["-m", "pip", "install", "vosk"])
-
-            def _pip_done(code, _status, loop=loop, dlg=dlg):
-                dlg.close()
-                loop.quit()
-            proc.finished.connect(_pip_done)
-            proc.start()
-            # never let a stalled pip soft-lock the app
-            QtCore.QTimer.singleShot(600_000, loop.quit)
-            loop.exec_()
-            if not capmod.vosk_importable():
-                QtWidgets.QMessageBox.warning(
-                    self, "Auto captions",
-                    "vosk could not be installed automatically.\n\n"
-                    "Install it manually with:\n    pip install vosk\n\n"
-                    "and try again.")
-                return False
-        if not capmod.model_ready():
-            ret = QtWidgets.QMessageBox.question(
-                self, "Auto captions — speech model",
-                "One more thing: the offline speech model (~40 MB) must be "
-                "downloaded once from alphacephei.com.\n\nDownload it now?",
-                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
-            if ret != QtWidgets.QMessageBox.Yes:
-                return False
-            loop = QtCore.QEventLoop()
-            dlg = QtWidgets.QProgressDialog(
-                "Downloading caption model...", None, 0, 100, self)
-            dlg.setWindowModality(QtCore.Qt.WindowModal)
-            dlg.show()
-            dl = capmod.ModelDownloader(self)
-            dlg.setMaximum(100000)
-
-            def _prog(done, total, dlg=dlg):
-                dlg.setMaximum(max(int(total), 1))
-                dlg.setValue(min(int(done), int(total)))
-            dl.progress.connect(_prog)
-
-            def _fin(ok, msg, loop=loop, dlg=dlg):
-                dlg.close()
-                loop.quit()
-                if not ok and msg:
-                    QtWidgets.QMessageBox.warning(
-                        self, "Auto captions",
-                        f"Model download failed: {msg}")
-            dl.finished.connect(_fin)
-            dl.start()
-            loop.exec_()
-            if not capmod.model_ready():
-                return False
-        return True
-
-    def _on_cap_final(self, text):
-        self._cap_final = text
-        self._update_cap_label()
-        self._hide_cap_model_pill()
-
-    def _on_cap_partial(self, text):
-        self._cap_partial = text
-        self._update_cap_label()
-        self._hide_cap_model_pill()
-
-    def _hide_cap_model_pill(self):
-        if (self._dvr_status.isVisible() and self._dvr_status.text()
-                .startswith("Captions:")):
-            self._set_dvr_status(None)
-
-    def _on_cap_status(self, text):
-        try:
-            log.info("captions status: %s", text)
-        except Exception:
-            pass
-
-    def _update_cap_label(self):
-        if self._cap_mode != "auto":
-            if self.cap_label.isVisible():
-                self.cap_label.hide()
-            return
-        lines = [l for l in (self._cap_final, self._cap_partial) if l]
-        txt = " ".join(lines)
-        if txt != self._last_cap:
-            self._last_cap = txt
-            self.cap_label.set_text(txt)
-            if txt:
-                if not self.overlay.isVisible():
-                    self.overlay.show()   # captions must show in fullscreen
+        if now is None and QtWidgets.QApplication.activeWindow() is None:
+            if self.overlay.isVisible():
+                self._overlay_suppressed = True
+                self._overlay_was_visible = True
+                self.overlay.hide()
+        elif now is not None and self._overlay_suppressed:
+            self._overlay_suppressed = False
+            if getattr(self, "_overlay_was_visible", False) \
+                    and not self._closing:
+                self.overlay.show()
                 self._layout_overlays()
+            self._overlay_was_visible = False
 
-    # ---- caption appearance / sync (see ui/subtitles.py) ----
-    def apply_subtitle_style(self):
-        self.cap_label.apply_style()
-        self._layout_overlays()
 
-    def captions_reset_position(self):
-        self.cap_label.reset_position()
-        self._layout_overlays()
 
-    def captions_restart_for_new_model(self):
-        """A bigger speech model finished downloading: restart the captioner
-        thread on the SAME wav. The VLC pipelines are never touched here —
-        restarting playback for a model swap used to spawn a stray video
-        window and duplicate caption streams."""
-        if self._cap_mode != "auto":
-            return
-        wav = self._cap_wav()
-        try:
-            self.captioner.stop()
-            self.captioner._model = None      # pick up the new model
-            if self.captioner.start(wav):
-                self.captioner.set_backoff(self.config.caption_sync_offset)
-                self._sync_captions()
-        except Exception as exc:  # noqa: BLE001
-            try:
-                log.warning("caption model swap failed: %r", exc)
-            except Exception:
-                pass
 
-    def captions_apply_sync(self):
-        """Apply the manual caption sync offset (Subtitle settings dialog)."""
-        if self._cap_mode == "auto":
-            try:
-                self.captioner.set_backoff(self.config.caption_sync_offset)
-            except Exception:  # noqa: BLE001
-                pass
 
-    def _sync_captions(self):
-        """Re-align auto-captions with what the video is SHOWING right now.
 
-        The wav is a sequential log of the displayed audio (see
-        _reopen_display), so syncing is simply: skip the feed to the log's
-        tail ("transcribe from this moment on") and pace it at the current
-        playback speed. Called after every seek / jump / rate change /
-        pause / pipeline restart."""
-        if self._cap_mode != "auto":
-            return
-        self._cap_final = ""
-        self._cap_partial = ""
-        self._update_cap_label()
-        try:
-            if self._mode == "chase":
-                paused = self._chase_paused or not self.vlc.is_playing()
-            else:
-                paused = not self.vlc.is_playing()
-            rate = 0.0 if paused else self._rate
-            self._cap_rate = rate
-            self.captioner.follow_live()
-            self.captioner.set_rate(rate)
-        except Exception as exc:  # noqa: BLE001
-            try:
-                log.debug("caption sync failed: %r", exc)
-            except Exception:
-                pass
+
+
+
+
 
     def stop(self):
         """Ordered full teardown. Every step is wrapped in try/except + log
@@ -2446,15 +2235,6 @@ class PlayerView(QtWidgets.QWidget):
             self.overlay.hide()
         except Exception:
             pass
-        try:
-            self._stop_captions()
-        except Exception as exc:  # noqa: BLE001
-            try:
-                log.warning("stop: caption teardown failed: %r", exc)
-            except Exception:
-                pass
-        self._cap_size = 0
-        self._cap_size_t = 0.0
         # (b) REC bookkeeping + display player down.
         try:
             self._stop_recording(stopping=True)
@@ -2490,15 +2270,8 @@ class PlayerView(QtWidgets.QWidget):
         self._vid_s = 0.0
         self._last_raw = None
         self._live_paused = False
-        self._cap_rate = None
         self._scrub_on = False
         self._set_rate(1.0)
-        if self._cap_dir:
-            try:
-                shutil.rmtree(self._cap_dir, ignore_errors=True)
-            except Exception:  # noqa: BLE001
-                pass
-            self._cap_dir = None
         try:
             self._update_control_state()
             self.btn_play.setIcon(ic.play())
@@ -2528,5 +2301,7 @@ class PlayerView(QtWidgets.QWidget):
             self._seek_ms(60000)
         elif key == QtCore.Qt.Key_M:
             self.btn_mute.toggle()
+        elif key == QtCore.Qt.Key_C:
+            self._cycle_spu()
         else:
             super().keyPressEvent(event)

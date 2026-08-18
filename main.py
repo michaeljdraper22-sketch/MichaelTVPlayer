@@ -7,12 +7,56 @@ import shutil
 import sys
 import tempfile
 
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 
-APP_NAME = "MichaelTVPlayer"
+APP_NAME = "MichaelTV"   # display name (config/log dirs stay MichaelTVPlayer)
 
 log = logging.getLogger("mtp")
+
+
+def _is_frozen() -> bool:
+    """True when running from the PyInstaller-built MichaelTVPlayer.exe."""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _bundle_dir() -> str:
+    """Where the read-only app resources live (script dir, or the PyInstaller
+    onefile unpack dir)."""
+    if _is_frozen():
+        return getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _install_dir() -> str:
+    """Where the .exe (or script) lives — writable sidecar files go here."""
+    if _is_frozen():
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _setup_windows_identity() -> None:
+    """Give the process an explicit AppUserModelID so the taskbar shows the
+    app's own icon (not python.exe's) and windows group correctly."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "MichaelTV")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _setup_bundled_vlc() -> None:
+    r"""Optional: use a VLC runtime shipped in a ``vlc`` folder next to the
+    exe (copy libvlc.dll, libvlccore.dll and the plugins\ folder there).
+    Without such a folder the installed VLC is used, as before."""
+    vlc_dir = os.path.join(_install_dir(), "vlc")
+    if os.path.isdir(vlc_dir):
+        os.environ.setdefault("PYTHON_VLC_MODULE_PATH", vlc_dir)
+        plugins = os.path.join(vlc_dir, "plugins")
+        if os.path.isdir(plugins):
+            os.environ.setdefault("PYTHON_VLC_PLUGIN_PATH", plugins)
 
 
 def cleanup_stale_dvr_buffers(max_age_days: float = None) -> None:
@@ -59,18 +103,23 @@ def main() -> int:
         pass
     # A crashed previous run can strand GB-sized DVR buffers in %TEMP%.
     cleanup_stale_dvr_buffers()
+    _setup_windows_identity()
+    _setup_bundled_vlc()
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("MichaelTV")
     app.setApplicationDisplayName(APP_NAME)
+    ico = os.path.join(_bundle_dir(), "assets", "icon.ico")
+    if os.path.exists(ico):
+        app.setWindowIcon(QtGui.QIcon(ico))
 
     if not vlc_available():
         QtWidgets.QMessageBox.critical(
             None,
             "VLC is required",
             (
-                "MichaelTVPlayer needs the VLC media player to be installed.\n\n"
+                "MichaelTV needs the VLC media player to be installed.\n\n"
                 "Please install VLC from https://www.videolan.org/ and restart.\n\n"
                 "Important: the VLC bitness must match your Python bitness\n"
                 "(64-bit Python needs 64-bit VLC)."

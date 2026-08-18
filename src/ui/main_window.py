@@ -119,7 +119,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.setWindowTitle("MichaelTVPlayer")
+        self.setWindowTitle("MichaelTV")
         self.resize(1340, 820)
         # Must fit the splitter's children minimums (170 + 6 handle + 280):
         # a smaller window minimum made Qt's layout fight the splitter while
@@ -239,6 +239,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.toggle_fullscreen)
         QtWidgets.QShortcut(QtGui.QKeySequence("F5"), self,
                             activated=self.reload_all)
+        QtWidgets.QShortcut(QtGui.QKeySequence("C"), self,
+                            activated=self.player_view._cycle_spu)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
@@ -432,7 +434,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("play", "Play / Pause"), ("fwd10", "Forward 10 s"),
             ("begin", "Jump to beginning"),
             ("live", "LIVE (jump to live edge)"), ("dvr", "DVR"),
-            ("rec", "Record"), ("cc", "Captions"),
+            ("rec", "Record"),
+            ("cc", "Subtitles"),
             ("scale", "Video scaling"), ("speed", "Playback speed"),
             ("mute", "Mute"), ("volume", "Volume slider"),
             ("timebar", "Time bar (DVR / Record)"),
@@ -659,14 +662,14 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_account(self, result):
         ok, val = result
         if ok == "ok":
-            self.setWindowTitle("MichaelTVPlayer")
+            self.setWindowTitle("MichaelTV")
         else:
             # No status bar / popup spam — a quiet hint in the title instead.
-            self.setWindowTitle("MichaelTVPlayer — account error (File > Account)")
+            self.setWindowTitle("MichaelTV — account error (File > Account)")
 
     def _show_help(self):
         QtWidgets.QMessageBox.information(
-            self, "MichaelTVPlayer — Help",
+            self, "MichaelTV — Help",
             "Click a channel/movie/episode (or press Enter) to play.\n"
             "Right-click any item for Play / Add-or-remove Favorite.\n\n"
             "Controls:\n"

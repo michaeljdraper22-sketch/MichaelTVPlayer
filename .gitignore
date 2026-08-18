@@ -3,6 +3,10 @@ __pycache__/
 *.pyc
 .venv/
 
+# PyInstaller build output
+build/
+dist/
+
 # Personal data — never upload
 TV Recordings/
 *.ts

@@ -1,6 +1,7 @@
-# MichaelTVPlayer
+# MichaelTV
 
 **⚠️ v1.0 PROTOTYPE** — this is the first working snapshot of the project,
+(now branded **MichaelTV**; settings/logs still live in `%APPDATA%\MichaelTVPlayer`)
 saved in its current form. It was built and tested on **Windows 11**. If it
 does not work on your machine, future developments will aim to make it more
 compatible with more Windows 11 users. There is currently **no intent for
@@ -11,7 +12,7 @@ subscription. Login is currently only available through the Xtream Codes
 API ("extreme code") credentials supplied by your provider.
 
 A VLC-powered IPTV player for **Xtream Codes API** accounts — your own
-personal "Smarters"-style player, named MichaelTVPlayer. **VLC (libvlc) is
+personal "Smarters"-style player. **VLC (libvlc) is
 at the heart of the project**: all playback, DVR/timeshift and recording run
 through a single VLC connection.
 
@@ -27,7 +28,7 @@ through a single VLC connection.
 - **Live TV, Movies (VOD) and Series** browsing with categories + live search
 - **Now / Next EPG** (TV guide) for the current live channel
 - **Real VLC playback** (libvlc) embedded in the window
-- **Single stream connection** — playback, DVR, recording and captions all
+- **Single stream connection** — playback, DVR and recording all
   run on ONE connection to your provider (works with 1-connection accounts).
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
@@ -37,6 +38,15 @@ through a single VLC connection.
     anywhere on the volume bar jumps the volume there**.
   - The controls (and the cursor) **appear when a stream starts / changes or
     the mouse moves**, and **hide after 4 s of no movement**.
+  - **Subtitles (CC)** — plays the stream's own embedded subtitle tracks.
+    Movies and series almost always carry a dozen+ SRT language tracks
+    (English, Spanish, …); some live channels carry DVB subtitles. The
+    button lights blue while a track is active; **C** cycles
+    Off → track 1 → track 2 → …, and the choice is sticky by language
+    across channel changes. Streams without subtitle tracks keep the
+    button disabled. (DVR-chase playback uses a re-muxed buffer, where
+    subtitle tracks generally don't survive — subtitles work best in
+    normal live playback and movies/series.)
   - **Playback speed** (speedometer; DVR mode, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
@@ -45,27 +55,6 @@ through a single VLC connection.
     edge — in plain live mode too (it resumes at the edge, and reconnects
     the stream if a long pause killed it). For movies/series it skips to
     the end.
-  - **Captions** (CC button): embedded subtitle tracks from the stream, or
-    **auto-generated captions** via local, offline speech recognition
-    ([vosk](https://alphacephei.com/vosk) — free, Apache-2.0; the ~40 MB
-    English model is downloaded once, on demand).
-    - Captions **start at the moment you enable them** and stay in sync
-      structurally: the caption engine tails a wav that logs exactly the
-      audio being displayed (seeks, pauses and speed changes included), so
-      they follow rewinds, fast-forward, speed changes, pause and
-      jump-to-live — in DVR mode, plain live AND movies/series. Enabling
-      them never restarts the DVR recorder or jumps the video to live.
-    - **Caption sync** (Subtitle settings): ±0.5 s nudges when captions run
-      ahead/behind, plus Reset — saved with your settings.
-    - Long stretches of speech wrap into a few centered lines (never a
-      giant box).
-    - **Subtitle settings…** (inside the CC menu): font, size, text color,
-      background color/opacity, or an **outline** instead of the background
-      (with its own color + thickness), plus **drag the caption box**
-      anywhere on the video. **Revert to defaults** undoes everything.
-    - A **high-accuracy speech model** (~1.3 GB, one-time download) can be
-      installed from the settings dialog — noticeably better with accents.
-      It hot-swaps into the running captions; playback is never restarted.
   - **Video scaling** (⤢): Fit (default) / Stretch / Crop to fill.
   - **Time scrubber** with current time on the left and total time on the
     right — appears in DVR / Record mode (and for movies). **Click anywhere
@@ -103,12 +92,22 @@ through a single VLC connection.
 
 ## Requirements
 - **Windows 10/11**
-- **Python 3.9+** (64-bit recommended): https://www.python.org/downloads/
-  (tick "Add Python to PATH" during install)
-- **VLC media player** — the bitness **must match** Python
-  (64-bit Python → 64-bit VLC): https://www.videolan.org/
+- **VLC media player** — the bitness **must match** (64-bit recommended):
+  https://www.videolan.org/
+- Python is **not** needed to run the packaged app — only to build it or
+  run from source.
 
-## Run
+## Run (packaged app — recommended)
+Double-click **`MichaelTV.exe`** (built into `dist\`; a desktop
+shortcut is created by `tools\make_shortcut.ps1`). No console window, no
+Python install, no venv — just the app.
+
+Build it yourself by double-clicking **`build.bat`** (needs Python 3.9+,
+64-bit). The exe still needs VLC installed — or drop a full `vlc\` folder
+(copy `libvlc.dll`, `libvlccore.dll` and `plugins\`) next to the exe to
+make it fully self-contained.
+
+## Run (from source, for development)
 Double-click **`run.bat`**. It creates a virtual environment, installs
 dependencies, and launches the app.
 
@@ -127,6 +126,7 @@ Click **Test Connection** to verify before saving. Your details are stored in
 | ← / → | Seek −10s / +10s |
 | ↑ / ↓ | Seek −60s / +60s |
 | M | Mute / Unmute |
+| C | Cycle subtitles (Off → track 1 → track 2 → …) |
 | Mouse wheel (over video) | Volume |
 | Double-click video | Toggle fullscreen |
 | ● LIVE button | Jump back to the live edge (DVR mode only) |

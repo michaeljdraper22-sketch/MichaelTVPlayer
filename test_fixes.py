@@ -142,7 +142,7 @@ def main():
             return 0
         def set_time(self, ms):
             calls.append(("set_time", ms))
-        def play_at(self, url, start, cap_path=None):
+        def play_at(self, url, start, record_path=None):
             calls.append(("play_at", round(start, 1)))
             self.state = "playing"
             self.t = int(start * 1000)
@@ -373,17 +373,6 @@ def main():
     view.vlc = real_vlc
     view.dvr = None
     view._mode = "live"
-
-    print("[16] caption worker generations (no zombie caption streams)")
-    from src import captions as capmod  # noqa: E402
-    if capmod.vosk_importable() and capmod.model_ready():
-        cap = capmod.AutoCaptioner()
-        gen0 = cap._gen
-        cap.stop()
-        check("stop() bumps the generation (zombie emissions die)",
-              cap._gen > gen0)
-    else:
-        check("vosk/model absent — generation check skipped", True)
 
     view.stop()
     app.processEvents()

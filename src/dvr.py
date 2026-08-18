@@ -51,10 +51,6 @@ class VlcRecorder:
           stays continuous when the recorder is restarted mid-session.
         - ``output_path`` additionally given: dual output — the same single
           stream feeds both the DVR buffer and a kept recording file.
-
-        (Auto-captions are no longer forked here: the DISPLAY player forks
-        its own caption wav, which keeps the wav in lockstep with what is
-        actually being watched — see VLCPlayer.play_at.)
         """
         reuse = bool(buffer_path and os.path.exists(buffer_path))
         self.stop(delete=not reuse)
