@@ -1,10 +1,11 @@
 # MichaelTV
 
-**⚠️ v1.0 PROTOTYPE** — this is the first working snapshot of the project,
+**Current release: v1.1** — grab **`MichaelTV.exe`** from the
+[Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
+page, or build it yourself with `build.bat` (see below).
+
 (now branded **MichaelTV**; settings/logs still live in `%APPDATA%\MichaelTVPlayer`)
-saved in its current form. It was built and tested on **Windows 11**. If it
-does not work on your machine, future developments will aim to make it more
-compatible with more Windows 11 users. There is currently **no intent for
+Built and tested on **Windows 11** — there is currently **no intent for
 macOS or Android development**.
 
 This project is specifically intended for use with an **8K Strong**
@@ -21,6 +22,8 @@ through a single VLC connection.
 - **Rewind (DVR / timeshift)** on live TV
 - **Record** live TV, movies and series
 - **Direct download** of movies and series (no re-encode)
+- **Built-in subtitles** for movies & series (the stream's own tracks,
+  with language selection — `C` cycles them)
 
 ## Features
 - **Dark mode by default** (theme applied on every launch) and a **black
@@ -98,9 +101,10 @@ through a single VLC connection.
   run from source.
 
 ## Run (packaged app — recommended)
-Double-click **`MichaelTV.exe`** (built into `dist\`; a desktop
-shortcut is created by `tools\make_shortcut.ps1`). No console window, no
-Python install, no venv — just the app.
+Download **`MichaelTV.exe`** from the
+[Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
+page (a desktop shortcut is created by `tools\make_shortcut.ps1`).
+No console window, no Python install, no venv — just the app.
 
 Build it yourself by double-clicking **`build.bat`** (needs Python 3.9+,
 64-bit). The exe still needs VLC installed — or drop a full `vlc\` folder
