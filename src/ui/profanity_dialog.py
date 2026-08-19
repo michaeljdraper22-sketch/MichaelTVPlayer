@@ -30,7 +30,7 @@ class ProfanityDialog(QtWidgets.QDialog):
         lay = QtWidgets.QVBoxLayout(self)
 
         self.ck_on = QtWidgets.QCheckBox(
-            "Mute audio during profanity (live TV)")
+            "Mute audio during profanity")
         self.ck_on.setChecked(bool(prof.get("enabled")))
         self.ck_on.setStyleSheet("font-weight:bold;")
         if not PROFANITY_AVAILABLE:
@@ -38,13 +38,17 @@ class ProfanityDialog(QtWidgets.QDialog):
             self.ck_on.setToolTip("Being reworked — see note below")
         lay.addWidget(self.ck_on)
         top_note = QtWidgets.QLabel(
-            "Reads the channel's CLOSED CAPTIONS — subtitles do not need "
-            "to be turned on, and only ONE stream connection is ever "
-            "used. Shows always start live: on live TV the filter runs "
-            "while DVR mode is on (press the DVR button — playback runs "
-            "your 'Live delay' seconds behind live, which the captions "
-            "need; at least 5 s). Live TV only for now; channels without "
-            "captions are not covered. Requires CCExtractor installed.")
+            "LIVE TV: reads the channel's CLOSED CAPTIONS while DVR mode "
+            "is on (press the DVR button — playback runs your Live-delay "
+            "setting behind live, at least 5 s; captions need the "
+            "cushion). Shows always start live; nothing is ever engaged "
+            "for you.\n"
+            "MOVIES & SERIES: automatic filtering is in the works — a "
+            "single-connection splitter that reads the file's own "
+            "subtitle track is built and in testing.\n"
+            "Subtitles do not need to be turned on. Requires CCExtractor "
+            "installed for live TV. DVB (image) subtitle channels are not "
+            "covered.")
         top_note.setWordWrap(True)
         top_note.setStyleSheet("color:#9aa0a6;")
         lay.addWidget(top_note)

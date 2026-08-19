@@ -16,6 +16,8 @@ from ..dvr import VlcRecorder
 from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
 from .. import profanity as prof_mod
 from ..live_cc import CCSource, find_ccextractor
+from .. import vod_splitter
+from ..vod_splitter import VodRelay
 from . import icons as ic
 from .worker import AsyncRunner, FileDownloader
 
@@ -269,6 +271,7 @@ class PlayerView(QtWidgets.QWidget):
         # profanity filter (live TV: captions from the DVR buffer + engine)
         self._filter_extractor = None
         self._cc_source = None        # live closed-caption reader
+        self._vod_relay = None        # VOD splitter (single-connection)
         self._filter_gen = 0          # session guard for probe callbacks
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
@@ -824,7 +827,7 @@ class PlayerView(QtWidgets.QWidget):
         self._set_rate(1.0)
         self._update_control_state()
         self._apply_scale()
-        self.vlc.play(playable.get("url", ""))
+        self.vlc.play(self._effective_url(playable.get("url", ""), kind))
         self._poke_audio()
         self._wake()
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
@@ -2269,6 +2272,43 @@ class PlayerView(QtWidgets.QWidget):
             return
         self._on_media_for_profanity((self.current or {}).get("kind"))
 
+    def _effective_url(self, url: str, kind: str) -> str:
+        """Playback URL, routed through the local splitter for VOD when
+        the profanity filter is on (single provider connection; the
+        splitter peels the subtitle text and feeds VLC byte-identical
+        data through localhost). Falls back to the original URL on any
+        hesitation — playback must never depend on the filter."""
+        if kind not in ("vod", "series") or self._closing \
+                or not prof_mod.PROFANITY_AVAILABLE \
+                or not vod_splitter.VOD_SPLITTER_READY \
+                or not self.config.profanity.get("enabled"):
+            return url
+        try:
+            relay = VodRelay(self)
+            local = relay.start(url, USER_AGENT)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("vod splitter: start failed (%r) — direct "
+                            "playback", exc)
+            except Exception:
+                pass
+            return url
+        if not local:
+            try:
+                relay.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            return url
+        relay.cue.connect(self._on_vod_cue)
+        self._vod_relay = relay
+        return local
+
+    def _on_vod_cue(self, start: float, end: float, text: str):
+        if self._closing:
+            return
+        # VOD subtitle tracks are pre-timed — no caption-lag lead
+        self._filter_engine.add_cue(start, end, text, lead_s=0.0)
+
     def _on_media_for_profanity(self, kind: str = None):
         """play_media(): fresh media decides whether the filter engages.
 
@@ -2276,9 +2316,10 @@ class PlayerView(QtWidgets.QWidget):
         edge; the caption-based filter only rides DVR/chase mode, which the
         USER turns on (DVR button) — with the trade-off stated in its
         tooltip. When the filter is enabled but live playback isn't in DVR
-        mode, a short notice says how to turn it on. VOD: not covered yet.
+        mode, a short notice says how to turn it on. VOD: the splitter was
+        already routed in _effective_url BEFORE playback started.
         """
-        self._stop_profanity()
+        self._stop_cc_source()      # previous media's caption reader only
         if not prof_mod.PROFANITY_AVAILABLE:
             return
         if not self.config.profanity.get("enabled"):
@@ -2358,6 +2399,20 @@ class PlayerView(QtWidgets.QWidget):
             return
         self._filter_engine.add_cue(start, end, text)
 
+    def _stop_cc_source(self):
+        """Tear down just the live caption reader (channel change etc.)."""
+        if self._cc_source is not None:
+            try:
+                self._cc_source.cue.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._cc_source.stop()
+                self._cc_source.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cc_source = None
+
     def _start_profanity_extraction(self, at: float = 0.0):
         """Probe the file's subtitle tracks (background thread), then start
         ffmpeg streaming the chosen track out as SRT (see _on_prof_probe)."""
@@ -2432,18 +2487,19 @@ class PlayerView(QtWidgets.QWidget):
             self._filter_engine.evaluate(t)
 
     def _stop_profanity(self, keep_windows: bool = False):
-        """Kill the caption reader / extractor + clear the filter mute."""
-        if self._cc_source is not None:
+        """Kill the caption reader / VOD splitter + clear the filter mute."""
+        if self._vod_relay is not None:
             try:
-                self._cc_source.cue.disconnect()
+                self._vod_relay.cue.disconnect()
             except Exception:  # noqa: BLE001
                 pass
             try:
-                self._cc_source.stop()
-                self._cc_source.deleteLater()
+                self._vod_relay.stop()
+                self._vod_relay.deleteLater()
             except Exception:  # noqa: BLE001
                 pass
-            self._cc_source = None
+            self._vod_relay = None
+        self._stop_cc_source()
         if self._filter_extractor is not None:
             try:
                 self._filter_extractor.cue.disconnect()

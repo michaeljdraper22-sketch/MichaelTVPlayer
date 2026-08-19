@@ -427,15 +427,19 @@ class ProfanityEngine(QtCore.QObject):
         self._last_state = None
 
     # ---- data ----
-    def add_cue(self, start: float, end: float, text: str):
-        """One caption cue arrived: fold its bad-word windows in, keep
-        order. Broadcast captions lag the spoken word by 1-3 s, so every
-        window is shifted EARLIER by lead_s (tunable per channel)."""
+    def add_cue(self, start: float, end: float, text: str,
+                lead_s: float = None):
+        """One caption/subtitle cue arrived: fold its bad-word windows in.
+        Live captions lag the spoken word by 1-3 s, so their windows are
+        shifted EARLIER by lead_s (tunable per channel). VOD subtitle
+        tracks are pre-timed — they pass lead_s=0."""
+        shift = self.lead_s if lead_s is None else float(lead_s)
         wins = windows_from_cues([(start, end, text)], self.words)
         if not wins:
             return
-        wins = [(max(0.0, ws - self.lead_s), max(0.0, we - self.lead_s))
-                for ws, we in wins]
+        if shift:
+            wins = [(max(0.0, ws - shift), max(0.0, we - shift))
+                    for ws, we in wins]
         self.windows = merge_windows(self.windows + wins, gap=0.05)
 
     def clear(self):
