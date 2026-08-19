@@ -15,6 +15,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from ..dvr import VlcRecorder
 from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
 from .. import profanity as prof_mod
+from ..live_cc import CCSource, find_ccextractor
 from . import icons as ic
 from .worker import AsyncRunner, FileDownloader
 
@@ -265,8 +266,9 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
         self._spu_name = ""           # its name — re-matched after media opens
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
-        # profanity filter (VOD: reads the track via ffmpeg, mutes by timing)
+        # profanity filter (live TV: captions from the DVR buffer + engine)
         self._filter_extractor = None
+        self._cc_source = None        # live closed-caption reader
         self._filter_gen = 0          # session guard for probe callbacks
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
@@ -1379,6 +1381,10 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._set_rate(1.0)
         self._update_control_state()
+        # profanity filter: begin reading captions from the buffer now
+        if (prof_mod.PROFANITY_AVAILABLE and self._filter_engine.enabled
+                and self._cc_source is None and not self._closing):
+            self._start_cc_when_buffer(tries_left=10)
         delay = self.config.chase_delay
         target = self._safe_seek_target(self._frontier_s() - delay)
         try:
@@ -2190,7 +2196,13 @@ class PlayerView(QtWidgets.QWidget):
         off.setChecked(self._spu_want == -1)
         off.triggered.connect(lambda *_, t=-1, n="": self._select_spu(t, n))
         for tid, name in tracks:
-            a = m.addAction(name or f"Track {tid}")
+            label = name or f"Track {tid}"
+            low = label.lower()
+            if "dvb" in low or "teletext" in low:
+                label += "  (image \u2014 not adjustable)"
+            elif "caption" in low or low.startswith("cc"):
+                label += "  (text \u2014 adjustable)"
+            a = m.addAction(label)
             a.setCheckable(True)
             a.setChecked(tid == self._spu_want)
             a.triggered.connect(lambda *_, t=tid, n=name:
@@ -2233,7 +2245,7 @@ class PlayerView(QtWidgets.QWidget):
 
     # ---- profanity filter (VOD subtitle track -> timed audio mute) ----
     def _apply_profanity_config(self):
-        """Config -> engine (words, pads, sync, on/off). No process effects."""
+        """Config -> engine (words, pads, sync, lead, on/off)."""
         prof = self.config.profanity
         words = prof.get("words") or [tuple(w) for w in prof_mod.DEFAULT_WORDS]
         self._filter_engine.words = [tuple(w) for w in words]
@@ -2242,40 +2254,85 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_engine.pad_after_s = \
             int(prof.get("pad_after_ms", 250)) / 1000.0
         self._filter_engine.sync_s = int(prof.get("sync_ms", 0)) / 1000.0
+        self._filter_engine.lead_s = int(prof.get("lead_ms", 1500)) / 1000.0
         self._filter_engine.enabled = bool(prof.get("enabled"))
 
     def apply_profanity_settings(self):
-        """The settings dialog saved: re-apply, and (re)start extraction for
-        whatever VOD item is already playing."""
+        """The settings dialog saved: re-apply; engage on the current
+        channel if it qualifies (live TV -> DVR + caption reader)."""
         self._apply_profanity_config()
-        if not prof_mod.PROFANITY_AVAILABLE:
+        if not prof_mod.PROFANITY_AVAILABLE \
+                or not self._filter_engine.enabled or self._closing:
             self._stop_profanity()
             return
-        if self._filter_engine.enabled and self._is_vod() \
-                and not self._closing:
-            self._start_profanity_extraction()
-        elif not self._filter_engine.enabled:
-            self._stop_profanity()
+        self._on_media_for_profanity((self.current or {}).get("kind"))
 
     def _on_media_for_profanity(self, kind: str = None):
         """play_media(): fresh media decides whether the filter engages.
-        Live TV is out of scope — its subtitles are DVB bitmaps/teletext,
-        not machine-readable text; movies & series carry SRT."""
+
+        LIVE TV: the filter reads closed captions out of the local DVR
+        buffer (CCExtractor) — it needs DVR/chase mode, which it engages
+        by itself, with a >=12 s cushion so caption timing settles.
+        VOD: not covered yet (no single-connection text source)."""
         self._stop_profanity()
         if not prof_mod.PROFANITY_AVAILABLE:
             return
         if not self.config.profanity.get("enabled"):
             return
-        if (kind or "live") not in ("vod", "series"):
+        if kind != "live" or not self._is_dvrable():
             return
-        if not prof_mod.find_ffmpeg():
+        if not find_ccextractor():
             try:
-                log.warning("profanity: enabled but no ffmpeg found "
-                            "(install ffmpeg or add it to PATH)")
+                log.warning("profanity: enabled but CCExtractor not found "
+                            "(install CCExtractor for live-TV filtering)")
             except Exception:
                 pass
             return
-        self._start_profanity_extraction(0.0)
+        # caption timing needs a cushion — enforce a sane DVR delay
+        if self.config.chase_delay < 12:
+            self.config.chase_delay = 15
+            self.config.save()
+            self._set_dvr_status("Profanity filter: live delay set to 15 s")
+        if not self.btn_dvr.isChecked():
+            self._set_dvr_status("Profanity filter: starting DVR mode\u2026")
+            self.btn_dvr.setChecked(True)   # triggers _on_dvr_toggled
+        elif self._mode == "chase" and self._cc_source is None:
+            self._start_cc_when_buffer(tries=40)
+
+    def _start_cc_when_buffer(self, tries_left: int = 40):
+        """Wait for the DVR buffer to hold data, then start the caption
+        reader joined at the current frontier (~2 s poll, ~80 s max)."""
+        if self._closing or tries_left <= 0:
+            return
+        if not self._filter_engine.enabled or self.dvr is None:
+            return
+        buf = None
+        try:
+            buf = self.dvr.buffer_file()
+        except Exception:  # noqa: BLE001
+            pass
+        if buf:
+            try:
+                frontier = self._frontier_s()
+            except Exception:  # noqa: BLE001
+                frontier = 0.0
+            src = CCSource(self)
+            src.cue.connect(self._on_cc_cue)
+            if src.start(buf, max(0.0, frontier)):
+                self._cc_source = src
+                try:
+                    log.info("profanity: caption reader on %s "
+                             "(frontier %.1fs)", buf, frontier)
+                except Exception:
+                    pass
+                return
+        QtCore.QTimer.singleShot(
+            2000, lambda: self._start_cc_when_buffer(tries_left - 1))
+
+    def _on_cc_cue(self, start: float, end: float, text: str):
+        if self._closing:
+            return
+        self._filter_engine.add_cue(start, end, text)
 
     def _start_profanity_extraction(self, at: float = 0.0):
         """Probe the file's subtitle tracks (background thread), then start
@@ -2335,30 +2392,34 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_engine.add_cue(start, end, text)
 
     def _filter_tick(self):
-        """100 ms: apply the filter mute for the current playback position,
-        and restart the extractor ahead of the playhead after long seeks."""
+        """100 ms: apply the filter mute for the current playback position.
+
+        Live/chase: the tracked position IS buffer content time — the same
+        clock the caption cues live on. VOD would use the file clock (VOD
+        support arrives with a later engine)."""
         if self._closing or not self._filter_engine.enabled \
                 or not self._filter_engine.windows:
             return
-        if not self._is_vod():
-            return
-        t = self._vid_s if self._vid_s > 0.0 else \
-            max(0.0, self.vlc.get_time() / 1000.0)
-        self._filter_engine.evaluate(t)
-        ex = self._filter_extractor
-        if ex is not None and ex.proc is not None and ex.frontier_s >= 0.0 \
-                and t - ex.frontier_s > 30.0:
-            try:
-                log.info("profanity: seeked past extraction (t=%.1fs "
-                         "frontier=%.1fs) — restarting ahead", t,
-                         ex.frontier_s)
-            except Exception:
-                pass
-            self._start_profanity_extraction(at=max(0.0, t - 5.0))
+        if self._mode == "chase":
+            self._filter_engine.evaluate(self._vid_s)
+        elif self._is_vod():
+            t = self._vid_s if self._vid_s > 0.0 else \
+                max(0.0, self.vlc.get_time() / 1000.0)
+            self._filter_engine.evaluate(t)
 
     def _stop_profanity(self, keep_windows: bool = False):
-        """Kill the extractor + clear the filter mute. Windows survive a
-        keep_windows=True restart (catch-up after a long seek)."""
+        """Kill the caption reader / extractor + clear the filter mute."""
+        if self._cc_source is not None:
+            try:
+                self._cc_source.cue.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._cc_source.stop()
+                self._cc_source.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            self._cc_source = None
         if self._filter_extractor is not None:
             try:
                 self._filter_extractor.cue.disconnect()

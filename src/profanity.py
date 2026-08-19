@@ -37,12 +37,11 @@ from PyQt5 import QtCore
 
 log = logging.getLogger("mtp")
 
-# Feature switch: the first engine read subtitles via a SECOND provider
-# connection (ffmpeg), which 1-connection accounts cannot afford — it broke
-# playback. The replacement taps the subtitle track through the ONE playing
-# connection (VLC sout fan-out, the same trick as recording). Until it is
-# wired in, the filter stays parked: nothing engages, nothing dials out.
-PROFANITY_AVAILABLE = False
+# Feature switch: live-TV filtering runs on closed captions extracted from
+# the LOCAL DVR buffer (see live_cc.py) — one provider connection, the one
+# the recorder already holds. Movies & series support comes later (a
+# single-connection text source for VOD does not exist yet).
+PROFANITY_AVAILABLE = True
 
 # ---- word levels ----
 LEVELS = ("exact", "partial", "whole")
@@ -421,17 +420,22 @@ class ProfanityEngine(QtCore.QObject):
         self.pad_before_s = 0.12
         self.pad_after_s = 0.25
         self.sync_s = 0.0             # + = mute later, − = earlier
-        self.windows = []             # sorted [(start, end)] pre-padding
+        self.lead_s = 1.5             # captions lag speech: mute EARLIER by this
+        self.windows = []             # sorted [(start, end)]
         self.enabled = False
         self.muted = False
         self._last_state = None
 
     # ---- data ----
     def add_cue(self, start: float, end: float, text: str):
-        """One SRT cue arrived: fold its bad-word windows in, keep order."""
+        """One caption cue arrived: fold its bad-word windows in, keep
+        order. Broadcast captions lag the spoken word by 1-3 s, so every
+        window is shifted EARLIER by lead_s (tunable per channel)."""
         wins = windows_from_cues([(start, end, text)], self.words)
         if not wins:
             return
+        wins = [(max(0.0, ws - self.lead_s), max(0.0, we - self.lead_s))
+                for ws, we in wins]
         self.windows = merge_windows(self.windows + wins, gap=0.05)
 
     def clear(self):

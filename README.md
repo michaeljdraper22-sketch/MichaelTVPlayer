@@ -87,14 +87,17 @@ through a single VLC connection.
   connection, even together with DVR mode — and live recordings are
   scrubbable while they record. Recordings are kept on disk.
 - **Profanity filter** (Settings ▸ Profanity filter…, off by default) —
-  mutes the audio during profanity in **movies & series** by reading the
-  video's subtitle track in the background (subtitles do NOT need to be
-  turned on). Editable word list with three match levels per word
-  (**Exact**: `dog` → `*** in the doghouse`; **Partial**:
-  `*** in the ***house`; **Whole**: `*** in the ********`), adjustable
-  mute padding before/after each word, and a sync offset for tracks that
-  run early/late. Requires **ffmpeg** installed. Live TV is not covered —
-  its subtitles are broadcast images, not text.
+  mutes the audio during profanity on **live TV** by reading the channel's
+  **closed captions** out of the DVR recording of the stream — subtitles
+  do not need to be turned on, and only ONE stream connection is ever
+  used (the filter engages DVR mode by itself, watching ~15 s behind
+  live). Editable word list with three match levels per word (**Exact**:
+  `dog` → `*** in the doghouse`; **Partial**: `*** in the ***house`;
+  **Whole**: `*** in the ********`), mute padding before/after each
+  word, a **mute lead** (broadcast captions lag speech by 1–3 s; the
+  lead shifts mutes earlier to compensate) and a sync offset. Requires
+  **CCExtractor** installed. Channels without captions aren't covered
+  yet; movies & series support is planned.
 - **Save favorites** and keep your own **custom stream URLs**
 - **Recently played** list + account status/expiry in the status bar
 - **Zen mode (View ▸ Hide controls, or ≡ button / H)** — hides the menu bar,

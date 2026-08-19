@@ -142,6 +142,24 @@ def main():
     check("clear() unmutes the filter", fp.calls[-1] is False
           and eng2.windows == [])
 
+    print("[5b] caption lead: windows shift EARLIER by lead_s")
+    fp2 = FakePlayer()
+    eng3 = ProfanityEngine(fp2)
+    eng3.enabled = True
+    eng3.words = [("hell", "exact")]
+    eng3.lead_s = 1.5
+    eng3.add_cue(10.0, 12.0, "what the hell is this")
+    w0 = eng3.windows[0]
+    # proportional: hell = chars 9..13 of 21
+    txt = "what the hell is this"
+    exp_s = 10 + txt.find("hell") / len(txt) * 2 - 1.5
+    check("window moved earlier by the lead",
+          abs(w0[0] - exp_s) < 0.01 and w0[1] < 12.0)
+    eng3.evaluate(exp_s)
+    check("mutes at the shifted (earlier) position", fp2.calls[-1] is True)
+    eng3.evaluate(12.5)
+    check("unmuted after the shifted window", fp2.calls[-1] is False)
+
     print("[6] VLCPlayer: filter mute layers under the user's mute")
     vp = VLCPlayer(timeshift=False)
     vp.set_filter_mute(True)
@@ -159,82 +177,83 @@ def main():
     check("user mute survives filter on/off", vp._mute is True)
     vp.stop_and_release()
 
-    print("[7] view integration: engage/disengage/cleanup")
+    print("[7] view integration: live engages DVR + caption reader")
     cfg = temp_config()
     view = PlayerView(cfg)
     mut = []
     view.vlc.set_filter_mute = mut.append
 
-    class StubExtractor(QtCore.QObject):
-        calls = []
+    CCStarts = []
+
+    class StubCC(QtCore.QObject):
         cue = QtCore.pyqtSignal(float, float, str)
 
         def __init__(self, parent=None):
             super().__init__()
-            self.proc = None
-            self.frontier_s = -1.0
-            self._prefer_language = ""
-            self._want_index = 0
 
-        def probe_track(self, url, ua):
-            StubExtractor.calls.append(("probe", url))
-            return True
-
-        def start(self, url, ua, prefer="", at=0.0, readrate=6):
-            StubExtractor.calls.append(("start", url, at))
-            self.proc = object()
+        def start(self, ts, offset=0.0):
+            CCStarts.append((ts, offset))
             return True
 
         def stop(self):
-            StubExtractor.calls.append(("stop",))
+            pass
 
         def deleteLater(self):
             pass
 
-    pv_mod.prof_mod.SubtitleExtractor = StubExtractor
-    pv_mod.prof_mod.find_ffmpeg = lambda: "C:/fake/ffmpeg.exe"
-    # the machinery is parked behind this flag in the app (second-connection
-    # engine retired); the tests exercise the machinery itself
+    pv_mod.CCSource = StubCC
+    pv_mod.find_ccextractor = lambda: "C:/fake/ccx.exe"
     pv_mod.prof_mod.PROFANITY_AVAILABLE = True
 
+    cfg.data["chase_delay"] = 5      # below the 12 s floor for the filter
     cfg.profanity = {"enabled": True}
-    view.apply_profanity_settings()
-    view.current = {"kind": "vod", "url": "http://x/movie.mkv",
-                    "title": "M"}
+    view._apply_profanity_config()
+    view.current = {"kind": "vod", "url": "http://x/m.mkv", "title": "M"}
     view._on_media_for_profanity("vod")
-    check("extraction probed for VOD with filter on",
-          ("probe", "http://x/movie.mkv") in StubExtractor.calls)
-    # probe runs async in the app; here we call the slot directly
-    view._on_prof_probe(("ok", True))
-    check("ffmpeg started", any(c[0] == "start"
-                                for c in StubExtractor.calls))
+    check("VOD does not engage the live filter",
+          CCStarts == [] and not view.btn_dvr.isChecked())
 
-    # cue -> window -> tick mutes inside, unmutes outside
+    view.current = {"kind": "live", "url": "http://x.ts", "title": "L"}
+    view.btn_dvr.blockSignals(True)      # don't start a REAL recorder here
+    view._on_media_for_profanity("live")
+    check("live bumps the DVR cushion to 15 s",
+          cfg.chase_delay == 15)
+    check("live auto-engages DVR mode", view.btn_dvr.isChecked())
+    view.btn_dvr.blockSignals(False)
+    view.btn_dvr.setChecked(False)
+
+    # chase active + buffer ready -> caption reader starts at the frontier
+    view._mode = "chase"
+    view._frontier_s = lambda: 42.0
+    view.dvr = type("FakeDVR", (), {
+        "running": True, "file_path": "X:/buffer.ts",
+        "buffer_file": lambda self: "X:/buffer.ts"})()
+    view._start_cc_when_buffer(tries_left=1)
+    check("caption reader started on the buffer",
+          CCStarts and CCStarts[0][0] == "X:/buffer.ts"
+          and view._cc_source is not None)
+    check("reader joined at the content frontier",
+          abs(CCStarts[0][1] - 42.0) < 0.01)
+
+    # caption cue -> lead-shifted window -> chase tick mutes
     view._filter_engine.words = [("hell", "exact")]
-    view._on_prof_cue(10.0, 12.0, "what the hell is this")
-    check("cue became a window", len(view._filter_engine.windows) == 1)
-    view._vid_s = 11.0
+    view._filter_engine.lead_s = 1.5
+    view._on_cc_cue(50.0, 52.0, "what the hell is this")
+    check("caption cue became a window",
+          len(view._filter_engine.windows) == 1)
+    view._vid_s = 49.6
     view._filter_tick()
-    check("tick muted inside the word", mut and mut[-1] is True)
-    view._vid_s = 40.0
+    check("chase tick muted inside the (lead-shifted) word",
+          mut and mut[-1] is True)
+    view._vid_s = 60.0
     view._filter_tick()
-    check("tick unmuted outside", mut[-1] is False)
+    check("chase tick unmuted outside", mut[-1] is False)
 
-    # disable -> everything torn down
-    StubExtractor.calls.clear()
+    # disable -> reader torn down + windows cleared
     cfg.profanity = {"enabled": False}
     view.apply_profanity_settings()
-    check("disabling stops the extractor",
-          any(c[0] == "stop" for c in StubExtractor.calls)
-          and view._filter_extractor is None)
-    check("disabling cleared windows",
-          view._filter_engine.windows == [])
-
-    # live channel never engages
-    StubExtractor.calls.clear()
-    view._on_media_for_profanity("live")
-    check("live TV does not engage the filter",
-          not any(c[0] == "probe" for c in StubExtractor.calls))
+    check("disabling tears down the reader",
+          view._cc_source is None and view._filter_engine.windows == [])
 
     print("[8] settings dialog")
     cfg2 = temp_config()

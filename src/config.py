@@ -38,6 +38,7 @@ PROFANITY_DEFAULTS = {
     "pad_before_ms": 120,       # mute starts N ms before the word
     "pad_after_ms": 250,        # mute ends N ms after the word
     "sync_ms": 0,               # + mute later, − mute earlier (track drift)
+    "lead_ms": 1500,            # captions lag speech: mute EARLIER by this
 }
 
 DEFAULTS = {
@@ -361,7 +362,8 @@ class Config:
     def profanity(self) -> dict:
         stored = self.data.get("profanity") or {}
         merged = dict(PROFANITY_DEFAULTS)
-        for key in ("enabled", "pad_before_ms", "pad_after_ms", "sync_ms"):
+        for key in ("enabled", "pad_before_ms", "pad_after_ms", "sync_ms",
+                    "lead_ms"):
             if key in stored:
                 merged[key] = stored[key]
         words = stored.get("words")
@@ -386,6 +388,8 @@ class Config:
                                            int(v.get("pad_after_ms", 250))))
         clean["sync_ms"] = max(-10000, min(10000,
                                            int(v.get("sync_ms", 0))))
+        clean["lead_ms"] = max(0, min(10000,
+                                      int(v.get("lead_ms", 1500))))
         words = v.get("words")
         clean["words"] = []
         if isinstance(words, list):

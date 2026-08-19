@@ -26,11 +26,11 @@ class ProfanityDialog(QtWidgets.QDialog):
                        (prof.get("words") or [list(d) for d in DEFAULT_WORDS])]
 
         self.setWindowTitle("Profanity filter")
-        self.setMinimumSize(460, 520)
+        self.setMinimumSize(460, 560)
         lay = QtWidgets.QVBoxLayout(self)
 
         self.ck_on = QtWidgets.QCheckBox(
-            "Mute audio during profanity (movies & series)")
+            "Mute audio during profanity (live TV)")
         self.ck_on.setChecked(bool(prof.get("enabled")))
         self.ck_on.setStyleSheet("font-weight:bold;")
         if not PROFANITY_AVAILABLE:
@@ -38,22 +38,14 @@ class ProfanityDialog(QtWidgets.QDialog):
             self.ck_on.setToolTip("Being reworked — see note below")
         lay.addWidget(self.ck_on)
         top_note = QtWidgets.QLabel(
-            "Reads the video's subtitle track in the background — subtitles "
-            "do not need to be turned on. Live TV is not covered (its "
-            "subtitles are images, not text). Requires ffmpeg installed.")
+            "Reads the channel's CLOSED CAPTIONS out of the DVR recording "
+            "of the stream — subtitles do not need to be turned on, and "
+            "only ONE stream connection is ever used. Live TV only for "
+            "now (movies & series support comes later). Channels without "
+            "captions are not covered yet. Requires CCExtractor installed.")
         top_note.setWordWrap(True)
         top_note.setStyleSheet("color:#9aa0a6;")
         lay.addWidget(top_note)
-        if not PROFANITY_AVAILABLE:
-            park = QtWidgets.QLabel(
-                "\u26a0\ufe0f The filter is temporarily disabled: its first "
-                "engine used a second stream connection, which accounts "
-                "with a one-connection limit cannot allow (it disrupted "
-                "playback). A single-connection version is in the works — "
-                "your word list and settings below are kept ready for it.")
-            park.setWordWrap(True)
-            park.setStyleSheet("color:#e0a030;")
-            lay.addWidget(park)
 
         # ---- timing ----
         tl = QtWidgets.QGridLayout()
@@ -66,6 +58,10 @@ class ProfanityDialog(QtWidgets.QDialog):
         self.sp_after.setRange(0, 5000)
         self.sp_after.setSuffix(" ms")
         self.sp_after.setValue(int(prof.get("pad_after_ms", 250)))
+        self.sp_lead = QtWidgets.QSpinBox()
+        self.sp_lead.setRange(0, 10000)
+        self.sp_lead.setSuffix(" ms")
+        self.sp_lead.setValue(int(prof.get("lead_ms", 1500)))
         self.sp_sync = QtWidgets.QSpinBox()
         self.sp_sync.setRange(-10000, 10000)
         self.sp_sync.setSuffix(" ms")
@@ -74,9 +70,13 @@ class ProfanityDialog(QtWidgets.QDialog):
         tl.addWidget(self.sp_before, 0, 1)
         tl.addWidget(QtWidgets.QLabel("Mute after word"), 0, 2)
         tl.addWidget(self.sp_after, 0, 3)
-        tl.addWidget(QtWidgets.QLabel("Sync offset"), 1, 0)
-        tl.addWidget(self.sp_sync, 1, 1)
-        tl.addWidget(QtWidgets.QLabel("+ = mutes later"), 1, 2, 1, 2)
+        tl.addWidget(QtWidgets.QLabel("Mute lead"), 1, 0)
+        tl.addWidget(self.sp_lead, 1, 1)
+        tl.addWidget(QtWidgets.QLabel("Sync offset"), 1, 2)
+        tl.addWidget(self.sp_sync, 1, 3)
+        tl.addWidget(QtWidgets.QLabel(
+            "captions lag speech — lead shifts mutes earlier.\n"
+            "+ sync = mutes later"), 2, 0, 1, 4)
         lay.addLayout(tl)
 
         # ---- word list ----
@@ -177,6 +177,7 @@ class ProfanityDialog(QtWidgets.QDialog):
             "pad_before_ms": int(self.sp_before.value()),
             "pad_after_ms": int(self.sp_after.value()),
             "sync_ms": int(self.sp_sync.value()),
+            "lead_ms": int(self.sp_lead.value()),
         }
         self.config.save()
         try:
