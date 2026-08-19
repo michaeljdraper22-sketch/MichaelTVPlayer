@@ -217,6 +217,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.last_tab = idx
         self.config.save()
 
+    def _exit_fullscreen_only(self):
+        """Esc: leave fullscreen, never re-enter it (F is the toggle)."""
+        if getattr(self.player_view, "_fullscreen", False):
+            self.toggle_fullscreen()
+
     def _on_countries_changed(self):
         """A country filter changed: reload every browser it can affect."""
         for tab in (self.live_tab, self.vod_tab, self.series_tab):
@@ -236,7 +241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         QtWidgets.QShortcut(QtGui.QKeySequence("F"), self,
                             activated=self.toggle_fullscreen)
         QtWidgets.QShortcut(QtGui.QKeySequence("Escape"), self,
-                            activated=self.toggle_fullscreen)
+                            activated=self._exit_fullscreen_only)
         QtWidgets.QShortcut(QtGui.QKeySequence("F5"), self,
                             activated=self.reload_all)
         QtWidgets.QShortcut(QtGui.QKeySequence("C"), self,

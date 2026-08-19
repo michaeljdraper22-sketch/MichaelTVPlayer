@@ -36,6 +36,8 @@ def main():
     app.processEvents()
 
     print("[1] backgrounded: cursor wake does not surface the overlay")
+    # model a genuinely backgrounded app: the flag AND another app front
+    view._app_foreground = lambda: False
     view._overlay_suppressed = True     # set by _on_focus_changed on focus loss
     view.overlay.hide()
     view.ctl.hide()
@@ -56,12 +58,38 @@ def main():
     check("overlay stays hidden on show_info", not view.overlay.isVisible())
 
     print("[4] foreground: wake works normally again")
+    del view._app_foreground            # back to the real method
     view._overlay_suppressed = False
     view._overlay_was_visible = False
     view._wake()
     app.processEvents()
     check("overlay shows when app is foreground", view.overlay.isVisible())
     check("control bar shows", view.ctl.isVisible())
+
+    print("[4b] latched suppression self-heals when the app is foreground")
+    # the real-world failure: a native color picker swallowed the focus
+    # events, latching _overlay_suppressed with nothing to clear it
+    view._overlay_suppressed = True
+    view.overlay.hide()
+    view.ctl.hide()
+    view._app_foreground = lambda: True   # our process owns the foreground
+    view._poll_cursor()
+    check("poll self-heals a latched suppression",
+          not view._overlay_suppressed)
+    view._overlay_suppressed = True        # latch again, heal via _wake
+    view._wake()
+    check("wake works when app is truly foreground",
+          view.overlay.isVisible() and view.ctl.isVisible())
+    check("suppression cleared by wake", not view._overlay_suppressed)
+    # genuinely backgrounded (another app owns the foreground): stays off
+    view._overlay_suppressed = True
+    view.overlay.hide()
+    view.ctl.hide()
+    view._app_foreground = lambda: False
+    view._wake()
+    check("still suppressed while another app is front",
+          not view.overlay.isVisible() and view._overlay_suppressed)
+    del view._app_foreground               # restore the real method
 
     print("[5] focus loss hides; focus regain restores")
     view._overlay_suppressed = True

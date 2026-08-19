@@ -276,6 +276,10 @@ class PlayerView(QtWidgets.QWidget):
             sub_args=subtitle_instance_args(config.subtitle_appearance),
             spu_delay_ms=int(config.subtitle_appearance.get("delay_ms", 0)
                              or 0))
+        # the freetype args this running VLC instance was BUILT with — used
+        # to tell the user when a style change needs a restart to apply
+        self._sub_args_built = subtitle_instance_args(
+            config.subtitle_appearance)
         self._filter_engine = prof_mod.ProfanityEngine(self.vlc)
         self._prof_runner = AsyncRunner()
         self._prof_runner.finished.connect(self._on_prof_probe)
@@ -1624,6 +1628,11 @@ class PlayerView(QtWidgets.QWidget):
         pos = QtGui.QCursor.pos()
         moved = self._last_cursor is not None and pos != self._last_cursor
         self._last_cursor = pos
+        # self-heal a latched suppression (native dialogs / video HWND can
+        # swallow the focus events that would have cleared it)
+        if self._overlay_suppressed and self._app_foreground():
+            self._overlay_suppressed = False
+            self._overlay_was_visible = False
         if moved and self.rect().contains(self.mapFromGlobal(pos)):
             self._wake()
             return
@@ -1635,6 +1644,33 @@ class PlayerView(QtWidgets.QWidget):
                 and not self.hide_timer.isActive()):
             self._sleep()
 
+    def _app_foreground(self) -> bool:
+        """True when a window of THIS process owns the OS foreground.
+
+        The honest test for 'another app is in front'. Qt's activeWindow()
+        alone is not: native dialogs (the settings' color picker) and the
+        video HWND swallow focus without Qt noticing, which used to latch
+        the overlay suppression forever — 'all controls disappeared'."""
+        try:
+            app = QtWidgets.QApplication.instance()
+            if app is not None and app.activeWindow() is not None:
+                return True
+        except Exception:  # noqa: BLE001
+            pass
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                hwnd = ctypes.windll.user32.GetForegroundWindow()
+                if not hwnd:
+                    return False
+                pid = ctypes.c_ulong()
+                ctypes.windll.user32.GetWindowThreadProcessId(
+                    hwnd, ctypes.byref(pid))
+                return bool(pid.value) and pid.value == os.getpid()
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
     def _wake(self):
         """Show the on-video controls (stream start, channel change, cursor
         move). The zen/fullscreen corner buttons are always shown: in normal
@@ -1643,11 +1679,18 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing:
             return
         if self._overlay_suppressed:
-            # Another app has the foreground (see _on_focus_changed): the
-            # ToolTip-style overlay paints above OTHER apps' windows too, so
-            # a cursor passing over the app's exposed area behind them must
-            # not surface the controls over e.g. Chrome.
-            return
+            if not self._app_foreground():
+                # Another app truly has the foreground (see
+                # _on_focus_changed): the ToolTip-style overlay paints above
+                # OTHER apps' windows too, so a cursor passing over the
+                # app's exposed area behind them must not surface the
+                # controls over e.g. Chrome.
+                return
+            # our own process owns the foreground — the flag latched
+            # spuriously (native dialog / video HWND swallowed the focus
+            # events); self-heal instead of hiding the controls forever
+            self._overlay_suppressed = False
+            self._overlay_was_visible = False
         self.unsetCursor()
         if not self.cursor_timer.isActive():
             self.cursor_timer.start()   # self-heal: stop() halts the poll
@@ -2159,8 +2202,15 @@ class PlayerView(QtWidgets.QWidget):
 
     def _open_sub_settings(self):
         from .subtitle_dialog import SubtitleDialog
+        before = subtitle_instance_args(self.config.subtitle_appearance)
         SubtitleDialog(self.config, self._apply_sub_delay,
                        parent=self.window()).exec_()
+        if subtitle_instance_args(self.config.subtitle_appearance) != before:
+            QtWidgets.QMessageBox.information(
+                self.window(), "Restart to apply",
+                "The new subtitle style takes effect after you restart "
+                "Michael TV.\n"
+                "(The delay you set applies immediately.)")
 
     def _apply_sub_delay(self, ms: int):
         """Delay is the one subtitle setting with a live runtime API —
@@ -2346,7 +2396,8 @@ class PlayerView(QtWidgets.QWidget):
         window would otherwise stay painted on top of OTHER apps."""
         if self._closing:
             return
-        if now is None and QtWidgets.QApplication.activeWindow() is None:
+        if now is None and QtWidgets.QApplication.activeWindow() is None \
+                and not self._app_foreground():
             if self.overlay.isVisible():
                 self._overlay_suppressed = True
                 self._overlay_was_visible = True
