@@ -205,7 +205,7 @@ def main():
     pv_mod.find_ccextractor = lambda: "C:/fake/ccx.exe"
     pv_mod.prof_mod.PROFANITY_AVAILABLE = True
 
-    cfg.data["chase_delay"] = 5      # below the 12 s floor for the filter
+    cfg.data["chase_delay"] = 5
     cfg.profanity = {"enabled": True}
     view._apply_profanity_config()
     view.current = {"kind": "vod", "url": "http://x/m.mkv", "title": "M"}
@@ -214,15 +214,16 @@ def main():
           CCStarts == [] and not view.btn_dvr.isChecked())
 
     view.current = {"kind": "live", "url": "http://x.ts", "title": "L"}
-    view.btn_dvr.blockSignals(True)      # don't start a REAL recorder here
     view._on_media_for_profanity("live")
-    check("live bumps the DVR cushion to 15 s",
-          cfg.chase_delay == 15)
-    check("live auto-engages DVR mode", view.btn_dvr.isChecked())
-    view.btn_dvr.blockSignals(False)
-    view.btn_dvr.setChecked(False)
+    check("live NEVER auto-engages DVR mode",
+          not view.btn_dvr.isChecked() and CCStarts == [])
+    check("live NEVER rewrites the delay setting", cfg.chase_delay == 5)
+    check("a notice tells the user how to opt in",
+          "press DVR" in view._dvr_status.text())
+    view._set_dvr_status("")
 
     # chase active + buffer ready -> caption reader starts at the frontier
+    cfg.data["chase_delay"] = 15     # user-chosen, above the 5 s floor
     view._mode = "chase"
     view._frontier_s = lambda: 42.0
     view.dvr = type("FakeDVR", (), {
@@ -254,6 +255,18 @@ def main():
     view.apply_profanity_settings()
     check("disabling tears down the reader",
           view._cc_source is None and view._filter_engine.windows == [])
+
+    # too-short cushion: reader skipped, setting untouched, notice shown
+    CCStarts.clear()
+    cfg.profanity = {"enabled": True}
+    view._apply_profanity_config()
+    cfg.data["chase_delay"] = 3
+    view._start_cc_when_buffer(tries_left=1)
+    check("short delay skips the reader (no late mutes)",
+          CCStarts == [] and view._cc_source is None)
+    check("short delay notice shown, setting untouched",
+          "too short" in view._dvr_status.text() and cfg.chase_delay == 3)
+    view._set_dvr_status("")
 
     print("[8] settings dialog")
     cfg2 = temp_config()

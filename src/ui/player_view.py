@@ -410,9 +410,11 @@ class PlayerView(QtWidgets.QWidget):
                                  "Jump to the beginning of the stream")
         self.btn_live = ctl_btn(ic.live(), "Jump to the live edge "
                                            "(from pause or rewind)")
-        self.btn_dvr = ctl_btn(ic.dvr(False),
-                               "DVR mode: record this channel so you can "
-                               "pause and rewind it", checkable=True)
+        self.btn_dvr = ctl_btn(
+            ic.dvr(False),
+            "DVR mode: record this channel so you can pause and rewind it "
+            "(plays a few seconds behind live; also runs the profanity "
+            "filter on caption channels)", checkable=True)
         # replaces the DVR button while a movie / series episode plays (the
         # file is already fully seekable — there is nothing to timeshift)
         self.btn_dl = ctl_btn(ic.download(),
@@ -2270,10 +2272,12 @@ class PlayerView(QtWidgets.QWidget):
     def _on_media_for_profanity(self, kind: str = None):
         """play_media(): fresh media decides whether the filter engages.
 
-        LIVE TV: the filter reads closed captions out of the local DVR
-        buffer (CCExtractor) — it needs DVR/chase mode, which it engages
-        by itself, with a >=12 s cushion so caption timing settles.
-        VOD: not covered yet (no single-connection text source)."""
+        NOTHING here ever changes playback. Live always starts live at the
+        edge; the caption-based filter only rides DVR/chase mode, which the
+        USER turns on (DVR button) — with the trade-off stated in its
+        tooltip. When the filter is enabled but live playback isn't in DVR
+        mode, a short notice says how to turn it on. VOD: not covered yet.
+        """
         self._stop_profanity()
         if not prof_mod.PROFANITY_AVAILABLE:
             return
@@ -2288,16 +2292,17 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
             return
-        # caption timing needs a cushion — enforce a sane DVR delay
-        if self.config.chase_delay < 12:
-            self.config.chase_delay = 15
-            self.config.save()
-            self._set_dvr_status("Profanity filter: live delay set to 15 s")
-        if not self.btn_dvr.isChecked():
-            self._set_dvr_status("Profanity filter: starting DVR mode\u2026")
-            self.btn_dvr.setChecked(True)   # triggers _on_dvr_toggled
-        elif self._mode == "chase" and self._cc_source is None:
-            self._start_cc_when_buffer(tries=40)
+        if self._mode == "chase" and self._cc_source is None:
+            self._start_cc_when_buffer(tries_left=40)
+        elif not self.btn_dvr.isChecked() and self._dvr_status.isHidden():
+            # informative only — never auto-engages anything
+            self._set_dvr_status(
+                "Profanity filter: press DVR to filter this channel "
+                "(watches behind live)")
+            QtCore.QTimer.singleShot(
+                2600, lambda: self._set_dvr_status("")
+                if self._dvr_status.text().startswith("Profanity filter:")
+                else None)
 
     def _start_cc_when_buffer(self, tries_left: int = 40):
         """Wait for the DVR buffer to hold data, then start the caption
@@ -2305,6 +2310,18 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing or tries_left <= 0:
             return
         if not self._filter_engine.enabled or self.dvr is None:
+            return
+        if self.config.chase_delay < 5:
+            # captions trail speech by 1-3 s — a shorter cushion than this
+            # cannot mute in time. Never touched the setting, just say so.
+            self._set_dvr_status(
+                f"Profanity filter: live delay {self.config.chase_delay} s "
+                "is too short (needs \u2265 5 s)")
+            try:
+                log.info("profanity: chase_delay=%d too short, skipping",
+                         self.config.chase_delay)
+            except Exception:
+                pass
             return
         buf = None
         try:
@@ -2325,6 +2342,13 @@ class PlayerView(QtWidgets.QWidget):
                              "(frontier %.1fs)", buf, frontier)
                 except Exception:
                     pass
+                if self._mode == "chase" and self._dvr_status.isHidden():
+                    self._set_dvr_status("Profanity filter active "
+                                         "(captions)")
+                    QtCore.QTimer.singleShot(
+                        2000, lambda: self._set_dvr_status("")
+                        if self._dvr_status.text()
+                        == "Profanity filter active (captions)" else None)
                 return
         QtCore.QTimer.singleShot(
             2000, lambda: self._start_cc_when_buffer(tries_left - 1))

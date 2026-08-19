@@ -38,11 +38,13 @@ class ProfanityDialog(QtWidgets.QDialog):
             self.ck_on.setToolTip("Being reworked — see note below")
         lay.addWidget(self.ck_on)
         top_note = QtWidgets.QLabel(
-            "Reads the channel's CLOSED CAPTIONS out of the DVR recording "
-            "of the stream — subtitles do not need to be turned on, and "
-            "only ONE stream connection is ever used. Live TV only for "
-            "now (movies & series support comes later). Channels without "
-            "captions are not covered yet. Requires CCExtractor installed.")
+            "Reads the channel's CLOSED CAPTIONS — subtitles do not need "
+            "to be turned on, and only ONE stream connection is ever "
+            "used. Shows always start live: on live TV the filter runs "
+            "while DVR mode is on (press the DVR button — playback runs "
+            "your 'Live delay' seconds behind live, which the captions "
+            "need; at least 5 s). Live TV only for now; channels without "
+            "captions are not covered. Requires CCExtractor installed.")
         top_note.setWordWrap(True)
         top_note.setStyleSheet("color:#9aa0a6;")
         lay.addWidget(top_note)
