@@ -64,9 +64,10 @@ def main():
     fake = FakeSpu([])
     fake.install(view)
     view._enforce_spu()
-    check("disabled while the stream has no tracks",
-          not view.btn_cc.isEnabled())
-    check("tooltip says none", "none" in view.btn_cc.toolTip().lower())
+    check("always clickable (settings reachable without tracks)",
+          view.btn_cc.isEnabled())
+    check("tooltip points at settings",
+          "settings" in view.btn_cc.toolTip().lower())
 
     print("[3] VLC auto-select is forced off (want == -1)")
     fake.active = 2
@@ -120,8 +121,9 @@ def main():
     view._refresh_spu_button()
     view._subs_menu()
     labels = [a.text() for a in captured[-1].actions()]
-    check("menu = Off + every track",
-          labels == ["Off", "English", "Spanish"])
+    check("menu = Off + every track + settings",
+          labels == ["Off", "English", "Spanish", "",
+                     "Subtitle settings\u2026"])
     checked = [a.text() for a in captured[-1].actions() if a.isChecked()]
     check("current track is checked", checked == ["Spanish"])
 

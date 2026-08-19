@@ -18,9 +18,15 @@ class AsyncRunner(QtCore.QObject):
         def _task():
             try:
                 result = fn(*args, **kwargs)
-                self.finished.emit(("ok", result))
+                try:
+                    self.finished.emit(("ok", result))
+                except RuntimeError:
+                    pass    # owner deleted mid-flight (app closing) — drop
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-                self.finished.emit(("err", str(exc)))
+                try:
+                    self.finished.emit(("err", str(exc)))
+                except RuntimeError:
+                    pass
 
         threading.Thread(target=_task, daemon=True).start()
 

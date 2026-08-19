@@ -50,6 +50,15 @@ through a single VLC connection.
     button disabled. (DVR-chase playback uses a re-muxed buffer, where
     subtitle tracks generally don't survive — subtitles work best in
     normal live playback and movies/series.)
+  - **Subtitle settings…** (bottom of the CC track menu) — **every change
+    applies instantly while you watch**: delay (± 0.25 s per click), font,
+    size, vertical position, text / background / outline colors, background
+    opacity and outline thickness. Movies & series subtitles are drawn by
+    the app itself, so restyling is immediate — and while you adjust, a
+    "subtitle test" placeholder shows on the video whenever no real
+    subtitle is on screen (no need to hunt for a talking scene). Cancel
+    restores the saved look. Live-TV subtitles are broadcast images and
+    can't be restyled.
   - **Playback speed** (speedometer; DVR mode, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
@@ -77,6 +86,15 @@ through a single VLC connection.
   your choice (Settings ▸ Recording folder). Runs through the same single
   connection, even together with DVR mode — and live recordings are
   scrubbable while they record. Recordings are kept on disk.
+- **Profanity filter** (Settings ▸ Profanity filter…, off by default) —
+  mutes the audio during profanity in **movies & series** by reading the
+  video's subtitle track in the background (subtitles do NOT need to be
+  turned on). Editable word list with three match levels per word
+  (**Exact**: `dog` → `*** in the doghouse`; **Partial**:
+  `*** in the ***house`; **Whole**: `*** in the ********`), adjustable
+  mute padding before/after each word, and a sync offset for tracks that
+  run early/late. Requires **ffmpeg** installed. Live TV is not covered —
+  its subtitles are broadcast images, not text.
 - **Save favorites** and keep your own **custom stream URLs**
 - **Recently played** list + account status/expiry in the status bar
 - **Zen mode (View ▸ Hide controls, or ≡ button / H)** — hides the menu bar,

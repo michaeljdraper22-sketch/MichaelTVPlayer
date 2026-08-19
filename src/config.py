@@ -7,6 +7,39 @@ from pathlib import Path
 
 APP_NAME = "MichaelTVPlayer"
 
+# Subtitle appearance. Defaults reproduce VLC's own rendering exactly —
+# every value maps 1:1 onto a libvlc option (see player.subtitle_instance_args)
+# so an untouched config emits NO extra VLC arguments at all.
+SUBTITLE_KEYS = (
+    "delay_ms", "font", "size", "pos_pct", "text_color",
+    "bg_enabled", "bg_color", "bg_opacity",
+    "outline_enabled", "outline_color", "outline_thickness",
+)
+SUBTITLE_DEFAULTS = {
+    "delay_ms": 0,            # + shows subtitles LATER, − earlier (applied live)
+    "font": "",               # "" = VLC's default font
+    "size": 0,                # px; 0 = auto (scales with the video)
+    "pos_pct": 0,             # −100..100, 0 = default bottom placement
+    "text_color": "#FFFFFF",
+    "bg_enabled": False,      # backing box behind the text
+    "bg_color": "#000000",
+    "bg_opacity": 50,         # 0..100 %, only meaningful when bg_enabled
+    "outline_enabled": True,  # VLC's default look has a black outline
+    "outline_color": "#000000",
+    "outline_thickness": 4,   # VLC units, default 4 ("normal")
+}
+
+# Profanity filter. Off by default (opt-in). Words are stored as a flat
+# [word, level] list so removals of defaults persist; level is one of
+# exact / partial / whole (see src.profanity).
+PROFANITY_DEFAULTS = {
+    "enabled": False,
+    "words": [],                # [] = the curated DEFAULT_WORDS list
+    "pad_before_ms": 120,       # mute starts N ms before the word
+    "pad_after_ms": 250,        # mute ends N ms after the word
+    "sync_ms": 0,               # + mute later, − mute earlier (track drift)
+}
+
 DEFAULTS = {
     "server_url": "",
     "username": "",
@@ -43,6 +76,8 @@ DEFAULTS = {
         "volume": True, "timebar": True,
     },
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
+    "subtitle_appearance": dict(SUBTITLE_DEFAULTS),
+    "profanity": dict(PROFANITY_DEFAULTS),
 }
 
 BUTTON_KEYS = (
@@ -304,6 +339,62 @@ class Config:
     def scale_mode(self, value: str) -> None:
         self.data["scale_mode"] = value if value in ("fit", "stretch", "crop") \
             else "fit"
+
+    @property
+    def subtitle_appearance(self) -> dict:
+        stored = self.data.get("subtitle_appearance") or {}
+        merged = dict(SUBTITLE_DEFAULTS)
+        for key in SUBTITLE_KEYS:
+            if key in stored:
+                merged[key] = stored[key]
+        return merged
+
+    @subtitle_appearance.setter
+    def subtitle_appearance(self, value) -> None:
+        clean = dict(SUBTITLE_DEFAULTS)
+        for key in SUBTITLE_KEYS:
+            if key in (value or {}):
+                clean[key] = value[key]
+        self.data["subtitle_appearance"] = clean
+
+    @property
+    def profanity(self) -> dict:
+        stored = self.data.get("profanity") or {}
+        merged = dict(PROFANITY_DEFAULTS)
+        for key in ("enabled", "pad_before_ms", "pad_after_ms", "sync_ms"):
+            if key in stored:
+                merged[key] = stored[key]
+        words = stored.get("words")
+        if isinstance(words, list) and words:
+            clean = []
+            for w in words:
+                if isinstance(w, (list, tuple)) and len(w) == 2 \
+                        and str(w[0]).strip() \
+                        and w[1] in ("exact", "partial", "whole"):
+                    clean.append([str(w[0]).strip().lower(), w[1]])
+            merged["words"] = clean
+        return merged
+
+    @profanity.setter
+    def profanity(self, value) -> None:
+        clean = dict(PROFANITY_DEFAULTS)
+        v = value or {}
+        clean["enabled"] = bool(v.get("enabled", False))
+        clean["pad_before_ms"] = max(0, min(5000,
+                                            int(v.get("pad_before_ms", 120))))
+        clean["pad_after_ms"] = max(0, min(5000,
+                                           int(v.get("pad_after_ms", 250))))
+        clean["sync_ms"] = max(-10000, min(10000,
+                                           int(v.get("sync_ms", 0))))
+        words = v.get("words")
+        clean["words"] = []
+        if isinstance(words, list):
+            for w in words:
+                if isinstance(w, (list, tuple)) and len(w) == 2 \
+                        and str(w[0]).strip() \
+                        and w[1] in ("exact", "partial", "whole"):
+                    clean["words"].append([str(w[0]).strip().lower(), w[1]])
+        self.data["profanity"] = clean
 
 
     @property

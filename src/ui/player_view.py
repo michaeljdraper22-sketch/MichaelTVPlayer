@@ -13,7 +13,8 @@ import urllib.parse
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..dvr import VlcRecorder
-from ..player import VLCPlayer
+from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
+from .. import profanity as prof_mod
 from . import icons as ic
 from .worker import AsyncRunner, FileDownloader
 
@@ -264,10 +265,25 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
         self._spu_name = ""           # its name — re-matched after media opens
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
+        # profanity filter (VOD: reads the track via ffmpeg, mutes by timing)
+        self._filter_extractor = None
+        self._filter_gen = 0          # session guard for probe callbacks
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
-        self.vlc = VLCPlayer(timeshift=config.timeshift, volume=config.volume,
-                             network_caching=config.network_caching)
+        self.vlc = VLCPlayer(
+            timeshift=config.timeshift, volume=config.volume,
+            network_caching=config.network_caching,
+            sub_args=subtitle_instance_args(config.subtitle_appearance),
+            spu_delay_ms=int(config.subtitle_appearance.get("delay_ms", 0)
+                             or 0))
+        self._filter_engine = prof_mod.ProfanityEngine(self.vlc)
+        self._prof_runner = AsyncRunner()
+        self._prof_runner.finished.connect(self._on_prof_probe)
+        self._filter_at = 0.0        # -ss point of the running extraction
+        self._filter_timer = QtCore.QTimer(self)
+        self._filter_timer.setInterval(100)
+        self._filter_timer.timeout.connect(self._filter_tick)
+        self._apply_profanity_config()
 
         app = QtWidgets.QApplication.instance()
         app.setStyleSheet(app.styleSheet() + _OVERLAY_QSS)
@@ -803,9 +819,10 @@ class PlayerView(QtWidgets.QWidget):
         self.vlc.play(playable.get("url", ""))
         self._poke_audio()
         self._wake()
-        # Subtitle choice is sticky across channels: _enforce_spu (via the
+        # Subtitle choice is sticky by language across channels: _enforce_spu (via the
         # tick) re-selects a track with the same NAME once the new media's
         # tracks appear, and leaves subtitles off when it has none.
+        self._on_media_for_profanity(kind)
         if kind == "live" and self.client and playable.get("stream_id"):
             self.runner.run(self.client.short_epg, playable["stream_id"], 4)
 
@@ -2038,24 +2055,27 @@ class PlayerView(QtWidgets.QWidget):
                 if self.vlc.active_spu() != -1:
                     self.vlc.set_spu(-1)
             elif self._spu_want not in [tid for tid, _ in tracks]:
-                # id unknown here (new media / DVR handoff): re-match by name
+                # id unknown here: re-match by name. An EMPTY track list is
+                # transient (mid-open ES update, player swap) — keep the
+                # sticky choice rather than treating it as "language gone".
                 match = None
-                for tid, name in tracks:
-                    if name and name == self._spu_name:
-                        match = (tid, name)
-                        break
-                if match is None and self._spu_name:
-                    low = self._spu_name.lower()
+                if tracks:
                     for tid, name in tracks:
-                        if name and low in name.lower():
+                        if name and name == self._spu_name:
                             match = (tid, name)
                             break
-                if match is None:
+                    if match is None and self._spu_name:
+                        low = self._spu_name.lower()
+                        for tid, name in tracks:
+                            if name and low in name.lower():
+                                match = (tid, name)
+                                break
+                if match is None and tracks:
                     self._spu_want = -1
                     self._spu_name = ""
                     if self.vlc.active_spu() != -1:
                         self.vlc.set_spu(-1)
-                else:
+                elif match is not None:
                     self._spu_want, self._spu_name = match
                     self.vlc.set_spu(self._spu_want)
             elif self.vlc.active_spu() != self._spu_want:
@@ -2066,7 +2086,8 @@ class PlayerView(QtWidgets.QWidget):
 
     def _refresh_spu_button(self):
         """Paint the CC button only on state changes — this runs every tick
-        and repeated setIcon/tooltip writes repaint the overlay."""
+        and repeated setIcon/tooltip writes repaint the overlay. The button
+        is ALWAYS clickable: with no tracks it still opens the settings."""
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
@@ -2077,12 +2098,12 @@ class PlayerView(QtWidgets.QWidget):
         if state == self._spu_ui:
             return
         self._spu_ui = state
-        self.btn_cc.setEnabled(enabled)
+        self.btn_cc.setEnabled(True)
         self.btn_cc.setIcon(ic.cc(on))
         label = self._spu_name if on else "Off"
         self.btn_cc.setToolTip(
             f"Subtitles — {label} (C)" if enabled
-            else "Subtitles — none on this stream")
+            else "Subtitles — settings (none on this stream)")
 
     def _select_spu(self, track_id: int, name: str = ""):
         """User picked a track from the menu (or -1 for Off)."""
@@ -2115,14 +2136,13 @@ class PlayerView(QtWidgets.QWidget):
         self._flash_spu(nxt, names.get(nxt, ""))
 
     def _subs_menu(self):
-        if not self.btn_cc.isEnabled():
-            return
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
-            return
+            tracks = []
         m = self._ctl_menu()
-        off = m.addAction("Off")
+        if tracks:
+            off = m.addAction("Off")
         off.setCheckable(True)
         off.setChecked(self._spu_want == -1)
         off.triggered.connect(lambda *_, t=-1, n="": self._select_spu(t, n))
@@ -2132,7 +2152,23 @@ class PlayerView(QtWidgets.QWidget):
             a.setChecked(tid == self._spu_want)
             a.triggered.connect(lambda *_, t=tid, n=name:
                                 self._select_spu(t, n))
+        m.addSeparator()
+        a = m.addAction("Subtitle settings\u2026")
+        a.triggered.connect(self._open_sub_settings)
         self._popup_above(m, self.btn_cc)
+
+    def _open_sub_settings(self):
+        from .subtitle_dialog import SubtitleDialog
+        SubtitleDialog(self.config, self._apply_sub_delay,
+                       parent=self.window()).exec_()
+
+    def _apply_sub_delay(self, ms: int):
+        """Delay is the one subtitle setting with a live runtime API —
+        applied instantly (and re-applied on player swaps by VLCPlayer)."""
+        try:
+            self.vlc.set_spu_delay(int(ms))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _flash_spu(self, track_id: int, name: str):
         """Brief on-video confirmation while cycling with the keyboard."""
@@ -2144,6 +2180,154 @@ class PlayerView(QtWidgets.QWidget):
                                  lambda: self._set_dvr_status("")
                                  if self._dvr_status.text() ==
                                  f"Subtitles: {text}" else None)
+
+    # ---- profanity filter (VOD subtitle track -> timed audio mute) ----
+    def _apply_profanity_config(self):
+        """Config -> engine (words, pads, sync, on/off). No process effects."""
+        prof = self.config.profanity
+        words = prof.get("words") or [tuple(w) for w in prof_mod.DEFAULT_WORDS]
+        self._filter_engine.words = [tuple(w) for w in words]
+        self._filter_engine.pad_before_s = \
+            int(prof.get("pad_before_ms", 120)) / 1000.0
+        self._filter_engine.pad_after_s = \
+            int(prof.get("pad_after_ms", 250)) / 1000.0
+        self._filter_engine.sync_s = int(prof.get("sync_ms", 0)) / 1000.0
+        self._filter_engine.enabled = bool(prof.get("enabled"))
+
+    def apply_profanity_settings(self):
+        """The settings dialog saved: re-apply, and (re)start extraction for
+        whatever VOD item is already playing."""
+        self._apply_profanity_config()
+        if not prof_mod.PROFANITY_AVAILABLE:
+            self._stop_profanity()
+            return
+        if self._filter_engine.enabled and self._is_vod() \
+                and not self._closing:
+            self._start_profanity_extraction()
+        elif not self._filter_engine.enabled:
+            self._stop_profanity()
+
+    def _on_media_for_profanity(self, kind: str = None):
+        """play_media(): fresh media decides whether the filter engages.
+        Live TV is out of scope — its subtitles are DVB bitmaps/teletext,
+        not machine-readable text; movies & series carry SRT."""
+        self._stop_profanity()
+        if not prof_mod.PROFANITY_AVAILABLE:
+            return
+        if not self.config.profanity.get("enabled"):
+            return
+        if (kind or "live") not in ("vod", "series"):
+            return
+        if not prof_mod.find_ffmpeg():
+            try:
+                log.warning("profanity: enabled but no ffmpeg found "
+                            "(install ffmpeg or add it to PATH)")
+            except Exception:
+                pass
+            return
+        self._start_profanity_extraction(0.0)
+
+    def _start_profanity_extraction(self, at: float = 0.0):
+        """Probe the file's subtitle tracks (background thread), then start
+        ffmpeg streaming the chosen track out as SRT (see _on_prof_probe)."""
+        url = (self.current or {}).get("url", "")
+        if not url or self._closing:
+            return
+        keep = at > 1.0     # catch-up restart keeps the windows it already has
+        self._stop_profanity(keep_windows=keep)
+        prefer = ""
+        if self._spu_name:
+            prefer = self._spu_name.split("(")[0].split("-")[0].strip()
+        ex = prof_mod.SubtitleExtractor(self)
+        ex._prefer_language = prefer.lower()
+        self._filter_extractor = ex
+        self._filter_at = max(0.0, float(at))
+        try:
+            log.info("profanity: probing subtitle tracks (prefer %r)", prefer)
+        except Exception:
+            pass
+        self._prof_runner.run(ex.probe_track, url, USER_AGENT)
+
+    def _on_prof_probe(self, result):
+        if self._closing or self._filter_extractor is None:
+            return
+        if self._filter_timer.isActive():
+            return   # this session already started (double-probe guard)
+        ok, val = result
+        if ok != "ok" or not val:
+            try:
+                log.info("profanity: no usable subtitle track (%r)", result)
+            except Exception:
+                pass
+            return
+        url = (self.current or {}).get("url", "")
+        if not url:
+            return
+        ex = self._filter_extractor
+        ex.cue.connect(self._on_prof_cue)
+        if ex.start(url, USER_AGENT, ex._prefer_language, self._filter_at):
+            self._filter_timer.start()
+            try:
+                log.info("profanity: extracting subtitle track #%s",
+                         ex._want_index)
+            except Exception:
+                pass
+        else:
+            try:
+                ex.cue.disconnect()
+            except Exception:
+                pass
+            self._filter_extractor = None
+
+    def _on_prof_cue(self, start: float, end: float, text: str):
+        if self._closing:
+            return
+        self._filter_engine.add_cue(start, end, text)
+
+    def _filter_tick(self):
+        """100 ms: apply the filter mute for the current playback position,
+        and restart the extractor ahead of the playhead after long seeks."""
+        if self._closing or not self._filter_engine.enabled \
+                or not self._filter_engine.windows:
+            return
+        if not self._is_vod():
+            return
+        t = self._vid_s if self._vid_s > 0.0 else \
+            max(0.0, self.vlc.get_time() / 1000.0)
+        self._filter_engine.evaluate(t)
+        ex = self._filter_extractor
+        if ex is not None and ex.proc is not None and ex.frontier_s >= 0.0 \
+                and t - ex.frontier_s > 30.0:
+            try:
+                log.info("profanity: seeked past extraction (t=%.1fs "
+                         "frontier=%.1fs) — restarting ahead", t,
+                         ex.frontier_s)
+            except Exception:
+                pass
+            self._start_profanity_extraction(at=max(0.0, t - 5.0))
+
+    def _stop_profanity(self, keep_windows: bool = False):
+        """Kill the extractor + clear the filter mute. Windows survive a
+        keep_windows=True restart (catch-up after a long seek)."""
+        if self._filter_extractor is not None:
+            try:
+                self._filter_extractor.cue.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._filter_extractor.stop()
+                self._filter_extractor.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            self._filter_extractor = None
+        try:
+            self._filter_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        if keep_windows:
+            self._filter_engine.set_muted(False)
+        else:
+            self._filter_engine.clear()
 
 
 
@@ -2213,6 +2397,15 @@ class PlayerView(QtWidgets.QWidget):
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("stop: timer shutdown failed: %r", exc)
+            except Exception:
+                pass
+        # Profanity filter: kill the ffmpeg extractor and clear the filter
+        # mute BEFORE the player goes away (engine.clear() touches VLC).
+        try:
+            self._stop_profanity()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("stop: profanity shutdown failed: %r", exc)
             except Exception:
                 pass
         try:

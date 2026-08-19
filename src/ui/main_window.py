@@ -303,6 +303,8 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu = menu_bar.addMenu("&Settings")
         act_buttons = QtWidgets.QAction("Playback controls…", self)
         act_buttons.triggered.connect(self.edit_control_buttons)
+        act_pf = QtWidgets.QAction("Profanity filter…", self)
+        act_pf.triggered.connect(self.edit_profanity)
         act_folder = QtWidgets.QAction("Recording folder…", self)
         act_folder.triggered.connect(self.choose_record_folder)
         act_dvr_window = QtWidgets.QAction("DVR buffer length…", self)
@@ -312,6 +314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_cache = QtWidgets.QAction("Network cache size…", self)
         act_cache.triggered.connect(self.edit_cache)
         settings_menu.addAction(act_buttons)
+        settings_menu.addAction(act_pf)
         settings_menu.addSeparator()
         settings_menu.addAction(act_folder)
         settings_menu.addAction(act_dvr_window)
@@ -469,6 +472,12 @@ class MainWindow(QtWidgets.QMainWindow):
             }
             self.config.save()
             self.player_view.apply_button_visibility()
+
+    def edit_profanity(self):
+        """Settings ▸ Profanity filter… — word list, levels, timing."""
+        from .profanity_dialog import ProfanityDialog
+        ProfanityDialog(self.config, self.player_view.apply_profanity_settings,
+                        parent=self).exec_()
 
     # ---- black title bar (Windows 10 dark / Windows 11 caption color) ----
     def showEvent(self, event):

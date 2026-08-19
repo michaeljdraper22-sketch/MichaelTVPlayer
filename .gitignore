@@ -12,3 +12,7 @@ TV Recordings/
 *.ts
 *.mp4
 *.mkv
+
+# PyInstaller staging (rename-swap builds)
+build_staging/
+dist_staging/

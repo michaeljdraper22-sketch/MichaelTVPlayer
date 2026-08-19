@@ -19,6 +19,61 @@ _STOP_WAIT_S = 2.5
 USER_AGENT = "MichaelTVPlayer/1.0"
 
 
+def _rgb_int(hex_color: str, fallback: int) -> int:
+    """'#RRGGBB' -> int for VLC's add_rgb options (they are 0xRRGGBB)."""
+    try:
+        h = str(hex_color).lstrip("#")
+        if len(h) == 6:
+            return int(h, 16)
+    except Exception:
+        pass
+    return fallback
+
+
+def subtitle_instance_args(appearance: dict) -> list:
+    """Map the saved subtitle appearance onto libvlc instance arguments.
+
+    VLC 3 has NO runtime API for text-renderer styling — these options are
+    read once when the freetype module loads, i.e. at vlc.Instance() creation
+    — so visual changes only take effect on the next app start (the delay is
+    the one exception: it has a live API, see set_spu_delay). An untouched
+    config returns [] so the player launches with VLC's exact defaults.
+    """
+    ap = appearance or {}
+    args = []
+    font = str(ap.get("font", "") or "").strip()
+    if font:
+        args.append(f"--freetype-font={font}")
+    size = int(ap.get("size", 0) or 0)
+    if size > 0:
+        args.append(f"--freetype-fontsize={size}")
+    pos = int(ap.get("pos_pct", 0) or 0)
+    if pos:
+        # ±100 % maps to ±540 px of margin (about half a 1080p screen).
+        # VLC's --sub-margin raises the subtitles from the bottom; negative
+        # values push them down past the default placement.
+        args.append(f"--sub-margin={int(pos * 5.4)}")
+    text = _rgb_int(ap.get("text_color", ""), 0xFFFFFF)
+    if text != 0xFFFFFF:
+        args.append(f"--freetype-color={text}")
+    if ap.get("bg_enabled"):
+        args.append(f"--freetype-background-color="
+                    f"{_rgb_int(ap.get('bg_color', ''), 0)}")
+        op = max(0, min(100, int(ap.get("bg_opacity", 50) or 0)))
+        args.append(f"--freetype-background-opacity={round(op * 255 / 100)}")
+    if ap.get("outline_enabled", True):
+        oc = _rgb_int(ap.get("outline_color", ""), 0)
+        if oc != 0:      # black is VLC's default outline color
+            args.append(f"--freetype-outline-color={oc}")
+        th = max(0, min(50, int(ap.get("outline_thickness", 4) or 4)))
+        if th != 4:
+            args.append(f"--freetype-outline-thickness={th}")
+    else:
+        # the default look HAS an outline — turning it off must be explicit
+        args.append("--freetype-outline-opacity=0")
+    return args
+
+
 class VLCPlayer:
     """Wraps a libvlc media player.
 
@@ -29,7 +84,8 @@ class VLCPlayer:
     """
 
     def __init__(self, timeshift: bool = True, volume: int = 100,
-                 network_caching: int = 1500):
+                 network_caching: int = 1500, sub_args: list = None,
+                 spu_delay_ms: int = 0):
         nc = max(0, min(50000, int(network_caching)))
         args = [
             "--no-video-title-show",
@@ -40,6 +96,8 @@ class VLCPlayer:
             "--disc-caching=1000",
             "--avcodec-skiploopfilter=1",
         ]
+        # subtitle appearance (freetype options are instance-level only)
+        args.extend([str(a) for a in (sub_args or [])])
         self.timeshift = timeshift
         # A few caching/display options. Some VLC builds reject unknown options
         # and return None, so fall back to a plain instance if that happens.
@@ -48,7 +106,9 @@ class VLCPlayer:
         )
         self.player = self.instance.media_player_new()
         self._volume = max(0, min(100, int(volume)))
+        self._spu_delay_ms = int(spu_delay_ms)   # desired sub delay (ms)
         self._mute = False            # desired mute state (re-applied per player)
+        self._filter_mute = False     # profanity filter's mute (layered on top)
         self._scale_mode = "fit"      # "fit" | "stretch" | "crop"
         self._scale_wh = None         # last (w, h) the scale was computed for
         self._scale_last = None       # (mode, w, h) last sent to a player
@@ -67,10 +127,8 @@ class VLCPlayer:
         # be re-applied even if (mode, w, h) is unchanged
         self._scale_last = None
         self._apply_volume(player)
-        try:
-            player.audio_set_mute(1 if self._mute else 0)
-        except Exception:
-            pass
+        self._apply_spu_delay(player)
+        self._apply_effective_mute(player)
         if self._scale_wh:
             self._apply_scale_to(player, *self._scale_wh)
         try:
@@ -89,8 +147,9 @@ class VLCPlayer:
         """VLC thread context: only thread-safe libvlc audio calls, no Qt."""
         try:
             self._apply_volume(self.player)
-            self.player.audio_set_mute(1 if self._mute else 0)
+            self._apply_effective_mute(self.player)
             self._unmute_late(self.player)
+            self._apply_spu_delay(self.player)
         except Exception:
             pass
 
@@ -112,7 +171,7 @@ class VLCPlayer:
                 return
             try:
                 self._apply_volume(pl)
-                pl.audio_set_mute(1 if self._mute else 0)
+                self._apply_effective_mute(pl)
             except Exception:
                 pass
         threading.Timer(1.2, _retry).start()
@@ -490,12 +549,37 @@ class VLCPlayer:
     def set_mute(self, on: bool) -> None:
         self._mute = bool(on)
         try:
-            self.player.audio_set_mute(1 if on else 0)
+            self._apply_effective_mute(self.player)
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("set_mute failed: %r", exc)
             except Exception:
                 pass
+
+    def set_filter_mute(self, on: bool) -> None:
+        """Profanity-filter mute — LAYERED on top of the user's mute, never
+        touching it: the mute button keeps showing the user's own choice,
+        and clearing either one re-applies the other. Thread-safe (called
+        from the filter engine's timer on the Qt thread)."""
+        on = bool(on)
+        if on == self._filter_mute:
+            return
+        self._filter_mute = on
+        try:
+            self._apply_effective_mute(self.player)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("set_filter_mute failed: %r", exc)
+            except Exception:
+                pass
+
+    def _apply_effective_mute(self, player) -> None:
+        """The ONE place audio mute is written: user OR filter."""
+        try:
+            player.audio_set_mute(1 if (self._mute or self._filter_mute)
+                                  else 0)
+        except Exception:
+            pass
 
     def is_mute(self) -> bool:
         """The user's DESIRED mute state — the single source of truth.
@@ -523,6 +607,29 @@ class VLCPlayer:
             return 1.0
 
     # ---- subtitles (embedded stream tracks) ----
+    def set_spu_delay(self, ms: int) -> None:
+        """Shift subtitle timing (positive = later, negative = earlier).
+
+        Unlike the visual styling this has a REAL runtime API — it applies
+        immediately, mid-playback, audio untouched. The desired value is
+        stored here and re-applied on fresh players (hung-stop swaps start
+        at 0) and on every Playing event, mirroring the volume handling."""
+        self._spu_delay_ms = int(ms)
+        self._apply_spu_delay(self.player)
+
+    def get_spu_delay(self) -> int:
+        """Current subtitle delay in ms (the stored DESIRED value)."""
+        return self._spu_delay_ms
+
+    def _apply_spu_delay(self, player) -> None:
+        try:
+            player.video_set_spu_delay(int(self._spu_delay_ms) * 1000)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("_apply_spu_delay failed: %r", exc)
+            except Exception:
+                pass
+
     def spu_tracks(self) -> list:
         """[(id, name), ...] subtitle tracks of the current media.
 
