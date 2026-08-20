@@ -55,10 +55,12 @@ DEFAULTS = {
     "vod_countries_configured": False,
     "series_enabled_countries": [],   # Series country/group filter
     "series_countries_configured": False,
-    "dvr_enabled": False,         # user's last DVR preference (never auto-start)
     "dvr_max_minutes": 30,        # rolling DVR buffer window
     "record_folder": "",          # where permanent recordings are saved
-    "chase_delay": 15,            # seconds behind live in DVR/chase mode
+    # Seconds behind live the always-on DVR chase keeps live TV. 5 is the
+    # floor: the caption cushion (profanity filter / app-rendered captions)
+    # cannot mute/render in time with less.
+    "chase_delay": 5,
     "favorites": [],              # list of "playable" dicts
     "recents": [],                # list of "playable" dicts (most-recent first)
     "custom_channels": [],        # user-defined stream URLs
@@ -72,7 +74,7 @@ DEFAULTS = {
     # (Settings ▸ Playback controls…).
     "control_buttons": {
         "back60": True, "back10": True, "play": True, "fwd10": True,
-        "begin": True, "live": True, "dvr": True, "rec": True,
+        "begin": True, "live": True, "rec": True,
         "cc": True, "scale": True, "speed": True, "mute": True,
         "volume": True, "timebar": True,
     },
@@ -82,7 +84,7 @@ DEFAULTS = {
 }
 
 BUTTON_KEYS = (
-    "back60", "back10", "play", "fwd10", "begin", "live", "dvr", "rec",
+    "back60", "back10", "play", "fwd10", "begin", "live", "rec",
     "cc", "scale", "speed", "mute", "volume", "timebar",
 )
 
@@ -123,6 +125,14 @@ class Config:
                 sub["size"] = SUBTITLE_DEFAULTS["size"]
             data["subtitle_appearance"] = sub
         data["_sub_size_migrated"] = True
+        # one-time migration: live TV is ALWAYS in DVR chase mode now, and
+        # the user approved trading ~5 s of latency for unified captions —
+        # configs still on the old 15 s default come down to 5 (an explicit
+        # other value is kept; the floor is 5 either way).
+        if not data.get("_chase_delay_migrated"):
+            if int(data.get("chase_delay", 5) or 5) == 15:
+                data["chase_delay"] = 5
+            data["_chase_delay_migrated"] = True
         return cls(data, path)
 
     def save(self) -> None:
@@ -414,14 +424,6 @@ class Config:
 
 
     @property
-    def dvr_enabled(self) -> bool:
-        return bool(self.data.get("dvr_enabled", False))
-
-    @dvr_enabled.setter
-    def dvr_enabled(self, value: bool) -> None:
-        self.data["dvr_enabled"] = bool(value)
-
-    @property
     def dvr_max_minutes(self) -> int:
         return int(self.data.get("dvr_max_minutes", 30))
 
@@ -439,7 +441,7 @@ class Config:
 
     @property
     def chase_delay(self) -> int:
-        return int(self.data.get("chase_delay", 15))
+        return int(self.data.get("chase_delay", 5))
 
     @chase_delay.setter
     def chase_delay(self, value: int) -> None:

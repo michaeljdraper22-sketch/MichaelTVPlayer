@@ -210,8 +210,7 @@ def main():
     view._apply_profanity_config()
     view.current = {"kind": "vod", "url": "http://x/m.mkv", "title": "M"}
     view._on_media_for_profanity("vod")
-    check("VOD does not engage the live filter",
-          CCStarts == [] and not view.btn_dvr.isChecked())
+    check("VOD does not engage the live filter", CCStarts == [])
 
     # VOD splitter glue: routing through the relay must ALSO start the
     # evaluation timer (the mute loop — its only other start() lives in
@@ -219,7 +218,7 @@ def main():
     class StubRelay(QtCore.QObject):
         cue = QtCore.pyqtSignal(float, float, str)
 
-        def start(self, url, ua):
+        def start(self, url, ua, prefer_language="eng"):
             return "http://127.0.0.1:1/v"
 
         def stop(self):
@@ -237,11 +236,9 @@ def main():
 
     view.current = {"kind": "live", "url": "http://x.ts", "title": "L"}
     view._on_media_for_profanity("live")
-    check("live NEVER auto-engages DVR mode",
-          not view.btn_dvr.isChecked() and CCStarts == [])
+    check("live alone does not start the reader (chase entry does)",
+          CCStarts == [])
     check("live NEVER rewrites the delay setting", cfg.chase_delay == 5)
-    check("a notice tells the user how to opt in",
-          "press DVR" in view._dvr_status.text())
     view._set_dvr_status("")
 
     # chase active + buffer ready -> caption reader starts at the frontier

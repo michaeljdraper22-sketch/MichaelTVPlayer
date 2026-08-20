@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """End-to-end DVR test: real provider + real PlayerView logic + real VLC.
 
-Plays a live channel, switches DVR on, and verifies:
+Plays a live channel (always-on chase engages automatically) and verifies:
   - chase mode engages quickly (fast entry)
   - the buffer grows (frontier advances)
   - REWIND (-30s) actually moves playback backwards
@@ -62,31 +62,27 @@ def wait_until(pred, timeout, what):
 
 
 try:
-    print("[1] play live channel", flush=True)
+    print("[1] play live channel (chase engages automatically)", flush=True)
     view.play_media(dict(CH))
-    ok = wait_until(lambda: view.vlc.is_playing(), 25, "live playing")
-    if not ok:
-        # one retry: the provider throttles rapid re-connections
-        print("  (retrying live open once)", flush=True)
-        view.play_media(dict(CH))
-        ok = wait_until(lambda: view.vlc.is_playing(), 30, "live playing 2")
-    check("live playback starts", ok)
-    pump(2)
-
-    print("[2] switch DVR on", flush=True)
-    t0 = time.time()
-    view.btn_dvr.setChecked(True)
     ok = wait_until(lambda: view._mode == "chase", 30, "chase mode")
+    check("always-on chase engages on play", ok)
+    t0 = time.time()
+    ok = wait_until(lambda: view.vlc.is_playing(), 30, "chase playing")
     t_chase = time.time() - t0
     check(f"chase engages (took {t_chase:.1f}s)", ok and t_chase < 15)
-    ok = wait_until(lambda: view.vlc.is_playing(), 30, "chase playing")
     pump(4)
     check("chase playback running", view.vlc.is_playing())
 
     print("[3] buffer grows", flush=True)
     f1 = view._frontier_s()
-    pump(5)
-    f2 = view._frontier_s()
+    f2 = f1
+    # VLC flushes the sout file in 2-4 s bursts: sample across a few
+    # windows before declaring the clock frozen.
+    for _ in range(4):
+        pump(4)
+        f2 = view._frontier_s()
+        if f2 > f1 + 2.0:
+            break
     check(f"frontier advances ({f1:.1f}s -> {f2:.1f}s)", f2 > f1 + 2.0)
 
     print("[4] rewind -30s (after the buffer has room)", flush=True)

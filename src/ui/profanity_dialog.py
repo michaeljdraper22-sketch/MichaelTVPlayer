@@ -38,17 +38,15 @@ class ProfanityDialog(QtWidgets.QDialog):
             self.ck_on.setToolTip("Being reworked — see note below")
         lay.addWidget(self.ck_on)
         top_note = QtWidgets.QLabel(
-            "LIVE TV: reads the channel's CLOSED CAPTIONS while DVR mode "
-            "is on (press the DVR button — playback runs your Live-delay "
-            "setting behind live, at least 5 s; captions need the "
-            "cushion). Shows always start live; nothing is ever engaged "
-            "for you.\n"
+            "LIVE TV: reads the channel's CLOSED CAPTIONS from the always-on\n"
+            "live buffer (playback runs your Live-delay setting behind live,\n"
+            "at least 5 s; captions need the cushion).\n"
             "MOVIES & SERIES: the file's own subtitle track is read in "
             "the background (no playback delay, no second connection) "
             "and the audio is muted ahead of the dialogue.\n"
             "Subtitles do not need to be turned on. Requires CCExtractor "
-            "installed for live TV. DVB (image) subtitle channels are not "
-            "covered.")
+            "for live TV (bundled with the app). DVB (image) subtitle "
+            "channels are not covered.")
         top_note.setWordWrap(True)
         top_note.setStyleSheet("color:#9aa0a6;")
         lay.addWidget(top_note)

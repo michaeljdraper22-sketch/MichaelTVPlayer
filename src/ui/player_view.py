@@ -19,6 +19,7 @@ from ..live_cc import CCSource, find_ccextractor
 from .. import vod_splitter
 from ..vod_splitter import VodRelay
 from . import icons as ic
+from .caption_overlay import CaptionOverlay, CueStore
 from .worker import AsyncRunner, FileDownloader
 
 log = logging.getLogger("mtp")
@@ -46,11 +47,14 @@ def _fmt(ms: int) -> str:
 
 # Chase-mode safety margin: never seek closer than this to the buffer's write
 # position (VLC stalls when it runs into the end of a still-growing file), and
-# the minimum spacing between watchdog reopens of the buffer.
-_CHASE_SAFETY_S = 3.0
+# the minimum spacing between watchdog reopens of the buffer. 5 s also keeps
+# a caption cushion after "jump to live": CCExtractor trails the write head by
+# a couple of seconds, so the app-rendered captions still have data to show
+# right at the clamped frontier.
+_CHASE_SAFETY_S = 5.0
 _REOPEN_COOLDOWN_S = 5.0
 
-# Playback speeds offered by the speed button (DVR mode only).
+# Playback speeds offered by the speed button (chase mode / VOD).
 # Capped at 4x: VLC mutes the audio output entirely above ~4x playback
 # speed ("fast forward 5x goes silent").
 _SPEEDS = (0.125, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
@@ -273,6 +277,15 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
         self._filter_gen = 0          # session guard for probe callbacks
+        # caption overlay: app-rendered subtitles, one style for every
+        # text source (live CC via CCExtractor, VOD SRT via the relay)
+        self._cap_cues = CueStore()   # every cue, both sources
+        self._cap_on = False          # the overlay owns caption rendering
+        self._cap_want = False        # user picked a text track (sticky)
+        self._cap_fail = False        # source dead this media: VLC renders
+        self._cap_timer = QtCore.QTimer(self)
+        self._cap_timer.setInterval(100)
+        self._cap_timer.timeout.connect(self._caption_tick)
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
         self.vlc = VLCPlayer(
@@ -322,6 +335,10 @@ class PlayerView(QtWidgets.QWidget):
 
         # overlays (children of the overlay window, positioned over the video)
         self.info_overlay = InfoOverlay(self.overlay)
+        # app-rendered subtitles — created BEFORE the controls so it stays
+        # beneath them in the stacking order (never raised either)
+        self._cap_wid = CaptionOverlay(self.overlay)
+        self._cap_wid.bind_config(lambda: self.config.subtitle_appearance)
         self._btn_panel = QtWidgets.QPushButton(self.overlay)
         self._btn_ovfs = QtWidgets.QPushButton(self.overlay)
         for b in (self._btn_panel, self._btn_ovfs):
@@ -413,13 +430,9 @@ class PlayerView(QtWidgets.QWidget):
                                  "Jump to the beginning of the stream")
         self.btn_live = ctl_btn(ic.live(), "Jump to the live edge "
                                            "(from pause or rewind)")
-        self.btn_dvr = ctl_btn(
-            ic.dvr(False),
-            "DVR mode: record this channel so you can pause and rewind it "
-            "(plays a few seconds behind live; also runs the profanity "
-            "filter on caption channels)", checkable=True)
-        # replaces the DVR button while a movie / series episode plays (the
-        # file is already fully seekable — there is nothing to timeshift)
+        # replaces the Record button while a movie / series episode plays
+        # (the file is already fully seekable — there is nothing to
+        # timeshift; recording a stream re-encodes, a download is verbatim)
         self.btn_dl = ctl_btn(ic.download(),
                               "Download this video to the recordings folder")
         self.btn_rec = ctl_btn(ic.rec(False),
@@ -436,7 +449,7 @@ class PlayerView(QtWidgets.QWidget):
         # area felt imprecise at the standard 34 px
         self.btn_scale.setFixedSize(42, 30)
         self.btn_speed = ctl_btn(ic.speed(), "Playback speed "
-                                              "(DVR mode, movies & series)")
+                                              "(live rewind, movies & series)")
         self.sep3 = ctl_sep()
         self.btn_mute = ctl_btn(ic.volume(True), "Mute (M)", checkable=True)
         # JumpSlider = click anywhere on the bar to set the volume directly
@@ -455,7 +468,7 @@ class PlayerView(QtWidgets.QWidget):
         rl.setSpacing(6)
         for w in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
-                  self.btn_dvr, self.btn_dl, self.btn_rec, self.sep2,
+                  self.btn_dl, self.btn_rec, self.sep2,
                   self.btn_cc, self.btn_scale, self.btn_speed, self.sep3,
                   self.btn_mute, self.vol_slider):
             rl.addWidget(w)
@@ -496,7 +509,6 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_scale.clicked.connect(self._scale_menu)
         self.btn_speed.clicked.connect(self._speed_menu)
         self.btn_mute.toggled.connect(self._on_mute)
-        self.btn_dvr.toggled.connect(self._on_dvr_toggled)
         self.btn_dl.clicked.connect(self._start_download)
         self.btn_rec.toggled.connect(self._on_rec_toggled)
         self.vol_slider.valueChanged.connect(self._on_volume)
@@ -603,6 +615,12 @@ class PlayerView(QtWidgets.QWidget):
             self._dvr_status.move(g.left() + (g.width() - ss.width()) // 2,
                                   g.top() + (g.height() - ss.height()) // 2)
             self._dvr_status.raise_()
+        # caption overlay: covers the whole surface, clears the control
+        # bar while the controls are visible (inset changes on wake/sleep)
+        if self._cap_wid.size() != g.size() or self._cap_wid.pos() != g.topLeft():
+            self._cap_wid.setGeometry(QtCore.QRect(g.topLeft(), g.size()))
+        self._cap_wid.set_bottom_inset(
+            self.ctl.height() + 14 if not self.ctl.isHidden() else 24)
 
     def set_client(self, client):
         self.client = client
@@ -805,17 +823,20 @@ class PlayerView(QtWidgets.QWidget):
         self._stop_recording(stopping=True)
         self.vlc.stop_and_release()
         self._ensure_dvr_stopped()
-        # The OLD media's filter machinery: the VOD relay holds a provider
-        # connection and must release it BEFORE the new URL opens (the
-        # account allows one connection — a leaked relay stalled the next
-        # channel). Also drops the live caption reader + filter windows.
+        # The OLD media's caption/filter machinery: the VOD relay holds a
+        # provider connection and must release it BEFORE the new URL opens
+        # (the account allows one connection — a leaked relay stalled the
+        # next channel). The overlay drops its claim on those sources
+        # first (while it owns them, _stop_profanity keeps them alive),
+        # then the live caption reader + filter windows go.
+        self._set_cap_on(False)
+        self._cap_fail = False
         self._stop_profanity()
-        for btn, icon in ((self.btn_dvr, ic.dvr(False)),
-                          (self.btn_rec, ic.rec(False))):
-            btn.blockSignals(True)
-            btn.setChecked(False)
-            btn.setIcon(icon)
-            btn.blockSignals(False)
+        self._cap_cues.clear()
+        self.btn_rec.blockSignals(True)
+        self.btn_rec.setChecked(False)
+        self.btn_rec.setIcon(ic.rec(False))
+        self.btn_rec.blockSignals(False)
         self._mode = "live"
         self._chase_paused = False
         self._dvr_t0 = None
@@ -832,10 +853,19 @@ class PlayerView(QtWidgets.QWidget):
         self._set_rate(1.0)
         self._update_control_state()
         self._apply_scale()
-        # Timeshift is LIVE-only: VLC's input-timeshift on seekable VOD
-        # drifts A/V sync over a movie (and fights the local relay).
-        self.vlc.play(self._effective_url(playable.get("url", ""), kind),
-                      timeshift=(kind == "live"), start_seconds=start_at)
+        url = playable.get("url", "")
+        if kind == "live" and url:
+            # Live TV ALWAYS runs through the DVR chase pipeline (user
+            # approved ~5 s behind live in exchange for unified captions):
+            # the recorder opens the single connection, playback watches
+            # the buffer. No direct network playback on the display player.
+            self._engage_chase()
+        else:
+            # VOD / series: the whole file exists — no timeshift wanted
+            # (VLC's input-timeshift drifts A/V sync on seekable files and
+            # fights the local relay).
+            self.vlc.play(self._effective_url(url, kind),
+                          timeshift=False, start_seconds=start_at)
         self._poke_audio()
         self._wake()
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
@@ -1136,70 +1166,46 @@ class PlayerView(QtWidgets.QWidget):
             # timestamps until the next successful drag.
             self._seeking = False
 
-    # ---- DVR / chase mode (single connection: recorder owns the stream) ----
-    def _on_dvr_toggled(self, on):
-        try:
-            log.info("_on_dvr_toggled on=%s", bool(on))
-        except Exception:
-            pass
+    # ---- chase mode (single connection: the recorder owns the stream) ----
+    def _engage_chase(self):
+        """Start the always-on live pipeline: the recorder opens the single
+        provider connection and playback watches the DVR buffer a few
+        seconds behind the frontier (config.chase_delay, floor 5 s).
+
+        ONE connection, strict handoff order:
+          1) the DISPLAY player stops the network URL first (when REC was
+             on in fallback-live mode this also stops its record output),
+          2) the recorder opens the single connection — with the kept
+             recording file as a second output when REC is on (dual
+             output), so no second vlc.play(url) is ever issued,
+          3) once the buffer holds data the display player switches to
+             watching the buffer file behind the live edge.
+        The display player never plays the network URL while the recorder
+        runs."""
         self._session += 1   # deferred chase callbacks from before are stale
-        self.config.dvr_enabled = bool(on)
-        self.config.save()
-        self.btn_dvr.setIcon(ic.dvr(bool(on)))
-        if on:
-            if not (self.current and self.current.get("kind") == "live"
-                    and self.current.get("url")):
-                self.btn_dvr.blockSignals(True)
-                self.btn_dvr.setChecked(False)
-                self.btn_dvr.setIcon(ic.dvr(False))
-                self.btn_dvr.blockSignals(False)
-                return
-            if (self._mode == "chase" and self.dvr and self.dvr.running):
-                # Already timeshifting (e.g. REC started the pipeline) —
-                # nothing to hand over, the buffer keeps growing.
-                self._update_control_state()
-                return
-            # ONE connection, strict handoff order:
-            #   1) the DISPLAY player stops the network URL first (when REC
-            #      was on in live mode this also stops its record output),
-            #   2) the recorder opens the single connection — with the kept
-            #      recording file as a second output when REC is on (dual
-            #      output), so no second vlc.play(url) is ever issued,
-            #   3) once the buffer holds data the display player switches to
-            #      watching the buffer file behind the live edge.
-            # The display player never plays the network URL while the
-            # recorder runs.
-            self._dvr_t0 = time.time()
-            self._dvr_base = 0.0
-            self._reset_dvr_clock()
-            self._stall_ticks = 0
-            self._last_reopen = 0.0
-            self._chase_started = False
-            try:
-                log.info("dvr on handoff: display player off the network "
-                         "(record=%s)", self.btn_rec.isChecked())
-            except Exception:
-                pass
-            self.vlc.stop_and_release()                 # (1)
-            self._ensure_dvr_stopped()                  # drop any stale buffer
-            record = self.btn_rec.isChecked()
-            self._restart_recorder(record=record)       # (2)
-            self._wait_and_enter_chase(self._session)   # (3)
-        else:
-            if self.btn_rec.isChecked():
-                # REC alone keeps the single-connection chase pipeline (the
-                # recording stays scrubbable), so only the UI state changes.
-                self._update_control_state()
-                return
-            self._exit_chase_to_live()
+        if self._mode == "chase" and self.dvr and self.dvr.running:
+            return            # already chasing (e.g. REC engaged it)
+        self._dvr_t0 = time.time()
+        self._dvr_base = 0.0
+        self._reset_dvr_clock()
+        self._stall_ticks = 0
+        self._last_reopen = 0.0
+        self._chase_started = False
+        self.vlc.stop_and_release()                 # (1)
+        self._ensure_dvr_stopped()                  # drop any stale buffer
+        record = self.btn_rec.isChecked()
+        self._restart_recorder(record=record)       # (2)
+        self._wait_and_enter_chase(self._session)   # (3)
 
     def _exit_chase_to_live(self):
         """Leave chase mode and return to the plain live stream.
 
-        Safe order (ONE provider connection at all times): the display player
-        stops first (it holds the buffer file handle), then the recorder and
-        its temp dir go, and only then does the display player dial the live
-        URL again.
+        Failure fallback only (the recorder never produced data — provider
+        blocked it / network down): chase is normally always on, so nothing
+        in the UI calls this. Safe order (ONE provider connection at all
+        times): the display player stops first (it holds the buffer file
+        handle), then the recorder and its temp dir go, and only then does
+        the display player dial the live URL again.
         """
         self._mode = "live"
         self._chase_paused = False
@@ -1306,7 +1312,7 @@ class PlayerView(QtWidgets.QWidget):
             d.safe_stop(delete=True)  # stops + retries temp dir delete, no raise
 
     def _set_dvr_status(self, text):
-        """Show/hide the small 'DVR starting' pill (chase buffer filling)."""
+        """Show/hide the small 'Buffering…' pill (chase buffer filling)."""
         if self._closing:
             return
         if text:
@@ -1352,32 +1358,20 @@ class PlayerView(QtWidgets.QWidget):
             self._set_dvr_status(None)
             self._start_chase_now(gen)
             return
-        self._set_dvr_status("DVR starting\u2026")
+        self._set_dvr_status("Buffering\u2026")
         if tries_left > 0:
             QtCore.QTimer.singleShot(
                 400, lambda: self._wait_and_enter_chase(gen, tries_left - 1)
             )
         else:
-            # Recorder failed (provider blocked it / network) — revert cleanly
-            # instead of hanging on a black screen.
+            # Recorder failed (provider blocked it / network) — revert to
+            # the plain live stream instead of hanging on a black screen.
             try:
-                log.warning("chase wait: gave up after %.1fs -- back to live",
-                            waited)
+                log.warning("chase wait: gave up after %.1fs -- back to "
+                            "direct live", waited)
             except Exception:
                 pass
-            self._set_dvr_status(None)
-            self._ensure_dvr_stopped()
-            self._mode = "live"
-            self._chase_paused = False
-            self._dvr_t0 = None
-            self._dvr_base = 0.0
-            self._reset_dvr_clock()
-            self.btn_dvr.blockSignals(True)
-            self.btn_dvr.setChecked(False)
-            self.btn_dvr.setIcon(ic.dvr(False))
-            self.btn_dvr.blockSignals(False)
-            self._update_control_state()
-            self._reopen_display()
+            self._exit_chase_to_live()
 
     def _start_chase_now(self, gen: int):
         if gen != self._session:
@@ -1395,10 +1389,14 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._set_rate(1.0)
         self._update_control_state()
-        # profanity filter: begin reading captions from the buffer now
-        if (prof_mod.PROFANITY_AVAILABLE and self._filter_engine.enabled
-                and self._cc_source is None and not self._closing):
+        # profanity filter / caption overlay: begin reading captions from
+        # the buffer now (ONE CCSource serves both)
+        if ((prof_mod.PROFANITY_AVAILABLE and self._filter_engine.enabled)
+                or self._cap_want) and self._cc_source is None \
+                and not self._closing:
             self._start_cc_when_buffer(tries_left=10)
+        if self._cap_want and not self._cap_fail:
+            self._set_cap_on(True)
         delay = self.config.chase_delay
         target = self._safe_seek_target(self._frontier_s() - delay)
         try:
@@ -1461,25 +1459,15 @@ class PlayerView(QtWidgets.QWidget):
                 folder, f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}.ts"
             )
             if self.dvr and self.dvr.running:
-                # Recorder already owns the single connection (chase mode or
-                # its entry window): restart it with the recording file as a
-                # second output (buffer keeps growing).
+                # Recorder already owns the single connection (chase mode):
+                # restart it with the recording file as a second output
+                # (buffer keeps growing).
                 self._restart_recorder(record=True)
             elif self.current.get("kind") == "live":
-                # Live TV: recording joins the single-connection chase
-                # pipeline so the timeline is scrubbable/seekable — the same
-                # handoff DVR mode uses (display player off the network,
-                # recorder on with dual output, then watch the buffer).
-                self._dvr_t0 = time.time()
-                self._dvr_base = 0.0
-                self._reset_dvr_clock()
-                self._stall_ticks = 0
-                self._last_reopen = 0.0
-                self._chase_started = False
-                self.vlc.stop_and_release()
-                self._ensure_dvr_stopped()
-                self._restart_recorder(record=True)
-                self._wait_and_enter_chase(self._session)
+                # Fallback direct-live mode (the recorder gave up earlier):
+                # recording re-engages the single-connection chase pipeline
+                # so the timeline is scrubbable/seekable.
+                self._engage_chase()
             else:
                 # VOD: the main player watches AND records in one go.
                 self.vlc.play_at(self.current["url"],
@@ -1497,20 +1485,15 @@ class PlayerView(QtWidgets.QWidget):
         if stopping:
             return
         if self.dvr and self.dvr.running:
-            if self.btn_dvr.isChecked():
-                # DVR still needs the single-connection recorder: drop only
-                # the recording output — the buffer keeps growing and the
-                # display player stays where it is. NEVER play the network
-                # URL here: that would open a second connection.
-                self._restart_recorder(record=False)
-            else:
-                # REC was the only reason for the chase pipeline — back to
-                # the plain live stream.
-                self._exit_chase_to_live()
+            # Chase needs the single-connection recorder regardless: drop
+            # only the recording output — the buffer keeps growing and the
+            # display player stays where it is. NEVER play the network URL
+            # here: that would open a second connection.
+            self._restart_recorder(record=False)
         elif self.current and self.current.get("url") and self._mode == "live":
-            # Plain live/VOD mode: the display player carried the record
-            # output, restart it as a plain viewer (still one connection,
-            #).
+            # Fallback direct-live / VOD mode: the display player carried
+            # the record output, restart it as a plain viewer (still one
+            # connection).
             self._reopen_display()
         if self.btn_rec.isChecked():
             self.btn_rec.blockSignals(True)
@@ -1754,8 +1737,10 @@ class PlayerView(QtWidgets.QWidget):
             self.setCursor(QtCore.Qt.BlankCursor)
         if not any(w.isVisible() for w in (
                 self._btn_panel, self._btn_ovfs, self._btn_showpanel,
-                self.info_overlay, self._dvr_status)):
+                self.info_overlay, self._dvr_status, self._cap_wid)):
             self.overlay.hide()   # nothing left to show over the video
+        # captions may sit lower now that the control bar is gone
+        self._layout_overlays()
 
     def _cursor_on_controls(self) -> bool:
         for w in (self.ctl, self._btn_panel, self._btn_ovfs,
@@ -1963,19 +1948,18 @@ class PlayerView(QtWidgets.QWidget):
     def _update_control_state(self):
         """Enable/disable + show/hide controls for the current mode.
 
-        Transport buttons (rewinds, begin, speed) work in DVR chase mode AND
-        for movies / series episodes — the whole file exists, so it is
-        seekable without timeshift. The DVR button is live-only; a Download
-        button takes its place for VOD. LIVE jumps to the buffer's write
-        frontier (chase), skips to the file end (VOD) or returns a paused
-        live stream to its edge (plain live)."""
+        Live TV is always in DVR chase mode (recorder on the single
+        connection, playback watching the buffer), so the transport buttons
+        (rewinds, begin, speed) are enabled for live AND movies / series —
+        the whole file/buffer exists, so both are seekable. LIVE jumps to
+        the buffer's write frontier (chase) or skips to the file end (VOD).
+        A Download button replaces Record for movies / series."""
         chase = self._mode == "chase"
         vod = self._is_vod()
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
                   self.btn_begin, self.btn_speed):
             b.setEnabled(chase or vod)
         self.btn_live.setEnabled(chase or vod or bool(self.current))
-        self.btn_dvr.setEnabled(self._is_dvrable())
         self.btn_dl.setEnabled(vod and not self._downloading)
         self._scrub_on = chase
         self._set_scrub_visible(chase)
@@ -1998,15 +1982,16 @@ class PlayerView(QtWidgets.QWidget):
             "back60": self.btn_back60, "back10": self.btn_back10,
             "play": self.btn_play, "fwd10": self.btn_fwd10,
             "begin": self.btn_begin,
-            "live": self.btn_live, "dvr": self.btn_dvr, "rec": self.btn_rec,
+            "live": self.btn_live, "rec": self.btn_rec,
             "cc": self.btn_cc, "scale": self.btn_scale,
             "speed": self.btn_speed, "mute": self.btn_mute,
             "volume": self.vol_slider,
         }
         for key, w in widgets.items():
             on = bool(vis.get(key, True)) and key not in compact
-            if key == "dvr":
-                # one slot: DVR for live streams, Download for movies/series
+            if key == "rec":
+                # one slot: Record for live streams, Download for movies/
+                # series (the verbatim copy the file already is)
                 w.setVisible(on and not vod)
                 self.btn_dl.setVisible(on and vod)
             else:
@@ -2019,11 +2004,11 @@ class PlayerView(QtWidgets.QWidget):
         seps_on = self._compact_level < 2
         self.sep1.setVisible(seps_on and
                              any_of("back60", "back10", "play", "fwd10")
-                             and (any_of("begin", "live", "dvr", "rec")
+                             and (any_of("begin", "live", "rec")
                                   or any_of("cc", "scale", "speed")
                                   or any_of("mute", "volume")))
         self.sep2.setVisible(seps_on and
-                             any_of("begin", "live", "dvr", "rec")
+                             any_of("begin", "live", "rec")
                              and (any_of("cc", "scale", "speed")
                                   or any_of("mute", "volume")))
         self.sep3.setVisible(seps_on and
@@ -2071,7 +2056,7 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
         self.btn_speed.setToolTip(
-            f"Playback speed — {rate:g}\u00d7 (DVR mode, movies & series)")
+            f"Playback speed — {rate:g}\u00d7 (live rewind, movies & series)")
 
     def _scale_menu(self):
         m = self._ctl_menu()
@@ -2109,10 +2094,19 @@ class PlayerView(QtWidgets.QWidget):
         remote MKVs report their tracks only seconds after Playing. The
         choice is sticky by NAME — track ids differ between medias, so a
         channel change re-selects e.g. "English" on the new stream when it
-        exists and quietly turns subtitles off when it doesn't."""
+        exists and quietly turns subtitles off when it doesn't.
+
+        While the caption overlay owns a text track, VLC's own spu stays
+        OFF here (double rendering would otherwise flash on ES updates);
+        the sticky choice is kept so a fallback re-selects it instantly."""
         if self._closing:
             return
         try:
+            if self._cap_on:
+                if self.vlc.active_spu() != -1:
+                    self.vlc.set_spu(-1)
+                self._refresh_spu_button()
+                return
             tracks = self.vlc.spu_tracks()
             if self._spu_want == -1:
                 if self.vlc.active_spu() != -1:
@@ -2141,6 +2135,10 @@ class PlayerView(QtWidgets.QWidget):
                 elif match is not None:
                     self._spu_want, self._spu_name = match
                     self.vlc.set_spu(self._spu_want)
+                    if self._cap_eligible(self._spu_name):
+                        # sticky text track matched on the new media — the
+                        # overlay takes the rendering back
+                        self._engage_caption_overlay()
             elif self.vlc.active_spu() != self._spu_want:
                 self.vlc.set_spu(self._spu_want)
         except Exception:  # noqa: BLE001
@@ -2155,8 +2153,8 @@ class PlayerView(QtWidgets.QWidget):
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
             tracks = []
-        enabled = bool(tracks)
-        on = self._spu_want != -1
+        enabled = bool(tracks) or self._cap_on
+        on = self._spu_want != -1 or self._cap_on
         state = (enabled, on, self._spu_name if on else "")
         if state == self._spu_ui:
             return
@@ -2172,11 +2170,206 @@ class PlayerView(QtWidgets.QWidget):
         """User picked a track from the menu (or -1 for Off)."""
         self._spu_want = int(track_id)
         self._spu_name = name or ""
+        if track_id != -1 and self._cap_eligible(name):
+            # text track: the app overlay renders it (VLC's spu stays off)
+            self._engage_caption_overlay()
+        else:
+            # Off, or an image/ASS track VLC must render itself
+            self._disengage_caption_overlay()
+            try:
+                self.vlc.set_spu(self._spu_want)
+            except Exception:  # noqa: BLE001
+                pass
+        self._refresh_spu_button()
+
+    # ---- caption overlay (app-rendered subtitles, one style) ----
+    @staticmethod
+    def _cap_track_kind(name: str) -> str:
+        """Classify a VLC subtitle track by name: 'text' (the overlay can
+        render it), 'bitmap'/'ass' (VLC must render it), or 'other'.
+        VLC names MKV SRT tracks plainly ('English (United States) -
+        [English]') so 'other' is treated as overlay fodder on VOD and left
+        on VLC for live (where DVB subs can carry plain names too)."""
+        low = (name or "").lower()
+        if any(w in low for w in ("dvb", "teletext", "pgs", "bitmap",
+                                  "image")):
+            return "bitmap"
+        if re.search(r"\bass\b|\bssa\b", low):
+            return "ass"
+        if ("caption" in low or low.startswith("cc") or "608" in low
+                or "708" in low or "srt" in low or "subrip" in low
+                or "utf8" in low or "text" in low):
+            return "text"
+        return "other"
+
+    def _cap_eligible(self, name: str) -> bool:
+        """Can the overlay render this track? Text always; plain names
+        only on VOD (the relay's MKV parser confirms real text tracks
+        there, and falls back to VLC when they aren't)."""
+        kind = self._cap_track_kind(name)
+        return kind == "text" or (kind == "other" and self._is_vod())
+
+    @staticmethod
+    def _cap_lang_hint(name: str) -> str:
+        """The language word out of a VLC track name, for the MKV parser's
+        prefer-language match ('English (United States) - [English]' ->
+        'english' — the full name never substring-matches the parser's
+        'eng english' metadata)."""
+        head = (name or "").split("(")[0].split("-")[0].strip().lower()
+        return head.split()[0] if head.split() else ""
+
+    def _engage_caption_overlay(self):
+        """The user picked a text subtitle track: render it in the app
+        overlay with ONE style. Live: CCSource tails the DVR buffer (zero
+        extra connections). VOD: playback routes through the local relay
+        so the MKV parser can feed cues (restarts in place when the relay
+        isn't up yet)."""
+        if self._closing or self._cap_fail:
+            return
+        self._cap_want = True
+        if self._is_dvrable():
+            if not find_ccextractor():
+                # caption pipeline unavailable: VLC renders this media
+                self._cap_fail = True
+                self._cap_note("Captions: VLC rendering "
+                               "(CCExtractor unavailable)")
+                return
+            self._set_cap_on(True)
+            if self._mode == "chase" and self.dvr:
+                self._start_cc_when_buffer(tries_left=40)
+            # buffer still filling (or REC pre-chase): _start_chase_now
+            # engages the moment chase playback enters
+        elif self._is_vod():
+            if self._vod_relay is not None:
+                self._set_cap_on(True)
+                self._vod_relay.set_prefer_language(
+                    self._cap_lang_hint(self._spu_name))
+            else:
+                self._restart_through_relay()
+
+    def _disengage_caption_overlay(self):
+        """Subtitles Off (or a VLC-rendered track): stop the overlay and,
+        when nothing else needs it, the live caption reader."""
+        self._cap_want = False
+        self._set_cap_on(False)
+        if not self._filter_engine.enabled:
+            self._stop_cc_source()
+
+    def _set_cap_on(self, on: bool):
+        """Flip who owns caption rendering: the overlay or VLC's spu."""
+        on = bool(on) and not self._cap_fail and not self._closing
+        if on == self._cap_on:
+            return
+        self._cap_on = on
+        if on:
+            self._cap_timer.start()
+            try:
+                self.vlc.set_spu(-1)   # VLC's own rendering OFF below the
+            except Exception:          # overlay (fallback re-enables it)
+                pass
+        else:
+            self._cap_timer.stop()
+            self._cap_wid.set_lines([])
+        self._refresh_spu_button()
+
+    def _caption_tick(self):
+        """100 ms: paint the cue active at the playback position (+ the
+        user's delay — pure arithmetic, so the delay applies live)."""
+        if self._closing or not self._cap_on:
+            return
         try:
-            self.vlc.set_spu(self._spu_want)
+            if self._mode == "chase" and self.dvr:
+                t = self._vid_s
+            elif self._is_vod():
+                ms = self.vlc.get_time()
+                if ms < 0:
+                    return            # player mid-(re)open: no clock yet
+                t = ms / 1000.0
+            else:
+                return
+            delay_ms = int(self.config.subtitle_appearance.get(
+                "delay_ms", 0) or 0)
+            lines = self._cap_cues.text_at(t + delay_ms / 1000.0)
+            if lines and self._filter_engine.enabled:
+                words = self._filter_engine.words
+                lines = [prof_mod.mask_text(ln, words) for ln in lines]
+            self._cap_wid.set_lines(lines)
         except Exception:  # noqa: BLE001
             pass
-        self._refresh_spu_button()
+
+    def _cap_note(self, text: str):
+        """Brief on-video note (caption fallbacks etc.)."""
+        if self._closing or not self._dvr_status.isHidden():
+            return
+        self._set_dvr_status(text)
+        QtCore.QTimer.singleShot(
+            2500, lambda: self._set_dvr_status("")
+            if self._dvr_status.text().startswith(text) else None)
+
+    def _cap_source_failed(self, why: str):
+        """CCSource died (CCExtractor exit / buffer rotation): hand the
+        session to VLC's spu rendering — playback never depends on the
+        overlay, and _enforce_spu restores the chosen track by name."""
+        if self._closing or self._cap_fail:
+            return
+        try:
+            log.warning("captions: source failed (%s) — VLC renders", why)
+        except Exception:
+            pass
+        self._cap_fail = True
+        self._set_cap_on(False)
+        self._stop_cc_source()
+        self._cap_note("Captions: switched to VLC rendering")
+
+    def _restart_through_relay(self):
+        """Re-open the current VOD through the local relay so the caption
+        overlay can read its subtitle track (ONE connection: the direct
+        provider stream is replaced, never duplicated). Playback resumes
+        at the current position."""
+        if self._closing or not self._is_vod() or self._vod_relay:
+            return
+        cur = dict(self.current or {})
+        if not cur.get("url"):
+            return
+        try:
+            t = self.vlc.get_time() / 1000.0
+        except Exception:  # noqa: BLE001
+            t = 0.0
+        start_at = max(0.0, t - 1.0) if t > 2.0 else 0.0
+        self._cap_note("Loading subtitles\u2026")
+        # one event-loop turn so the pill paints before the blocking
+        # relay start inside play_media
+        QtCore.QTimer.singleShot(
+            60, lambda: None if self._closing
+            else self.play_media(cur, start_at=start_at))
+
+    def _cap_vod_check(self):
+        """A few seconds after VOD overlay engagement: did the relay's MKV
+        parser find a real text track? If every subtitle track is ASS/PGS
+        the overlay can never render anything — give the selection back
+        to VLC."""
+        relay = self._vod_relay
+        if (self._closing or not self._cap_on or not self._cap_want
+                or relay is None or self._is_dvrable()):
+            return
+        tracks = getattr(relay, "parser_tracks", None) or {}
+        if not tracks:
+            return                  # head not parsed yet: keep waiting
+        if not any(c.startswith("S_TEXT/UTF8") or c in ("S_UTF8",
+                                                        "S_TEXT/WEBVTT")
+                   for c in tracks.values()):
+            try:
+                log.info("captions: no text track in this file "
+                         "(%s) — VLC renders", sorted(set(tracks.values())))
+            except Exception:
+                pass
+            self._cap_fail = True
+            self._set_cap_on(False)
+            try:
+                self.vlc.set_spu(self._spu_want)
+            except Exception:  # noqa: BLE001
+                pass
+            self._cap_note("No restyleable text track — VLC renders")
 
     def _cycle_spu(self):
         """C key: Off -> track 1 -> track 2 -> ... -> Off."""
@@ -2211,10 +2404,12 @@ class PlayerView(QtWidgets.QWidget):
         off.triggered.connect(lambda *_, t=-1, n="": self._select_spu(t, n))
         for tid, name in tracks:
             label = name or f"Track {tid}"
-            low = label.lower()
-            if "dvb" in low or "teletext" in low:
+            kind = self._cap_track_kind(name)
+            if kind == "bitmap":
                 label += "  (image \u2014 not adjustable)"
-            elif "caption" in low or low.startswith("cc"):
+            elif kind == "ass":
+                label += "  (ASS \u2014 VLC rendering)"
+            elif kind == "text":
                 label += "  (text \u2014 adjustable)"
             a = m.addAction(label)
             a.setCheckable(True)
@@ -2232,7 +2427,12 @@ class PlayerView(QtWidgets.QWidget):
         SubtitleDialog(self.config, self._apply_sub_delay,
                        parent=self.window()).exec_()
         if subtitle_instance_args(self.config.subtitle_appearance) != before:
-            self._reapply_sub_style()
+            if self._cap_on:
+                # the overlay IS the renderer: repaint is enough — style,
+                # size, colors, position all apply instantly, no restart
+                self._cap_wid.update()
+            else:
+                self._reapply_sub_style()
 
     def _reapply_sub_style(self):
         """Subtitle style args are read once at vlc.Instance() creation —
@@ -2339,33 +2539,44 @@ class PlayerView(QtWidgets.QWidget):
 
     def _effective_url(self, url: str, kind: str) -> str:
         """Playback URL, routed through the local splitter for VOD when
-        the profanity filter is on (single provider connection; the
-        splitter peels the subtitle text and feeds VLC byte-identical
-        data through localhost). Falls back to the original URL on any
-        hesitation — playback must never depend on the filter."""
+        captions are wanted (the overlay's text track and/or the profanity
+        filter) — single provider connection; the splitter peels the
+        subtitle text and feeds VLC byte-identical data through localhost.
+        Falls back to the original URL on any hesitation — playback must
+        never depend on it."""
+        want_caps = self._cap_want and not self._cap_fail
         if kind not in ("vod", "series") or self._closing \
-                or not prof_mod.PROFANITY_AVAILABLE \
-                or not vod_splitter.VOD_SPLITTER_READY \
-                or not self.config.profanity.get("enabled"):
+                or not (want_caps or self.config.profanity.get("enabled")) \
+                or not vod_splitter.VOD_SPLITTER_READY:
             return url
         try:
             relay = VodRelay(self)
-            local = relay.start(url, USER_AGENT)
+            local = relay.start(url, USER_AGENT,
+                                prefer_language=self._cap_lang_hint(
+                                    self._spu_name) or "eng")
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("vod splitter: start failed (%r) — direct "
                             "playback", exc)
             except Exception:
                 pass
+            if want_caps:
+                self._cap_fail = True   # no text source: VLC renders
             return url
         if not local:
             try:
                 relay.stop()
             except Exception:  # noqa: BLE001
                 pass
+            if want_caps:
+                self._cap_fail = True   # not an MKV etc.: VLC renders
             return url
         relay.cue.connect(self._on_vod_cue)
         self._vod_relay = relay
+        if want_caps:
+            self._set_cap_on(True)
+            # a few seconds in, verify the file actually HAS a text track
+            QtCore.QTimer.singleShot(4000, self._cap_vod_check)
         # the evaluation loop: without this the windows pile up but no
         # mute is ever applied (the only other start() lives in dead
         # legacy code)
@@ -2377,16 +2588,17 @@ class PlayerView(QtWidgets.QWidget):
             return
         # VOD subtitle tracks are pre-timed — no caption-lag lead
         self._filter_engine.add_cue(start, end, text, lead_s=0.0)
+        self._cap_cues.add(start, end, text)
 
     def _on_media_for_profanity(self, kind: str = None):
         """play_media(): fresh media decides whether the filter engages.
 
-        NOTHING here ever changes playback. Live always starts live at the
-        edge; the caption-based filter only rides DVR/chase mode, which the
-        USER turns on (DVR button) — with the trade-off stated in its
-        tooltip. When the filter is enabled but live playback isn't in DVR
-        mode, a short notice says how to turn it on. VOD: the splitter was
-        already routed in _effective_url BEFORE playback started.
+        NOTHING here ever changes playback. Live is ALWAYS in chase mode
+        now, so when the filter is on the caption reader simply joins the
+        running buffer (via _start_chase_now when chase enters, or here
+        when the media already chases — e.g. REC engaged it first). VOD:
+        the splitter was already routed in _effective_url BEFORE playback
+        started.
         """
         self._stop_cc_source()      # previous media's caption reader only
         if not prof_mod.PROFANITY_AVAILABLE:
@@ -2404,34 +2616,33 @@ class PlayerView(QtWidgets.QWidget):
             return
         if self._mode == "chase" and self._cc_source is None:
             self._start_cc_when_buffer(tries_left=40)
-        elif not self.btn_dvr.isChecked() and self._dvr_status.isHidden():
-            # informative only — never auto-engages anything
-            self._set_dvr_status(
-                "Profanity filter: press DVR to filter this channel "
-                "(watches behind live)")
-            QtCore.QTimer.singleShot(
-                2600, lambda: self._set_dvr_status("")
-                if self._dvr_status.text().startswith("Profanity filter:")
-                else None)
 
     def _start_cc_when_buffer(self, tries_left: int = 40):
         """Wait for the DVR buffer to hold data, then start the caption
-        reader joined at the current frontier (~2 s poll, ~80 s max)."""
+        reader joined at the current frontier (~2 s poll, ~80 s max).
+        Serves BOTH the profanity filter and the caption overlay."""
         if self._closing or tries_left <= 0:
             return
-        if not self._filter_engine.enabled or self.dvr is None:
+        if self._cc_source is not None or self.dvr is None:
             return
+        if not (self._cap_want
+                or (prof_mod.PROFANITY_AVAILABLE
+                    and self._filter_engine.enabled)):
+            return   # nobody wants captions anymore (user toggled Off)
         if self.config.chase_delay < 5:
-            # captions trail speech by 1-3 s — a shorter cushion than this
-            # cannot mute in time. Never touched the setting, just say so.
-            self._set_dvr_status(
-                f"Profanity filter: live delay {self.config.chase_delay} s "
-                "is too short (needs \u2265 5 s)")
-            try:
-                log.info("profanity: chase_delay=%d too short, skipping",
-                         self.config.chase_delay)
-            except Exception:
-                pass
+            # captions trail speech by 1-3 s and CCExtractor trails the
+            # buffer's write head — a shorter cushion cannot render (or
+            # mute) in time. The config UI enforces >= 5; this guards
+            # hand-edited settings files.
+            if self._filter_engine.enabled:
+                self._set_dvr_status(
+                    f"Profanity filter: live delay {self.config.chase_delay} s "
+                    "is too short (needs \u2265 5 s)")
+                try:
+                    log.info("profanity: chase_delay=%d too short, skipping",
+                             self.config.chase_delay)
+                except Exception:
+                    pass
             return
         buf = None
         try:
@@ -2445,6 +2656,9 @@ class PlayerView(QtWidgets.QWidget):
                 frontier = 0.0
             src = CCSource(self)
             src.cue.connect(self._on_cc_cue)
+            if hasattr(src, "failed"):
+                # any hesitation hands captions back to VLC for this media
+                src.failed.connect(self._cap_source_failed)
             if src.start(buf, max(0.0, frontier)):
                 self._cc_source = src
                 # evaluation loop for the caption windows (see
@@ -2470,6 +2684,7 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing:
             return
         self._filter_engine.add_cue(start, end, text)
+        self._cap_cues.add(start, end, text)
 
     def _stop_cc_source(self):
         """Tear down just the live caption reader (channel change etc.)."""
@@ -2559,8 +2774,13 @@ class PlayerView(QtWidgets.QWidget):
             self._filter_engine.evaluate(t)
 
     def _stop_profanity(self, keep_windows: bool = False):
-        """Kill the caption reader / VOD splitter + clear the filter mute."""
-        if self._vod_relay is not None:
+        """Kill the caption reader / VOD splitter + clear the filter mute.
+
+        While the caption overlay owns those sources (subtitles selected
+        on a text track) they must survive: the relay IS the playback URL
+        at that point, and the CCSource feeds the overlay, not just the
+        filter. play_media/_set_cap_on(False) releases the claim first."""
+        if self._vod_relay is not None and not self._cap_on:
             try:
                 self._vod_relay.cue.disconnect()
             except Exception:  # noqa: BLE001
@@ -2571,7 +2791,19 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:  # noqa: BLE001
                 pass
             self._vod_relay = None
-        self._stop_cc_source()
+        if not self._cap_on:
+            self._stop_cc_source()
+        self._filter_extractor_tear()
+        try:
+            self._filter_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        if keep_windows:
+            self._filter_engine.set_muted(False)
+        else:
+            self._filter_engine.clear()
+
+    def _filter_extractor_tear(self):
         if self._filter_extractor is not None:
             try:
                 self._filter_extractor.cue.disconnect()
@@ -2583,14 +2815,6 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:  # noqa: BLE001
                 pass
             self._filter_extractor = None
-        try:
-            self._filter_timer.stop()
-        except Exception:  # noqa: BLE001
-            pass
-        if keep_windows:
-            self._filter_engine.set_muted(False)
-        else:
-            self._filter_engine.clear()
 
 
 
@@ -2663,8 +2887,14 @@ class PlayerView(QtWidgets.QWidget):
                 log.warning("stop: timer shutdown failed: %r", exc)
             except Exception:
                 pass
-        # Profanity filter: kill the ffmpeg extractor and clear the filter
-        # mute BEFORE the player goes away (engine.clear() touches VLC).
+        # Profanity filter / caption overlay: release the overlay's claim
+        # on the caption sources, then kill the ffmpeg extractor and clear
+        # the filter mute BEFORE the player goes away (engine.clear()
+        # touches VLC).
+        try:
+            self._set_cap_on(False)
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._stop_profanity()
         except Exception as exc:  # noqa: BLE001

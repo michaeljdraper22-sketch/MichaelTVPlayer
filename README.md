@@ -19,11 +19,11 @@ through a single VLC connection.
 
 ## Standout features
 - **Pause/Resume** live TV
-- **Rewind (DVR / timeshift)** on live TV
+- **Rewind (DVR / timeshift)** on live TV — always on, every channel
 - **Record** live TV, movies and series
 - **Direct download** of movies and series (no re-encode)
-- **Built-in subtitles** for movies & series (the stream's own tracks,
-  with language selection — `C` cycles them)
+- **Unified subtitles** — live-TV closed captions and movies/series text
+  tracks render through one app-styled overlay (`C` cycles them)
 
 ## Features
 - **Dark mode by default** (theme applied on every launch) and a **black
@@ -35,31 +35,32 @@ through a single VLC connection.
   run on ONE connection to your provider (works with 1-connection accounts).
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
-  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · DVR/⬇ · ⏺ | CC · ⤢ · ⏱ | 🔊 ▁▁▁`
+  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ⤢ · ⏱ | 🔊 ▁▁▁`
   - The row **compacts automatically** in half/quarter-screen windows
     (tighter spacing → no separators → shorter volume bar), and **clicking
     anywhere on the volume bar jumps the volume there**.
   - The controls (and the cursor) **appear when a stream starts / changes or
     the mouse moves**, and **hide after 4 s of no movement**.
-  - **Subtitles (CC)** — plays the stream's own embedded subtitle tracks.
-    Movies and series almost always carry a dozen+ SRT language tracks
-    (English, Spanish, …); some live channels carry DVB subtitles. The
-    button lights blue while a track is active; **C** cycles
+  - **Subtitles (CC)** — text subtitles render through the app's own
+    overlay: live-TV **closed captions** (read from the always-on DVR
+    buffer) and the embedded SRT tracks of movies & series (those almost
+    always carry a dozen+ languages) share **one caption style**, set in
+    the app. The button lights blue while a track is active; **C** cycles
     Off → track 1 → track 2 → …, and the choice is sticky by language
-    across channel changes. Streams without subtitle tracks keep the
-    button disabled. (DVR-chase playback uses a re-muxed buffer, where
-    subtitle tracks generally don't survive — subtitles work best in
-    normal live playback and movies/series.)
+    across channel changes. Image-based tracks (DVB subtitles) and styled
+    ASS subtitles are handed to VLC's own renderer instead. Streams
+    without subtitle tracks keep the button disabled.
   - **Subtitle settings…** (bottom of the CC track menu) — the **delay
-    applies instantly** (± 0.25 s per click); the visual style (font,
-    size, vertical position, text / background / outline colors,
-    background opacity, outline thickness) applies the moment you OK the
-    dialog — playback restarts in place (movies resume where they were;
-    live restarts at the edge, and an active DVR/recording session stops
-    with it). Size defaults to a concrete 40 px; set 0 for Auto
-    (VLC sizes it from the video height). Cancel restores the saved
-    look. Live-TV subtitles are broadcast images and can't be restyled.
-  - **Playback speed** (speedometer; DVR mode, movies & series): 0.125× … 4×
+    applies instantly** (± 0.25 s per click), and while the app overlay
+    renders the captions the visual style (font, size, vertical position,
+    text / background / outline colors, background opacity, outline
+    thickness) reapplies the moment you OK the dialog — no restart, no
+    position lost. For VLC-rendered tracks (image/ASS) a style change
+    restarts playback in place (movies resume where they were; live
+    restarts at the edge, the DVR buffer with it). Size defaults to a
+    concrete 40 px; set 0 for Auto (scales with the video height).
+    Cancel restores the saved look.
+  - **Playback speed** (speedometer; live rewind, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
   - **Jump to beginning** (⏮, next to LIVE) rewinds to the start of the DVR
@@ -74,24 +75,24 @@ through a single VLC connection.
     swells when the cursor is over it. Timestamps are tracked locally and
     tick smoothly even when the stream's own timestamps misbehave.
   - Every button can be switched on/off in **Settings ▸ Playback controls…**
-- **DVR mode (opt-in per channel)** — press **DVR** and the stream is recorded
-  to a short-term buffer that you watch a few seconds behind live (Settings ▸
-  Live delay). The buffer first fills for about the length of that delay (a
-  small "DVR …s buffered" pill on the video shows the progress), then playback
-  starts a safe distance behind the live edge. Pause is flawless, rewind is an
-  instant seek, and **LIVE** jumps to the newest recorded moment. Resets to
-  plain live on every channel change; the buffer is deleted when you leave
-  the channel.
+- **Live TV always runs in DVR chase mode** — every channel is recorded to
+  a short-term buffer that you watch a few seconds behind live (default 5 s,
+  Settings ▸ Live delay). A small "Buffering…" pill covers the couple of
+  extra seconds a channel takes to start; pause is then flawless, rewind is
+  an instant seek, and **LIVE** jumps to the newest recorded moment (a safe
+  5 s behind the write head, which also keeps captions flowing there). The
+  buffer is deleted when you leave the channel; if the recorder can't get
+  data (blocked provider, network), playback falls back to the direct live
+  stream for that channel.
 - **Record (⏺)** — the red button — saves the current stream to a folder of
   your choice (Settings ▸ Recording folder). Runs through the same single
-  connection, even together with DVR mode — and live recordings are
+  connection as the live buffer — and live recordings are
   scrubbable while they record. Recordings are kept on disk.
 - **Profanity filter** (Settings ▸ Profanity filter…, off by default) —
   mutes the audio during profanity. **Live TV** reads the channel's
-  **closed captions** while DVR mode is
-  on — your choice, via the DVR button (playback runs your Live-delay
-  setting behind live, at least 5 s; captions physically trail speech).
-  Shows always start live and nothing is ever engaged for you.
+  **closed captions** from the always-on live buffer (playback runs your
+  Live-delay setting behind live, at least 5 s; captions physically trail
+  speech).
   **Movies & series** work with no playback delay: the app relays the
   single provider connection through localhost, peels the embedded
   subtitle text from the local cache and mutes ahead of the dialogue
@@ -160,31 +161,34 @@ Click **Test Connection** to verify before saving. Your details are stored in
 | C | Cycle subtitles (Off → track 1 → track 2 → …) |
 | Mouse wheel (over video) | Volume |
 | Double-click video | Toggle fullscreen |
-| ● LIVE button | Jump back to the live edge (DVR mode only) |
+| ● LIVE button | Jump back to the live edge / end of the movie |
 | F / Esc | Toggle fullscreen (Esc always exits) |
 | Enter | Play selected channel/movie/episode |
 | F5 | Reload channel lists |
 
-## How DVR (timeshift) works
-Playback is **live by default** — the stream plays directly, no delay, on a
-single connection. Opt in per channel with the **DVR** button (or Playback ▸
-DVR mode): the stream is recorded to a short-term buffer that you watch **a few
-seconds behind live** (Settings ▸ Live delay). Pause is flawless, rewind is an
-instant seek, and the red **● LIVE** button — the one live affordance, enabled
-only in DVR mode — jumps back to the live edge. DVR (and REC) reset to OFF on
-every channel change; the buffer is deleted when you leave the channel or close
-the app (buffers stranded by a crash are cleaned out on the next launch).
+## How live rewind (timeshift) works
+Live TV **always** plays through a DVR chase buffer on a single connection:
+the stream is recorded to a short-term buffer and you watch it **a few
+seconds behind live** (default 5 s, Settings ▸ Live delay) — that trade buys
+a flawless pause, instant rewinds, the profanity filter's caption cushion and
+unified app-rendered captions. Channels may take a couple of extra seconds to
+start while the buffer fills (a small "Buffering…" pill covers it). The red
+**● LIVE** button jumps back to the live edge (a safe 5 s behind the write
+head). The buffer is deleted when you leave the channel or close the app
+(buffers stranded by a crash are cleaned out on the next launch); if the
+recorder can't get data at all, playback falls back to the direct live
+stream for that channel.
 **REC** is unchanged: it saves a permanent recording (kept on disk)
-through the same single connection, even together with DVR mode.
+through the same single connection.
 
 ## Adding your own channels
 Channels ▸ **Add custom channel…** lets you add any stream URL
 (HLS `.m3u8`, MPEG-TS, RTSP, etc.). These appear under the **➕ Custom** tab.
 
 ## Movies & Series notes
-- For movies and episodes the **DVR button is replaced by a Download
+- For movies and episodes the **REC button is replaced by a Download
   button**: it saves the original file straight into your recordings
-  folder (no re-encode). Playback controls work without DVR — scrub,
+  folder (no re-encode). Playback controls work like on live TV — scrub,
   **⏮ restart**, **⏭ skip to the end** and the **speed** button are all
   enabled, and recording works like on live TV.
 - The **Movies** and **Series** tabs open in the **first category** (fast).

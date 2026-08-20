@@ -13,7 +13,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src.live_cc import bundled_ccextractor, find_ccextractor  # noqa: E402
+from src.live_cc import (bundled_ccextractor, ccx_args,  # noqa: E402
+                         find_ccextractor)
 
 PASS = []
 FAIL = []
@@ -49,6 +50,23 @@ def main():
     out = p.stdout.decode("utf-8", "replace")
     check("vendored exe runs standalone (exit 0)", p.returncode == 0)
     check("reports itself as CCExtractor", "CCExtractor" in out)
+
+    # The 0.88 build predates the long flags: it must get the legacy
+    # single-dash form, while modern builds keep --stdin/--stdout.
+    v_args = ccx_args(vendored)
+    check("vendored 0.88 gets the legacy single-dash flags",
+          v_args == ["-in=ts", "-srt", "-utf8", "-", "-stdout"])
+    if found:
+        m_args = ccx_args(found)
+        check("installed build keeps the modern flags",
+              m_args == ["-in=ts", "-srt", "-utf8", "--stdin", "--stdout"]
+              or os.path.abspath(found) == vendored)
+    probe = subprocess.run([vendored] + v_args, input=b"",
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=30)
+    check("legacy flags accepted (no 'not understood' error)",
+          b"not understood" not in probe.stdout
+          and b"not understood" not in (probe.stderr or b""))
 
     print()
     if FAIL:

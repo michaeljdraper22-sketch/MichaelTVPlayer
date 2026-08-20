@@ -198,13 +198,13 @@ def main():
     real.t = 50_000
     view._vid_s = 50.0
     view._seek_ms(300000)         # 50s + 300s > frontier: must clamp
-    check("dead player: big FF revives clamped to frontier-3",
-          saw("play_at", 197.0))
+    check("dead player: big FF revives clamped to frontier-safety",
+          saw("play_at", 195.0))
     view._chase_paused = True
     real.state = "ended"
     view._jump_live()
-    check("LIVE from paused+dead resumes at frontier-3",
-          saw("play_at", 197.0) and not view._chase_paused)
+    check("LIVE from paused+dead resumes at frontier-safety",
+          saw("play_at", 195.0) and not view._chase_paused)
     view._chase_paused = False
     real.state = "playing"
     view._toggle_pause()
@@ -243,7 +243,7 @@ def main():
           "waited >= 2.5" in src)
     body = src.split('"""', 2)[-1]      # drop the docstring
     check("no countdown pill text", "s buffered" not in body
-          and "DVR starting" in body)
+          and "Buffering" in body)
 
     print("[10] watchdog gated on playback start")
     check("_chase_started defaults False", view._chase_started is False)
@@ -278,22 +278,22 @@ def main():
     check("click emits sliderReleased (the seek actually runs)",
           bool(released))
 
-    print("[12] VOD: DVR swaps to Download; speed/seek without DVR")
+    print("[12] VOD: Record swaps to Download; speed/seek without live TV")
     view.current = {"kind": "vod", "title": "Movie", "url": "http://x/m.mp4"}
     view._mode = "live"
     view._update_control_state()
     app.processEvents()
-    check("DVR button hidden for VOD", view.btn_dvr.isHidden())
+    check("Record button hidden for VOD", view.btn_rec.isHidden())
     check("Download button shown + enabled for VOD",
           not view.btn_dl.isHidden() and view.btn_dl.isEnabled())
     check("speed button enabled for VOD", view.btn_speed.isEnabled())
     check("seek buttons enabled for VOD", view.btn_back10.isEnabled())
     view._set_rate(2.0)
-    check("VOD speed applies without DVR", abs(view._rate - 2.0) < 1e-6)
+    check("VOD speed applies without live TV", abs(view._rate - 2.0) < 1e-6)
     view.current = {"kind": "live", "title": "Ch", "url": "http://x/s.ts"}
     view._update_control_state()
     app.processEvents()
-    check("DVR button back for live", not view.btn_dvr.isHidden())
+    check("Record button back for live", not view.btn_rec.isHidden())
     check("Download hidden for live", view.btn_dl.isHidden())
     check("rate resets to 1x leaving VOD", abs(view._rate - 1.0) < 1e-6)
     check("LIVE enabled in plain live mode", view.btn_live.isEnabled())

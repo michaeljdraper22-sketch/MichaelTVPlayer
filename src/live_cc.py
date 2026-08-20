@@ -81,6 +81,16 @@ def bundled_ccextractor() -> str:
     return ""
 
 
+def ccx_args(exe: str) -> list:
+    """CLI for streaming captions through pipes. The vendored 0.88 build
+    predates the long flags — it wants the old single-dash form (and '-'
+    as the positional input for stdin)."""
+    if exe and bundled_ccextractor() and \
+            os.path.abspath(exe) == os.path.abspath(bundled_ccextractor()):
+        return ["-in=ts", "-srt", "-utf8", "-", "-stdout"]
+    return ["-in=ts", "-srt", "-utf8", "--stdin", "--stdout"]
+
+
 class CCSource(QtCore.QObject):
     """Streams captions out of a growing MPEG-TS DVR buffer.
 
@@ -110,7 +120,8 @@ class CCSource(QtCore.QObject):
             self.failed.emit("CCExtractor not found")
             return False
         self.stop()
-        self.parser = SrtParser()
+        self.parser = SrtParser(keep_lines=True)   # overlay renders the
+        #                                            roll-up line structure
         self._offset_s = float(content_offset_s or 0.0)
         try:
             size = os.path.getsize(ts_path)
@@ -121,7 +132,7 @@ class CCSource(QtCore.QObject):
         self._ts_pos = max(0, size - (size % 188))
         try:
             self.proc = subprocess.Popen(
-                [exe, "-in=ts", "-srt", "-utf8", "--stdin", "--stdout"],
+                [exe] + ccx_args(exe),
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
@@ -187,8 +198,15 @@ class CCSource(QtCore.QObject):
                             self.proc.stdin.write(chunk)
                             self._ts_pos += len(chunk)
                 except Exception:  # noqa: BLE001
-                    # recorder rotated/recreated the buffer — stop cleanly
-                    self._alive = False
+                    if self._alive:
+                        # recorder rotated/recreated the buffer under us —
+                        # the caption pipeline is done (stop() clears
+                        # _alive first, so a normal teardown stays silent)
+                        self._alive = False
+                        try:
+                            self.failed.emit("buffer stream error")
+                        except Exception:  # noqa: BLE001
+                            pass
                     break
             time.sleep(_TAIL_POLL_S)
 
@@ -200,6 +218,14 @@ class CCSource(QtCore.QObject):
             except Exception:  # noqa: BLE001
                 break
             if not chunk:
+                if self._alive:
+                    # CCExtractor exited on its own (crash / bad stream) —
+                    # let the owner fall back to VLC's caption rendering
+                    self._alive = False
+                    try:
+                        self.failed.emit("CCExtractor exited")
+                    except Exception:  # noqa: BLE001
+                        pass
                 break
             with self._out_lock:
                 self._out_chunks.append(chunk)

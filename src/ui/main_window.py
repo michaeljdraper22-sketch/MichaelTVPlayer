@@ -292,15 +292,8 @@ class MainWindow(QtWidgets.QMainWindow):
         act_live.triggered.connect(self.player_view._jump_live)
         act_pause = QtWidgets.QAction("Pause / Resume", self)
         act_pause.triggered.connect(self.player_view.toggle_pause)
-        self.act_dvr = QtWidgets.QAction("DVR mode (pause & rewind live)", self)
-        self.act_dvr.setCheckable(True)
-        self.act_dvr.setChecked(False)
-        self.act_dvr.triggered.connect(self.toggle_dvr)
-        self.player_view.btn_dvr.toggled.connect(self.act_dvr.setChecked)
         act_stop = QtWidgets.QAction("Stop", self)
         act_stop.triggered.connect(self.player_view.stop)
-        play_menu.addAction(self.act_dvr)
-        play_menu.addSeparator()
         play_menu.addAction(act_pause)
         play_menu.addAction(act_live)
         play_menu.addAction(act_stop)
@@ -314,7 +307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_folder.triggered.connect(self.choose_record_folder)
         act_dvr_window = QtWidgets.QAction("DVR buffer length…", self)
         act_dvr_window.triggered.connect(self.edit_dvr_window)
-        act_delay = QtWidgets.QAction("Live delay in DVR mode…", self)
+        act_delay = QtWidgets.QAction("Live delay (behind live)\u2026", self)
         act_delay.triggered.connect(self.edit_chase_delay)
         act_cache = QtWidgets.QAction("Network cache size…", self)
         act_cache.triggered.connect(self.edit_cache)
@@ -336,10 +329,6 @@ class MainWindow(QtWidgets.QMainWindow):
             # A series entry was somehow activated directly; open its episodes.
             self.series_tab._open_series(playable)
             return
-        # DVR/timeshift only applies to live streams: a movie or episode is
-        # already a complete, seekable file (a Download button takes the
-        # DVR button's place there).
-        self.act_dvr.setEnabled(playable.get("kind") == "live")
         self.player_view.play_media(playable)
         self.config.add_recent(playable)
         self.config.data["last_channel"] = playable
@@ -403,11 +392,13 @@ class MainWindow(QtWidgets.QMainWindow):
                 pass
 
     def toggle_dvr(self):
-        self.player_view.btn_dvr.toggle()
+        """Legacy alias: live TV is always in DVR chase mode now — there is
+        no toggle left to flip."""
+        pass
 
     def edit_dvr_window(self):
         value, ok = QtWidgets.QInputDialog.getInt(
-            self, "DVR buffer length",
+            self, "Live TV buffer length",
             "How many minutes of live TV to keep available for rewind.\n"
             "More = more disk use while watching (deleted when you switch "
             "channels).",
@@ -441,12 +432,12 @@ class MainWindow(QtWidgets.QMainWindow):
             ("back60", "Rewind 60 s"), ("back10", "Rewind 10 s"),
             ("play", "Play / Pause"), ("fwd10", "Forward 10 s"),
             ("begin", "Jump to beginning"),
-            ("live", "LIVE (jump to live edge)"), ("dvr", "DVR"),
-            ("rec", "Record"),
+            ("live", "LIVE (jump to live edge)"),
+            ("rec", "Record / Download"),
             ("cc", "Subtitles"),
             ("scale", "Video scaling"), ("speed", "Playback speed"),
             ("mute", "Mute"), ("volume", "Volume slider"),
-            ("timebar", "Time bar (DVR / Record)"),
+            ("timebar", "Time bar (live rewind)"),
         ]
         current = self.config.control_buttons
         dlg = QtWidgets.QDialog(self)
@@ -519,8 +510,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def edit_chase_delay(self):
         value, ok = QtWidgets.QInputDialog.getInt(
-            self, "Live delay in DVR mode",
-            "How many seconds behind the live edge DVR mode keeps you.\n"
+            self, "Live delay",
+            "Live TV always plays this many seconds behind the live edge\n"
+            "(the pause/rewind buffer and the caption cushion).\n"
             "Higher = smoother playback on bad links; lower = closer to live.",
             value=self.config.chase_delay, min=5, max=120, step=5,
         )
@@ -704,31 +696,29 @@ class MainWindow(QtWidgets.QMainWindow):
             "                        click the ≡ button to restore everything.\n"
             "  Fullscreen ......... Full screen (controls auto-hide; move cursor to the\n"
             "                       bottom to bring them back).\n\n"
-            "Playback modes (everything runs on a SINGLE stream connection):\n"
-            "  Default: the live stream plays directly. DVR and Record reset to\n"
-            "  OFF on every channel change — re-enable them if you want them.\n\n"
-            "  DVR mode (the DVR button, or Playback menu): the stream is recorded\n"
-            "  to a short-term buffer and you watch that, a few seconds behind\n"
-            "  live (Settings -> Live delay). Pause is flawless, the rewind\n"
-            "  buttons are instant, and the red LIVE button (enabled only in DVR\n"
-            "  mode) jumps to the front of the recording. Turning DVR off returns\n"
-            "  you to true live. The buffer is deleted when you switch channels\n"
-            "  or turn DVR off.\n\n"
+            "Playback (everything runs on a SINGLE stream connection):\n"
+            "  Live TV always plays through a short-term DVR buffer, a few\n"
+            "  seconds behind live (Settings -> Live delay). That buys a\n"
+            "  flawless pause, instant rewind buttons and the red LIVE\n"
+            "  button (jump to the front of the buffer). Channels may take\n"
+            "  a couple of extra seconds to start; the buffer is deleted\n"
+            "  when you switch channels. Record resets to OFF on every\n"
+            "  channel change.\n\n"
             "  Record (the REC button): saves the current stream to a file —\n"
             "  choose the folder once in Settings -> Recording folder. Works\n"
-            "  together with DVR mode through the same single connection;\n"
-            "  recordings are kept on disk.\n\n"
-            "Settings menu: recording folder, DVR buffer length, live delay and\n"
-            "network cache size.\n\n"
+            "  through the same single connection; recordings are kept\n"
+            "  on disk.\n\n"
+            "Settings menu: recording folder, live TV buffer length, live\n"
+            "delay and network cache size.\n\n"
             "The window can be made very small and snapped to halves/corners (Windows\n"
             "Snap) so you can tile it next to another player.\n\n"
             "Countries -> Filter by Country: tick the regions you want — one\n"
             "tab each for Live TV, Movies and Series; saved automatically and\n"
             "applied immediately.\n\n"
-            "Movies & series: the DVR button becomes a Download button (saves\n"
+            "Movies & series: the REC button becomes a Download button (saves\n"
             "the original file to your recordings folder); scrub, jump-to-\n"
-            "begin, LIVE (skip to end) and playback speed all work without\n"
-            "DVR on a full file.\n\n"
+            "begin, LIVE (skip to end) and playback speed all work on a\n"
+            "full file.\n\n"
             "Settings -> Network cache size adjusts buffering (0–50,000 ms).\n\n"
             "Your settings are saved in %APPDATA%\\MichaelTVPlayer.\n\n"
             "Bug reports: attach the log file, %APPDATA%\\MichaelTVPlayer"

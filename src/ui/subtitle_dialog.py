@@ -164,8 +164,10 @@ class SubtitleDialog(QtWidgets.QDialog):
         lay.addLayout(gl)
 
         note = QtWidgets.QLabel(
-            "Style changes apply immediately: playback restarts briefly "
-            "(movies resume where they were). The delay applies live.")
+            "Style changes apply immediately — text captions are drawn by "
+            "the app. Image/ASS tracks (rendered by VLC) restart playback "
+            "briefly; movies resume where they were. The delay always "
+            "applies live.")
         note.setStyleSheet("color:#9aa0a6;")
         note.setWordWrap(True)
         lay.addWidget(note)

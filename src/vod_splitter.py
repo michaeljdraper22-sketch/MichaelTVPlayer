@@ -155,15 +155,26 @@ class VodRelay(QtCore.QObject):
         self._server = None
         self._parser = None
         self._alive = False
+        self._prefer = "eng"        # preferred subtitle language (tap)
+        self._tap_restart = False   # re-select the tap's track on the
+        #                            # next loop pass (set_prefer_language)
+        self.parser_tracks = {}     # {mkv track number: codec id} — the
+        #                            # UI reads this to learn which tracks
+        #                            # are real text (S_TEXT/UTF8)
+        self.parser_tracks_meta = {}   # full {number: {codec,lang,name}}
+        self.parser_selected = None
 
     # ---- lifecycle ----
-    def start(self, url: str, ua: str) -> str:
+    def start(self, url: str, ua: str, prefer_language: str = "eng") -> str:
         """Open the provider, verify MKV, bring the relay up. Returns the
         local URL for VLC, or '' when the input isn't MKV (caller falls
-        back to playing the original URL)."""
+        back to playing the original URL). ``prefer_language`` steers the
+        tap's subtitle-track choice (the user's CC-menu selection)."""
         self.stop()
         self.url = url
         self.ua = ua or self.ua
+        self._prefer = (prefer_language or "eng").lower() or "eng"
+        self._tap_restart = False
         fd, self.cache_path = tempfile.mkstemp(suffix=".mkv",
                                                prefix="mtp_split_")
         os.close(fd)
@@ -447,9 +458,19 @@ class VodRelay(QtCore.QObject):
 
     # ---- subtitle tap (streams the LOCAL cache into the MKV parser) ----
     def _start_ffmpeg_tap(self):
-        self._parser = MkvSubParser()
+        self._parser = MkvSubParser(prefer_language=self._prefer)
         threading.Thread(target=self._tap_cache, daemon=True,
                          name="mtp-tap").start()
+
+    def set_prefer_language(self, prefer: str):
+        """User picked a different subtitle language in the CC menu: the
+        tap re-selects its track on the next loop pass (the current cache
+        window is re-parsed from its start with the new preference; cue
+        times are file-absolute, so re-emitted cues dedupe downstream)."""
+        prefer = (prefer or "").lower()
+        if prefer and prefer != self._prefer:
+            self._prefer = prefer
+            self._tap_restart = True
 
     def _tap_cache(self):
         """Thread: tail the cache from byte 0, feeding the streaming MKV
@@ -459,6 +480,24 @@ class VodRelay(QtCore.QObject):
         base = self.cache_base
         parser = self._parser
         while self._alive or pos < self.cache_size:
+            if self._tap_restart:
+                self._tap_restart = False
+                # fresh parser with the new preference. When the window
+                # still starts at the file head the Tracks element is
+                # re-parsed normally; after a rebase the metadata snapshot
+                # (captured below) feeds the selection instead.
+                at_head = (self.cache_base == 0)
+                keep = dict(self.parser_tracks_meta) \
+                    if not at_head and self.parser_tracks_meta else None
+                parser = MkvSubParser(prefer_language=self._prefer,
+                                      mid_stream=not at_head)
+                if keep:
+                    parser._track_meta = {n: dict(m)
+                                          for n, m in keep.items()}
+                    parser._select_track()
+                    parser._saw_tracks = True
+                self._parser = parser
+                pos = 0
             if self.cache_base != base:
                 base = self.cache_base
                 pos = 0
@@ -469,6 +508,14 @@ class VodRelay(QtCore.QObject):
                     # selection over so the rebased parser keeps matching
                     parser._selected = keep_sel
                     parser._saw_tracks = True
+            if parser._track_meta and \
+                    len(parser._track_meta) != len(self.parser_tracks_meta):
+                # snapshot for re-selections after a rebase + for the UI's
+                # text-track check (PlayerView._cap_vod_check)
+                self.parser_tracks_meta = dict(parser._track_meta)
+                self.parser_tracks = {n: m["codec"]
+                                      for n, m in parser._track_meta.items()}
+                self.parser_selected = parser._selected
             if pos < self.cache_size:
                 data = self.read_cache(self.cache_base + pos, _CHUNK)
                 if data:

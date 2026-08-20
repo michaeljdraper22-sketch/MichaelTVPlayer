@@ -27,7 +27,15 @@ def api(action=None, **extra):
         return json.loads(r.read().decode("utf-8", "replace"))
 
 live = api("get_live_streams")
-ch = next((c for c in live if "dazn nfl" in c["name"].lower()), live[0])
+# 24/7 channels that caption near-continuously; anything else risks an
+# un-captioned stretch (or a channel with none at all) breaking the run.
+# Keywords run in priority order — "4K: ESPN" is the verified carrier,
+# main HD news feeds next; offshoot variants of a brand can lack
+# caption carriage entirely.
+CAPTIONED = ("4k: espn", "fox news hd", "cnn hd", "msnbc hd", "cnbc hd",
+             "bbc news", "sky news", "fox news", "cnn", "msnbc", "espn")
+ch = next((c for key in CAPTIONED
+           for c in live if key in c["name"].lower()), live[0])
 url = f"{base}/live/{user}/{pw}/{ch['stream_id']}.ts"
 print(f"channel: {ch['name']!r}")
 assert find_ccextractor(), "CCExtractor not found"

@@ -245,8 +245,9 @@ class MkvSubParser:
                        or m["codec"] in ("S_TEXT/UTF8", "S_UTF8",
                                          "S_TEXT/WEBVTT")}
         if not text_tracks:
-            if self._track_meta:
-                self._selected = min(self._track_meta)
+            # only ASS/PGS tracks (or none parsed): emit nothing — parsing
+            # their payloads as text would be garbage. The UI falls back
+            # to VLC's own rendering for those codecs.
             return
         if self.prefer_language:
             for n, m in text_tracks.items():

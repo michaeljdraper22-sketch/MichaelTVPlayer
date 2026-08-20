@@ -139,11 +139,17 @@ class SrtParser:
 
     Tolerant: index lines are optional, blank-line separation enforced
     loosely, junk lines ignored (ffmpeg output is well-formed anyway).
+
+    ``keep_lines=True`` preserves the cue's internal line breaks (tags and
+    brace overrides still stripped) — the caption overlay renders roll-up
+    caption screens as a multi-line window. The default collapses to one
+    line, which is all the profanity matcher needs.
     """
 
-    def __init__(self):
+    def __init__(self, keep_lines: bool = False):
         self.cues = []
         self._buf = []
+        self._keep_lines = bool(keep_lines)
 
     def feed(self, chunk: str) -> list:
         """Feed a text chunk; returns cues completed by this chunk."""
@@ -174,23 +180,34 @@ class SrtParser:
             return [c] if c else []
         return []
 
-    @staticmethod
-    def _finish(lines) -> tuple:
+    def _finish(self, lines) -> tuple:
         """Lines of one block -> (start_s, end_s, text) or None."""
-        span = None
-        text_lines = []
-        for ln in lines:
-            t = parse_srt_time(ln)
-            if t is not None:
-                span = t
-            elif span is not None:
-                text_lines.append(ln)
-        if span is None:
-            return None
-        text = clean_text("\n".join(text_lines))
+        return _finish_cue(lines, self._keep_lines)
+
+
+def _finish_cue(lines, keep_lines: bool):
+    """Lines of one SRT block -> (start_s, end_s, text) or None."""
+    span = None
+    text_lines = []
+    for ln in lines:
+        t = parse_srt_time(ln)
+        if t is not None:
+            span = t
+        elif span is not None:
+            text_lines.append(ln)
+    if span is None:
+        return None
+    if keep_lines:
+        text = "\n".join(
+            _ASS_RE.sub("", _TAG_RE.sub("", ln)).strip()
+            for ln in text_lines if ln.strip())
         if not text:
             return None
         return (span[0], span[1], text)
+    text = clean_text("\n".join(text_lines))
+    if not text:
+        return None
+    return (span[0], span[1], text)
 
 
 def windows_from_cues(cues, words) -> list:
