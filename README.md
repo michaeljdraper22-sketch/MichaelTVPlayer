@@ -43,23 +43,37 @@ through a single VLC connection.
     the mouse moves**, and **hide after 4 s of no movement**.
   - **Subtitles (CC)** — text subtitles render through the app's own
     overlay: live-TV **closed captions** (read from the always-on DVR
-    buffer) and the embedded SRT tracks of movies & series (those almost
-    always carry a dozen+ languages) share **one caption style**, set in
-    the app. The button lights blue while a track is active; **C** cycles
+    buffer) and the embedded text tracks of movies & series (SRT, plus
+    ASS/SSA flattened to plain text — those almost always carry a dozen+
+    languages) share **one caption style**, set in the app. Live cues are
+    timed by ARRIVAL against the app's own clock (the provider's PTS
+    timeline drifts against VLC's, so CCExtractor's own timestamps are
+    only used for relative spacing) — this keeps live captions in sync
+    and lets a mid-session engage skip the back of the buffer instead of
+    replaying it. The caption reader spins up in PARALLEL with the
+    channel's startup fill, so captions are ready about when the video
+    starts, and the arrival anchor is smoothed across cues so burst
+    jitter never wiggles individual captions. The button
+    lights blue while a track is active; **C** cycles
     Off → track 1 → track 2 → …, and the choice is sticky by language
-    across channel changes. Image-based tracks (DVB subtitles) and styled
-    ASS subtitles are handed to VLC's own renderer instead. Streams
-    without subtitle tracks keep the button disabled.
+    across channel changes. Turning captions off keeps the live reader
+    alive, so turning them back on is instant. Image-based tracks
+    (DVB/PGS subtitles) are
+    handed to VLC's own renderer instead — bitmaps can't be restyled.
+    Streams without subtitle tracks keep the button disabled.
   - **Subtitle settings…** (bottom of the CC track menu) — the **delay
     applies instantly** (± 0.25 s per click), and while the app overlay
     renders the captions the visual style (font, size, vertical position,
     text / background / outline colors, background opacity, outline
-    thickness) reapplies the moment you OK the dialog — no restart, no
-    position lost. For VLC-rendered tracks (image/ASS) a style change
-    restarts playback in place (movies resume where they were; live
+    thickness) applies **live as you adjust it** — move the position
+    slider or pick a color and the captions on the video follow
+    immediately, no OK in between; a preview line stands in during quiet
+    moments so the style is always visible. OK just closes; **Cancel
+    reverts the style** to its dialog-open state. For VLC-rendered image
+    tracks a style change restarts playback in place when you OK
+    (movies resume where they were; live
     restarts at the edge, the DVR buffer with it). Size defaults to a
     concrete 40 px; set 0 for Auto (scales with the video height).
-    Cancel restores the saved look.
   - **Playback speed** (speedometer; live rewind, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
@@ -89,22 +103,31 @@ through a single VLC connection.
   connection as the live buffer — and live recordings are
   scrubbable while they record. Recordings are kept on disk.
 - **Profanity filter** (Settings ▸ Profanity filter…, off by default) —
-  mutes the audio during profanity. **Live TV** reads the channel's
+  mutes the audio during profanity, and when the app-rendered captions are
+  showing, masks the matched words on screen too (`hell` → `****`) — one
+  word list for everything. **Live TV** reads the channel's
   **closed captions** from the always-on live buffer (playback runs your
   Live-delay setting behind live, at least 5 s; captions physically trail
   speech).
   **Movies & series** work with no playback delay: the app relays the
   single provider connection through localhost, peels the embedded
   subtitle text from the local cache and mutes ahead of the dialogue
-  (seeks stay smooth — one connection restart per jump). Subtitles do
+  (seeks stay smooth — one connection restart per jump). The relay's
+  startup (seek-index prefetch, track discovery) runs in the background
+  so opening a movie doesn't stall the app; a resume/engage opens
+  exactly one provider stream, landed by VLC's own seek at the resume
+  position; and switching subtitle language re-anchors the reader
+  at the playback position immediately (the earlier history is
+  backfilled in the background). Subtitles do
   not need to be on. Editable word list with three match
   levels per word (**Exact**: `dog` → `*** in the doghouse`;
   **Partial**: `*** in the ***house`; **Whole**: `*** in the
   ********`), mute padding before/after each word, a **mute lead**
-  (live-caption lag compensation) and a sync offset. Requires **ffmpeg**
-  installed; **CCExtractor** ships bundled with the app (an installed
-  copy is used instead when present). DVB (image) subtitle channels
-  aren't covered.
+  (live-caption lag compensation) and a sync offset. No external tools
+  are needed for movies & series; live TV needs **CCExtractor**, which
+  ships bundled with the app (an installed copy is used instead when
+  present). Coverage: live CC and VOD text tracks (SRT/ASS-style);
+  image subtitles (PGS/DVB) carry no text and aren't filtered.
 - **Save favorites** and keep your own **custom stream URLs**
 - **Recently played** list + account status/expiry in the status bar
 - **Zen mode (View ▸ Hide controls, or ≡ button / H)** — hides the menu bar,
@@ -123,10 +146,25 @@ through a single VLC connection.
 
 ## Requirements
 - **Windows 10/11**
-- **VLC media player** — the bitness **must match** (64-bit recommended):
-  https://www.videolan.org/
+- **VLC media player** — only needed as a **one-time source** for the private
+  runtime (see *VLC isolation* below); the app does not use your installed
+  VLC at run time. https://www.videolan.org/
 - Python is **not** needed to run the packaged app — only to build it or
   run from source.
+
+## VLC isolation (important)
+MichaelTV ships a **private VLC runtime** in `vlc\` (a full copy of a VLC
+install: `libvlc.dll`, `libvlccore.dll`, `plugins\`) — in the project root
+for source runs, and in `dist\vlc\` next to the built exe (`build.bat`
+copies it automatically). The app loads DLLs and plugins **only** from that
+copy and passes `--ignore-config` to every `vlc.Instance`, so it **never
+reads or writes** your shared `%APPDATA%\vlc` config. Whatever the app does
+(caching, subtitle rendering, decoder settings) cannot affect the VLC media
+player installed on the machine — and vice versa. If the `vlc\` folder is
+missing, the app falls back to the installed VLC (still with
+`--ignore-config`). To refresh the private copy, delete `vlc\`, re-copy any
+VLC install into it, then run `vlc\vlc-cache-gen.exe vlc\plugins`. Verify
+with `.venv\Scripts\python.exe tools\verify_vlc_isolation.py`.
 
 ## Run (packaged app — recommended)
 Download **`MichaelTV.exe`** from the
@@ -135,9 +173,8 @@ page (a desktop shortcut is created by `tools\make_shortcut.ps1`).
 No console window, no Python install, no venv — just the app.
 
 Build it yourself by double-clicking **`build.bat`** (needs Python 3.9+,
-64-bit). The exe still needs VLC installed — or drop a full `vlc\` folder
-(copy `libvlc.dll`, `libvlccore.dll` and `plugins\`) next to the exe to
-make it fully self-contained.
+64-bit). The build bundles the private VLC runtime into `dist\vlc\`, so the
+exe is fully self-contained and never touches the installed VLC.
 
 ## Run (from source, for development)
 Double-click **`run.bat`**. It creates a virtual environment, installs
@@ -150,6 +187,27 @@ On first launch you'll be asked for your Xtream details:
 
 Click **Test Connection** to verify before saving. Your details are stored in
 `%APPDATA%\MichaelTVPlayer\settings.json`.
+
+### Manual acceptance — unified subtitles
+Before shipping changes to the caption pipeline, run this checklist by hand
+(automated counterparts: `test_caption_overlay.py` and
+`tools\e2e_unified_captions.py`):
+
+1. **One size & position across sources.** Leave the window at one size and
+   play, in turn, a **16:9 live channel**, an **SRT-subtitled movie** and an
+   **ASS-subtitled movie** (e.g. from an anime category), turning captions on
+   in each. In all three the captions must show the **same size and bottom
+   position relative to the picture** — including a letterboxed (e.g. 2.35:1)
+   movie, where captions shrink and rise with the picture, not the window.
+2. **Style changes apply live.** With captions showing in any of the
+   three sources: CC menu ▸ **Subtitle settings…** — drag the vertical
+   position slider, change font, size, colors, background, outline. The
+   captions on the video follow **while you adjust** — no restart, no
+   rebuild, no OK needed, playback position unchanged; Cancel puts the
+   style back.
+3. **Profanity masks & mutes everywhere.** Enable the filter with a word
+   that actually occurs, and confirm in **all three** sources that the word
+   is masked on screen (`hell` → `****`) **and** the audio mutes around it.
 
 ## Keyboard shortcuts
 | Key | Action |

@@ -242,8 +242,8 @@ def main():
     check("entry needs only buffer-ready + 2.5s",
           "waited >= 2.5" in src)
     body = src.split('"""', 2)[-1]      # drop the docstring
-    check("no countdown pill text", "s buffered" not in body
-          and "Buffering" in body)
+    check("no countdown or buffering pill text", "s buffered" not in body
+          and "Buffering" not in body)
 
     print("[10] watchdog gated on playback start")
     check("_chase_started defaults False", view._chase_started is False)

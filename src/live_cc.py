@@ -4,13 +4,19 @@
 The DVR recorder writes the live stream (with CEA-608/708 captions riding
 inside the video) to the local buffer file on the ONE provider connection.
 This module tails that file and pipes it into CCExtractor, which emits SRT
-cues with stream-PTS timestamps — the SAME content timeline the chase-mode
-playhead uses. Zero extra connections, zero audio decoding, ~1 s of CPU
-per minute of TV.
+cues — zero extra connections, zero audio decoding, ~1 s of CPU per minute
+of TV.
 
-Timestamps: ccextractor times are relative to the first packet it sees, so
-``content_offset_s`` (the buffer frontier when we joined) is added to land
-on the shared content clock.
+Timestamps: CCExtractor's SRT times are on its OWN PTS-derived axis, and
+that axis does NOT match VLC's playback clock on every provider — a probe
+against a burst-y 4K channel measured CCX running 12-32 s AHEAD of
+get_time() with continuous drift (VLC's demuxer absorbs PTS
+discontinuities its own way; CCX accumulates raw deltas). So cue display
+times are NOT taken from CCX at all: the UI anchors each arriving cue
+against its own frontier clock (PlayerView._on_cc_cue), which re-syncs the
+two axes at every fresh cue and makes the exact join byte irrelevant —
+which in turn lets a mid-session engage skip the back of the buffer
+(join_bytes) instead of replaying minutes of content nobody will display.
 """
 
 import logging
@@ -27,8 +33,8 @@ from .profanity import SrtParser
 
 log = logging.getLogger("mtp")
 
-_TAIL_POLL_S = 0.4      # buffer growth poll
-_SRT_POLL_MS = 500      # finished-cue harvest
+_TAIL_POLL_S = 0.25     # buffer growth poll
+_SRT_POLL_MS = 250      # finished-cue harvest
 
 
 def find_ccextractor() -> str:
@@ -105,7 +111,8 @@ class CCSource(QtCore.QObject):
         super().__init__(parent)
         self.proc = None
         self.parser = SrtParser()
-        self._offset_s = 0.0       # buffer frontier when we joined
+        self._offset_s = 0.0       # always 0: cues are emitted on the
+        #                            # buffer file's own (VLC) timeline
         self._ts_pos = 0           # bytes of the buffer already piped
         self._out_chunks = []      # SRT bytes read from stdout, not parsed
         self._out_lock = threading.Lock()
@@ -113,23 +120,40 @@ class CCSource(QtCore.QObject):
         self._timer = None
 
     # ---- lifecycle ----
-    def start(self, ts_path: str, content_offset_s: float = 0.0) -> bool:
-        """Begin tailing ``ts_path`` (joined at its current end)."""
+    def start(self, ts_path: str, content_offset_s: float = 0.0,
+              join_bytes: int = 0) -> bool:
+        """Begin tailing ``ts_path`` — from byte 0, or from ``join_bytes``
+        when engaging mid-session on a long-running buffer.
+
+        ``content_offset_s`` is accepted for API compatibility and IGNORED
+        (see below). ``join_bytes`` skips the back of the buffer so
+        CCExtractor does not spend ~1 s of CPU per buffered minute
+        replaying content nobody will display — the emitted cue times are
+        then relative to the join, but the UI anchors live cues by ARRIVAL
+        against its own clock (see PlayerView._on_cc_cue), so the exact
+        join point does not need to be precise. Bytes past EOF are
+        clamped; a bad guess only shifts which cues exist, never their
+        display times.
+        """
         exe = find_ccextractor()
         if not exe:
             self.failed.emit("CCExtractor not found")
             return False
         self.stop()
         self.parser = SrtParser(keep_lines=True)   # overlay renders the
-        #                                            roll-up line structure
-        self._offset_s = float(content_offset_s or 0.0)
+        #                                            # roll-up line structure
+        self._offset_s = 0.0
+        self._ts_pos = max(0, int(join_bytes))     # skip the back of the
+        #                                            # buffer (arrival-
+        #                                            # anchored display)
+        self._ts_pos -= self._ts_pos % 188          # land on a packet
         try:
             size = os.path.getsize(ts_path)
+            if self._ts_pos >= size:
+                self._ts_pos = 0 if size == 0 else \
+                    max(0, (size - 1) // 188 * 188)
         except OSError:
-            size = 0
-        # join at the live end of the buffer — its content time is the
-        # frontier passed in as the offset
-        self._ts_pos = max(0, size - (size % 188))
+            self._ts_pos = 0
         try:
             self.proc = subprocess.Popen(
                 [exe] + ccx_args(exe),
@@ -151,8 +175,8 @@ class CCSource(QtCore.QObject):
         self._timer.timeout.connect(self._harvest)
         self._timer.start()
         try:
-            log.info("cc source started: buffer=%s offset=%.1fs join_at=%d",
-                     ts_path, self._offset_s, self._ts_pos)
+            log.info("cc source started: buffer=%s join_at_byte=%d "
+                     "(arrival-anchored display)", ts_path, self._ts_pos)
         except Exception:
             pass
         return True

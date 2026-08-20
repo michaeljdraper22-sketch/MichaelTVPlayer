@@ -14,6 +14,8 @@ fully wired and takes over the moment the overlay hesitates (missing
 CCExtractor, dead caption source) — see PlayerView._cap_fail.
 """
 
+import re
+
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # cues kept per source (a 2 h movie carries ~1-3k; a long live session
@@ -21,6 +23,54 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 _MAX_CUES = 5000
 _ROLLUP_LINES = 3          # broadcast roll-up caption window height
 _CUE_GRACE_S = 0.25        # hold a cue briefly past its end (anti-flicker)
+
+# Characters that render as NOTHING (bidi embedding/isolate controls,
+# zero-width space, BOM, LRM/RLM marks, soft hyphen, word joiner) —
+# rippers pad subtitle lines with them. A line made only of these (plus
+# NBSP) painted a background box with no text ("the box shows up but
+# it's empty"). Soft hyphen and LRM/RLM joined the list after the same
+# report came back: a line of only U+00AD or U+200E survives a plain
+# strip() yet paints nothing.
+_INVIS_RE = re.compile(
+    "[\u00ad\u200b\u200e\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]")
+# Zero-width JOINERS (U+200C/200D) are stripped only for the paintable
+# test: Arabic shaping needs them INSIDE words, so they stay in the
+# emitted text — but a line made only of them (padding again) paints
+# nothing and must drop.
+_JOINS_RE = re.compile("[\u200c\u200d\xa0\\s]")
+
+
+def visible_lines(text: str) -> list:
+    """Cue text -> lines that would actually paint something."""
+    out = []
+    for ln in (text or "").split("\n"):
+        ln = _INVIS_RE.sub("", ln).replace("\xa0", " ").strip()
+        if ln and _JOINS_RE.sub("", ln):
+            out.append(ln)
+    return out
+
+
+def displayed_video_rect(video_wh, mode: str, surface_w: int, surface_h: int):
+    """Where the decoded video paints inside the surface: (x, y, w, h).
+
+    Pure geometry (no Qt types) so the caption anchoring is testable.
+    ``fit`` letterboxes/pillarboxes the whole picture inside the surface,
+    centered — the rect is then smaller than the surface.  ``crop`` and
+    ``stretch`` cover the entire surface (zoomed past the picture's edges
+    or distorted onto them).  An unknown size ((0, 0) — nothing decoded
+    yet, video_get_size before playback) also maps to the full surface,
+    so callers keep the historic whole-surface behavior until the real
+    size arrives."""
+    vw = int(video_wh[0] or 0)
+    vh = int(video_wh[1] or 0)
+    sw, sh = int(surface_w), int(surface_h)
+    if (vw <= 0 or vh <= 0 or sw <= 0 or sh <= 0
+            or mode in ("crop", "stretch")):
+        return 0, 0, max(0, sw), max(0, sh)
+    scale = min(sw / vw, sh / vh)
+    dw = max(1, int(vw * scale + 0.5))
+    dh = max(1, int(vh * scale + 0.5))
+    return (sw - dw) // 2, (sh - dh) // 2, dw, dh
 
 
 class CueStore:
@@ -37,8 +87,8 @@ class CueStore:
     def add(self, start: float, end: float, text: str):
         """One cue. Duplicates (relay re-parse after a rebase) drop out."""
         text = (text or "").strip()
-        if not text:
-            return
+        if not text or not visible_lines(text):
+            return      # nothing paintable (padding-only lines) — skip
         key = (round(float(start), 3), text)
         if key in self._seen:
             return
@@ -66,17 +116,19 @@ class CueStore:
                 break           # cues are sorted: everything older is dead
         if active is None:
             return []
-        lines = [ln.strip() for ln in active.split("\n") if ln.strip()]
-        return lines[-_ROLLUP_LINES:]
+        return visible_lines(active)[-_ROLLUP_LINES:]
 
 
 class CaptionOverlay(QtWidgets.QWidget):
     """Draws subtitle lines over the video, styled from the config.
 
-    Covers the whole video surface (its parent is the overlay window that
-    exactly tracks the video). Style is re-read on every paint, so changes
-    in Subtitle settings apply instantly — no player rebuild. Transparent
-    for mouse events; paints nothing while no lines are set.
+    PlayerView._layout_overlays sizes/positions this widget onto the
+    DISPLAYED picture rect (see displayed_video_rect — letterboxed movies
+    get a smaller overlay than the surface, so captions scale and anchor
+    with the picture, not the widget).  Style is re-read on every paint,
+    so changes in Subtitle settings apply instantly — no player rebuild.
+    Transparent for mouse events; paints nothing while no lines are set
+    (a preview line may stand in while the settings dialog is open).
     """
 
     def __init__(self, parent=None):
@@ -85,7 +137,9 @@ class CaptionOverlay(QtWidgets.QWidget):
         self.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self.setAttribute(QtCore.Qt.WA_NoSystemBackground, True)
         self._lines = []
-        self._bottom_inset = 24      # px above the surface bottom (controls)
+        self._preview = ""       # sample line while the settings dialog
+        #                          is open (see set_preview)
+        self._bottom_inset = 24      # px above the picture bottom (controls)
         self.hide()
 
     # ---- data ----
@@ -94,11 +148,22 @@ class CaptionOverlay(QtWidgets.QWidget):
         if lines == self._lines:
             return
         self._lines = lines
-        if lines:
-            self.show()
-        else:
-            self.hide()
+        self._sync_visibility()
         self.update()
+
+    def set_preview(self, text):
+        """A sample line painted whenever no cue is active — the settings
+        dialog sets it so style/position tweaks are visible on the video
+        even mid-silence. Real cues always take precedence."""
+        text = (text or "").strip()
+        if text == self._preview:
+            return
+        self._preview = text
+        self._sync_visibility()
+        self.update()
+
+    def _sync_visibility(self):
+        self.setVisible(bool(self._lines or self._preview))
 
     def set_bottom_inset(self, px: int):
         px = max(0, int(px))
@@ -108,7 +173,8 @@ class CaptionOverlay(QtWidgets.QWidget):
 
     # ---- painting ----
     def paintEvent(self, _event):
-        if not self._lines or self.height() < 40 or self.width() < 80:
+        lines = self._lines or ([self._preview] if self._preview else [])
+        if not lines or self.height() < 40 or self.width() < 80:
             return
         ap = self._appearance() or {}
         w, h = self.width(), self.height()
@@ -123,8 +189,8 @@ class CaptionOverlay(QtWidgets.QWidget):
         # wrap lines to ~90% of the surface width
         max_w = int(w * 0.9)
         wrapped = []
-        for ln in self._lines:
-            wrapped.extend(self._wrap(fm, ln, max_w) or [" "])
+        for ln in lines:
+            wrapped.extend(self._wrap(fm, ln, max_w))
         if not wrapped:
             return
 

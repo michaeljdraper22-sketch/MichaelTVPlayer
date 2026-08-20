@@ -391,11 +391,6 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:  # noqa: BLE001
                 pass
 
-    def toggle_dvr(self):
-        """Legacy alias: live TV is always in DVR chase mode now — there is
-        no toggle left to flip."""
-        pass
-
     def edit_dvr_window(self):
         value, ok = QtWidgets.QInputDialog.getInt(
             self, "Live TV buffer length",

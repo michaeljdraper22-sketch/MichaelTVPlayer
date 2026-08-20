@@ -1,14 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Profanity filter: read the subtitle track, mute the audio over bad words.
+"""Profanity filter: read the text under the playback, mute the audio over
+bad words — one word list for both live paths.
 
-Architecture (movies & series — the content that carries text subtitle
-tracks):
+Two text sources feed the SAME engine (ProfanityEngine):
 
-    ffmpeg (2nd connection to the same VOD file, read at several times
-    realtime, video/audio packets discarded)  -->  SRT text on stdout
-        |                                                         |
-        v                                                         v
-  SubtitleExtractor (QProcess)  -->  cues (start, end, text)
+  LIVE TV — CCExtractor (bundled) reads closed captions out of the local
+  DVR buffer the recorder already writes (see live_cc.py): one provider
+  connection, the one playback already holds. Captions trail speech by
+  1-3 s, so each cue's windows are shifted EARLIER by lead_s.
+
+  MOVIES & SERIES — playback is routed through the local VOD relay
+  (vod_splitter) when the filter (or the caption overlay) is on: it peels
+  the file's embedded text track (MKV SRT/ASS, MP4 mov_text) from its
+  cache and serves VLC byte-identical data over localhost — still one
+  provider connection. Those cues are pre-timed: lead_s=0.
+
+    cues (start, end, text)
         |
         v
   find_matches() + windows_from_cues()  -->  mute windows [(s, e)]
@@ -16,32 +23,28 @@ tracks):
         v
   ProfanityEngine (100 ms timer, PlayerView's playback clock)
         -->  VLCPlayer.set_filter_mute(True/False)
+        -->  mask_text() also masks the words in the overlay captions
 
 The filter reads the TRACK DATA — subtitles do NOT need to be visible.
 libvlc 3 offers no way to hand the embedded text to the app, hence the
-parallel ffmpeg read (the app's Download button already opens a second
-VOD connection while playing, so this matches existing usage).
+two app-side readers above.
 
 Mute windows are computed at word granularity: within a cue, each word's
 start/end is estimated from its share of the cue's characters — the
 pad-before / pad-after / sync-offset settings exist to tune around that
 estimate (and any track's timing drift).
+
+Coverage: live CC and VOD text tracks (SRT/ASS-style). Image subtitles
+(PGS, DVB) carry no text and are not filtered.
 """
 
 import logging
 import re
 import shutil
-import threading
 
 from PyQt5 import QtCore
 
 log = logging.getLogger("mtp")
-
-# Feature switch: live-TV filtering runs on closed captions extracted from
-# the LOCAL DVR buffer (see live_cc.py) — one provider connection, the one
-# the recorder already holds. Movies & series support comes later (a
-# single-connection text source for VOD does not exist yet).
-PROFANITY_AVAILABLE = True
 
 # ---- word levels ----
 LEVELS = ("exact", "partial", "whole")
@@ -138,7 +141,8 @@ class SrtParser:
     """Incremental SRT parser: feed stdout lines, get finished cues.
 
     Tolerant: index lines are optional, blank-line separation enforced
-    loosely, junk lines ignored (ffmpeg output is well-formed anyway).
+    loosely, junk lines ignored (CCExtractor and the relay emit
+    well-formed SRT anyway).
 
     ``keep_lines=True`` preserves the cue's internal line breaks (tags and
     brace overrides still stripped) — the caption overlay renders roll-up
@@ -256,7 +260,11 @@ def mask_text(text: str, words) -> str:
 
 
 def find_ffmpeg() -> str:
-    """Locate ffmpeg.exe (PATH, then the common winget location)."""
+    """Locate ffmpeg.exe (PATH, then the common winget location).
+
+    Nothing in the app needs ffmpeg at runtime — the test suite uses it
+    to build VOD-splitter fixtures (sample MKV/MP4 files with subs).
+    """
     exe = shutil.which("ffmpeg")
     if exe:
         return exe
@@ -276,155 +284,6 @@ def find_ffmpeg() -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
-
-
-class SubtitleExtractor(QtCore.QObject):
-    """Streams one subtitle track out of a remote media file with ffmpeg.
-
-    ffmpeg reads the input faster than realtime (``-readrate``) and copies
-    ONLY the subtitle stream to SRT on stdout — audio/video packets are
-    demuxed but discarded. Cues are emitted as they arrive.
-    """
-
-    cue = QtCore.pyqtSignal(float, float, str)     # start_s, end_s, text
-    failed = QtCore.pyqtSignal(str)
-    started_ok = QtCore.pyqtSignal()
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.proc = None
-        self.parser = SrtParser()
-        self._want_index = None
-        self._chosen_index = None
-        self.frontier_s = -1.0      # end time of the last cue received
-
-    # ---- lifecycle ----
-    def start(self, url: str, user_agent: str, prefer_language: str = "",
-              start_at: float = 0.0, readrate: int = 6):
-        """Begin extracting. Call probe_track() first (or index defaults
-        to sub-stream 0). Returns False when ffmpeg is missing."""
-        self.stop()
-        ffmpeg = find_ffmpeg()
-        if not ffmpeg:
-            self.failed.emit("ffmpeg not found")
-            return False
-        self._prefer_language = (prefer_language or "").lower()
-        self._start_at = max(0.0, float(start_at))
-        idx = 0 if self._want_index is None else int(self._want_index)
-        args = [
-            "-hide_banner", "-nostdin", "-loglevel", "error",
-            "-user_agent", user_agent,
-        ]
-        if self._start_at > 1.0:
-            args += ["-ss", f"{self._start_at:.1f}"]
-        args += [
-            "-readrate", str(max(1, int(readrate))),
-            "-i", url,
-            "-map", f"0:s:{idx}",
-            "-c:s", "srt", "-f", "srt", "pipe:1",
-        ]
-        self.proc = QtCore.QProcess(self)
-        self.proc.setProgram(ffmpeg)
-        self.proc.setArguments(args)
-        self.proc.readyReadStandardOutput.connect(self._on_stdout)
-        self.proc.finished.connect(self._on_finished)
-        self.proc.errorOccurred.connect(self._on_error)
-        self.proc.start()
-        return True
-
-    def stop(self):
-        if self.proc is not None:
-            try:
-                self.proc.readyReadStandardOutput.disconnect()
-                self.proc.finished.disconnect()
-                self.proc.errorOccurred.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                self.proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-            self.proc = None
-        self.frontier_s = -1.0
-
-    # ---- track choice (from an ffprobe pass) ----
-    def probe_track(self, url: str, user_agent: str) -> bool:
-        """Pick the sub stream index: preferred language, else English,
-        else 0. Blocking (runs ffprobe) — call from a worker thread."""
-        import os as _os
-        ff = find_ffmpeg()
-        if not ff:
-            return False
-        exe = _os.path.join(_os.path.dirname(ff), "ffprobe.exe")
-        import json as _json
-        import subprocess
-        cmd = [exe, "-v", "error", "-user_agent", user_agent,
-               "-show_entries",
-               "stream=index,codec_type:stream_tags=language,title",
-               "-of", "json", url]
-        try:
-            out = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=45,
-                                 creationflags=0x08000000)
-            data = _json.loads(out.stdout or "{}")
-        except Exception as exc:  # noqa: BLE001
-            try:
-                log.warning("profanity probe failed: %r", exc)
-            except Exception:
-                pass
-            return False
-        subs = []
-        for s in data.get("streams", []):
-            if s.get("codec_type") == "subtitle":
-                tags = s.get("tags", {}) or {}
-                subs.append((s.get("index", 0),
-                             str(tags.get("language", "")),
-                             str(tags.get("title", ""))))
-        if not subs:
-            return False
-        want = getattr(self, "_prefer_language", "")
-        for i, (idx, lang, title) in enumerate(subs):
-            blob = f"{lang} {title}".lower()
-            if want and want in blob:
-                self._want_index = i
-                return True
-        for i, (idx, lang, title) in enumerate(subs):
-            if "english" in f"{lang} {title}".lower():
-                self._want_index = i
-                return True
-        self._want_index = 0
-        return True
-
-    # ---- process output ----
-    def _on_stdout(self):
-        if self.proc is None:
-            return
-        raw = bytes(self.proc.readAllStandardOutput())
-        try:
-            text = raw.decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001
-            return
-        for start, end, ctxt in self.parser.feed(text):
-            self._emit_cue(start, end, ctxt)
-
-    def _emit_cue(self, start, end, text):
-        # cues are relative to the -ss point when one was used
-        start += self._start_at
-        end += self._start_at
-        self.frontier_s = max(self.frontier_s, end)
-        self.cue.emit(start, end, text)
-
-    def _on_finished(self):
-        for start, end, ctxt in self.parser.flush():
-            self._emit_cue(start, end, ctxt)
-        try:
-            log.info("profanity extractor finished (frontier=%.1fs)",
-                     self.frontier_s)
-        except Exception:
-            pass
-
-    def _on_error(self, err):
-        self.failed.emit(f"ffmpeg error {err}")
 
 
 class ProfanityEngine(QtCore.QObject):

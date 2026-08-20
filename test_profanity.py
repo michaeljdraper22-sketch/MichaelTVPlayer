@@ -18,7 +18,7 @@ from src.config import Config  # noqa: E402
 from src.player import VLCPlayer  # noqa: E402
 from src.profanity import (DEFAULT_WORDS, SrtParser, find_matches,  # noqa: E402
                            mask_text, merge_windows, windows_from_cues)
-from src.profanity import ProfanityEngine, SubtitleExtractor  # noqa: E402
+from src.profanity import ProfanityEngine  # noqa: E402
 from src.ui import player_view as pv_mod  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
 from src.ui.profanity_dialog import ProfanityDialog  # noqa: E402
@@ -191,8 +191,8 @@ def main():
         def __init__(self, parent=None):
             super().__init__()
 
-        def start(self, ts, offset=0.0):
-            CCStarts.append((ts, offset))
+        def start(self, ts, offset=0.0, join_bytes=0):
+            CCStarts.append((ts, offset, join_bytes))
             return True
 
         def stop(self):
@@ -203,7 +203,6 @@ def main():
 
     pv_mod.CCSource = StubCC
     pv_mod.find_ccextractor = lambda: "C:/fake/ccx.exe"
-    pv_mod.prof_mod.PROFANITY_AVAILABLE = True
 
     cfg.data["chase_delay"] = 5
     cfg.profanity = {"enabled": True}
@@ -213,12 +212,13 @@ def main():
     check("VOD does not engage the live filter", CCStarts == [])
 
     # VOD splitter glue: routing through the relay must ALSO start the
-    # evaluation timer (the mute loop — its only other start() lives in
-    # dead legacy code, which is how the filter shipped inert)
+    # evaluation timer (the mute loop — the live CC reader is the only
+    # other start() site)
     class StubRelay(QtCore.QObject):
         cue = QtCore.pyqtSignal(float, float, str)
+        failed = QtCore.pyqtSignal(str)
 
-        def start(self, url, ua, prefer_language="eng"):
+        def start(self, url, ua, prefer_language="eng", start_offset=0):
             return "http://127.0.0.1:1/v"
 
         def stop(self):
@@ -254,20 +254,28 @@ def main():
           and view._cc_source is not None)
     check("live caption engagement starts the evaluation timer",
           view._filter_timer.isActive())
-    check("reader joined at the content frontier",
-          abs(CCStarts[0][1] - 42.0) < 0.01)
+    check("young buffer joins from byte 0 (no skip)",
+          CCStarts and CCStarts[0][1] == 0.0 and CCStarts[0][2] == 0)
 
-    # caption cue -> lead-shifted window -> chase tick mutes
+    # caption cue -> ARRIVAL-ANCHORED window -> chase tick mutes
+    # (CCX's own times are remapped onto the app clock; lead is 0 — the
+    # anchor already absorbs the pipeline lag)
     view._filter_engine.words = [("hell", "exact")]
     view._filter_engine.lead_s = 1.5
-    view._on_cc_cue(50.0, 52.0, "what the hell is this")
-    check("caption cue became a window",
+    view.vlc.get_time = lambda: -1     # idle player: clock follows _vid_s
+    view._on_cc_cue(50.0, 50.5, "warm-up")     # lone opener: untrusted
+    view._on_cc_cue(50.5, 52.0, "what the hell is this")   # fresh: anchors
+    off = view._cc_off
+    check("live cue anchored onto the app clock (arrival)",
+          off is not None and abs(off - (42.0 - pv_mod._CC_LAG_S - 52.0))
+          < 1e-9)
+    check("anchored caption cue became a window",
           len(view._filter_engine.windows) == 1)
-    view._vid_s = 49.6
+    view.vlc.get_time = lambda: int((51.6 + off) * 1000)   # in the word
     view._filter_tick()
-    check("chase tick muted inside the (lead-shifted) word",
+    check("chase tick muted inside the anchored word",
           mut and mut[-1] is True)
-    view._vid_s = 60.0
+    view.vlc.get_time = lambda: int((60.0 + off) * 1000)   # past it
     view._filter_tick()
     check("chase tick unmuted outside", mut[-1] is False)
 
@@ -294,18 +302,13 @@ def main():
     print("[8] settings dialog")
     cfg2 = temp_config()
     saved = []
-    from src.ui import profanity_dialog as pdlg_mod
-    pdlg_mod.PROFANITY_AVAILABLE = False   # parked: as shipped right now
     dlg = ProfanityDialog(cfg2, lambda: saved.append(True))
     check("starts with the default word list",
           dlg.table.rowCount() == len(DEFAULT_WORDS))
-    check("toggle disabled while parked", not dlg.ck_on.isEnabled())
     dlg._add_row("hell", "partial")
     dlg.ck_on.setChecked(True)
     dlg.accept()
-    check("parked dialog refuses to enable",
-          cfg2.profanity["enabled"] is False)
-    pdlg_mod.PROFANITY_AVAILABLE = True    # engine available again
+    check("toggle saves enabled", cfg2.profanity["enabled"] is True)
     dlg = ProfanityDialog(cfg2, lambda: saved.append(True))
     dlg._add_row("hell", "partial")
     dlg._add_row("hell", "whole")     # duplicate is dropped on collect
@@ -337,4 +340,9 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    code = main()
+    sys.stdout.flush()
+    # Real libvlc instances + Qt teardown race at interpreter exit on
+    # Windows (a segfault AFTER the result is decided) — hard-exit like
+    # the e2e tools so the exit code stays trustworthy.
+    os._exit(code)

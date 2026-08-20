@@ -63,10 +63,13 @@ def main():
     check("font/size/pos/color mapped",
           "--freetype-font=Segoe UI" in args
           and "--freetype-fontsize=24" in args
-          and "--sub-margin=270" in args
+          and "--sub-margin=313" in args
           and "--freetype-color=16711680" in args)
+    # margin mirrors the overlay's raise (4 % + pos/2 at the 1080p ref):
+    # 0.04*1080 + 50*5.4 = 313
     args = subtitle_instance_args({"pos_pct": -100})
-    check("negative position allowed", "--sub-margin=-540" in args)
+    check("negative position allowed (baseline still added)",
+          "--sub-margin=-497" in args)
     args = subtitle_instance_args({"bg_enabled": True, "bg_color": "#0000FF",
                                    "bg_opacity": 50})
     check("background color+opacity mapped",
@@ -142,6 +145,60 @@ def main():
     check("view routes the live delay to the player",
           fake.delay_calls == [250])
 
+    print("[4b] _open_sub_settings: live apply, preview line, rebuild choice")
+
+    class ScriptedDialog:
+        """Stands in for SubtitleDialog: applies a position change LIVE
+        mid-dialog (exactly what the real one does now) then closes OK."""
+        made = []
+
+        def __init__(self, config, apply_delay, parent=None,
+                     apply_live=None):
+            self.config = config
+            self.apply_live = apply_live
+            self.saw_preview = ""
+            ScriptedDialog.made.append(self)
+
+        def exec_(self):
+            self.saw_preview = view._cap_wid._preview
+            ap = dict(self.config.subtitle_appearance)
+            ap["pos_pct"] = 60
+            self.config.subtitle_appearance = ap
+            if self.apply_live:
+                self.apply_live(ap)
+            return 1                      # QDialog.Accepted
+
+    import src.ui.subtitle_dialog as sd_mod
+    real_dlg = sd_mod.SubtitleDialog
+    sd_mod.SubtitleDialog = ScriptedDialog
+    rebuilt = []
+    view._reapply_sub_style = lambda: rebuilt.append(1)
+    view.current = {"kind": "live", "url": "http://x/s.ts", "title": "L"}
+    try:
+        view._open_sub_settings()        # overlay OFF -> rebuild path
+    finally:
+        sd_mod.SubtitleDialog = real_dlg
+    check("live style change reached the config mid-dialog",
+          view.config.subtitle_appearance["pos_pct"] == 60)
+    check("preview line shown while the dialog is open",
+          bool(ScriptedDialog.made and ScriptedDialog.made[0].saw_preview))
+    check("preview line cleared after the dialog closes",
+          view._cap_wid._preview == "")
+    check("VLC-rendered captions rebuild once on close", rebuilt == [1])
+    ScriptedDialog.made = []
+    rebuilt.clear()
+    ap = dict(view.config.subtitle_appearance)
+    ap["pos_pct"] = 0                    # so the scripted change differs again
+    view.config.subtitle_appearance = ap
+    sd_mod.SubtitleDialog = ScriptedDialog
+    view._cap_on = True                  # the app overlay owns rendering
+    try:
+        view._open_sub_settings()
+    finally:
+        sd_mod.SubtitleDialog = real_dlg
+        view._cap_on = False
+    check("overlay-rendered captions never rebuild", not rebuilt)
+
     print("[5] dialog: delay nudge is instant and persists")
     cfg2 = temp_config()
     applied = []
@@ -159,8 +216,9 @@ def main():
           cfg2.subtitle_appearance["delay_ms"] == 0
           and applied[-1] == 0)
 
-    print("[6] dialog: OK writes style, Cancel leaves config alone")
-    dlg = SubtitleDialog(cfg2, lambda ms: None)
+    print("[6] dialog: style applies LIVE; Cancel reverts to dialog-open")
+    live_calls = []
+    dlg = SubtitleDialog(cfg2, lambda ms: None, apply_live=live_calls.append)
     if dlg.cb_font.count() > 1:       # offscreen Qt may expose no families
         dlg.cb_font.setCurrentIndex(1)   # first real family, not "Default"
         expected_font = dlg.cb_font.itemData(1)
@@ -171,23 +229,42 @@ def main():
     dlg.ck_bg.setChecked(True)
     dlg.sl_bg.setValue(80)
     dlg.ck_out.setChecked(False)
+    ap = cfg2.subtitle_appearance
+    check(f"live: font applied without OK ({expected_font!r})",
+          ap["font"] == expected_font)
+    check("live: size/position applied", ap["size"] == 24
+          and ap["pos_pct"] == 25)
+    check("live: background applied on",
+          ap["bg_enabled"] and ap["bg_opacity"] == 80)
+    check("live: outline applied off", ap["outline_enabled"] is False)
+    check("apply_live fired per change", len(live_calls) >= 4)
     dlg.accept()
     ap = cfg2.subtitle_appearance
-    check(f"font saved ({expected_font!r})",
-          ap["font"] == expected_font)
-    check("size/position saved", ap["size"] == 24 and ap["pos_pct"] == 25)
-    check("background saved on", ap["bg_enabled"] and ap["bg_opacity"] == 80)
-    check("outline saved off", ap["outline_enabled"] is False)
+    check("OK keeps the live-applied values",
+          ap["size"] == 24 and ap["pos_pct"] == 25
+          and ap["outline_enabled"] is False)
     before = dict(ap)
     dlg2 = SubtitleDialog(cfg2, lambda ms: None)
     dlg2.sp_size.setValue(48)
+    check("slider drag updates the config live",
+          cfg2.subtitle_appearance["size"] == 48)
     dlg2.reject()
-    check("cancel discards style edits",
-          cfg2.subtitle_appearance["size"] == before["size"])
-
-    print("[7] reset to defaults restores every control")
+    check("cancel reverts to the dialog-open style",
+          cfg2.subtitle_appearance["size"] == before["size"]
+          and cfg2.subtitle_appearance["pos_pct"] == before["pos_pct"])
     dlg3 = SubtitleDialog(cfg2, lambda ms: None)
-    dlg3._reset_all()
+    dlg3.sp_size.setValue(72)
+    dlg3._nudge_delay(+1)
+    dlg3.reject()
+    check("cancel keeps the delay nudges but reverts the style",
+          cfg2.subtitle_appearance["size"] == before["size"]
+          and cfg2.subtitle_appearance["delay_ms"] == 250)
+
+    print("[7] reset to defaults restores every control (live)")
+    dlg4 = SubtitleDialog(cfg2, lambda ms: None)
+    dlg4.sp_size.setValue(72)
+    dlg4.sl_pos.setValue(40)
+    dlg4._reset_all()
     check("config back to defaults",
           cfg2.subtitle_appearance == SUBTITLE_DEFAULTS)
 

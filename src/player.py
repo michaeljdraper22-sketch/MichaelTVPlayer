@@ -51,10 +51,14 @@ def subtitle_instance_args(appearance: dict) -> list:
         args.append(f"--freetype-fontsize={size}")
     pos = int(ap.get("pos_pct", 0) or 0)
     if pos:
-        # ±100 % maps to ±540 px of margin (about half a 1080p screen).
-        # VLC's --sub-margin raises the subtitles from the bottom; negative
-        # values push them down past the default placement.
-        args.append(f"--sub-margin={int(pos * 5.4)}")
+        # Mirror the overlay's raise above the picture bottom (see
+        # CaptionOverlay.paintEvent): 4 % of the height + half the
+        # position percentage, expressed at VLC's 1080p pixel reference
+        # (VLC scales --sub-margin with the video height), so VLC-rendered
+        # fallback tracks (bitmap DVB/PGS) anchor roughly where the app
+        # overlay would put them. VLC's own default bottom padding stands
+        # in for the overlay's control-bar inset.
+        args.append(f"--sub-margin={round(0.04 * 1080 + pos * 5.4)}")
     text = _rgb_int(ap.get("text_color", ""), 0xFFFFFF)
     if text != 0xFFFFFF:
         args.append(f"--freetype-color={text}")
@@ -90,6 +94,12 @@ class VLCPlayer:
                  spu_delay_ms: int = 0):
         nc = max(0, min(50000, int(network_caching)))
         args = [
+            # never read/write the user's shared %APPDATA%\vlc config — the
+            # app passes everything it needs explicitly (see main.py's
+            # bundled-VLC isolation). NOTE: libvlc knows this option as
+            # --ignore-config; a wrong name would make vlc.Instance(args)
+            # return None and silently fall back to a no-args instance.
+            "--ignore-config",
             "--no-video-title-show",
             "--no-stats",
             f"--network-caching={nc}",
@@ -689,6 +699,17 @@ class VLCPlayer:
                 pass
 
     # ---- video ----
+    def video_size(self) -> tuple:
+        """Decoded video size (w, h) of the main vout, (0, 0) while there
+        is none (before playback starts / after stop — video_get_size
+        raises then, and python-vlc hands 0s back in other transient
+        states). Callers treat (0, 0) as "unknown, keep the fallback"."""
+        try:
+            w, h = self.player.video_get_size(0)
+            return int(w or 0), int(h or 0)
+        except Exception:  # noqa: BLE001
+            return (0, 0)
+
     def set_scale_mode(self, mode: str) -> None:
         """'fit' (letterbox), 'stretch' (distort to fill) or 'crop' (zoom)."""
         self._scale_mode = mode if mode in ("fit", "stretch", "crop") else "fit"

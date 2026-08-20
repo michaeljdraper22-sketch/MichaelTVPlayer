@@ -24,7 +24,14 @@ if errorlevel 1 (
     exit /b 1
 )
 
+echo Copying private VLC runtime into dist\vlc ...
+robocopy "vlc" "dist\vlc" /E /NFL /NDL /NJH /NJS /NP >nul
+if errorlevel 8 (
+    echo WARNING: failed to copy the bundled VLC runtime from vlc\ —
+    echo the exe will fall back to the user's installed VLC.
+)
+
 echo.
-echo Done. Double-click:  dist\MichaelTVPlayer.exe
-echo (VLC must still be installed, or drop a vlc\ folder next to the exe.)
+echo Done. Double-click:  dist\MichaelTV.exe
+echo Runs fully isolated on dist\vlc\ — the installed VLC is not used.
 pause

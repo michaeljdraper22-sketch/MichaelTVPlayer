@@ -47,16 +47,31 @@ def _setup_windows_identity() -> None:
             pass
 
 
+_vlc_dll_dir_cookie = None   # keeps the add_dll_directory() handle alive
+
+
 def _setup_bundled_vlc() -> None:
-    r"""Optional: use a VLC runtime shipped in a ``vlc`` folder next to the
-    exe (copy libvlc.dll, libvlccore.dll and the plugins\ folder there).
+    r"""Use the private VLC runtime shipped in a ``vlc`` folder next to the
+    exe (a full copy of a VLC install: libvlc.dll, libvlccore.dll, plugins\).
+    This keeps MichaelTV completely isolated from the user's installed VLC —
+    own DLLs, own plugins, and (with ``--no-config`` on every vlc.Instance)
+    no reads or writes of the shared ``%APPDATA%\vlc`` config.
     Without such a folder the installed VLC is used, as before."""
+    global _vlc_dll_dir_cookie
     vlc_dir = os.path.join(_install_dir(), "vlc")
-    if os.path.isdir(vlc_dir):
-        os.environ.setdefault("PYTHON_VLC_MODULE_PATH", vlc_dir)
-        plugins = os.path.join(vlc_dir, "plugins")
-        if os.path.isdir(plugins):
-            os.environ.setdefault("PYTHON_VLC_PLUGIN_PATH", plugins)
+    if not os.path.isfile(os.path.join(vlc_dir, "libvlc.dll")):
+        return
+    # PYTHON_VLC_LIB_PATH is the only knob python-vlc honors for the actual
+    # DLL load; VLC_PLUGIN_PATH (the env var libvlc itself reads) pins plugin
+    # discovery to the bundled copy.
+    os.environ["PYTHON_VLC_LIB_PATH"] = os.path.join(vlc_dir, "libvlc.dll")
+    os.environ["VLC_PLUGIN_PATH"] = os.path.join(vlc_dir, "plugins")
+    # libvlc.dll's dependencies (libvlccore.dll, ...) live next to it; make
+    # Windows resolve them from the bundled folder.
+    try:
+        _vlc_dll_dir_cookie = os.add_dll_directory(vlc_dir)
+    except (OSError, AttributeError):
+        pass
 
 
 def cleanup_stale_temp_files(root: str = None) -> None:

@@ -8,6 +8,8 @@ Run:  .venv\\Scripts\\python.exe test_caption_overlay.py
 import os
 import sys
 import tempfile
+import threading
+import time
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -16,10 +18,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from src.config import Config  # noqa: E402
+from src import live_cc as live_cc_mod  # noqa: E402
 from src.profanity import SrtParser, mask_text  # noqa: E402
 from src.ui import player_view as pv_mod  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
-from src.ui.caption_overlay import CueStore, CaptionOverlay  # noqa: E402
+from src.ui.caption_overlay import (CueStore, CaptionOverlay,  # noqa: E402
+                                    displayed_video_rect)
 
 PASS = []
 FAIL = []
@@ -58,6 +62,40 @@ for i in range(6000):
 check("store bounded (6000 adds -> <= 5000 cues)", len(cs2.cues) <= 5000)
 check("oldest evicted, newest kept",
       cs2.cues[-1][2] == "c5999" and cs2.cues[0][0] > 900.0)
+
+# rip-house padding: cues/lines made only of bidi controls + NBSP paint
+# NOTHING — they must not render the "background box with no text"
+cs3 = CueStore()
+cs3.add(20.0, 22.0, "\u202b\xa0\u202c")            # bidi + NBSP only
+check("invisible-only cue skipped (no empty box)", cs3.text_at(21.0) == [])
+cs3.add(24.0, 26.0, "hello\n\u202b\xa0\u202b\nworld")   # padded middle line
+check("invisible-only LINES dropped, visible ones kept",
+      cs3.text_at(25.0) == ["hello", "world"])
+cs3.add(28.0, 30.0, "\ufeffreal\u200b \u202bmarked")
+check("zero-width marks stripped from visible text",
+      cs3.text_at(29.0) == ["real marked"])
+cs3.add(32.0, 34.0, "\u202b\u0645\u0631\u062d\u0628\u0627")   # Arabic: kept
+check("Arabic glyphs survive the cleanup", cs3.text_at(33.0) is not None
+      and "\u0645" in cs3.text_at(33.0)[0])
+# second round of the same report: soft hyphens, LRM/RLM marks and
+# zero-width joiners ALSO paint nothing — a line made only of them
+# still rendered the background box with no text inside
+cs3.add(36.0, 38.0, "\u00ad\u00ad\u00ad")          # soft hyphens only
+check("soft-hyphen-only cue skipped (no empty box)",
+      cs3.text_at(37.0) == [])
+cs3.add(40.0, 42.0, "\u200e\u200f\u200e")          # LRM/RLM only
+check("LRM/RLM-only cue skipped (no empty box)",
+      cs3.text_at(41.0) == [])
+cs3.add(44.0, 46.0, "\u200d\u200d")                # ZWJ only
+check("ZWJ-only cue skipped (no empty box)",
+      cs3.text_at(45.0) == [])
+cs3.add(48.0, 50.0, "ca\u00adffe\u0301 \u200eo\u200f")   # marks INSIDE words
+check("soft hyphen/LRM stripped from visible text",
+      cs3.text_at(49.0) == ["caffe\u0301 o"])
+arabic_lig = "\u0645\u200d\u0631"                  # ZWJ between Arabic
+cs3.add(52.0, 54.0, arabic_lig)
+check("ZWJ kept inside Arabic text (shaping)",
+      cs3.text_at(53.0) == [arabic_lig])
 
 print("[2] SrtParser keep_lines (roll-up line structure)")
 p = SrtParser(keep_lines=True)
@@ -103,6 +141,101 @@ check("color parses hex + alpha",
 bad = ov._color("not-a-color", "#FFFFFF", 10)
 check("invalid color falls back", bad.isValid() and bad.alpha() == 10)
 
+print("[3a] preview line (settings-dialog live feedback)")
+ov.set_preview("Subtitle preview")
+check("preview shows the widget with no lines", ov.isVisible())
+ov.set_preview("Subtitle preview")
+check("same preview is a no-op", ov._preview == "Subtitle preview")
+ov.set_lines(["real cue"])
+check("real cues take precedence over the preview",
+      ov.isVisible() and ov._lines == ["real cue"])
+ov.set_lines([])
+check("preview survives cue gaps", ov.isVisible())
+ov.set_preview("")
+check("clearing the preview hides the widget again", not ov.isVisible())
+
+print("[3b] displayed-video rect math (captions anchor to the picture)")
+check("16:9 video in a 16:9 surface fills it",
+      displayed_video_rect((1920, 1080), "fit", 1920, 1080)
+      == (0, 0, 1920, 1080))
+check("2.35:1 movie letterboxed in a 16:9 surface",
+      displayed_video_rect((2350, 1000), "fit", 1920, 1080)
+      == (0, 131, 1920, 817))
+check("4:3 video pillarboxed in a 16:9 surface",
+      displayed_video_rect((1440, 1080), "fit", 1920, 1080)
+      == (240, 0, 1440, 1080))
+check("portrait video pillarboxed",
+      displayed_video_rect((1080, 1920), "fit", 1920, 1080)
+      == (656, 0, 608, 1080))
+check("crop covers the whole surface", displayed_video_rect(
+    (2350, 1000), "crop", 1920, 1080) == (0, 0, 1920, 1080))
+check("stretch covers the whole surface", displayed_video_rect(
+    (1440, 1080), "stretch", 1920, 1080) == (0, 0, 1920, 1080))
+check("unknown size (0,0) falls back to the whole surface",
+      displayed_video_rect((0, 0), "fit", 1920, 1080) == (0, 0, 1920, 1080))
+check("degenerate surface doesn't crash",
+      displayed_video_rect((1920, 1080), "fit", 0, 0) == (0, 0, 0, 0))
+# acceptance core: same caption size RELATIVE TO THE PICTURE whatever the
+# letterboxing — config 40 px @1080p against each picture height
+px16 = ov._font_px(ap, 1080)
+px235 = ov._font_px(ap, displayed_video_rect((2350, 1000), "fit",
+                                             1920, 1080)[3])
+check("16:9 and letterboxed captions share one size relative to the picture",
+      abs(px16 / 1080.0 - px235 / 817.0) < 0.001)
+
+
+print("[3c] one painted caption size/position: 16:9 live vs letterboxed movie")
+
+
+def _ink_rows(w):
+    """Top/bottom pixel rows carrying ink in a grab of the widget — the
+    overlay paints text over transparency, so ink rows == the text."""
+    img = w.grab().toImage()
+    if img.format() != img.Format_ARGB32:
+        img = img.convertToFormat(img.Format_ARGB32)
+    data = img.constBits().asstring(img.sizeInBytes())
+    bpl = img.bytesPerLine()
+    rows = [y for y in range(img.height())
+            if any(data[y * bpl + 3:(y + 1) * bpl:4])]
+    return (rows[0], rows[-1]) if rows else None
+
+
+# The overlay anchors to the DISPLAYED picture rect (displayed_video_rect
+# + _layout_overlays), so a 16:9 channel filling the window and a 2.35:1
+# movie letterboxed inside it must PAINT captions at the same size and
+# height relative to the PICTURE — measured through the real paint path
+# (grab + ink scan), not just the geometry math.
+r_live = displayed_video_rect((1920, 1080), "fit", 1920, 1080)
+r_film = displayed_video_rect((2350, 1000), "fit", 1920, 1080)
+check("live-sized surface: picture fills it", r_live == (0, 0, 1920, 1080))
+check("movie-sized surface: 2.35:1 letterboxed in 16:9",
+      r_film == (0, 131, 1920, 817))
+check("font px pinned on the live picture (40 @1080p)",
+      ov._font_px(ap, r_live[3]) == 40)
+check("font px pinned on the letterboxed picture (30 @817p)",
+      ov._font_px(ap, r_film[3]) == 30)
+ov.set_bottom_inset(0)   # drop the constant control-bar clearance: the
+#                         # invariant under test is picture-relative math
+metrics = {}
+for tag, rect in (("live", r_live), ("film", r_film)):
+    ov.resize(rect[2], rect[3])
+    ov.set_lines(["the quick brown fox"])
+    app.processEvents()
+    top, bot = _ink_rows(ov) or (-1, -1)
+    metrics[tag] = (rect[3], bot - top, rect[3] - bot)
+ov.set_lines([])
+ov.set_bottom_inset(24)
+h_l, th_l, bm_l = metrics["live"]
+h_f, th_f, bm_f = metrics["film"]
+check(f"both pictures painted ink (live {th_l}px, film {th_f}px)",
+      th_l > 0 and th_f > 0)
+check(f"painted text height identical relative to the picture "
+      f"({th_l}/{h_l} vs {th_f}/{h_f})",
+      abs(th_l / h_l - th_f / h_f) < 0.004)
+check(f"painted bottom anchor identical relative to the picture "
+      f"({bm_l}/{h_l} vs {bm_f}/{h_f})",
+      abs(bm_l / h_l - bm_f / h_f) < 0.004)
+
 print("[4] track classification")
 kind = PlayerView._cap_track_kind
 check("live CEA-608 tracks are text",
@@ -116,6 +249,99 @@ check("ASS tracks are ass",
       kind("English (ASS)") == "ass" and kind("Signs (SSA)") == "ass")
 check("plain language names are 'other'",
       kind("English (United States) - [English]") == "other")
+check("VobSub-named tracks are bitmap (VLC renders them)",
+      kind("English (VobSub) - [English]") == "bitmap"
+      and kind("VobSub") == "bitmap")
+
+print("[4c] language matching (CC-menu word vs MKV ISO code)")
+from src.mkv_subs import MkvSubParser as _MkvP, lang_matches, \
+    is_language_name  # noqa: E402
+check("full word matches ISO code", lang_matches("english", "eng", ""))
+check("ISO code matches full word", lang_matches("eng", "", "English"))
+check("two-letter code matches ISO code", lang_matches("en", "eng", ""))
+check("mismatched languages never match",
+      not lang_matches("english", "ara", "")
+      and not lang_matches("english", "ger", "German"))
+check("short codes never substring-match",
+      not lang_matches("en", "", "French"))
+check("known language words recognized",
+      is_language_name("english") and is_language_name("en")
+      and is_language_name("german"))
+check("junk hints rejected",
+      not is_language_name("track") and not is_language_name("closed")
+      and not is_language_name(""))
+
+# the regression this file guards: an 'English' pick used to fall through
+# to the FIRST text track (Arabic on multi-language rips) because the
+# MKV Language element says 'eng', not 'english'
+p = _MkvP(prefer_language="english")
+p._track_meta = {
+    3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+    4: {"codec": "S_TEXT/UTF8", "lang": "eng", "name": ""},
+    5: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""},
+}
+p._select_track()
+check("'english' hint selects the eng text track", p._selected == 4)
+
+p2 = _MkvP(prefer_language="english")   # no English TEXT track exists
+p2._track_meta = {
+    3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+    4: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""},
+}
+p2._select_track()
+check("no wanted-language text -> first text track (UI then hands off)",
+      p2._selected == 3)
+
+print("[4b] overlay eligibility by content kind (unified subtitles)")
+
+
+class _EligShim:
+    """Just enough PlayerView for _cap_eligible: a ``current`` media of
+    the wanted kind, borrowing the real classifier methods."""
+
+    _is_vod = PlayerView._is_vod
+    _cap_track_kind = staticmethod(PlayerView._cap_track_kind)
+
+    def __init__(self, kind):
+        self.current = {"kind": kind, "url": "http://x/m.mkv",
+                        "title": "T"}
+
+
+def elig(kind, name):
+    return PlayerView._cap_eligible(_EligShim(kind), name)
+
+
+# text always renders in the overlay; ASS and plain names only on VOD
+# (the relay's MKV parser flattens ASS there; live plain names may hide
+# DVB bitmaps); bitmap tracks never qualify.
+check("ASS is overlay-eligible on VOD (the relay flattens it)",
+      elig("vod", "English (ASS)") and elig("series", "Signs (SSA)"))
+check("ASS stays on VLC for live", not elig("live", "English (ASS)"))
+check("plain names are overlay-eligible on VOD (SRT MKVs carry them)",
+      elig("vod", "English (United States) - [English]"))
+check("plain names stay on VLC for live",
+      not elig("live", "English (United States) - [English]"))
+check("DVB bitmap tracks are never overlay-eligible",
+      not elig("vod", "English (DVB)") and not elig("live", "Danish (DVB)"))
+check("CC/SRT text tracks are overlay-eligible everywhere",
+      elig("live", "Closed captions 1") and elig("vod", "Track 1 - [SRT]"))
+
+print("[4d] CC-menu language hints (relay track re-selection)")
+
+# VLC names unnamed MKV tracks "Track N - [Language]" — the bracket is the
+# only language cue; the bare head word is "track" (junk). Regression:
+# the junk hint defeated the relay's prefer-language match AND the
+# _cap_vod_check language check on multi-track rips.
+check("bracketed language extracted from 'Track N - [Language]'",
+      PlayerView._cap_lang_hint("Track 2 - [English]") == "english")
+check("bracketed language works for any known language",
+      PlayerView._cap_lang_hint("Track 7 - [German]") == "german")
+check("named tracks keep the head-word hint",
+      PlayerView._cap_lang_hint(
+          "English (United States) - [English]") == "english")
+check("junk without a language falls through empty",
+      PlayerView._cap_lang_hint("Track 2 - [Commentary]") == ""
+      and PlayerView._cap_lang_hint("") == "")
 
 print("[5] view: live engagement + fallback to VLC rendering")
 cfg = temp_config()
@@ -130,8 +356,8 @@ class StubCC(QtCore.QObject):
     def __init__(self, parent=None):
         super().__init__()
 
-    def start(self, ts, offset=0.0):
-        CCStarts.append((ts, offset))
+    def start(self, ts, offset=0.0, join_bytes=0):
+        CCStarts.append((ts, offset, join_bytes))
         return True
 
     def stop(self):
@@ -168,6 +394,9 @@ class FakeVLC:
     def get_time(self):
         return self.times.get("t", -1)
 
+    def is_playing(self):
+        return self.times.get("playing", True)
+
     def stop_and_release(self):
         pass
 
@@ -194,19 +423,83 @@ check("VLC's own spu forced OFF under the overlay", fake.spu == -1)
 check("cap timer runs while the overlay owns captions",
       view._cap_timer.isActive())
 
-# cues flow to the store and render at the tracked position (+delay)
+# ---- live cues: ARRIVAL-anchored times + tracked caption clock ----
+# CCX's SRT times live on their own drifting axis (probe: 12-32 s ahead
+# of VLC's clock with continuous drift), so every FRESH cue re-anchors a
+# running offset that maps them onto the app's frontier clock.
+view._frontier_s = lambda: 100.0           # mature buffer
 view._on_cc_cue(50.0, 52.0, "what the hell is this")
-view._vid_s = 51.0
+check("lone first cue on a mature buffer does not anchor (untrusted)",
+      view._cc_off is None and not view._cap_cues.cues)
+view._on_cc_cue(52.0, 54.0, "what the hell is this")   # fresh successor
+LAG = pv_mod._CC_LAG_S
+off = view._cc_off
+check("fresh successor cue anchors the CCX->app clock",
+      off is not None and abs(off - (100.0 - LAG - 54.0)) < 1e-9)
+view._on_cc_cue(70.0, 120.0, "ancient catch-up burst")
+check("catch-up burst does not re-anchor (advance >> wall time)",
+      view._cc_off == off)
+# EWMA smoothing: per-cue lag estimates jitter with the pipeline (burst
+# flushes, poll phase) — a fresh cue steps the anchor PART of the way
+# toward its own estimate instead of jumping the whole distance
+view._cc_last_t = time.time() - 1.0        # plausible elapsed for advance
+view._on_cc_cue(118.0, 122.0, "fresh successor after the burst")  # fresh
+target2 = 100.0 - LAG - 122.0
+expected2 = off + (target2 - off) * pv_mod._CC_ANCHOR_ALPHA
+check("fresh cue steps the anchor part-way (EWMA, not a jump)",
+      abs(view._cc_off - expected2) < 1e-9
+      and abs(view._cc_off - target2) > 1e-6)
+c0, c1 = 52.0 + off, 54.0 + off            # the anchored display window
+
+
+def _show_at(t):
+    """One caption tick with the clock seeded at ``t`` (a fresh-media
+    clock state: no reading, zero value — seeding follows _vid_s)."""
+    view._cap_raw_s = None
+    view._cap_clock_s = 0.0
+    view._vid_s = t
+    view._caption_tick()
+    return view._cap_wid._lines
+
+
+check("arrival-anchored cue renders inside its window",
+      _show_at(c0 + 0.5) == ["what the hell is this"])
+check("cue clears after its anchored window",
+      _show_at(c1 + 5.0) == [])
+
+# caption timing keys on VLC's DISPLAYED position when it reports one:
+# the tracked clock snaps to live readings (frozen / garbage broadcast
+# PTS is what desynced live captions before)
+fake.times["t"] = int((c0 + 0.5) * 1000)
 view._caption_tick()
-check("active cue rendered by the overlay",
-      view._cap_wid._lines == ["what the hell is this"])
-view._vid_s = 60.0
+check("VLC's displayed position drives the caption clock",
+      abs(view._cap_clock_s - (c0 + 0.5)) < 0.01
+      and view._cap_wid._lines == ["what the hell is this"])
+for _ in range(2):                 # VLC's clock frozen at the same value:
+    time.sleep(0.05)               # caption time integrates forward
+    view._caption_tick()
+check("frozen VLC clock keeps caption time moving (integration)",
+      view._cap_clock_s > c0 + 0.55)
+fake.times["t"] = -5_000                  # negative garbage reading
 view._caption_tick()
-check("cue clears after its window", view._cap_wid._lines == [])
+check("garbage negative reading cannot yank the clock back",
+      view._cap_clock_s >= c0 + 0.55)
+fake.times["playing"] = False
+before = view._cap_clock_s
+fake.times["t"] = -1                # transient -1, player mid-reopen
+time.sleep(0.05)
+view._caption_tick()
+check("transient -1 with the player down holds the clock",
+      abs(view._cap_clock_s - before) < 1e-9)
+fake.times["playing"] = True
+fake.times["t"] = -1
+view._cap_clock_s = 0.0             # back to no-VLC-clock mode for the
+view._vid_s = 60.0                  # remaining _vid_s-fallback tests
+view._cap_raw_s = None
 
 # delay applies live (arithmetic, no rebuild)
 cfg.subtitle_appearance = dict(cfg.subtitle_appearance, delay_ms=2000)
-view._vid_s = 48.5
+view._vid_s = c0 - 1.5              # +2 s of delay lands inside the cue
 view._caption_tick()
 check("positive delay shows the cue 2 s early-at-position",
       view._cap_wid._lines == ["what the hell is this"])
@@ -238,34 +531,254 @@ view._select_spu(-1, "")
 check("Off stops the overlay + claim", not view._cap_on
       and not view._cap_want)
 
-# bitmap / ASS tracks never engage the overlay
+# bitmap tracks (and ASS on live) never engage the overlay
 view._select_spu(3, "English (DVB)")
 check("bitmap track stays on VLC", not view._cap_on and fake.spu == 3)
 view._select_spu(4, "Signs (ASS)")
-check("ASS track stays on VLC", not view._cap_on and fake.spu == 4)
+check("ASS track stays on VLC (live)", not view._cap_on and fake.spu == 4)
+
+# the CC menu must open even with NO VLC tracks (live channels expose
+# theirs seconds after start, some never) — regression: 'off' was only
+# bound inside `if tracks:` and the click crashed with UnboundLocalError,
+# leaving captions unselectable on live TV
+menus = []
+view._popup_above = lambda menu, btn: menus.append(menu)
+fake.tracks = []
+view._subs_menu()
+labels = [a.text() for a in menus[-1].actions()]
+check("trackless stream still opens the CC menu",
+      "Off" in labels and "Subtitle settings\u2026" in labels)
+fake.tracks = [(2, "Closed captions 1")]
+
+# VOD: the relay's parser flattens ASS to text — the overlay renders it
+view.current = {"kind": "vod", "url": "http://x/m.mkv", "title": "M"}
+
+class _RelayStub:
+    def set_prefer_language(self, prefer):
+        pass
+
+view._vod_relay = _RelayStub()
+view._select_spu(5, "English (ASS)")
+check("ASS track engages the overlay on VOD", view._cap_on
+      and fake.spu == -1 and view._cap_want)
+view._spu_want = 5
+view._cap_relay_failed("tap parser crashed: RuntimeError('boom')")
+check("relay failure hands captions back to VLC", view._cap_fail
+      and not view._cap_on and fake.spu == 5)
+
+# _cap_vod_check language handoff: the user picked 'English' but the
+# parser's only text track is Arabic (English lives on PGS bitmaps) —
+# the overlay must hand captions back to VLC, not sit mute
+class _RelayStub2:
+    def __init__(self, selected, meta, tracks):
+        self.parser_selected = selected
+        self.parser_tracks_meta = meta
+        self.parser_tracks = tracks
+
+    def set_prefer_language(self, prefer):
+        pass
+
+
+view._cap_fail = False
+view._vod_relay = _RelayStub2(
+    3, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+        4: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""}},
+    {3: "S_TEXT/UTF8", 4: "S_HDMV/PGS"})
+view._select_spu(4, "English (United States) - [English]")
+check("plain-name VOD pick engages the overlay", view._cap_on)
+view._cap_vod_check()
+check("Arabic-only text track hands captions back to VLC",
+      view._cap_fail and not view._cap_on and fake.spu == 4)
+
+# a matching eng text track keeps the app overlay
+view._cap_fail = False
+view._vod_relay = _RelayStub2(
+    5, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+        5: {"codec": "S_TEXT/UTF8", "lang": "eng", "name": ""}},
+    {3: "S_TEXT/UTF8", 5: "S_TEXT/UTF8"})
+view._select_spu(5, "English (United States) - [English]")
+check("re-engage with a matching text track", view._cap_on)
+view._cap_vod_check()
+check("eng text track keeps the app overlay",
+      not view._cap_fail and view._cap_on)
+
+# a tap that never produced ANY metadata (dead after a cache rebase)
+# must hand captions back to VLC once the retries run out — sitting
+# mute forever was the "no subtitles on movies" failure mode
+view._cap_fail = False
+view._cap_on = True
+view._cap_want = True
+view._spu_want = 5
+view._vod_relay = _RelayStub2(None, {}, {})
+view._cap_vod_tries = 0
+view._cap_vod_check()
+check("dead tap (no track metadata) hands captions back to VLC",
+      view._cap_fail and not view._cap_on and fake.spu == 5)
+
+view._vod_relay = None
+view.current = {"kind": "live", "url": "http://x/s.ts", "title": "L"}
+
+print("[5b] CCSource piping: whole buffer, and mid-buffer join")
+
+# The live contract: which BYTES get piped. Default joins the WHOLE
+# buffer (young chase buffers — CCX catch-up is trivial); a mid-session
+# engage on a long-running buffer joins near the playback position
+# (join_bytes) so CCX doesn't replay minutes of content nobody will
+# display — display times come from the arrival anchor either way.
+# CCExtractor itself is stubbed (launching the real one inside the
+# offscreen test crashed the Qt event loop); a recording stdin captures
+# exactly what would be piped.
+_blob = b"\x47" * (188 * 100 + 100)      # 100 packets + a ragged tail
+_writes = []
+
+
+class _FakeProc:
+    """Per-INSTANCE fake CCExtractor: a recording stdin plus a stdout
+    that blocks until THIS proc is killed (a shared latched Event let
+    the second source's reader see instant EOF and kill the source
+    before the tailer ever wrote)."""
+
+    def __init__(self):
+        self.killed = threading.Event()
+        outer = self
+
+        class _In:
+            def write(self, data):
+                _writes.append(bytes(data))
+
+            def close(self):
+                pass
+
+        class _Out:
+            def read(self, _n):
+                # block like a real pipe: instant EOF raced the
+                # tailer's first write and "killed" the source
+                # before it fed
+                outer.killed.wait(timeout=5)
+                return b""
+
+        self.stdin = _In()
+        self.stdout = _Out()
+
+    def kill(self):
+        self.killed.set()
+
+
+_real_popen = live_cc_mod.subprocess.Popen
+live_cc_mod.subprocess.Popen = lambda *a, **k: _FakeProc()
+_real_find = live_cc_mod.find_ccextractor
+live_cc_mod.find_ccextractor = lambda: "C:/fake/ccx.exe"
+try:
+    fd, ts = tempfile.mkstemp(suffix=".ts")
+    os.write(fd, _blob)
+    os.close(fd)
+    real_src = live_cc_mod.CCSource()
+    ok_start = real_src.start(ts, content_offset_s=123.0)
+    check("CCSource starts on a non-empty buffer", ok_start)
+    for _ in range(40):             # let the tailer thread finish its pass
+        if sum(len(w) for w in _writes) >= len(_blob):
+            break
+        time.sleep(0.05)
+    fed = b"".join(_writes)
+    check("frontier offset ignored (offset 0, VLC-clock axis)",
+          real_src._offset_s == 0.0)
+    check("piped from byte 0 through the ragged tail (whole buffer)",
+          fed == _blob)
+    real_src.stop()
+    # mid-session join: the pipe starts at the aligned join byte and
+    # carries everything after it
+    _writes.clear()
+    real_src2 = live_cc_mod.CCSource()
+    ok_join = real_src2.start(ts, join_bytes=188 * 50 + 55)
+    check("joined start accepted", ok_join)
+    for _ in range(40):
+        if sum(len(w) for w in _writes) >= len(_blob) - 188 * 50:
+            break
+        time.sleep(0.05)
+    fed2 = b"".join(_writes)
+    check("join starts at the packet-aligned byte and carries the tail",
+          fed2[:188] == _blob[188 * 50:188 * 51]
+          and _blob[188 * 50:] in fed2)
+    real_src2.stop()
+    os.remove(ts)
+finally:
+    live_cc_mod.subprocess.Popen = _real_popen
+    live_cc_mod.find_ccextractor = _real_find
 
 print("[6] view: profanity masking in the overlay render")
 view._cap_fail = False
 view._select_spu(2, "Closed captions 1")
 view._filter_engine.enabled = True
 view._filter_engine.words = [("hell", "exact")]
-view._on_cc_cue(70.0, 72.0, "what the hell is this")
-view._vid_s = 71.0
-view._caption_tick()
+view._cc_off = None                       # fresh anchor scenario
+view._cc_last_c = None
+view._on_cc_cue(70.0, 70.5, "warm-up")    # lone opener: untrusted, dropped
+view._on_cc_cue(70.5, 72.0, "what the hell is this")   # fresh: anchors
+off6 = view._cc_off
+shown6 = _show_at(71.0 + off6)             # inside the anchored window
 check("masked line rendered while the filter is on",
-      view._cap_wid._lines == [mask_text("what the hell is this",
-                                         [("hell", "exact")])]
-      and "*" in view._cap_wid._lines[0])
+      shown6 == [mask_text("what the hell is this", [("hell", "exact")])]
+      and "*" in shown6[0])
 view._filter_engine.enabled = False
-view._vid_s = 70.5
-view._caption_tick()
 check("unmasked once the filter is off",
-      view._cap_wid._lines == ["what the hell is this"])
+      _show_at(70.5 + off6) == ["what the hell is this"])
 
 view._set_cap_on(False)
 view._stop_cc_source()
 view.dvr = None
 view.current = None
+
+print("[7] view: overlay anchors to the displayed video rect")
+view.resize(1920, 1080)
+view.layout().activate()
+app.processEvents()
+view._layout_overlays()           # deterministic relayout after the resize
+g = view.surface.geometry()
+check("view laid out: surface fills the 1920x1080 view",
+      (g.width(), g.height()) == (1920, 1080))
+
+# size unknown (fake has no vout yet) -> historic whole-surface overlay
+fake.video_size = lambda: (0, 0)
+view._poll_video_size()
+check("unknown size keeps the whole-surface overlay",
+      view._cap_wid.geometry() == QtCore.QRect(0, 0, 1920, 1080))
+
+# 2:1 movie letterboxed in the 16:9 view -> overlay shrinks to the picture
+fake.video_size = lambda: (2000, 1000)
+view._poll_video_size()
+check("letterboxed movie: overlay = displayed picture rect",
+      view._cap_wid.geometry() == QtCore.QRect(0, 60, 1920, 960))
+
+# the inset clears the whole-surface control bar (picture bottom above it)
+view._wake()
+view._layout_overlays()
+bar_top = 1080 - view.ctl.height() - 10
+check("bottom inset clears the control bar from the picture bottom",
+      view._cap_wid._bottom_inset >= (60 + 960) - bar_top + 4)
+view.ctl.hide()
+view._layout_overlays()
+check("controls hidden -> plain 24 px inset above the picture",
+      view._cap_wid._bottom_inset == 24)
+
+# crop mode: picture covers the surface again
+view._set_scale_mode("crop")
+view._apply_scale()
+view._layout_overlays()
+check("crop mode: overlay back to the full surface",
+      view._cap_wid.geometry() == QtCore.QRect(0, 0, 1920, 1080))
+view._set_scale_mode("fit")
+
+# 16:9 channel at the same window size: full-surface overlay, same
+# size-relative-to-picture as the letterboxed movie above
+fake.video_size = lambda: (1920, 1080)
+view._poll_video_size()
+check("16:9 channel: overlay = full surface",
+      view._cap_wid.geometry() == QtCore.QRect(0, 0, 1920, 1080))
+d169 = view._cap_wid.height()
+check("16:9 and 2:1 overlays keep one caption scale relative to the picture",
+      abs(view._cap_wid._font_px(ap, d169) / d169
+          - view._cap_wid._font_px(ap, 960) / 960.0) < 0.001)
+fake.video_size = lambda: (0, 0)
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

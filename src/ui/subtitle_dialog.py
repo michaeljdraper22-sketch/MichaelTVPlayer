@@ -1,11 +1,15 @@
 # -*- coding: utf-8 -*-
 """Subtitle appearance dialog — opened from the CC button's track menu.
 
-Delay applies IMMEDIATELY (live libvlc API) and persists on its own; the
-visual settings (font, size, position, colors, outline) are read once at
-vlc.Instance() creation — on save the PlayerView rebuilds its VLCPlayer
-mid-session (movies resume at the current position) so they apply without
-restarting the app.
+EVERY change applies live while the dialog is open: the delay through the
+``apply_delay`` callback (VLC's runtime API) and every visual setting
+(font, size, position, colors, outline) through ``apply_live`` — the app
+caption overlay re-reads the config on each paint, so sliders and color
+picks are visible on the video mid-adjustment, and multiple tweaks need
+no OK in between. OK simply closes; Cancel reverts the visual settings to
+their dialog-open state (the delay keeps its instant-persist behavior).
+VLC-rendered image tracks cannot restyle at runtime: for those the
+PlayerView rebuilds the player once when the dialog closes with changes.
 """
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -14,17 +18,30 @@ from ..config import SUBTITLE_DEFAULTS, SUBTITLE_KEYS
 
 _DELAY_STEP_MS = 250          # the +/- buttons move in quarter seconds
 _POS_MAX = 100                # +/- 100 % == about half a screen
+_SAVE_DEBOUNCE_MS = 300       # slider drags save once, not per tick
+
+# visual keys only — the delay persists instantly and is never reverted
+_STYLE_KEYS = tuple(k for k in SUBTITLE_KEYS if k != "delay_ms")
 
 
 class SubtitleDialog(QtWidgets.QDialog):
-    def __init__(self, config, apply_delay, parent=None):
-        """``apply_delay(ms)`` is called on every +/- click so the delay is
-        live during playback (PlayerView._apply_sub_delay)."""
+    def __init__(self, config, apply_delay, parent=None, apply_live=None):
+        """``apply_delay(ms)`` runs on every +/- click (live VLC API);
+        ``apply_live(appearance)`` runs on every VISUAL change so the
+        caption overlay repaints mid-dialog (PlayerView passes
+        ``_apply_sub_style_live``)."""
         super().__init__(parent)
         self.config = config
         self._apply_delay = apply_delay
+        self._apply_live = apply_live
         self.appearance = dict(config.subtitle_appearance)   # working copy
         self._delay_ms = int(self.appearance.get("delay_ms", 0) or 0)
+        # what Cancel restores (delay excluded — it applied live already)
+        self._open_style = {k: self.appearance.get(k) for k in _STYLE_KEYS}
+        self._save_timer = QtCore.QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(_SAVE_DEBOUNCE_MS)
+        self._save_timer.timeout.connect(self.config.save)
 
         self.setWindowTitle("Subtitle settings")
         self.setMinimumWidth(420)
@@ -64,7 +81,7 @@ class SubtitleDialog(QtWidgets.QDialog):
         line.setFrameShape(QtWidgets.QFrame.HLine)
         lay.addWidget(line)
 
-        # ---- style (applies after restart) ----
+        # ---- style (applies live to the app caption overlay) ----
         gl = QtWidgets.QGridLayout()
         gl.setHorizontalSpacing(10)
         gl.setVerticalSpacing(9)
@@ -164,10 +181,11 @@ class SubtitleDialog(QtWidgets.QDialog):
         lay.addLayout(gl)
 
         note = QtWidgets.QLabel(
-            "Style changes apply immediately — text captions are drawn by "
-            "the app. Image/ASS tracks (rendered by VLC) restart playback "
-            "briefly; movies resume where they were. The delay always "
-            "applies live.")
+            "Changes apply live as you adjust — text captions "
+            "(including flattened ASS/SSA tracks) are drawn by the app. "
+            "Cancel reverts the style; the delay always keeps what you "
+            "clicked. Image tracks (rendered by VLC) restyle with a "
+            "brief restart on OK; movies resume where they were.")
         note.setStyleSheet("color:#9aa0a6;")
         note.setWordWrap(True)
         lay.addWidget(note)
@@ -186,6 +204,15 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.b_delay_up.clicked.connect(lambda: self._nudge_delay(+1))
         self.b_delay_reset.clicked.connect(lambda: self._nudge_delay(0, True))
         self.b_reset.clicked.connect(self._reset_all)
+        # live style: every control change writes the config (the caption
+        # overlay repaints from it) — no OK needed between adjustments
+        self.cb_font.currentIndexChanged.connect(lambda _i: self._live_apply())
+        self.sp_size.valueChanged.connect(lambda _v: self._live_apply())
+        self.sl_pos.valueChanged.connect(lambda _v: self._live_apply())
+        self.ck_bg.toggled.connect(lambda _on: self._live_apply())
+        self.sl_bg.valueChanged.connect(lambda _v: self._live_apply())
+        self.ck_out.toggled.connect(lambda _on: self._live_apply())
+        self.sl_out.valueChanged.connect(lambda _v: self._live_apply())
 
     # ---- helpers ----
     def _color_btn(self, hex_color: str) -> QtWidgets.QPushButton:
@@ -220,6 +247,7 @@ class SubtitleDialog(QtWidgets.QDialog):
         if col.isValid():
             btn.setProperty("hex", col.name())
             self._paint_color_btn(btn)
+            self._live_apply()
 
     @staticmethod
     def _select_data(combo: QtWidgets.QComboBox, data) -> None:
@@ -254,8 +282,38 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.config.subtitle_appearance = self.appearance
         self.config.save()
 
+    # ---- live style (applies on every change, saved debounced) ----
+    def _collect(self) -> None:
+        """Read the style widgets into the working copy."""
+        self.appearance.update({
+            "font": self.cb_font.currentData() or "",
+            "size": int(self.sp_size.value()),
+            "pos_pct": int(self.sl_pos.value()),
+            "text_color": str(self.bt_text.property("hex") or "#FFFFFF"),
+            "bg_enabled": bool(self.ck_bg.isChecked()),
+            "bg_color": str(self.bt_bg.property("hex") or "#000000"),
+            "bg_opacity": int(self.sl_bg.value()),
+            "outline_enabled": bool(self.ck_out.isChecked()),
+            "outline_color": str(self.bt_out.property("hex") or "#000000"),
+            "outline_thickness": int(self.sl_out.value()),
+        })
+
+    def _live_apply(self) -> None:
+        """A visual control changed: write the config now (the caption
+        overlay repaints from it via ``apply_live``) and save debounced —
+        a slider drag fires this many times a second, so the JSON write
+        waits for the drag to settle."""
+        self._collect()
+        clean = {k: self.appearance.get(k) for k in SUBTITLE_KEYS}
+        self.config.subtitle_appearance = clean
+        self._save_timer.start()
+        if self._apply_live:
+            try:
+                self._apply_live(clean)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _reset_all(self) -> None:
-        self.appearance = dict(SUBTITLE_DEFAULTS)
         self.cb_font.setCurrentIndex(0)
         self.sp_size.setValue(int(SUBTITLE_DEFAULTS["size"]))
         self.sl_pos.setValue(int(SUBTITLE_DEFAULTS["pos_pct"]))
@@ -268,25 +326,31 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.sl_bg.setValue(int(SUBTITLE_DEFAULTS["bg_opacity"]))
         self.ck_out.setChecked(SUBTITLE_DEFAULTS["outline_enabled"])
         self.sl_out.setValue(int(SUBTITLE_DEFAULTS["outline_thickness"]))
+        self._live_apply()          # color buttons carry no change signal
         # delay too — it applies immediately, like the +/- clicks
         self._nudge_delay(0, reset=True)
 
     # ---- result ----
     def accept(self) -> None:
-        self.appearance.update({
-            "font": self.cb_font.currentData() or "",
-            "size": int(self.sp_size.value()),
-            "pos_pct": int(self.sl_pos.value()),
-            "text_color": str(self.bt_text.property("hex") or "#FFFFFF"),
-            "bg_enabled": bool(self.ck_bg.isChecked()),
-            "bg_color": str(self.bt_bg.property("hex") or "#000000"),
-            "bg_opacity": int(self.sl_bg.value()),
-            "outline_enabled": bool(self.ck_out.isChecked()),
-            "outline_color": str(self.bt_out.property("hex") or "#000000"),
-            "outline_thickness": int(self.sl_out.value()),
-            "delay_ms": int(self._delay_ms),
-        })
+        self._collect()
         clean = {k: self.appearance.get(k) for k in SUBTITLE_KEYS}
+        self._save_timer.stop()
         self.config.subtitle_appearance = clean
         self.config.save()
         super().accept()
+
+    def reject(self) -> None:
+        """Cancel: the style reverts to its dialog-open state (changes had
+        applied live meanwhile — undo them live too); the delay keeps
+        whatever was clicked (instant-persist, like the +/- buttons)."""
+        self.appearance.update(self._open_style)
+        clean = {k: self.appearance.get(k) for k in SUBTITLE_KEYS}
+        self._save_timer.stop()
+        self.config.subtitle_appearance = clean
+        self.config.save()
+        if self._apply_live:
+            try:
+                self._apply_live(clean)
+            except Exception:  # noqa: BLE001
+                pass
+        super().reject()

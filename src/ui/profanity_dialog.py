@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """Profanity filter settings — Settings ▸ Profanity filter…
 
-The filter reads a movie/series' subtitle track in the background (VLC has
-no API for the text, so a parallel ffmpeg read is used — subtitles do NOT
-need to be visible) and mutes the audio during matched words. This dialog
+Live TV is filtered from the channel's closed captions (read from the
+always-on DVR buffer); movies & series from the file's own text subtitle
+track (read by the local relay that playback is routed through — no
+second connection, and subtitles do NOT need to be visible). This dialog
 manages the word list (with per-word match levels), the mute padding and
 the sync offset.
 """
@@ -11,7 +12,7 @@ the sync offset.
 from PyQt5 import QtCore, QtWidgets
 
 from ..config import PROFANITY_DEFAULTS
-from ..profanity import DEFAULT_WORDS, LEVELS, PROFANITY_AVAILABLE
+from ..profanity import DEFAULT_WORDS, LEVELS
 
 
 class ProfanityDialog(QtWidgets.QDialog):
@@ -33,9 +34,6 @@ class ProfanityDialog(QtWidgets.QDialog):
             "Mute audio during profanity")
         self.ck_on.setChecked(bool(prof.get("enabled")))
         self.ck_on.setStyleSheet("font-weight:bold;")
-        if not PROFANITY_AVAILABLE:
-            self.ck_on.setEnabled(False)
-            self.ck_on.setToolTip("Being reworked — see note below")
         lay.addWidget(self.ck_on)
         top_note = QtWidgets.QLabel(
             "LIVE TV: reads the channel's CLOSED CAPTIONS from the always-on\n"
@@ -45,8 +43,9 @@ class ProfanityDialog(QtWidgets.QDialog):
             "the background (no playback delay, no second connection) "
             "and the audio is muted ahead of the dialogue.\n"
             "Subtitles do not need to be turned on. Requires CCExtractor "
-            "for live TV (bundled with the app). DVB (image) subtitle "
-            "channels are not covered.")
+            "for live TV (bundled with the app); the movies & series path "
+            "needs nothing external. Image subtitles (PGS/DVB) carry no "
+            "text and are not covered.")
         top_note.setWordWrap(True)
         top_note.setStyleSheet("color:#9aa0a6;")
         lay.addWidget(top_note)
@@ -175,8 +174,7 @@ class ProfanityDialog(QtWidgets.QDialog):
     def accept(self) -> None:
         words = self._collect_words() or [list(d) for d in DEFAULT_WORDS]
         self.config.profanity = {
-            "enabled": bool(self.ck_on.isChecked())
-            and PROFANITY_AVAILABLE,
+            "enabled": bool(self.ck_on.isChecked()),
             "words": words,
             "pad_before_ms": int(self.sp_before.value()),
             "pad_after_ms": int(self.sp_after.value()),

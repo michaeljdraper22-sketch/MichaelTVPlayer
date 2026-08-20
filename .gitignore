@@ -16,3 +16,9 @@ TV Recordings/
 # PyInstaller staging (rename-swap builds)
 build_staging/
 dist_staging/
+
+# CCExtractor's OCR engine writes this wherever it runs (dev + dist)
+tess.log
+
+# Private bundled VLC runtime (full install copy, ~185 MB) — never commit
+/vlc/

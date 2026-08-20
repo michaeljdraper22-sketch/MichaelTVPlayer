@@ -79,7 +79,7 @@ class VlcRecorder:
         if self._shared_instance is not None:
             self._instance = self._shared_instance
         else:
-            args = ["--no-video-title-show", "--no-stats",
+            args = ["--ignore-config", "--no-video-title-show", "--no-stats",
                     f"--network-caching={nc}", f"--live-caching={nc}"]
             self._instance = vlc.Instance(args) or vlc.Instance()
         self._player = self._instance.media_player_new()

@@ -8,17 +8,21 @@ stream output, and the account allows a single stream connection.
 
 So the app inserts itself as a tiny local relay:
 
-    provider ===ONE streaming GET===> cache file (temp .mkv)
+    provider ===ONE streaming GET===> cache file (temp .mkv/.mp4)
                                       |            |
              local HTTP (ranges)      |            +--> streaming MKV parser
              serves VLC  <============+                  (subtitle cues)
+                                      +--> MP4 sample-table tap
+                                           (src.mp4_subs)
 
 VLC plays http://127.0.0.1:<port>/v — byte-identical to the original
 (seeking works: range requests are served from the cache prefix, or by
 restarting the single provider connection at the new offset — never two
 connections at once). The parser (src.mkv_subs) tails the LOCAL cache and
 emits subtitle cues on the file's own timeline, which is exactly VLC's
-playback clock: the filter sees each cue before its words play.
+playback clock: the filter sees each cue before its words play. MP4
+inputs (ftyp box) run the same relay with the moov-index tap from
+src.mp4_subs instead.
 """
 
 import logging
@@ -32,6 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from PyQt5 import QtCore
 
 from .mkv_subs import MkvSubParser
+from .mp4_subs import Mp4SubParser
 
 log = logging.getLogger("mtp")
 
@@ -54,6 +59,31 @@ def tlog(fmt, *args):
 
 _CHUNK = 1 << 16
 _EBML_MAGIC = b"\x1a\x45\xdf\xa3"          # MKV header magic
+_FTYP = b"ftyp"                            # MP4: brand box at offset 4
+
+# VLC's MKV demuxer opens a second connection for the file's seek index
+# asking for the last ~2.3 MB (Cues + duration + track entries at the
+# tail; measured on this provider: a 1.9 GB rip asked 1.3 MB + 11 KB).
+# The prefetch must COVER that whole request: one byte short and the
+# handler acquires the provider for the remainder — killing VLC's
+# main connection (ConnectionReset) and rebasing the cache window away
+# from the head, which starves the subtitle tap (see _tap_cache).
+# 2.5 MB = 2.3 MB + margin; every MB cut here is ~0.5 s off EVERY
+# subtitle-carrying movie start (the prefetch sits on the critical path
+# before VLC's first byte).
+_TAIL_PREFETCH = 2_621_440
+
+# Head pre-parse budget: the Tracks element (subtitle track metadata)
+# lives in the first KBs; half an MB covers every rip seen in practice
+# while costing ~0.2 s of sequential read on the single connection.
+_HEAD_PARSE_BYTES = 1 << 19
+
+# Language-switch re-anchor distance: the tap's fresh parser restarts
+# this far behind the write frontier so the cues around the CURRENT
+# playback position (which trails the frontier by VLC's read-ahead) are
+# re-emitted immediately; the rest of the window is backfilled from its
+# start on a side thread (dupes dedupe downstream).
+_TAP_RESTART_BACK_BYTES = 24 << 20
 
 # Seek pacing: the serving handler HOLDS the one provider stream across
 # chunks (re-acquiring per chunk used to close its own live connection
@@ -138,6 +168,8 @@ class VodRelay(QtCore.QObject):
         self.url = ""
         self.ua = "MichaelTVPlayer/1.0"
         self.total = 0                 # Content-Length (0 = unknown)
+        self._container = ""           # "mkv" | "mp4" (probe sets it)
+        self._content_type = "video/x-matroska"
         self.cache_base = 0            # file offset of the cache window
         self.cache_size = 0            # bytes in the window
         self.cache_gen = 0
@@ -160,55 +192,71 @@ class VodRelay(QtCore.QObject):
         #                            # next loop pass (set_prefer_language)
         self.parser_tracks = {}     # {mkv track number: codec id} — the
         #                            # UI reads this to learn which tracks
-        #                            # are real text (S_TEXT/UTF8)
+        #                            # are text the parser can flatten
         self.parser_tracks_meta = {}   # full {number: {codec,lang,name}}
         self.parser_selected = None
+        # startup/off the UI thread: start() returns after the probe; the
+        # head fetch + tail prefetch + main acquire happen on a thread and
+        # handlers wait for _ready (bounded) so playback simply buffers
+        self._ready = threading.Event()
+        self._startup_failed = False
+        self._head = b""            # prefetched file head (metadata + VLC probes)
+        self._start_offset = 0      # where the main stream opens (resume/switch)
 
     # ---- lifecycle ----
-    def start(self, url: str, ua: str, prefer_language: str = "eng") -> str:
-        """Open the provider, verify MKV, bring the relay up. Returns the
-        local URL for VLC, or '' when the input isn't MKV (caller falls
-        back to playing the original URL). ``prefer_language`` steers the
-        tap's subtitle-track choice (the user's CC-menu selection)."""
+    def start(self, url: str, ua: str, prefer_language: str = "eng",
+              start_offset: int = 0) -> str:
+        """Open the provider, verify MKV or MP4, bring the relay up.
+        Returns the local URL for VLC, or '' when the input is neither
+        (caller falls back to playing the original URL).
+
+        ``prefer_language`` steers the tap's subtitle-track choice (the
+        user's CC-menu selection). ``start_offset`` is a RESUME MARKER
+        (any truthy value): playback resumes mid-file, so the relay
+        prefetches only the tail and VLC's own opening walk drives the
+        provider (VLC seeks by TIME — the resume byte cannot be known
+        in advance; see _startup).
+
+        Only the tiny probe runs synchronously — start() returns as soon
+        as the local server listens, and the head fetch + tail prefetch +
+        main acquire complete on a background thread (one provider
+        connection at a time, strictly ordered). Handlers wait for that
+        startup (bounded), so VLC just buffers through it instead of the
+        UI thread freezing for the 4 MB tail download.
+        """
         self.stop()
         self.url = url
         self.ua = ua or self.ua
         self._prefer = (prefer_language or "eng").lower() or "eng"
         self._tap_restart = False
-        fd, self.cache_path = tempfile.mkstemp(suffix=".mkv",
-                                               prefix="mtp_split_")
-        os.close(fd)
+        self._start_offset = max(0, int(start_offset))
         try:
+            # ONE tiny request settles the container + the total size.
+            # Anything but MKV/MP4 is refused HERE — before any temp
+            # file or the 2 MB tail prefetch, so the direct-playback
+            # fallback costs a single tiny connection instead of three
+            # plus a wasted tail download.
+            if not self._probe_head():
+                self.failed.emit("not an MKV or MP4 stream")
+                return ""
+            if self.total and self._start_offset >= self.total:
+                self._start_offset = 0
+            fd, self.cache_path = tempfile.mkstemp(
+                suffix=".mp4" if self._container == "mp4" else ".mkv",
+                prefix="mtp_split_")
+            os.close(fd)
             # SEPARATE handles: one shared pointer would let the tap
             # reader's seeks hijack the append position (that corrupted
             # the cache)
             self._cache = open(self.cache_path, "r+b")    # writer
             self._cache_r = open(self.cache_path, "rb")   # reader
             self.cache_size = 0
-            # ONE 4-byte request settles MKV-or-not + the total size.
-            # Non-MKV containers (mp4…) are refused HERE — before the
-            # 2 MB tail prefetch, so the direct-playback fallback costs a
-            # single tiny connection instead of three plus a wasted tail
-            # download.
-            if not self._probe_head():
-                self.stop()
-                self.failed.emit("not an MKV stream")
-                return ""
-            self._bootstrap_tail()
-            st = self._acquire(0)
-            if st is None:
-                self.stop()
-                self.failed.emit("provider open failed")
-                return ""
-            head = st.read(4)
-            if len(head) < 4 or head != _EBML_MAGIC:
-                self.stop()
-                self.failed.emit("not an MKV stream")
-                return ""
-            # the 4 magic bytes were already appended to the cache by
-            # st.read
-            self._alive = True      # BEFORE the tap: it must survive the
-            self._start_ffmpeg_tap()  # startup window with a near-empty cache
+            self._ready.clear()
+            self._startup_failed = False
+            self._head = b""
+            self._alive = True      # BEFORE the startup thread + tap
+            threading.Thread(target=self._startup, daemon=True,
+                             name="mtp-relay-start").start()
             try:
                 self._server = ThreadingHTTPServer(
                     ("127.0.0.1", 0), self._make_handler())
@@ -224,21 +272,112 @@ class VodRelay(QtCore.QObject):
                 self.failed.emit(f"relay failed: {exc}")
                 return ""
             try:
-                log.info("vod splitter: %s -> 127.0.0.1:%d (total=%d)",
-                         url, self._server.server_address[1], self.total)
+                log.info("vod splitter: %s -> 127.0.0.1:%d (total=%d "
+                         "offset=%d, startup async)",
+                         url, self._server.server_address[1], self.total,
+                         self._start_offset)
             except Exception:
                 pass
             return f"http://127.0.0.1:{self._server.server_address[1]}/v"
         except Exception as exc:  # noqa: BLE001
             # The known aborts above stop themselves; this catches the
-            # UNPLANNED ones (e.g. a network error inside _bootstrap_tail)
-            # so an unexpected raise can never strand the cache file.
+            # UNPLANNED ones (e.g. a network error inside the probe) so an
+            # unexpected raise can never strand the cache file.
             self.stop()
             self.failed.emit(f"splitter failed: {exc}")
             return ""
 
+    def _startup(self):
+        """Background: bring the relay up, strictly one provider
+        connection at a time. Offset-0 sessions ride the head pre-parse
+        on the MAIN stream (its bytes land in the cache, so VLC's opening
+        walk continues on the same stream — zero rebases, one fewer
+        connection). Resume / mid-movie-engage sessions let VLC's own
+        opening walk drive everything after the tail prefetch: its
+        bytes=0- walk GET opens the provider at 0 (consumed bytes land
+        in the cache — the tap parses the Tracks element from them),
+        the seek index is served from the tail prefetch, and the seek
+        GET lands the main provider stream exactly where playback
+        continues."""
+        try:
+            self._bootstrap_tail()
+            if not self._alive:
+                return
+            if self._start_offset:
+                # VLC-driven resume engage (see docstring). The previous
+                # design pre-fetched the head AND pre-opened a stream at
+                # start_offset: measured on a real provider, VLC's walk
+                # REPLACED that stream before it served a playback byte —
+                # a wasted provider open plus ~5 MB streamed into a
+                # window VLC immediately rebased away from (~2 s of dead
+                # download on the "turn subtitles on mid-movie" path).
+                self._start_ffmpeg_tap(mid_stream=self.cache_base > 0)
+                self._ready.set()
+                tlog("startup ready (vlc-driven): head=%d tail=%d base=%d",
+                     len(self._head), len(self._tail), self.cache_base)
+                return
+            st = None
+            for attempt in range(3):
+                if not self._alive:
+                    return
+                st = self._acquire(self._start_offset)
+                if st is not None:
+                    break
+                tlog("startup: main acquire attempt %d failed", attempt + 1)
+                time.sleep(1.0)
+            if st is None:
+                self._startup_failed = True
+                self.failed.emit("provider open failed")
+                return
+            self._ride_head(st)
+            if not self._alive:
+                return
+            # the tap now (metadata from the head parse is in hand, the
+            # window base is final) — before _ready so no byte is ever
+            # served without the tap watching for it
+            self._start_ffmpeg_tap(mid_stream=self.cache_base > 0)
+            self._ready.set()
+            tlog("startup ready: head=%d tail=%d base=%d",
+                 len(self._head), len(self._tail), self.cache_base)
+        except Exception as exc:  # noqa: BLE001
+            tlog("startup failed (%r)", exc)
+            self._startup_failed = True
+            try:
+                self.failed.emit(f"splitter startup failed: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            # never leave waiters blocked, whatever happened
+            self._ready.set()
+
+    def _ride_head(self, st) -> None:
+        """Offset-0 head phase: read the head budget off the MAIN stream
+        (append_cache runs inside read — the cache and the stream stay in
+        lockstep, so VLC's later walk continues on this very stream with
+        no rebase and no extra provider connection) while feeding the
+        MKV track parser."""
+        parser = MkvSubParser(prefer_language=self._prefer) \
+            if self._container == "mkv" else None
+        buf = bytearray()
+        while len(buf) < _HEAD_PARSE_BYTES and not st.dead and self._alive:
+            data = st.read_some(min(1 << 16, _HEAD_PARSE_BYTES - len(buf)))
+            if not data:
+                break
+            buf += data
+            if parser is not None:
+                parser.feed(bytes(data))
+        self._head = bytes(buf)
+        if parser is not None and parser._track_meta:
+            self.parser_tracks_meta = dict(parser._track_meta)
+            self.parser_tracks = {num: m["codec"]
+                                  for num, m in parser._track_meta.items()}
+            self.parser_selected = parser._selected
+        tlog("head ride: %d bytes, %d tracks, selected=%r",
+             len(buf), len(self.parser_tracks), self.parser_selected)
+
     def stop(self):
         self._alive = False
+        self._ready.set()        # un-block any handler still waiting
         if self._server is not None:
             try:
                 self._server.shutdown()
@@ -279,26 +418,34 @@ class VodRelay(QtCore.QObject):
                     pass
             self.cache_path = None
         self.cache_size = 0
+        self._head = b""
 
     def _probe_head(self) -> bool:
-        """One tiny ranged GET (bytes 0-3): the EBML magic plus the total
-        size from Content-Range."""
+        """One tiny ranged GET (bytes 0-11): the EBML magic (MKV) or an
+        ftyp box at offset 4 (MP4) plus the total size from
+        Content-Range. Sets ``self._container``/``_content_type``."""
         try:
             req = urllib.request.Request(
                 self.url, headers={"User-Agent": self.ua,
-                                   "Range": "bytes=0-3"})
+                                   "Range": "bytes=0-11"})
             with urllib.request.urlopen(req, timeout=20) as r:
-                head = r.read(4)
+                head = r.read(12)
                 cr = r.headers.get("Content-Range") or ""
                 if "/" in cr:
                     try:
                         self.total = int(cr.split("/")[1])
                     except ValueError:
                         pass
-            if head != _EBML_MAGIC:
-                tlog("probe: not an MKV stream")
+            if head[:4] == _EBML_MAGIC:
+                self._container = "mkv"
+                self._content_type = "video/x-matroska"
+            elif len(head) >= 8 and head[4:8] == _FTYP:
+                self._container = "mp4"
+                self._content_type = "video/mp4"
+            else:
+                tlog("probe: not an MKV or MP4 stream")
                 return False
-            tlog("probe: MKV, total=%d", self.total)
+            tlog("probe: %s, total=%d", self._container, self.total)
             return True
         except Exception as exc:  # noqa: BLE001
             tlog("probe failed (%r)", exc)
@@ -313,7 +460,11 @@ class VodRelay(QtCore.QObject):
         if not self.total:
             return
         try:
-            tail_len = min(self.total, 2 << 20)   # cues live in the last MBs
+            tail_len = min(self.total, _TAIL_PREFETCH)   # cues live in the
+            #                                          # last MBs; 4 MB so
+            #                                          # VLC's whole index
+            #                                          # GET is served from
+            #                                          # the prefetch
             req = urllib.request.Request(
                 self.url, headers={
                     "User-Agent": self.ua,
@@ -456,21 +607,65 @@ class VodRelay(QtCore.QObject):
         except Exception:  # noqa: BLE001
             return b""
 
-    # ---- subtitle tap (streams the LOCAL cache into the MKV parser) ----
-    def _start_ffmpeg_tap(self):
-        self._parser = MkvSubParser(prefer_language=self._prefer)
+    def _tap_read(self, offset: int, n: int) -> bytes:
+        """The MP4 tap's sample reader: cache first, then the prefetched
+        head and tail. Bytes in the tail region are served to VLC from
+        _tail (never streamed through the cache), so without this
+        fallback the tap would never see text samples that live there —
+        ALL of them when a small file fits inside the tail prefetch. The
+        head region likewise: a window starting past 0 (resume /
+        mid-movie engage) never re-caches bytes 0..len(_head)."""
+        data = self.read_cache(offset, n)
+        if len(data) >= n:
+            return data
+        if self._head and offset < len(self._head):
+            part = self._head[offset:offset + n]
+            return part if not data else data + part
+        if self._tail_base < 0:
+            return data
+        tail_end = self._tail_base + len(self._tail)
+        if offset >= tail_end or offset + n > tail_end:
+            return data             # the hole is not a tail-region hole
+        part = self._tail[max(0, offset - self._tail_base):
+                          offset - self._tail_base + n]
+        return (data + part) if offset < self._tail_base else part
+
+    # ---- subtitle tap (streams the LOCAL cache into the parsers) ----
+    def _start_ffmpeg_tap(self, mid_stream: bool = False):
+        """Launch the tap thread. ``mid_stream`` starts the MKV parser in
+        cluster-resync mode with the head-fetched track metadata injected —
+        used when the cache window begins past byte 0 (resume / mid-movie
+        subtitle engage), where no Tracks element will ever pass by."""
+        if self._container == "mp4":
+            self._parser = Mp4SubParser(prefer_language=self._prefer)
+            threading.Thread(target=self._tap_cache_mp4, daemon=True,
+                             name="mtp-tap").start()
+            return
+        parser = MkvSubParser(prefer_language=self._prefer,
+                              mid_stream=mid_stream)
+        if mid_stream and self.parser_tracks_meta:
+            parser._track_meta = {num: dict(m) for num, m
+                                  in self.parser_tracks_meta.items()}
+            parser._select_track()
+            parser._saw_tracks = True
+        self._parser = parser
         threading.Thread(target=self._tap_cache, daemon=True,
                          name="mtp-tap").start()
 
-    def set_prefer_language(self, prefer: str):
+    def set_prefer_language(self, prefer: str) -> bool:
         """User picked a different subtitle language in the CC menu: the
-        tap re-selects its track on the next loop pass (the current cache
-        window is re-parsed from its start with the new preference; cue
-        times are file-absolute, so re-emitted cues dedupe downstream)."""
+        tap re-anchors a fresh parser a bounded distance behind the write
+        frontier on the next loop pass (instant cues at the playback
+        position) and a backfill thread re-parses the window from its
+        start so rewinds keep the new language. Returns True when the
+        preference actually changed (the caller drops the old language's
+        cues then)."""
         prefer = (prefer or "").lower()
         if prefer and prefer != self._prefer:
             self._prefer = prefer
             self._tap_restart = True
+            return True
+        return False
 
     def _tap_cache(self):
         """Thread: tail the cache from byte 0, feeding the streaming MKV
@@ -482,34 +677,57 @@ class VodRelay(QtCore.QObject):
         while self._alive or pos < self.cache_size:
             if self._tap_restart:
                 self._tap_restart = False
-                # fresh parser with the new preference. When the window
-                # still starts at the file head the Tracks element is
-                # re-parsed normally; after a rebase the metadata snapshot
-                # (captured below) feeds the selection instead.
-                at_head = (self.cache_base == 0)
+                tlog("tap restart: prefer=%r cache_base=%d cache_size=%d",
+                     self._prefer, self.cache_base, self.cache_size)
+                # fresh parser with the new preference, re-anchored a
+                # bounded distance behind the frontier so cues around the
+                # CURRENT playback position (which trails the frontier by
+                # VLC's read-ahead) re-appear immediately. The head
+                # metadata (from the startup head fetch, or parsed before
+                # a rebase) feeds the selection — the window itself no
+                # longer contains the Tracks element at offset > 0.
                 keep = dict(self.parser_tracks_meta) \
-                    if not at_head and self.parser_tracks_meta else None
-                parser = MkvSubParser(prefer_language=self._prefer,
-                                      mid_stream=not at_head)
+                    if self.parser_tracks_meta else \
+                    (dict(parser._track_meta) if parser._track_meta
+                     else None)
+                pos = max(0, self.cache_size - _TAP_RESTART_BACK_BYTES)
+                parser = self._parser = MkvSubParser(
+                    prefer_language=self._prefer,
+                    mid_stream=(self.cache_base > 0 or pos > 0))
                 if keep:
                     parser._track_meta = {n: dict(m)
                                           for n, m in keep.items()}
                     parser._select_track()
                     parser._saw_tracks = True
-                self._parser = parser
-                pos = 0
+                # rewind coverage: re-parse the whole window from its
+                # start on a side thread (re-emitted cues dedupe
+                # downstream on (start, text))
+                threading.Thread(target=self._tap_backfill,
+                                 args=(self._prefer, keep, self.cache_base),
+                                 daemon=True,
+                                 name="mtp-tap-backfill").start()
             if self.cache_base != base:
                 base = self.cache_base
                 pos = 0
+                tlog("tap rebase -> %d (meta kept: %d tracks)",
+                     self.cache_base, len(self.parser_tracks_meta))
                 keep_sel = parser._selected
-                parser = self._parser = MkvSubParser(mid_stream=True)
-                if keep_sel is not None:
-                    # track metadata lives at the file head — carry the
-                    # selection over so the rebased parser keeps matching
-                    parser._selected = keep_sel
+                keep_meta = dict(self.parser_tracks_meta) \
+                    if self.parser_tracks_meta else \
+                    (dict(parser._track_meta) if parser._track_meta
+                     else None)
+                parser = self._parser = MkvSubParser(
+                    prefer_language=self._prefer, mid_stream=True)
+                if keep_meta:
+                    parser._track_meta = {n: dict(m)
+                                          for n, m in keep_meta.items()}
+                    parser._select_track()
                     parser._saw_tracks = True
-            if parser._track_meta and \
-                    len(parser._track_meta) != len(self.parser_tracks_meta):
+                    if keep_sel is not None:
+                        parser._selected = keep_sel
+            if parser._track_meta and (
+                    len(parser._track_meta) != len(self.parser_tracks_meta)
+                    or self.parser_selected != parser._selected):
                 # snapshot for re-selections after a rebase + for the UI's
                 # text-track check (PlayerView._cap_vod_check)
                 self.parser_tracks_meta = dict(parser._track_meta)
@@ -520,17 +738,125 @@ class VodRelay(QtCore.QObject):
                 data = self.read_cache(self.cache_base + pos, _CHUNK)
                 if data:
                     pos += len(data)
-                    for cue in parser.feed(data):
+                    try:
+                        made = parser.feed(data)
+                    except Exception as exc:  # noqa: BLE001
+                        # a dead tap loses captions, never playback —
+                        # the UI falls back to VLC's own rendering
+                        self.failed.emit(f"tap parser crashed: {exc!r}")
+                        break
+                    for cue in made:
+                        tlog("tap cue @%.1f-%.1f %r", cue[0], cue[1],
+                             cue[2][:30])
                         self.cue.emit(*cue)
                     continue
             elif not self._alive:
                 break
             time.sleep(0.25)
-        try:
-            for cue in parser.flush():
+        tlog("tap thread exit: alive=%r pos=%d cache_size=%d "
+             "selected=%r track_meta=%d", self._alive, pos,
+             self.cache_size, getattr(parser, "_selected", None),
+             len(getattr(parser, "_track_meta", {}) or {}))
+
+    def _tap_backfill(self, prefer: str, meta, base: int):
+        """Language-switch backfill: re-parse the cached window from its
+        START with the new preference so rewinds find the new track's
+        cues (the live tap only re-anchored near the frontier). Aborts if
+        the window rebases (a seek moved it) — the live tap owns the new
+        window then. Window-relative reads only; no provider traffic."""
+        import time
+        parser = MkvSubParser(prefer_language=prefer, mid_stream=base > 0)
+        if meta:
+            parser._track_meta = {n: dict(m) for n, m in meta.items()}
+            parser._select_track()
+            parser._saw_tracks = True
+        pos = 0
+        gen = self.cache_gen
+        while self._alive and pos < self.cache_size:
+            if self.cache_base != base or self.cache_gen != gen:
+                tlog("tap backfill aborted: window rebased")
+                return
+            data = self.read_cache(base + pos, _CHUNK)
+            if not data:
+                time.sleep(0.2)
+                continue
+            pos += len(data)
+            try:
+                made = parser.feed(data)
+            except Exception:  # noqa: BLE001
+                return
+            for cue in made:
                 self.cue.emit(*cue)
-        except Exception:  # noqa: BLE001
-            pass
+        tlog("tap backfill done: %d bytes @%d", pos, base)
+
+    def _tap_cache_mp4(self):
+        """Thread: the MP4 tap. The moov index comes from the prefetched
+        tail (streaming-layout files keep it at the end), the prefetched
+        head (faststart files), or the cache head as it streams; text
+        samples are then read from the cache window at their stco file
+        offsets as the frontier passes them (see src.mp4_subs for why
+        this beats a moov-less walk over mdat). Cue times are
+        file-absolute media times = VLC's playback clock; after a rebase
+        the cursor rewinds and re-emitted cues dedupe downstream — the
+        same contract as the MKV tap."""
+        import time
+        parser = self._parser
+        if self._tail:
+            parser.parse_tail(self._tail)
+        if not parser.have_index and self._head:
+            parser.parse_head_bytes(self._head)
+        base = self.cache_base
+        tail_tried = bool(self._tail)
+        head_tried = True
+        while self._alive:
+            if self._tap_restart:
+                self._tap_restart = False
+                parser.reselect(self._prefer)
+            if self.cache_base != base:
+                base = self.cache_base
+                parser.rewind(base)   # index + selection carried over
+            if not parser.have_index:
+                # the startup thread may still be prefetching the tail —
+                # retry both static sources as they land
+                if not tail_tried and self._tail:
+                    tail_tried = True
+                    parser.parse_tail(self._tail)
+                if not parser.have_index and self._head:
+                    parser.parse_head_bytes(self._head)
+                if not parser.have_index and self.cache_base == 0:
+                    parser.scan_head(self.read_cache, self.cache_base,
+                                     self.cache_size)
+            if parser._track_meta and (
+                    len(parser._track_meta) != len(self.parser_tracks_meta)
+                    or self.parser_selected != parser._selected):
+                # snapshot for the UI's text-track check
+                # (PlayerView._cap_vod_check) and CC-menu re-selections
+                self.parser_tracks_meta = dict(parser._track_meta)
+                self.parser_tracks = {n: m["codec"]
+                                      for n, m in parser._track_meta.items()}
+                self.parser_selected = parser._selected
+            try:
+                made = parser.extract(self._tap_read, self.cache_base,
+                                      self.cache_size, self._tail_base,
+                                      len(self._tail))
+            except Exception as exc:  # noqa: BLE001
+                # a dead tap loses captions, never playback — the UI
+                # falls back to VLC's own rendering
+                self.failed.emit(f"tap parser crashed: {exc!r}")
+                break
+            for cue in made:
+                self.cue.emit(*cue)
+            time.sleep(0.25)
+        # death drain: pull whatever the final window holds
+        if parser.have_index:
+            try:
+                for cue in parser.extract(self._tap_read, self.cache_base,
+                                          self.cache_size,
+                                          self._tail_base,
+                                          len(self._tail)):
+                    self.cue.emit(*cue)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _kill_ffmpeg(self):
         self._parser = None
@@ -548,7 +874,7 @@ class VodRelay(QtCore.QObject):
             def _headers(self, code, length, rng=None):
                 self.send_response(code)
                 self.send_header("Accept-Ranges", "bytes")
-                self.send_header("Content-Type", "video/x-matroska")
+                self.send_header("Content-Type", relay._content_type)
                 if rng is not None:
                     self.send_header("Content-Range", rng)
                 if length is not None:
@@ -569,6 +895,18 @@ class VodRelay(QtCore.QObject):
                 tlog("GET %s (ua=%s)",
                      self.headers.get("Range") or "-",
                      (self.headers.get("User-Agent") or "")[:24])
+                # startup (head fetch -> tail prefetch -> main acquire)
+                # runs off the UI thread; VLC simply buffers while the
+                # first bytes of the tail download land
+                if not relay._ready.is_set():
+                    deadline = time.monotonic() + 30.0
+                    while (not relay._ready.is_set() and relay._alive
+                           and time.monotonic() < deadline):
+                        time.sleep(0.1)
+                    if (not relay._ready.is_set() or relay._startup_failed
+                            or not relay._alive):
+                        self._headers(503, 0)
+                        return
                 a, b = self._range()
                 total = relay.total
                 if a is None:
@@ -637,6 +975,26 @@ class VodRelay(QtCore.QObject):
                                 src = "cache"
                             self.wfile.write(data)
                             pos += len(data)
+                            continue
+                        if relay._head and pos < relay.cache_base \
+                                and pos < len(relay._head):
+                            # prefetched head bytes (offset-0 sessions,
+                            # via _ride_head): once a seek rebases the
+                            # window PAST the head, VLC's re-probes of the
+                            # EBML header / tracks must not rebase the
+                            # window back to 0. Resume sessions carry no
+                            # _head — their walk GET caches the head
+                            # region for real instead.
+                            n = (len(relay._head) - pos) if b is None \
+                                else min(len(relay._head) - pos,
+                                         b - pos + 1)
+                            if src != "head":
+                                tlog("serve @%d -> head +%d", pos,
+                                     len(relay._head))
+                                src = "head"
+                            self.wfile.write(
+                                relay._head[pos:pos + n])
+                            pos += n
                             continue
                         if relay._tail_base >= 0 \
                                 and pos >= relay._tail_base:
