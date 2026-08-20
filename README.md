@@ -50,15 +50,15 @@ through a single VLC connection.
     button disabled. (DVR-chase playback uses a re-muxed buffer, where
     subtitle tracks generally don't survive — subtitles work best in
     normal live playback and movies/series.)
-  - **Subtitle settings…** (bottom of the CC track menu) — **every change
-    applies instantly while you watch**: delay (± 0.25 s per click), font,
-    size, vertical position, text / background / outline colors, background
-    opacity and outline thickness. Movies & series subtitles are drawn by
-    the app itself, so restyling is immediate — and while you adjust, a
-    "subtitle test" placeholder shows on the video whenever no real
-    subtitle is on screen (no need to hunt for a talking scene). Cancel
-    restores the saved look. Live-TV subtitles are broadcast images and
-    can't be restyled.
+  - **Subtitle settings…** (bottom of the CC track menu) — the **delay
+    applies instantly** (± 0.25 s per click); the visual style (font,
+    size, vertical position, text / background / outline colors,
+    background opacity, outline thickness) applies the moment you OK the
+    dialog — playback restarts in place (movies resume where they were;
+    live restarts at the edge, and an active DVR/recording session stops
+    with it). Size defaults to a concrete 40 px; set 0 for Auto
+    (VLC sizes it from the video height). Cancel restores the saved
+    look. Live-TV subtitles are broadcast images and can't be restyled.
   - **Playback speed** (speedometer; DVR mode, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
@@ -92,15 +92,18 @@ through a single VLC connection.
   on — your choice, via the DVR button (playback runs your Live-delay
   setting behind live, at least 5 s; captions physically trail speech).
   Shows always start live and nothing is ever engaged for you.
-  Movies & series support is in the works (a single-connection local
-  splitter is built and in testing). Subtitles do not need to be on.
-  Editable word list with three match
+  **Movies & series** work with no playback delay: the app relays the
+  single provider connection through localhost, peels the embedded
+  subtitle text from the local cache and mutes ahead of the dialogue
+  (seeks stay smooth — one connection restart per jump). Subtitles do
+  not need to be on. Editable word list with three match
   levels per word (**Exact**: `dog` → `*** in the doghouse`;
   **Partial**: `*** in the ***house`; **Whole**: `*** in the
   ********`), mute padding before/after each word, a **mute lead**
   (live-caption lag compensation) and a sync offset. Requires **ffmpeg**
-  and **CCExtractor** installed. DVB (image) subtitle channels aren't
-  covered.
+  installed; **CCExtractor** ships bundled with the app (an installed
+  copy is used instead when present). DVB (image) subtitle channels
+  aren't covered.
 - **Save favorites** and keep your own **custom stream URLs**
 - **Recently played** list + account status/expiry in the status bar
 - **Zen mode (View ▸ Hide controls, or ≡ button / H)** — hides the menu bar,

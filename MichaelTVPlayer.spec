@@ -5,7 +5,12 @@ double-clickable file, no console window, no Python install required.
 Build:  build.bat  (or: .venv\\Scripts\\pyinstaller --noconfirm MichaelTVPlayer.spec)
 """
 
-datas = [("assets/icon.ico", "assets")]
+datas = [
+    ("assets/icon.ico", "assets"),
+    # static CCExtractor: zero-install caption support in every release
+    # (an installed copy still wins discovery — see live_cc.find_ccextractor)
+    ("vendor/ccextractorwin.exe", "vendor"),
+]
 
 a = Analysis(
     ["main.py"],

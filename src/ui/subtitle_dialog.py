@@ -2,9 +2,10 @@
 """Subtitle appearance dialog — opened from the CC button's track menu.
 
 Delay applies IMMEDIATELY (live libvlc API) and persists on its own; the
-visual settings (font, size, position, colors, outline) are baked into the
-VLC instance at startup, so they take effect after restarting the app —
-the dialog says so, mirroring the Network cache setting's behaviour.
+visual settings (font, size, position, colors, outline) are read once at
+vlc.Instance() creation — on save the PlayerView rebuilds its VLCPlayer
+mid-session (movies resume at the current position) so they apply without
+restarting the app.
 """
 
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -83,6 +84,9 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.sp_size.setRange(0, 96)
         self.sp_size.setSuffix(" px")
         self.sp_size.setSpecialValueText("Auto (scales with video)")
+        self.sp_size.setToolTip(
+            "Subtitle text height at 1080p (scales with the video).\n"
+            "0 = Auto: VLC sizes it from the video height.")
         self.sp_size.setValue(int(self.appearance.get("size", 0) or 0))
         gl.addWidget(self.sp_size, r, 1)
         r += 1
@@ -160,8 +164,10 @@ class SubtitleDialog(QtWidgets.QDialog):
         lay.addLayout(gl)
 
         note = QtWidgets.QLabel(
-            "Style changes take effect after restarting Michael TV.")
+            "Style changes apply immediately: playback restarts briefly "
+            "(movies resume where they were). The delay applies live.")
         note.setStyleSheet("color:#9aa0a6;")
+        note.setWordWrap(True)
         lay.addWidget(note)
 
         # ---- buttons ----

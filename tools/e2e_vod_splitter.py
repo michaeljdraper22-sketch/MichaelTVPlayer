@@ -94,9 +94,13 @@ time.sleep(4)
 app.processEvents()
 t = p.get_time()
 print(f"seek to {target}ms -> playing={p.is_playing()} t={t}ms "
-      f"cache={relay.cache_size/1048576:.0f} MiB")
+      f"cache={relay.cache_size/1048576:.0f} MiB "
+      f"provider_opens={relay.provider_opens}")
 assert p.is_playing(), "playback died after the seek"
 assert abs(t - target) < 15000, "seek did not land near target"
+assert relay.provider_opens <= 4, \
+    f"provider reopened per chunk ({relay.provider_opens}x) — seek " \
+    "pacing regressed"
 
 p.stop_and_release()
 relay.stop()

@@ -25,6 +25,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -34,13 +35,33 @@ from .mkv_subs import MkvSubParser
 
 log = logging.getLogger("mtp")
 
+# MTP_SPLIT_TRACE=1 prints a relay timeline (requests, provider reopens,
+# rebases, slow reads) for seek-pacing diagnosis. Shared time base so
+# tools can print markers onto the same timeline.
+TRACE = bool(os.environ.get("MTP_SPLIT_TRACE"))
+TRACE_T0 = time.monotonic()
+
+
+def tlog(fmt, *args):
+    if TRACE:
+        try:
+            print("[split %+9.3f] %s" % (time.monotonic() - TRACE_T0,
+                                         fmt % args if args else fmt),
+                  flush=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 _CHUNK = 1 << 16
 _EBML_MAGIC = b"\x1a\x45\xdf\xa3"          # MKV header magic
 
-# Ships OFF: the relay/parser pipeline is proven (byte-perfect serving,
-# ground-truth cue extraction, mid-stream rebases), but VLC's post-seek
-# re-buffering through the relay still needs pacing work.
-VOD_SPLITTER_READY = False
+# Seek pacing: the serving handler HOLDS the one provider stream across
+# chunks (re-acquiring per chunk used to close its own live connection
+# and reopen the provider every 64 KiB — seeks stalled for 40+ s), and
+# overlapping requests trail the owner through the cache instead of
+# replacing it. Real-provider seeks resume in ~2 s (one provider reopen,
+# the rest is VLC's own re-buffer).
+VOD_SPLITTER_READY = True
 
 
 class _ProviderStream:
@@ -58,19 +79,41 @@ class _ProviderStream:
         req = urllib.request.Request(
             relay.url, headers={"User-Agent": relay.ua,
                                 "Range": f"bytes={offset}-"})
+        t0 = time.monotonic()
         self.resp = urllib.request.urlopen(req, timeout=30)
+        tlog("provider open @%d: %.3fs", offset, time.monotonic() - t0)
 
     def read(self, n: int) -> bytes:
+        return self._read(n, partial=False)
+
+    def read_some(self, n: int) -> bytes:
+        """Like read(), but returns as soon as any data is available —
+        the first bytes reach VLC sooner after a provider restart."""
+        return self._read(n, partial=True)
+
+    def _read(self, n: int, partial: bool) -> bytes:
         if self.dead:
             return b""
+        at = self.offset
+        t0 = time.monotonic()
         try:
-            data = self.resp.read(n)
-        except Exception:  # noqa: BLE001
+            if partial:
+                r1 = getattr(self.resp, "read1", None)
+                data = r1(n) if r1 is not None else self.resp.read(n)
+            else:
+                data = self.resp.read(n)
+        except Exception as exc:  # noqa: BLE001
+            tlog("provider read @%d: died (%r)", at, exc)
             self.dead = True
             return b""
+        dt = time.monotonic() - t0
         if not data:
+            tlog("provider read @%d: EOF after %.3fs", at, dt)
             self.dead = True
             return b""
+        if dt > 0.2:
+            tlog("provider read @%d: %d bytes stalled %.3fs",
+                 at, len(data), dt)
         self.offset += len(data)
         if self.appendable:
             self.relay.append_cache(data)
@@ -106,6 +149,9 @@ class VodRelay(QtCore.QObject):
         self._gen = 0
         self._lock = threading.Lock()
         self._stream = None            # the ONE provider stream
+        self.provider_opens = 0        # provider connections opened (diag/
+        #                               # regression: seek pacing must not
+        #                               # reopen per chunk)
         self._server = None
         self._parser = None
         self._alive = False
@@ -121,45 +167,64 @@ class VodRelay(QtCore.QObject):
         fd, self.cache_path = tempfile.mkstemp(suffix=".mkv",
                                                prefix="mtp_split_")
         os.close(fd)
-        # SEPARATE handles: one shared pointer would let the tap reader's
-        # seeks hijack the append position (that corrupted the cache)
-        self._cache = open(self.cache_path, "r+b")    # writer
-        self._cache_r = open(self.cache_path, "rb")   # reader
-        self.cache_size = 0
-        self._bootstrap_tail()
-        st = self._acquire(0)
-        if st is None:
-            self.stop()
-            self.failed.emit("provider open failed")
-            return ""
-        head = st.read(4)
-        if len(head) < 4 or head != _EBML_MAGIC:
-            self.stop()
-            self.failed.emit("not an MKV stream")
-            return ""
-        # the 4 magic bytes were already appended to the cache by st.read
-        self._alive = True      # BEFORE the tap: it must survive the
-        self._start_ffmpeg_tap()  # startup window with a near-empty cache
         try:
-            self._server = ThreadingHTTPServer(
-                ("127.0.0.1", 0), self._make_handler())
-            self._server.daemon_threads = True
+            # SEPARATE handles: one shared pointer would let the tap
+            # reader's seeks hijack the append position (that corrupted
+            # the cache)
+            self._cache = open(self.cache_path, "r+b")    # writer
+            self._cache_r = open(self.cache_path, "rb")   # reader
+            self.cache_size = 0
+            # ONE 4-byte request settles MKV-or-not + the total size.
+            # Non-MKV containers (mp4…) are refused HERE — before the
+            # 2 MB tail prefetch, so the direct-playback fallback costs a
+            # single tiny connection instead of three plus a wasted tail
+            # download.
+            if not self._probe_head():
+                self.stop()
+                self.failed.emit("not an MKV stream")
+                return ""
+            self._bootstrap_tail()
+            st = self._acquire(0)
+            if st is None:
+                self.stop()
+                self.failed.emit("provider open failed")
+                return ""
+            head = st.read(4)
+            if len(head) < 4 or head != _EBML_MAGIC:
+                self.stop()
+                self.failed.emit("not an MKV stream")
+                return ""
+            # the 4 magic bytes were already appended to the cache by
+            # st.read
+            self._alive = True      # BEFORE the tap: it must survive the
+            self._start_ffmpeg_tap()  # startup window with a near-empty cache
+            try:
+                self._server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0), self._make_handler())
+                self._server.daemon_threads = True
 
-            def _quiet_error(*_a, **_k):
-                pass         # VLC drops probe connections routinely
-            self._server.handle_error = _quiet_error
-            threading.Thread(target=self._server.serve_forever,
-                             daemon=True, name="mtp-relay").start()
+                def _quiet_error(*_a, **_k):
+                    pass         # VLC drops probe connections routinely
+                self._server.handle_error = _quiet_error
+                threading.Thread(target=self._server.serve_forever,
+                                 daemon=True, name="mtp-relay").start()
+            except Exception as exc:  # noqa: BLE001
+                self.stop()
+                self.failed.emit(f"relay failed: {exc}")
+                return ""
+            try:
+                log.info("vod splitter: %s -> 127.0.0.1:%d (total=%d)",
+                         url, self._server.server_address[1], self.total)
+            except Exception:
+                pass
+            return f"http://127.0.0.1:{self._server.server_address[1]}/v"
         except Exception as exc:  # noqa: BLE001
+            # The known aborts above stop themselves; this catches the
+            # UNPLANNED ones (e.g. a network error inside _bootstrap_tail)
+            # so an unexpected raise can never strand the cache file.
             self.stop()
-            self.failed.emit(f"relay failed: {exc}")
+            self.failed.emit(f"splitter failed: {exc}")
             return ""
-        try:
-            log.info("vod splitter: %s -> 127.0.0.1:%d (total=%d)",
-                     url, self._server.server_address[1], self.total)
-        except Exception:
-            pass
-        return f"http://127.0.0.1:{self._server.server_address[1]}/v"
 
     def stop(self):
         self._alive = False
@@ -187,15 +252,46 @@ class VodRelay(QtCore.QObject):
                 pass
             self._cache_r = None
         if self.cache_path:
+            path = self.cache_path
             for _ in range(3):
                 try:
-                    os.remove(self.cache_path)
+                    os.remove(path)
                     break
                 except OSError:
-                    import time
                     time.sleep(0.3)
+            else:
+                try:
+                    log.warning("vod splitter: cache %s still locked "
+                                "after 3 tries — left for the startup "
+                                "sweep", path)
+                except Exception:
+                    pass
             self.cache_path = None
         self.cache_size = 0
+
+    def _probe_head(self) -> bool:
+        """One tiny ranged GET (bytes 0-3): the EBML magic plus the total
+        size from Content-Range."""
+        try:
+            req = urllib.request.Request(
+                self.url, headers={"User-Agent": self.ua,
+                                   "Range": "bytes=0-3"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                head = r.read(4)
+                cr = r.headers.get("Content-Range") or ""
+                if "/" in cr:
+                    try:
+                        self.total = int(cr.split("/")[1])
+                    except ValueError:
+                        pass
+            if head != _EBML_MAGIC:
+                tlog("probe: not an MKV stream")
+                return False
+            tlog("probe: MKV, total=%d", self.total)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            tlog("probe failed (%r)", exc)
+            return False
 
     def _bootstrap_tail(self):
         """VLC's MKV demuxer opens a SECOND connection asking for the
@@ -203,24 +299,17 @@ class VodRelay(QtCore.QObject):
         connection would rebase away the main stream and kill playback —
         so prefetch the tail first, sequentially (probe -> tail -> main;
         never two connections at once)."""
+        if not self.total:
+            return
         try:
-            req = urllib.request.Request(
-                self.url, headers={"User-Agent": self.ua,
-                                   "Range": "bytes=0-0"})
-            with urllib.request.urlopen(req, timeout=20) as r:
-                cr = r.headers.get("Content-Range") or ""
-                if "/" not in cr:
-                    return
-                total = int(cr.split("/")[1])
-            self.total = total
-            tail_len = min(total, 2 << 20)     # cues live in the last MBs
+            tail_len = min(self.total, 2 << 20)   # cues live in the last MBs
             req = urllib.request.Request(
                 self.url, headers={
                     "User-Agent": self.ua,
-                    "Range": f"bytes={total - tail_len}-"})
+                    "Range": f"bytes={self.total - tail_len}-"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 self._tail = r.read()
-            self._tail_base = total - len(self._tail)
+            self._tail_base = self.total - len(self._tail)
             try:
                 log.info("vod splitter: tail prefetched %d bytes at %d",
                          len(self._tail), self._tail_base)
@@ -245,15 +334,20 @@ class VodRelay(QtCore.QObject):
         the cache."""
         with self._lock:
             st = self._stream
-            if st is not None and not st.dead and st.offset == offset                     and st.owner is None:
+            if st is not None and not st.dead and st.offset == offset \
+                    and st.owner is None:
+                tlog("acquire @%d: reuse", offset)
                 st.owner = owner
                 return st
             if st is not None:
+                tlog("acquire @%d: replace (old @%d dead=%s owned=%s)",
+                     offset, st.offset, st.dead, st.owner is not None)
                 st.close()
             if st is None or st.offset != offset:
                 self._rebase(offset)
             try:
                 st = _ProviderStream(self, offset)
+                self.provider_opens += 1
                 status = getattr(st.resp, "status", 206)
                 if offset > 0 and status == 200:
                     # provider ignored our Range — reading it would count
@@ -288,6 +382,8 @@ class VodRelay(QtCore.QObject):
     def _rebase(self, offset: int):
         """Drop the cached prefix; the window restarts at ``offset``
         (forward jumps must not starve the subtitle tap)."""
+        tlog("rebase: window [%d +\u00d7%d) -> base %d",
+             self.cache_base, self.cache_size, offset)
         with self._cache_lock:
             try:
                 self._cache.seek(0)
@@ -297,6 +393,32 @@ class VodRelay(QtCore.QObject):
             self.cache_base = offset
             self.cache_size = 0
         self.cache_gen += 1
+
+    def wait_cache(self, pos: int, timeout: float) -> bool:
+        """A sibling handler is fetching the bytes at ``pos`` on the one
+        provider stream. Wait for them to land in the cache (or for the
+        slot to free up) instead of killing its connection. True -> retry
+        the serve loop; False -> take the slot over the old way."""
+        deadline = time.monotonic() + timeout
+        while True:
+            if self.cache_base + self.cache_size > pos:
+                return True
+            cur = self._stream
+            if cur is None or cur.dead or cur.owner is None:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
+
+    def _release(self, st, owner):
+        """Handler teardown: drop stream ownership under the slot lock, so
+        a concurrent _acquire reuses the live stream instead of paying a
+        provider reopen."""
+        if st is None:
+            return
+        with self._lock:
+            if st.owner == owner:
+                st.owner = None
 
     def append_cache(self, data: bytes):
         if self._cache is None:
@@ -389,6 +511,7 @@ class VodRelay(QtCore.QObject):
                 self.end_headers()
 
             def do_HEAD(self):
+                tlog("HEAD")
                 total = relay.total or relay.cache_size
                 if not total:
                     self._headers(200, None)
@@ -396,6 +519,9 @@ class VodRelay(QtCore.QObject):
                 self._headers(200, total)
 
             def do_GET(self):
+                tlog("GET %s (ua=%s)",
+                     self.headers.get("Range") or "-",
+                     (self.headers.get("User-Agent") or "")[:24])
                 a, b = self._range()
                 total = relay.total
                 if a is None:
@@ -442,48 +568,81 @@ class VodRelay(QtCore.QObject):
 
             def _stream_out(self, a, b):
                 pos = a
-                stale = False
                 me = id(self)
-                st = None
+                st = None            # held across chunks: re-acquiring
+                #                     # per chunk closed our own healthy
+                #                     # stream and reopened the provider
+                src = ""             # last source served from (trace only)
+                why = "range-end"
                 try:
-                    while not stale and (b is None or pos <= b):
-                        if relay.cache_base <= pos                                 < relay.cache_base + relay.cache_size:
-                            n = _CHUNK if b is None else \
-                                min(_CHUNK, b - pos + 1)
-                            data = relay.read_cache(pos, n)
+                    while b is None or pos <= b:
+                        if relay.cache_base <= pos \
+                                < relay.cache_base + relay.cache_size:
+                            data = relay.read_cache(
+                                pos, _CHUNK if b is None
+                                else min(_CHUNK, b - pos + 1))
                             if not data:
+                                why = "cache-miss"
                                 break
+                            if src != "cache":
+                                tlog("serve @%d -> cache [%d +%d)",
+                                     pos, relay.cache_base, relay.cache_size)
+                                src = "cache"
                             self.wfile.write(data)
                             pos += len(data)
                             continue
-                        if relay._tail_base >= 0                                 and pos >= relay._tail_base:
+                        if relay._tail_base >= 0 \
+                                and pos >= relay._tail_base:
                             # tail (seek-index) region: prefetched bytes
                             off = pos - relay._tail_base
-                            n = (len(relay._tail) - off) if b is None                                 else min(len(relay._tail) - off,
+                            n = (len(relay._tail) - off) if b is None \
+                                else min(len(relay._tail) - off,
                                          b - pos + 1)
                             if n <= 0:
+                                why = "tail-end"
                                 break
+                            if src != "tail":
+                                tlog("serve @%d -> tail @%d +%d",
+                                     pos, relay._tail_base,
+                                     len(relay._tail))
+                                src = "tail"
                             self.wfile.write(relay._tail[off:off + n])
                             pos += n
                             continue
-                        st = relay._acquire(pos, owner=me)
+                        if st is not None and (st.dead
+                                               or st.gen != relay._gen):
+                            why = "stale" if st.gen != relay._gen \
+                                else "provider-eof"
+                            break
                         if st is None:
-                            break
-                        data = st.read(_CHUNK if b is None
-                                       else min(_CHUNK, b - pos + 1))
+                            cur = relay._stream
+                            if cur is not None and not cur.dead \
+                                    and cur.owner is not None \
+                                    and cur.offset >= pos >= relay.cache_base \
+                                    and relay.wait_cache(pos, 1.5):
+                                # a sibling handler is fetching these very
+                                # bytes — trail it via the cache instead of
+                                # replacing its connection
+                                continue
+                            st = relay._acquire(pos, owner=me)
+                            if st is None:
+                                why = "provider-fail"
+                                break
+                            if src != "provider":
+                                tlog("serve @%d -> provider", pos)
+                                src = "provider"
+                        data = st.read_some(_CHUNK if b is None
+                                            else min(_CHUNK, b - pos + 1))
                         if not data:
-                            break
-                        if st.gen != relay._gen:
-                            # a newer request took over the provider
-                            stale = True
+                            why = "provider-eof"
                             break
                         self.wfile.write(data)
                         pos += len(data)
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as exc:  # noqa: BLE001
+                    why = f"exc {exc!r}"
                 finally:
-                    if st is not None and st.owner == me:
-                        st.owner = None
+                    relay._release(st, me)
+                tlog("serve done at %d (%s)", pos, why)
                 try:
                     self.wfile.flush()
                 except Exception:  # noqa: BLE001

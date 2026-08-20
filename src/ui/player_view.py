@@ -755,7 +755,7 @@ class PlayerView(QtWidgets.QWidget):
     def hide_info(self):
         self.info_overlay.hide()
 
-    def play_media(self, playable: dict):
+    def play_media(self, playable: dict, start_at: float = 0.0):
         if not self._attach_done and not self._closing:
             # Video surface not bound yet (startup attach pending/retrying):
             # queue the item — the attach callback starts playback as soon
@@ -805,6 +805,11 @@ class PlayerView(QtWidgets.QWidget):
         self._stop_recording(stopping=True)
         self.vlc.stop_and_release()
         self._ensure_dvr_stopped()
+        # The OLD media's filter machinery: the VOD relay holds a provider
+        # connection and must release it BEFORE the new URL opens (the
+        # account allows one connection — a leaked relay stalled the next
+        # channel). Also drops the live caption reader + filter windows.
+        self._stop_profanity()
         for btn, icon in ((self.btn_dvr, ic.dvr(False)),
                           (self.btn_rec, ic.rec(False))):
             btn.blockSignals(True)
@@ -827,7 +832,10 @@ class PlayerView(QtWidgets.QWidget):
         self._set_rate(1.0)
         self._update_control_state()
         self._apply_scale()
-        self.vlc.play(self._effective_url(playable.get("url", ""), kind))
+        # Timeshift is LIVE-only: VLC's input-timeshift on seekable VOD
+        # drifts A/V sync over a movie (and fights the local relay).
+        self.vlc.play(self._effective_url(playable.get("url", ""), kind),
+                      timeshift=(kind == "live"), start_seconds=start_at)
         self._poke_audio()
         self._wake()
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
@@ -1233,10 +1241,11 @@ class PlayerView(QtWidgets.QWidget):
         url = self.current.get("url", "") if self.current else ""
         if not url:
             return False
+        live = (self.current or {}).get("kind") == "live"
         if rec:
-            self.vlc.play_at(url, record_path=rec)
+            self.vlc.play_at(url, record_path=rec, timeshift=live)
         else:
-            self.vlc.play(url)
+            self.vlc.play(url, timeshift=live)
         self._poke_audio()
         return True
 
@@ -2223,11 +2232,67 @@ class PlayerView(QtWidgets.QWidget):
         SubtitleDialog(self.config, self._apply_sub_delay,
                        parent=self.window()).exec_()
         if subtitle_instance_args(self.config.subtitle_appearance) != before:
-            QtWidgets.QMessageBox.information(
-                self.window(), "Restart to apply",
-                "The new subtitle style takes effect after you restart "
-                "Michael TV.\n"
-                "(The delay you set applies immediately.)")
+            self._reapply_sub_style()
+
+    def _reapply_sub_style(self):
+        """Subtitle style args are read once at vlc.Instance() creation —
+        so rebuild the player mid-session to apply them without restarting
+        the app. Movies/episodes resume at the current position; live
+        restarts at the edge (DVR, if on, restarts with it)."""
+        self._sub_args_built = subtitle_instance_args(
+            self.config.subtitle_appearance)
+        cur = dict(self.current or {})
+        if self._closing or not cur.get("url"):
+            return          # nothing playing: next playback picks them up
+        kind = cur.get("kind", "live")
+        start_at = 0.0
+        if kind in ("vod", "series"):
+            try:
+                t = self.vlc.get_time() / 1000.0
+                if t > 2.0:
+                    start_at = t - 1.0
+            except Exception:  # noqa: BLE001
+                start_at = 0.0
+        mute = False
+        try:
+            mute = self.vlc.is_mute()
+        except Exception:  # noqa: BLE001
+            pass
+        old = self.vlc
+        try:
+            self.vlc = VLCPlayer(
+                timeshift=self.config.timeshift,
+                volume=self.config.volume,
+                network_caching=self.config.network_caching,
+                sub_args=self._sub_args_built,
+                spu_delay_ms=int(
+                    self.config.subtitle_appearance.get("delay_ms", 0) or 0))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("sub style: player rebuild failed (%r) — "
+                            "keeping the old instance", exc)
+            except Exception:
+                pass
+            self.vlc = old
+            return
+        self._filter_engine.player = self.vlc
+        if mute:
+            try:
+                self.vlc.set_mute(True)
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            old.stop_and_release()   # close the old media/connection first
+        except Exception:  # noqa: BLE001
+            pass
+        self.play_media(cur, start_at=start_at)
+        self._set_dvr_status(
+            "Subtitle style applied" +
+            ("" if start_at else " (live edge)"))
+        QtCore.QTimer.singleShot(
+            1800, lambda: self._set_dvr_status("")
+            if self._dvr_status.text().startswith("Subtitle style applied")
+            else None)
 
     def _apply_sub_delay(self, ms: int):
         """Delay is the one subtitle setting with a live runtime API —
@@ -2301,6 +2366,10 @@ class PlayerView(QtWidgets.QWidget):
             return url
         relay.cue.connect(self._on_vod_cue)
         self._vod_relay = relay
+        # the evaluation loop: without this the windows pile up but no
+        # mute is ever applied (the only other start() lives in dead
+        # legacy code)
+        self._filter_timer.start()
         return local
 
     def _on_vod_cue(self, start: float, end: float, text: str):
@@ -2378,6 +2447,9 @@ class PlayerView(QtWidgets.QWidget):
             src.cue.connect(self._on_cc_cue)
             if src.start(buf, max(0.0, frontier)):
                 self._cc_source = src
+                # evaluation loop for the caption windows (see
+                # _effective_url: nothing else starts this timer)
+                self._filter_timer.start()
                 try:
                     log.info("profanity: caption reader on %s "
                              "(frontier %.1fs)", buf, frontier)
@@ -2474,16 +2546,16 @@ class PlayerView(QtWidgets.QWidget):
         """100 ms: apply the filter mute for the current playback position.
 
         Live/chase: the tracked position IS buffer content time — the same
-        clock the caption cues live on. VOD would use the file clock (VOD
-        support arrives with a later engine)."""
+        clock the caption cues live on. VOD uses VLC's own file clock
+        (fresh every tick; the 400 ms position poll that maintains _vid_s
+        would quantize mute edges by up to ~400 ms)."""
         if self._closing or not self._filter_engine.enabled \
                 or not self._filter_engine.windows:
             return
         if self._mode == "chase":
             self._filter_engine.evaluate(self._vid_s)
         elif self._is_vod():
-            t = self._vid_s if self._vid_s > 0.0 else \
-                max(0.0, self.vlc.get_time() / 1000.0)
+            t = max(0.0, self.vlc.get_time() / 1000.0)
             self._filter_engine.evaluate(t)
 
     def _stop_profanity(self, keep_windows: bool = False):

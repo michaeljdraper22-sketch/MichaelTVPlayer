@@ -59,28 +59,45 @@ def _setup_bundled_vlc() -> None:
             os.environ.setdefault("PYTHON_VLC_PLUGIN_PATH", plugins)
 
 
-def cleanup_stale_dvr_buffers(max_age_days: float = None) -> None:
-    """Best-effort: delete EVERY leftover mtp_dvr_* / mtp_cap_* temp dir
-    from previous runs (a crashed or wedged exit strands multi-GB buffers).
+def cleanup_stale_temp_files(root: str = None) -> None:
+    """Best-effort: delete EVERY leftover mtp_* temp artifact from previous
+    runs (a crashed or wedged exit strands multi-GB DVR buffers and VOD
+    splitter caches) — mtp_dvr_* / mtp_cap_* buffer DIRECTORIES and
+    mtp_split_* relay cache FILES.
 
-    Folders belonging to a STILL-RUNNING instance are held open on Windows
-    and simply survive this pass. Never raises; everything is logged.
+    Artifacts belonging to a STILL-RUNNING instance are held open on
+    Windows and simply survive this pass; the next launch sweeps again.
+    Never raises; everything is logged.
     """
+    count = 0
+    freed = 0
     try:
-        root = tempfile.gettempdir()
-        for prefix in ("mtp_dvr_", "mtp_cap_"):
+        root = root or tempfile.gettempdir()
+        for prefix in ("mtp_dvr_", "mtp_cap_", "mtp_split_"):
             for path in glob.glob(os.path.join(root, prefix + "*")):
                 try:
-                    if not os.path.isdir(path):
-                        continue
-                    shutil.rmtree(path, ignore_errors=True)
+                    if os.path.isdir(path):
+                        shutil.rmtree(path, ignore_errors=True)
+                    else:
+                        try:
+                            freed += os.path.getsize(path)
+                        except OSError:
+                            pass
+                        os.remove(path)
                     if os.path.exists(path):
                         log.info("startup cleanup: %s locked (in use?)",
                                  path)
                     else:
+                        count += 1
                         log.info("startup cleanup: removed %s", path)
                 except Exception as exc:  # noqa: BLE001
                     log.warning("startup cleanup: %s failed: %r", path, exc)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if count:
+            log.info("startup cleanup: %d artifacts removed, "
+                     "%.1f MB freed", count, freed / 1e6)
     except Exception:  # noqa: BLE001
         pass
 
@@ -101,8 +118,9 @@ def main() -> int:
         setup_logging()
     except Exception:
         pass
-    # A crashed previous run can strand GB-sized DVR buffers in %TEMP%.
-    cleanup_stale_dvr_buffers()
+    # A crashed previous run can strand GB-sized DVR buffers and VOD
+    # splitter caches in %TEMP%.
+    cleanup_stale_temp_files()
     _setup_windows_identity()
     _setup_bundled_vlc()
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)

@@ -35,9 +35,11 @@ def subtitle_instance_args(appearance: dict) -> list:
 
     VLC 3 has NO runtime API for text-renderer styling — these options are
     read once when the freetype module loads, i.e. at vlc.Instance() creation
-    — so visual changes only take effect on the next app start (the delay is
-    the one exception: it has a live API, see set_spu_delay). An untouched
-    config returns [] so the player launches with VLC's exact defaults.
+    — so visual changes only take effect when the instance is rebuilt
+    (PlayerView._reapply_sub_style does that without an app restart; the
+    delay is the exception: it has a live API, see set_spu_delay). A size
+    of 0 with defaults otherwise returns [] so the player launches with
+    VLC's exact auto sizing.
     """
     ap = appearance or {}
     args = []
@@ -202,7 +204,7 @@ class VLCPlayer:
     # ---- playback ----
     def play_at(self, url: str, start_seconds: float = 0.0,
                 record_path: str = None,
-                append: bool = False) -> None:
+                append: bool = False, timeshift: bool = None) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
@@ -210,6 +212,11 @@ class VLCPlayer:
 
         ``record_path`` attaches a kept MPEG-TS recording file to the SAME
         single connection through VLC stream-output duplication.
+
+        ``timeshift`` (None = the instance default) must be False for
+        seekable VOD: VLC's input-timeshift runs the whole input through
+        its pause/rewind cache, which drifts A/V sync over a movie and
+        fights the local relay's single connection. Live needs it for DVR.
         """
         try:
             kind = "live" if url.startswith(("http://", "https://")) else "file"
@@ -247,13 +254,15 @@ class VLCPlayer:
             self.media.add_option(f":sout={sout}")
             if append:
                 self.media.add_option(":sout-file-append")
-        elif self.timeshift and url.startswith(("http://", "https://")):
-            # Timeshift for live inputs only (never for local buffer files),
-            # and only without a sout chain (timeshift + sout conflict).
+        elif (self.timeshift if timeshift is None else timeshift) \
+                and url.startswith(("http://", "https://")):
+            # Timeshift for live inputs only (never for local buffer files
+            # and never for seekable VOD), and only without a sout chain
+            # (timeshift + sout conflict).
             try:
                 self.media.add_option("input-timeshift=1")
                 self.media.add_option("timeshift-granularity=50")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001
                 try:
                     log.warning("play_at: add timeshift options failed: %r",
                                 exc)
@@ -267,8 +276,9 @@ class VLCPlayer:
         self.player.set_media(self.media)
         self.player.play()
 
-    def play(self, url: str) -> None:
-        self.play_at(url, 0.0)
+    def play(self, url: str, timeshift: bool = None,
+             start_seconds: float = 0.0) -> None:
+        self.play_at(url, start_seconds, timeshift=timeshift)
 
     def play_and_record(self, url: str, path: str, append: bool = False) -> None:
         """Backwards-compatible wrapper around play_at()."""

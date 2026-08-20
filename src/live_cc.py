@@ -16,6 +16,7 @@ on the shared content clock.
 import logging
 import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -31,7 +32,9 @@ _SRT_POLL_MS = 500      # finished-cue harvest
 
 
 def find_ccextractor() -> str:
-    """Locate CCExtractor (PATH, then the winget/MSI default location)."""
+    """Locate CCExtractor: an INSTALLED copy first (PATH, then the winget/
+    MSI default location), then the static build vendored in vendor/ as
+    the zero-install fallback (bundled into the PyInstaller release)."""
     for name in ("ccextractorwinfull", "ccextractor"):
         try:
             from shutil import which
@@ -50,6 +53,29 @@ def find_ccextractor() -> str:
             hits = glob.glob(pat)
             if hits:
                 return hits[0]
+    except Exception:  # noqa: BLE001
+        pass
+    return bundled_ccextractor()
+
+
+def bundled_ccextractor() -> str:
+    """Path of the vendored static CCExtractor (0.88 win build — a
+    self-contained exe, unlike the modern MSI build whose ffmpeg DLLs
+    it must not ship without). Checked LAST on purpose: whatever the
+    user installed wins; this only serves machines with nothing, so
+    releases get captions without any install step."""
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        cands = [os.path.join(root, "vendor", "ccextractorwin.exe")]
+        mep = getattr(sys, "_MEIPASS", None)   # PyInstaller onefile data
+        if mep:
+            cands.append(os.path.join(mep, "vendor", "ccextractorwin.exe"))
+        if getattr(sys, "frozen", False):      # dropped next to the exe
+            cands.append(os.path.join(os.path.dirname(sys.executable),
+                                      "vendor", "ccextractorwin.exe"))
+        for c in cands:
+            if os.path.isfile(c):
+                return c
     except Exception:  # noqa: BLE001
         pass
     return ""

@@ -213,6 +213,28 @@ def main():
     check("VOD does not engage the live filter",
           CCStarts == [] and not view.btn_dvr.isChecked())
 
+    # VOD splitter glue: routing through the relay must ALSO start the
+    # evaluation timer (the mute loop — its only other start() lives in
+    # dead legacy code, which is how the filter shipped inert)
+    class StubRelay(QtCore.QObject):
+        cue = QtCore.pyqtSignal(float, float, str)
+
+        def start(self, url, ua):
+            return "http://127.0.0.1:1/v"
+
+        def stop(self):
+            pass
+
+    pv_mod.VodRelay = StubRelay
+    local = view._effective_url("http://x/m.mkv", "vod")
+    check("VOD routes through the splitter when the filter is on",
+          local == "http://127.0.0.1:1/v" and view._vod_relay is not None)
+    check("VOD engagement starts the evaluation timer",
+          view._filter_timer.isActive())
+    view._stop_profanity()
+    check("teardown stops the VOD evaluation timer",
+          not view._filter_timer.isActive())
+
     view.current = {"kind": "live", "url": "http://x.ts", "title": "L"}
     view._on_media_for_profanity("live")
     check("live NEVER auto-engages DVR mode",
@@ -233,6 +255,8 @@ def main():
     check("caption reader started on the buffer",
           CCStarts and CCStarts[0][0] == "X:/buffer.ts"
           and view._cc_source is not None)
+    check("live caption engagement starts the evaluation timer",
+          view._filter_timer.isActive())
     check("reader joined at the content frontier",
           abs(CCStarts[0][1] - 42.0) < 0.01)
 
@@ -255,6 +279,8 @@ def main():
     view.apply_profanity_settings()
     check("disabling tears down the reader",
           view._cc_source is None and view._filter_engine.windows == [])
+    check("evaluation timer stops with the reader",
+          not view._filter_timer.isActive())
 
     # too-short cushion: reader skipped, setting untouched, notice shown
     CCStarts.clear()

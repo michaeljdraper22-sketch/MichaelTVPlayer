@@ -43,9 +43,9 @@ class ProfanityDialog(QtWidgets.QDialog):
             "setting behind live, at least 5 s; captions need the "
             "cushion). Shows always start live; nothing is ever engaged "
             "for you.\n"
-            "MOVIES & SERIES: automatic filtering is in the works — a "
-            "single-connection splitter that reads the file's own "
-            "subtitle track is built and in testing.\n"
+            "MOVIES & SERIES: the file's own subtitle track is read in "
+            "the background (no playback delay, no second connection) "
+            "and the audio is muted ahead of the dialogue.\n"
             "Subtitles do not need to be turned on. Requires CCExtractor "
             "installed for live TV. DVB (image) subtitle channels are not "
             "covered.")

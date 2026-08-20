@@ -36,10 +36,10 @@ def temp_config() -> Config:
 def main():
     app = QtWidgets.QApplication(sys.argv)
 
-    print("[1] config defaults = VLC's current look")
+    print("[1] config defaults = VLC's current look + a concrete size")
     d = SUBTITLE_DEFAULTS
-    check("no delay, auto size, default font", d["delay_ms"] == 0
-          and d["size"] == 0 and d["font"] == "")
+    check("no delay, numeric default size, default font",
+          d["delay_ms"] == 0 and d["size"] == 40 and d["font"] == "")
     check("no background, white text, black outline on",
           not d["bg_enabled"] and d["text_color"] == "#FFFFFF"
           and d["outline_enabled"] and d["outline_thickness"] == 4)
@@ -50,12 +50,13 @@ def main():
     check("setter keeps unknown keys out and merges",
           cfg.subtitle_appearance["font"] == "Arial"
           and cfg.subtitle_appearance["delay_ms"] == -250
-          and cfg.subtitle_appearance["size"] == 0)
+          and cfg.subtitle_appearance["size"] == 40)
 
-    print("[2] argument builder — defaults must emit NOTHING")
-    check("all-default config -> no VLC args",
-          subtitle_instance_args(SUBTITLE_DEFAULTS) == [])
-    check("empty dict -> no VLC args", subtitle_instance_args({}) == [])
+    print("[2] argument builder — the default size is emitted explicitly")
+    check("all-default config -> just the size arg",
+          subtitle_instance_args(SUBTITLE_DEFAULTS)
+          == ["--freetype-fontsize=40"])
+    check("size 0 (Auto) -> no VLC args", subtitle_instance_args({}) == [])
     args = subtitle_instance_args({
         "font": "Segoe UI", "size": 24, "pos_pct": 50,
         "text_color": "#FF0000"})

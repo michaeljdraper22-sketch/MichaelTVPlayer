@@ -18,7 +18,7 @@ SUBTITLE_KEYS = (
 SUBTITLE_DEFAULTS = {
     "delay_ms": 0,            # + shows subtitles LATER, − earlier (applied live)
     "font": "",               # "" = VLC's default font
-    "size": 0,                # px; 0 = auto (scales with the video)
+    "size": 40,               # px at 1080p; 0 = auto (scales with video)
     "pos_pct": 0,             # −100..100, 0 = default bottom placement
     "text_color": "#FFFFFF",
     "bg_enabled": False,      # backing box behind the text
@@ -111,6 +111,18 @@ class Config:
                     data.update(loaded)
             except Exception:
                 pass
+        # one-time migration: the old default size 0 (VLC "auto") became a
+        # concrete number, so the setting starts somewhere tunable — 0/Auto
+        # can still be chosen explicitly afterwards (marker stops this from
+        # overriding a deliberate Auto on later launches). Copy first:
+        # DEFAULTS' inner dicts are shared objects.
+        sub = data.get("subtitle_appearance")
+        if isinstance(sub, dict):
+            sub = dict(sub)
+            if not data.get("_sub_size_migrated") and sub.get("size", 0) == 0:
+                sub["size"] = SUBTITLE_DEFAULTS["size"]
+            data["subtitle_appearance"] = sub
+        data["_sub_size_migrated"] = True
         return cls(data, path)
 
     def save(self) -> None:

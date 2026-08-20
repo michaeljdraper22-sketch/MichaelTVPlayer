@@ -83,6 +83,7 @@ def main():
     relay2.stop()
 
     print("[2] byte fidelity + range requests through the relay")
+    opens_before = relay.provider_opens
     status, body = get(local)
     check("full GET streams the whole file",
           status == 200 and body[:4] == b"\x1a\x45\xdf\xa3")
@@ -94,6 +95,9 @@ def main():
         _, body = get(local)
     check("relayed bytes identical to the source file",
           body == sample)
+    check("one provider connection serves the whole file "
+          "(no reopen-per-chunk)",
+          relay.provider_opens - opens_before <= 1)
     status, part = get(local, rng=f"bytes=100-199")
     check("range request served from cache",
           status == 206 and part == sample[100:200])
@@ -115,6 +119,7 @@ def main():
           abs(hell[0] - 1.0) < 0.3 and abs(hell[1] - 4.0) < 0.3)
 
     print("[4] VLC plays through the relay (and seeks)")
+    opens_before = relay.provider_opens
     p = VLCPlayer(timeshift=False)
     p.play(local)
     ok_play = False
@@ -134,13 +139,37 @@ def main():
     time.sleep(3.0)
     app.processEvents()
     t = p.get_time()
-    print(f"    (seek debug: t={t})")
+    print(f"    (seek debug: t={t}, provider_opens="
+          f"{relay.provider_opens - opens_before})")
     check("seek lands through the relay", 5500 <= t <= 9500)
+    check("seek needs no provider reopen (cached window)",
+          relay.provider_opens - opens_before <= 1)
     p.stop_and_release()
 
     relay.stop()
     time.sleep(0.5)
     check("cache file cleaned up", not os.path.exists(relay.cache_path or "x"))
+
+    print("[4] unexpected start() failure must not leak the cache file")
+    import glob
+    import tempfile as _tf
+
+    def _split_caches():
+        return set(glob.glob(
+            os.path.join(_tf.gettempdir(), "mtp_split_*")))
+
+    before = _split_caches()
+    relay3 = VodRelay()
+
+    def _boom():
+        raise RuntimeError("simulated probe crash")
+    relay3._probe_head = _boom
+    local3 = relay3.start("file:///definitely/not/here.mkv", "test/ua")
+    check("crashed start returns '' (direct-playback fallback)",
+          local3 == "")
+    check("crashed start leaves no mtp_split_* cache behind",
+          _split_caches() == before)
+    relay3.stop()
 
     print()
     if FAIL:
