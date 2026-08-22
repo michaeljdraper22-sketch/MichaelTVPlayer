@@ -1,0 +1,39 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.1s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    L(t) profile: const(1.5s)
+  [m1] +5 s anchor/store displacement injected at VT=1000618.4 (held via edge bias)
+    calibration m0=-0.17s m0r=-0.17s (150 samples)
+    drift: painted=577 n=577 |perr| p50=4.07 p95=5.30 max=5.57 exact=0/577 ambig=383 nomatch=0 maxstop=0.8s rebases=0 diag[neighbor=481/577]
+  FAIL a: drift painted displacement p95 <= 1.5 s   [p95=5.30]
+  FAIL a: drift exact-window text >= 85%   [0/577 ambig=383 nomatch=0]
+  ok   a: no silent-stop over 6 s during drift   [max=0.8s]
+  ok   a: wedge applied (+5 s anchor & store)
+  ok   a: no blank beyond the watchdog window after data returns   [max=0.6s]
+    post-wedge verify: painted=100 n=100 |perr| p50=5.51 p95=5.86 max=6.06 exact=0/100 ambig=100 nomatch=0 maxstop=0.0s rebases=1 diag[neighbor=911/1099]
+  FAIL a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)   [backlog=13s rebased=True walkoff_within1.5=0% of 274 heal_within1.5=0% of 148 verify_p95=5.86 verify_within1.5=0%]
+  ok   a: no pipeline exceptions
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    L(t) profile: const(1.5s)
+    f: steady: painted=692 n=692 |perr| p50=4.98 p95=5.45 max=5.65 exact=0/692 ambig=34 nomatch=0 maxstop=0.8s rebases=0 diag[neighbor=492/692]
+  FAIL f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=5.45 max=5.65]
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+    f: scrubbed-back region: painted=163 n=163 |perr| p50=5.00 p95=5.15 max=5.16 exact=0/163 ambig=129 nomatch=0 maxstop=4.0s rebases=0 diag[neighbor=644/855]
+  FAIL f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=5.15]
+  FAIL f: scrubbed-back exact-window text >= 85%   [0/163 ambig=129]
+    f: post-rebase stability: painted=81 n=81 |perr| p50=4.54 p95=4.64 max=4.64 exact=0/81 ambig=81 nomatch=0 maxstop=2.4s rebases=2 diag[neighbor=723/936]
+  FAIL f: rebased store stays coherent behind the head (outcome)   [p95=4.64 exact=0/81]
+  ok   f: delay_ms shifts the painted cue live (+1.5 s, direction-neutral)   [probe@+0.0s base=2ln shifted=2ln]
+  ok   f: no pipeline exceptions
+
+7/14 checks passed (mechanism 7/14, data-limited 0/0)
+  FAILED: a: drift painted displacement p95 <= 1.5 s
+  FAILED: a: drift exact-window text >= 85%
+  FAILED: a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)
+  FAILED: f: steady painted cues stable (p95 <= 1.5, max <= 2.5)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)
+mutation m1 on scenarios a,f: 7 passed, 7 failed (exit 1)

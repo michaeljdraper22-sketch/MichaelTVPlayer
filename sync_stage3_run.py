@@ -95,9 +95,16 @@ def raw_s():
 CHECKS = []
 
 
-def check(name, cond, detail=""):
-    CHECKS.append((name, bool(cond)))
+def check(name, cond, detail="", kind="mechanism"):
+    """Record one acceptance check. ``kind`` labels regime dependence
+    (WP0): *mechanism* checks must pass in every provider regime;
+    *data-limited* checks are gated on the measured delivery regime
+    (frontier growth / caption lag L) and quote their gate in ``detail``
+    — provider weather can then never mask a mechanism regression, and a
+    mechanism failure is never excused as weather."""
+    CHECKS.append((name, bool(cond), kind))
     print(f"  {'ok  ' if cond else 'FAIL'} {name}"
+          + ("" if kind == "mechanism" else f"  [{kind}]")
           + (f"  [{detail}]" if detail else ""), flush=True)
 
 
@@ -381,9 +388,14 @@ try:
     else:
         run_vod()
 finally:
-    npass = sum(1 for _, ok in CHECKS if ok)
-    print(f"\nchecks: {npass}/{len(CHECKS)} passed", flush=True)
-    for name, ok in CHECKS:
+    npass = sum(1 for _, ok, _k in CHECKS if ok)
+    mech = [c for c in CHECKS if c[2] == "mechanism"]
+    dlim = [c for c in CHECKS if c[2] == "data-limited"]
+    print(f"\nchecks: {npass}/{len(CHECKS)} passed "
+          f"(mechanism {sum(1 for c in mech if c[1])}/{len(mech)}, "
+          f"data-limited {sum(1 for c in dlim if c[1])}/{len(dlim)})",
+          flush=True)
+    for name, ok, _k in CHECKS:
         if not ok:
             print("  FAILED:", name, flush=True)
     try:

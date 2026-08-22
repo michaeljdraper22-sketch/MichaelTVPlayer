@@ -546,13 +546,70 @@ view._cap_clock_s = 0.0             # back to no-VLC-clock mode for the
 view._vid_s = 60.0                  # remaining _vid_s-fallback tests
 view._cap_raw_s = None
 
-# delay applies live (arithmetic, no rebuild)
+# delay applies live (arithmetic, no rebuild). POSITIVE = LATER — the
+# overlay must agree with config.py's wording, the +/- tooltip and VLC's
+# own spu-delay path (player.py: positive ms = later): the tick queries
+# the store at t - delay, holding every cue back by the delay.
+view._cap_cues.clear()              # isolate the probe from the anchored
+view._cap_cues.add(80.0, 82.0, "delay probe cue")   # live-cue windows
 cfg.subtitle_appearance = dict(cfg.subtitle_appearance, delay_ms=2000)
-view._vid_s = c0 - 1.5              # +2 s of delay lands inside the cue
-view._caption_tick()
-check("positive delay shows the cue 2 s early-at-position",
-      view._cap_wid._lines == ["fresh successor after the burst"])
+check("positive delay holds the cue back at its true position (+ = later)",
+      _show_at(80.5) == [])
+check("positive delay shows the cue 2 s past its true window",
+      _show_at(83.5) == ["delay probe cue"])
 cfg.subtitle_appearance = dict(cfg.subtitle_appearance, delay_ms=0)
+check("delay 0 paints the true window again",
+      _show_at(80.5) == ["delay probe cue"])
+
+# _caption_tick stays non-fatal on errors, but never SILENT: each
+# DISTINCT error logs once (repeats suppressed; a new error logs once
+# more)
+import logging as _logging  # noqa: E402
+_tick_log = []
+
+
+class _TickLogCatcher(_logging.Handler):
+    def emit(self, record):
+        _tick_log.append(record.getMessage())
+
+
+_tick_handler = _TickLogCatcher()
+pv_mod.log.addHandler(_tick_handler)
+
+
+class _BoomCues:
+    cues = []
+
+    def clear(self):
+        pass
+
+    def text_at(self, _t):
+        raise RuntimeError("tick-boom")
+
+
+_real_cues = view._cap_cues
+try:
+    view._cap_cues = _BoomCues()
+    for _ in range(3):                # the SAME error three times…
+        view._caption_tick()
+
+    class _BoomCues2(_BoomCues):
+        def text_at(self, _t):
+            raise KeyError("tick-other-boom")
+
+    view._cap_cues = _BoomCues2()
+    view._caption_tick()              # …then a DIFFERENT error
+finally:
+    view._cap_cues = _real_cues
+    pv_mod.log.removeHandler(_tick_handler)
+view._caption_tick()                  # healthy store again: still painting
+check("caption tick survives the errors (paints again after)",
+      view._cap_wid._lines == ["delay probe cue"])
+_tick_errs = [m for m in _tick_log if "tick failed" in m]
+check("caption tick errors logged once per distinct error",
+      len(_tick_errs) == 2
+      and sum("tick-boom" in m for m in _tick_errs) == 1
+      and sum("tick-other-boom" in m for m in _tick_errs) == 1)
 
 # _enforce_spu keeps VLC's spu off while the overlay owns captions
 view._spu_want = 2
@@ -663,6 +720,74 @@ view._cap_vod_tries = 0
 view._cap_vod_check()
 check("dead tap (no track metadata) hands captions back to VLC",
       view._cap_fail and not view._cap_on and fake.spu == 5)
+
+print("[5c] stale relay deliveries never touch the next movie's store")
+# VodRelay emits cue/failed from its worker threads over queued
+# connections. play_media's teardown (relay disconnect+stop, store clear,
+# session bump) races emissions that were already in flight — and
+# `failed` isn't disconnected at all — so a delivery from the PREVIOUS
+# media's relay can land after the next movie attached its own relay:
+# stray caption, phantom profanity-mute window, cap_fail latched against
+# a healthy new relay. The handlers must drop anything that isn't from
+# the current media's relay. relay_a's connections stay live to model
+# that in-flight delivery (this Qt build purges pending events on
+# disconnect; the race window is an emit racing the disconnect itself).
+class _StaleRelay(QtCore.QObject):
+    cue = QtCore.pyqtSignal(float, float, str)
+    failed = QtCore.pyqtSignal(str)
+
+    def stop(self):
+        pass
+
+    def deleteLater(self):
+        pass
+
+
+relay_a = _StaleRelay()
+relay_a.cue.connect(view._on_vod_cue)
+relay_a.failed.connect(view._cap_relay_failed)
+view._vod_relay = relay_a
+view._cap_relay_gen = view._session          # the attach marker
+view._cap_on = True                          # movie A: overlay engaged
+# --- play_media teardown for movie B: overlay released, store cleared,
+# --- session bumped, then a FRESH relay attached for the new media
+view._cap_fail = False
+view._cap_cues.clear()
+view._filter_engine.clear()
+view._filter_engine.words = [("hell", "exact")]   # a delivered stale cue
+#                                                 # would open a window
+view._session += 1
+relay_b = _StaleRelay()
+relay_b.cue.connect(view._on_vod_cue)
+relay_b.failed.connect(view._cap_relay_failed)
+view._vod_relay = relay_b
+view._cap_relay_gen = view._session
+# the stale deliveries arrive NOW, queued from relay A's worker thread
+_stale_done = threading.Event()
+
+
+def _stale_emit():
+    relay_a.cue.emit(500.0, 502.0, "previous movie hell line")
+    relay_a.failed.emit("tap reader died during teardown")
+    _stale_done.set()
+
+
+_stale_thread = threading.Thread(target=_stale_emit)
+_stale_thread.start()
+_stale_done.wait()
+_stale_thread.join()
+app.processEvents()                          # stale queued events land
+check("stale cue from the previous relay never lands in the store",
+      not view._cap_cues.cues)
+check("stale cue opens no phantom profanity-mute window",
+      not view._filter_engine.windows)
+check("stale relay failure does not latch against the new media",
+      not view._cap_fail)
+relay_a.cue.disconnect()
+relay_a.failed.disconnect()
+relay_b.cue.disconnect()
+relay_b.failed.disconnect()
+view._set_cap_on(False)
 
 view._vod_relay = None
 view.current = {"kind": "live", "url": "http://x/s.ts", "title": "L"}

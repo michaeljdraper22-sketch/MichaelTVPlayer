@@ -35,7 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PyQt5 import QtCore
 
-from .mkv_subs import MkvSubParser
+from .mkv_subs import MkvSubParser, _vint_size
 from .mp4_subs import Mp4SubParser
 
 log = logging.getLogger("mtp")
@@ -92,6 +92,30 @@ _TAP_RESTART_BACK_BYTES = 24 << 20
 # replacing it. Real-provider seeks resume in ~2 s (one provider reopen,
 # the rest is VLC's own re-buffer).
 VOD_SPLITTER_READY = True
+
+
+def _snap_cluster(buf: bytes) -> int:
+    """Offset of the first plausibly-real Cluster header in ``buf``:
+    the magic plus a size vint that fits the buffer, followed by the
+    next cluster header (or the buffer end). A mid-file prefetch
+    boundary starts MID-ELEMENT — the parser's size decode of that
+    garbage can exceed 1 MB and its stream-skip then swallows the whole
+    region without ever resyncing, so the harvest must anchor on a
+    validated header instead of feeding from offset 0. Falls back to
+    the first magic whose size merely fits, else -1."""
+    magic = b"\x1f\x43\xb6\x75"
+    first_fit = -1
+    i = buf.find(magic)
+    while i >= 0:
+        size, slen = _vint_size(buf, i + 4, keep_marker=False)
+        if size is not None and size > 0 and i + 4 + slen + size <= len(buf):
+            if first_fit < 0:
+                first_fit = i
+            j = i + 4 + slen + size
+            if j == len(buf) or buf[j:j + 4] == magic:
+                return i
+        i = buf.find(magic, i + 1)
+    return first_fit
 
 
 class _ProviderStream:
@@ -191,10 +215,13 @@ class VodRelay(QtCore.QObject):
         self._tap_restart = False   # re-select the tap's track on the
         #                            # next loop pass (set_prefer_language)
         self.parser_tracks = {}     # {mkv track number: codec id} — the
-        #                            # UI reads this to learn which tracks
-        #                            # are text the parser can flatten
+        #                               # UI reads this to learn which tracks
+        #                               # are text the parser can flatten
         self.parser_tracks_meta = {}   # full {number: {codec,lang,name}}
         self.parser_selected = None
+        self.parser_scale_ns = 1_000_000   # Info TimecodeScale seen by the
+        #                                      # tap (seeds mid-stream parsers)
+        self._tail_harvested = False  # one-shot tail-region parse ran
         # startup/off the UI thread: start() returns after the probe; the
         # head fetch + tail prefetch + main acquire happen on a thread and
         # handlers wait for _ready (bounded) so playback simply buffers
@@ -229,6 +256,8 @@ class VodRelay(QtCore.QObject):
         self.ua = ua or self.ua
         self._prefer = (prefer_language or "eng").lower() or "eng"
         self._tap_restart = False
+        self._tail_harvested = False
+        self.parser_scale_ns = 1_000_000
         self._start_offset = max(0, int(start_offset))
         try:
             # ONE tiny request settles the container + the total size.
@@ -372,6 +401,7 @@ class VodRelay(QtCore.QObject):
             self.parser_tracks = {num: m["codec"]
                                   for num, m in parser._track_meta.items()}
             self.parser_selected = parser._selected
+            self.parser_scale_ns = parser._tc_scale_ns
         tlog("head ride: %d bytes, %d tracks, selected=%r",
              len(buf), len(self.parser_tracks), self.parser_selected)
 
@@ -381,6 +411,10 @@ class VodRelay(QtCore.QObject):
         if self._server is not None:
             try:
                 self._server.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._server.server_close()   # free the listening socket
             except Exception:  # noqa: BLE001
                 pass
             self._server = None
@@ -494,6 +528,8 @@ class VodRelay(QtCore.QObject):
         already being read by another handler is closed and replaced:
         two threads reading one response interleave bytes and corrupt
         the cache."""
+        if not self._alive:
+            return None       # a stopped relay opens no provider streams
         with self._lock:
             st = self._stream
             if st is not None and not st.dead and st.offset == offset \
@@ -614,21 +650,29 @@ class VodRelay(QtCore.QObject):
         fallback the tap would never see text samples that live there —
         ALL of them when a small file fits inside the tail prefetch. The
         head region likewise: a window starting past 0 (resume /
-        mid-movie engage) never re-caches bytes 0..len(_head)."""
-        data = self.read_cache(offset, n)
-        if len(data) >= n:
-            return data
-        if self._head and offset < len(self._head):
-            part = self._head[offset:offset + n]
-            return part if not data else data + part
-        if self._tail_base < 0:
-            return data
-        tail_end = self._tail_base + len(self._tail)
-        if offset >= tail_end or offset + n > tail_end:
-            return data             # the hole is not a tail-region hole
-        part = self._tail[max(0, offset - self._tail_base):
-                          offset - self._tail_base + n]
-        return (data + part) if offset < self._tail_base else part
+        mid-movie engage) never re-caches bytes 0..len(_head). Regions
+        are stitched only where contiguous in file space (a sample may
+        straddle the cache->tail seam); a read that starts in, or runs
+        into, an uncached HOLE returns just the readable prefix — never
+        bytes from the wrong file position."""
+        out = bytearray()
+        while len(out) < n:
+            if self.cache_base <= offset \
+                    < self.cache_base + self.cache_size:
+                take = self.read_cache(offset, n - len(out))
+            elif self._head and offset < len(self._head):
+                take = self._head[offset:offset + (n - len(out))]
+            elif self._tail_base >= 0 and self._tail_base <= offset \
+                    < self._tail_base + len(self._tail):
+                i = offset - self._tail_base
+                take = self._tail[i:i + (n - len(out))]
+            else:
+                break
+            if not take:
+                break
+            out += take
+            offset += len(take)
+        return bytes(out)
 
     # ---- subtitle tap (streams the LOCAL cache into the parsers) ----
     def _start_ffmpeg_tap(self, mid_stream: bool = False):
@@ -642,7 +686,8 @@ class VodRelay(QtCore.QObject):
                              name="mtp-tap").start()
             return
         parser = MkvSubParser(prefer_language=self._prefer,
-                              mid_stream=mid_stream)
+                              mid_stream=mid_stream,
+                              timecode_scale_ns=self.parser_scale_ns)
         if mid_stream and self.parser_tracks_meta:
             parser._track_meta = {num: dict(m) for num, m
                                   in self.parser_tracks_meta.items()}
@@ -677,6 +722,8 @@ class VodRelay(QtCore.QObject):
         while self._alive or pos < self.cache_size:
             if self._tap_restart:
                 self._tap_restart = False
+                self._tail_harvested = False   # re-harvest in the new
+                #                                   # language below
                 tlog("tap restart: prefer=%r cache_base=%d cache_size=%d",
                      self._prefer, self.cache_base, self.cache_size)
                 # fresh parser with the new preference, re-anchored a
@@ -690,10 +737,13 @@ class VodRelay(QtCore.QObject):
                     if self.parser_tracks_meta else \
                     (dict(parser._track_meta) if parser._track_meta
                      else None)
+                self.parser_scale_ns = getattr(parser, "_tc_scale_ns",
+                                               self.parser_scale_ns)
                 pos = max(0, self.cache_size - _TAP_RESTART_BACK_BYTES)
                 parser = self._parser = MkvSubParser(
                     prefer_language=self._prefer,
-                    mid_stream=(self.cache_base > 0 or pos > 0))
+                    mid_stream=(self.cache_base > 0 or pos > 0),
+                    timecode_scale_ns=self.parser_scale_ns)
                 if keep:
                     parser._track_meta = {n: dict(m)
                                           for n, m in keep.items()}
@@ -716,8 +766,11 @@ class VodRelay(QtCore.QObject):
                     if self.parser_tracks_meta else \
                     (dict(parser._track_meta) if parser._track_meta
                      else None)
+                self.parser_scale_ns = getattr(parser, "_tc_scale_ns",
+                                               self.parser_scale_ns)
                 parser = self._parser = MkvSubParser(
-                    prefer_language=self._prefer, mid_stream=True)
+                    prefer_language=self._prefer, mid_stream=True,
+                    timecode_scale_ns=self.parser_scale_ns)
                 if keep_meta:
                     parser._track_meta = {n: dict(m)
                                           for n, m in keep_meta.items()}
@@ -734,6 +787,30 @@ class VodRelay(QtCore.QObject):
                 self.parser_tracks = {n: m["codec"]
                                       for n, m in parser._track_meta.items()}
                 self.parser_selected = parser._selected
+            if parser._track_meta:
+                self.parser_scale_ns = parser._tc_scale_ns
+            if self._tail and self._tail_base >= 0 \
+                    and not self._tail_harvested \
+                    and (self.parser_tracks_meta or parser._track_meta):
+                # One-shot harvest of the prefetched tail: VLC's reads of
+                # the tail region are served straight from _tail and NEVER
+                # enter the cache, so the sequential parse above can never
+                # reach those clusters — captions stopped for the last
+                # _TAIL_PREFETCH bytes of every MKV, and a seek landing
+                # inside the region never rebased the window (tail bytes
+                # cost no provider stream), leaving the tap anchored
+                # elsewhere with its parser starved. Cluster timecodes are
+                # absolute, so a mid-stream parser resynced inside the
+                # tail emits cues on the file's own clock; re-emitted cues
+                # dedupe downstream on (start, text).
+                self._tail_harvested = True
+                meta = {n: dict(m) for n, m in
+                        (self.parser_tracks_meta or parser._track_meta)
+                        .items()}
+                threading.Thread(
+                    target=self._tap_tail_harvest,
+                    args=(self._prefer, meta, self.parser_scale_ns),
+                    daemon=True, name="mtp-tap-tail").start()
             if pos < self.cache_size:
                 data = self.read_cache(self.cache_base + pos, _CHUNK)
                 if data:
@@ -765,7 +842,8 @@ class VodRelay(QtCore.QObject):
         the window rebases (a seek moved it) — the live tap owns the new
         window then. Window-relative reads only; no provider traffic."""
         import time
-        parser = MkvSubParser(prefer_language=prefer, mid_stream=base > 0)
+        parser = MkvSubParser(prefer_language=prefer, mid_stream=base > 0,
+                              timecode_scale_ns=self.parser_scale_ns)
         if meta:
             parser._track_meta = {n: dict(m) for n, m in meta.items()}
             parser._select_track()
@@ -788,6 +866,41 @@ class VodRelay(QtCore.QObject):
             for cue in made:
                 self.cue.emit(*cue)
         tlog("tap backfill done: %d bytes @%d", pos, base)
+
+    def _tap_tail_harvest(self, prefer: str, meta, scale_ns: int):
+        """One-shot side parse of the prefetched tail region (spawned by
+        _tap_cache once track metadata exists; re-run on a language
+        switch). Window-independent — _tail is a prefetch snapshot that
+        never rebases — and costs no provider traffic."""
+        import time
+        parser = MkvSubParser(prefer_language=prefer, mid_stream=True,
+                              timecode_scale_ns=scale_ns)
+        if meta:
+            parser._track_meta = {n: dict(m) for n, m in meta.items()}
+            parser._select_track()
+            parser._saw_tracks = True
+        pos = 0
+        tail = self._tail
+        start = _snap_cluster(tail)
+        if start < 0:
+            tlog("tail harvest: no cluster header found in %d bytes",
+                 len(tail))
+            return
+        tlog("tail harvest: snapped to cluster @%d (region %d bytes)",
+             start, len(tail))
+        while self._alive and start + pos < len(tail):
+            data = tail[start + pos:start + pos + _CHUNK]
+            pos += len(data)
+            try:
+                made = parser.feed(data)
+            except Exception:  # noqa: BLE001
+                return
+            for cue in made:
+                tlog("tail cue @%.1f-%.1f %r", cue[0], cue[1],
+                     cue[2][:30])
+                self.cue.emit(*cue)
+        tlog("tail harvest done: %d bytes @%d selected=%r", pos,
+             self._tail_base + start, parser._selected)
 
     def _tap_cache_mp4(self):
         """Thread: the MP4 tap. The moov index comes from the prefetched

@@ -1,0 +1,17 @@
+  [m2] constant +3 s caption-clock skew injected
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.1s)
+
+== scenario b: pause 60 s -> resume +25 s step (3 cycles) ==
+    L(t) profile: const(1.5s)
+    b (3 cycles): painted=4121 n=4121 |perr| p50=2.11 p95=3.46 max=4.77 exact=82/4121 ambig=3382 nomatch=0 maxstop=8.8s rebases=0 diag[neighbor=4121/4121]
+  ok   b: divergence recorded for each +25 s step (accumulates to ~75)   [div=+74.7 want~+75]
+  FAIL b: painted cues coherent through pause/resume/step (p95 <= 1.5)   [p95=3.46]
+  FAIL b: no silent-stop beyond watchdog window (~5+3 s)   [max=8.8s]
+  ok   b: 3 pause cycles executed
+  ok   b: no pipeline exceptions
+
+3/5 checks passed (mechanism 3/5, data-limited 0/0)
+  FAILED: b: painted cues coherent through pause/resume/step (p95 <= 1.5)
+  FAILED: b: no silent-stop beyond watchdog window (~5+3 s)
+mutation m2 on scenarios b: 3 passed, 2 failed (exit 1)

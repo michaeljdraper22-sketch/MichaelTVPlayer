@@ -43,6 +43,10 @@ SRT_IN = os.path.abspath("build/split_test_in.srt").replace("\\", "/")
 MP4 = os.path.abspath("build/split_test.mp4").replace("\\", "/")
 MP4_FS = os.path.abspath("build/split_test_fs.mp4").replace("\\", "/")
 SRT_M_IN = os.path.abspath("build/split_test_mp4_in.srt").replace("\\", "/")
+TAIL_MKV = os.path.abspath("build/split_test_tail.mkv").replace("\\", "/")
+TAIL_SRT_IN = os.path.abspath("build/split_test_tail_in.srt").replace("\\", "/")
+SCALE_MKV = os.path.abspath("build/split_test_scale.mkv").replace("\\", "/")
+ELST_MP4 = os.path.abspath("build/split_test_elst.mp4").replace("\\", "/")
 
 
 def build_sample():
@@ -83,6 +87,117 @@ def build_sample_mp4():
              "-preset", "ultrafast", "-c:s", "mov_text",
              "-metadata:s:s:0", "language=eng"] + extra + [dst],
             check=True, timeout=120, creationflags=0x08000000)
+
+
+def build_tail_sample():
+    """A ~4.7 MB MKV whose late cues live INSIDE the 2.5 MB tail prefetch:
+    noise + CBR keeps the bitrate (and therefore byte offsets) predictable,
+    so the t>=60s subtitle clusters land past total-_TAIL_PREFETCH while
+    the t=1s cue stays inside the 512 KB head-ride region. This is the
+    regression shape for "MKV captions stop in the last ~2.5 MB"."""
+    with open(TAIL_SRT_IN, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:01,000 --> 00:00:03,000\n"
+                "early head cue\n\n"
+                "2\n00:01:00,000 --> 00:01:02,000\n"
+                "late tail alpha\n\n"
+                "3\n00:01:03,000 --> 00:01:05,000\n"
+                "late tail beta\n\n"
+                "4\n00:01:26,000 --> 00:01:28,000\n"
+                "late tail gamma\n")
+    subprocess.run(
+        [FF, "-y", "-v", "error",
+         "-f", "lavfi", "-i", "color=c=steelblue:s=256x144:d=90:r=10",
+         "-i", TAIL_SRT_IN,
+         "-vf", "noise=alls=18:allf=t",
+         "-map", "0:v", "-map", "1:s", "-c:v", "libx264",
+         "-preset", "ultrafast",
+         "-b:v", "420k", "-minrate", "420k", "-maxrate", "420k",
+         "-bufsize", "84k", "-x264-params", "nal-hrd=cbr",
+         "-c:s", "srt", TAIL_MKV],
+        check=True, timeout=300, creationflags=0x08000000)
+
+
+def build_scale_sample():
+    """Copy of the base MKV with Info/TimestampScale patched 1e6 -> 2e6
+    ns (same 3-byte width, so no element shifts): every cluster/block
+    timecode now means 2 ms, so a scale-honoring parser must report the
+    1 s SRT cue at 2.0 s; one that hardcodes milliseconds says 1.0 s."""
+    blob = bytearray(open(MKV, "rb").read())
+    pat = b"\x2a\xd7\xb1\x83\x0f\x42\x40"      # TimecodeScale, 1e6
+    i = bytes(blob).find(pat)
+    assert i > 0, "no default TimestampScale element found to patch"
+    blob[i + 4:i + 7] = (2_000_000).to_bytes(3, "big")
+    with open(SCALE_MKV, "wb") as f:
+        f.write(blob)
+
+
+def build_elst_sample():
+    """Plain mov_text MP4 with the TEXT trak's elst media_time patched
+    0 -> 0.7 s worth of media ticks (same field width, no size changes):
+    an edit-list-honoring parser must shift every cue 0.7 s earlier
+    (1.0 s SRT cue -> 0.3 s); one that ignores elst says 1.0 s. ffmpeg
+    itself always writes media_time=0, hence the patch."""
+    with open(SRT_M_IN, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:01,000 --> 00:00:03,000\n"
+                "what the hell is this\n\n"
+                "2\n00:00:05,000 --> 00:00:07,000\n"
+                "clean as snow\n\n"
+                "3\n00:00:09,000 --> 00:00:11,000\n"
+                "damn dogs everywhere\n")
+    subprocess.run(
+        [FF, "-y", "-v", "error",
+         "-f", "lavfi", "-i", "color=c=seagreen:s=256x144:d=12:r=10",
+         "-i", SRT_M_IN,
+         "-map", "0:v", "-map", "1:s", "-c:v", "libx264",
+         "-preset", "ultrafast", "-c:s", "mov_text",
+         "-metadata:s:s:0", "language=eng", ELST_MP4],
+        check=True, timeout=120, creationflags=0x08000000)
+    from src.mp4_subs import _boxes
+    blob = bytearray(open(ELST_MP4, "rb").read())
+    patched = 0
+    for typ, s, e in _boxes(blob, 0, len(blob)):
+        if typ != b"moov":
+            continue
+        for t2, s2, e2 in _boxes(blob, s, e):
+            if t2 != b"trak":
+                continue
+            hdlr = stsd = b""
+            timescale = 0
+            elst_at = None
+            for t3, s3, e3 in _boxes(blob, s2, e2):
+                if t3 == b"edts":
+                    for t4, s4, e4 in _boxes(blob, s3, e3):
+                        if t4 == b"elst":
+                            elst_at = s4
+                elif t3 != b"mdia":
+                    continue
+                for t4, s4, e4 in _boxes(blob, s3, e3):
+                    if t4 == b"hdlr":
+                        hdlr = bytes(blob[s4 + 8:s4 + 12])
+                    elif t4 == b"mdhd":
+                        off = 12 if blob[s4] == 0 else 20
+                        timescale = int.from_bytes(
+                            blob[s4 + off:s4 + off + 4], "big")
+                    elif t4 == b"minf":
+                        for t5, s5, e5 in _boxes(blob, s4, e4):
+                            if t5 != b"stbl":
+                                continue
+                            for t6, s6, e6 in _boxes(blob, s5, e5):
+                                if t6 == b"stsd":
+                                    stsd = bytes(blob[s6 + 12:s6 + 16])
+            if (hdlr not in (b"sbtl", b"text", b"subt")
+                    and stsd != b"tx3g") or elst_at is None:
+                continue
+            assert timescale > 0, "no mdhd timescale for the text trak"
+            ticks = int(0.7 * timescale)      # 0.7 s in media ticks
+            if blob[elst_at] == 0:
+                blob[elst_at + 12:elst_at + 16] = ticks.to_bytes(4, "big")
+            else:
+                blob[elst_at + 16:elst_at + 24] = ticks.to_bytes(8, "big")
+            patched += 1
+    assert patched == 1, f"expected one text-trak elst, patched {patched}"
+    with open(ELST_MP4, "wb") as f:
+        f.write(blob)
 
 
 def get(url, rng=None):
@@ -163,6 +278,9 @@ def main():
     assert FF, "ffmpeg not found"
     build_sample()
     build_sample_mp4()
+    build_tail_sample()
+    build_scale_sample()
+    build_elst_sample()
     sample = open(MKV, "rb").read()
     app = QtWidgets.QApplication(sys.argv)
 
@@ -256,6 +374,10 @@ def main():
           == "Real, commas, kept")
     check("ffmpeg field-style payload reduced to its text",
           flatten_ass_text("0,0,Default,,0,0,0,,what the hell is this")
+          == "what the hell is this")
+    check("bare full dialogue (10 fields) reduced to its text",
+          flatten_ass_text("0,0:00:01.00,0:00:02.00,Default,,0,0,0,"
+                           ",what the hell is this")
           == "what the hell is this")
     check("plain comma text left alone",
           flatten_ass_text("one, two, three") == "one, two, three")
@@ -639,6 +761,211 @@ def main():
     time.sleep(0.5)
     check("mp4 cache file cleaned up",
           not os.path.exists(relay_m.cache_path or "x"))
+
+    print("[6] MKV tap sees the tail prefetch region "
+          "(captions in the last ~2.5 MB)")
+    # VLC's last reads of an MKV are served straight from _tail and NEVER
+    # enter read_cache, and the MKV tap parsed only the cache — so cues
+    # whose clusters live in the final _TAIL_PREFETCH bytes were lost
+    # (full-file play), and a seek landing inside the region never even
+    # rebased the window (no provider acquire happens for tail bytes), so
+    # the tap stayed anchored elsewhere with its parser starved.
+    tailblob = open(TAIL_MKV, "rb").read()
+    tail_base = len(tailblob) - vod_splitter._TAIL_PREFETCH
+    check("tail fixture: late cues inside the tail, early cue outside",
+          len(tailblob) > 3_000_000
+          and tailblob.find(b"late tail alpha") >= tail_base
+          and tailblob.find(b"late tail gamma") >= tail_base
+          and 0 < tailblob.find(b"early head cue")
+          < vod_splitter._HEAD_PARSE_BYTES)
+    prov_t = _Provider(tailblob, "video/x-matroska")
+    threading.Thread(target=prov_t.serve_forever, daemon=True).start()
+
+    # (a) full-file play: pull everything through the relay like a
+    # play-through does; the late cues must still be tapped
+    relay_t = VodRelay()
+    tcues = []
+    relay_t.cue.connect(lambda s, e, t: tcues.append((s, e, t)))
+    local_t = relay_t.start(
+        f"http://127.0.0.1:{prov_t.server_address[1]}/big.mkv",
+        "MichaelTVPlayer/1.0")
+    check("tail mkv accepted", bool(local_t))
+    tbody = b""
+    deadline = time.time() + 30
+    while time.time() < deadline and (len(tbody) < len(tailblob)
+                                      or len(tcues) < 4):
+        app.processEvents()
+        _, tbody = get(local_t)
+        time.sleep(0.2)
+    check("(a) tail fixture byte fidelity through the relay",
+          tbody == tailblob)
+    late = [c for c in tcues if "late tail" in c[2]]
+    check("(a) full-file play taps the tail-region cues",
+          len({c[2] for c in late}) >= 3)
+    alpha = next((c for c in late if "alpha" in c[2]), None)
+    check("(a) tail cue times on the file's own clock",
+          alpha is not None and abs(alpha[0] - 60.0) < 0.5
+          and abs(alpha[1] - 62.0) < 0.5)
+    check("(a) early (non-tail) cues still tapped via the cache",
+          any("early head cue" in c[2] for c in tcues))
+    check("(a) whole-file pull stays on one provider connection",
+          relay_t.provider_opens <= 1)
+    relay_t.stop()
+    time.sleep(0.3)
+
+    # (b) a seek DIRECTLY into the tail region: the seek GET is served
+    # from the prefetch (no provider stream, no rebase) — the tap must
+    # still deliver cues for that region
+    relay_t2 = VodRelay()
+    tcues2 = []
+    relay_t2.cue.connect(lambda s, e, t: tcues2.append((s, e, t)))
+    local_t2 = relay_t2.start(
+        f"http://127.0.0.1:{prov_t.server_address[1]}/big.mkv",
+        "MichaelTVPlayer/1.0")
+    deadline = time.time() + 10
+    while time.time() < deadline and not (
+            relay_t2._ready.is_set() and relay_t2.parser_tracks):
+        app.processEvents()
+        time.sleep(0.1)
+    a = len(tailblob) - 1_000_000        # inside the tail prefetch
+    status, part = get(local_t2, rng=f"bytes={a}-{a + 65535}")
+    check("(b) tail-region seek GET served from the prefetch",
+          status == 206 and part == tailblob[a:a + 65536]
+          and relay_t2.provider_opens == 1)
+    deadline = time.time() + 15
+    while time.time() < deadline and not any(
+            "late tail" in c[2] for c in tcues2):
+        app.processEvents()
+        time.sleep(0.25)
+    check("(b) seek into the tail region keeps captions tapped",
+          any("late tail" in c[2] for c in tcues2))
+    relay_t2.stop()
+    time.sleep(0.3)
+    prov_t.shutdown()
+
+    print("[6b] unit: _tap_read serves head/tail, refuses holes")
+    from src.mp4_subs import _boxes as _mp4_boxes  # noqa: F401 (parity)
+    rhole = VodRelay()
+    rhole._cache = None
+    rhole._cache_r = None       # __init__ leaves these to start()
+    rhole._head = b"HEADBYTES"
+    rhole._tail = (b"0123456789" * 300_000)[:vod_splitter._TAIL_PREFETCH]
+    rhole._tail_base = 100
+    check("head bytes served below the window",
+          rhole._tap_read(0, 4) == b"HEAD")
+    check("tail bytes served inside the tail region",
+          rhole._tap_read(102, 4) == b"2345")
+    check("hole between head and tail returns EMPTY, not wrong bytes",
+          rhole._tap_read(50, 4) == b"")
+    check("past the file end returns empty",
+          rhole._tap_read(rhole._tail_base + len(rhole._tail), 4) == b"")
+    rstrad = VodRelay()
+    import tempfile as _tf2
+    fd_s, path_s = _tf2.mkstemp(prefix="mtp_tapread_")
+    os.write(fd_s, b"CACHEbytes")
+    os.close(fd_s)
+    rstrad._cache = open(path_s, "r+b")
+    rstrad._cache_r = open(path_s, "rb")
+    rstrad.cache_base = 90
+    rstrad.cache_size = 10                      # [90, 100)
+    rstrad._tail = b"0123456789"
+    rstrad._tail_base = 100                     # contiguous
+    check("cache->tail straddling read stitched whole",
+          rstrad._tap_read(95, 10) == b"bytes01234")
+    rstrad._cache.close()
+    rstrad._cache_r.close()
+    os.remove(path_s)
+
+    print("[6c] unit: no provider stream is opened after stop()")
+    relay_s = VodRelay()
+    local_s = relay_s.start("file:///" + MKV.replace("\\", "/"),
+                            "MichaelTVPlayer/1.0")
+    check("stop-test relay started", bool(local_s))
+    deadline = time.time() + 10
+    while time.time() < deadline and not relay_s._ready.is_set():
+        app.processEvents()
+        time.sleep(0.1)
+    opens_s = relay_s.provider_opens
+    relay_s.stop()
+    time.sleep(0.2)
+    st_s = relay_s._acquire(0)
+    check("_acquire refused after stop() (no dead connection)",
+          st_s is None and relay_s.provider_opens == opens_s)
+
+    print("[7] ASS bare fixed-fields fallback (ffmpeg-shaped payload)")
+    from src.mkv_subs import flatten_ass_text
+    check("bare fixed-field dialogue (empty Name) reduced to its text",
+          flatten_ass_text("0,0:00:01.00,0:00:02.00,Default,,0,0,0,,"
+                           "what the hell is this")
+          == "what the hell is this")
+    check("bare fixed-field text keeps its commas",
+          flatten_ass_text("0,0:00:01.00,0:00:02.00,Default,,0,0,0,,"
+                           "Real, commas, kept")
+          == "Real, commas, kept")
+
+    print("[7b] lang_matches: full-word hints match on word boundaries")
+    from src.mkv_subs import lang_matches
+    check("'english' does NOT match 'Non-English Comments'",
+          not lang_matches("english", "und", "Non-English Comments"))
+    check("'english' DOES match 'English Comments'",
+          lang_matches("english", "und", "English Comments"))
+    check("'english' matches parenthesized '(English)'",
+          lang_matches("english", "und", "Signs (English)"))
+    check("short codes keep alias behavior (en vs eng)",
+          lang_matches("en", "eng", "")
+          and not lang_matches("en", "", "French"))
+
+    print("[8] MKV TimecodeScale honored in cue timing")
+    scaleblob = open(SCALE_MKV, "rb").read()
+    from src.mkv_subs import MkvSubParser
+    ps = MkvSubParser(prefer_language="eng")
+    made_s = ps.feed(scaleblob)
+    hell_s = next((c for c in made_s if "hell" in c[2]), None)
+    check("non-default TimecodeScale (2x) shifts cue times",
+          hell_s is not None and abs(hell_s[0] - 2.0) < 0.05
+          and abs(hell_s[1] - 6.0) < 0.05)
+    check("default-scale files keep millisecond timing",
+          abs(next(c for c in MkvSubParser().feed(
+              open(MKV, "rb").read()) if "hell" in c[2])[0] - 1.0) < 0.05)
+    prov_sc = _Provider(scaleblob, "video/x-matroska")
+    threading.Thread(target=prov_sc.serve_forever, daemon=True).start()
+    relay_sc = VodRelay()
+    scues = []
+    relay_sc.cue.connect(lambda s, e, t: scues.append((s, e, t)))
+    local_sc = relay_sc.start(
+        f"http://127.0.0.1:{prov_sc.server_address[1]}/scale.mkv",
+        "MichaelTVPlayer/1.0")
+    deadline = time.time() + 15
+    while time.time() < deadline and not any(
+            "hell" in c[2] for c in scues):
+        app.processEvents()
+        time.sleep(0.25)
+    hell_sc = next((c for c in scues if "hell" in c[2]), None)
+    check("scale honored through the live relay tap",
+          hell_sc is not None and abs(hell_sc[0] - 2.0) < 0.05)
+    relay_sc.stop()
+    prov_sc.shutdown()
+    time.sleep(0.3)
+
+    print("[9] MP4 edit-list media_time honored in cue timing")
+    from src.mp4_subs import Mp4SubParser
+    elstblob = open(ELST_MP4, "rb").read()
+    pe = Mp4SubParser(prefer_language="eng")
+    pe.parse_tail(elstblob)
+    made_e = pe.extract(lambda off, n: elstblob[off:off + n], 0,
+                        len(elstblob))
+    hell_e = next((c for c in made_e if "hell" in c[2]), None)
+    check("elst media_time (0.7 s skip) shifts cue times earlier",
+          hell_e is not None and abs(hell_e[0] - 0.3) < 0.05
+          and abs(hell_e[1] - 2.3) < 0.05)
+    pf = Mp4SubParser(prefer_language="eng")
+    plainblob = open(MP4, "rb").read()
+    pf.parse_tail(plainblob)
+    made_f = pf.extract(lambda off, n: plainblob[off:off + n], 0,
+                        len(plainblob))
+    hell_f = next((c for c in made_f if "hell" in c[2]), None)
+    check("media_time=0 edit lists leave timing alone",
+          hell_f is not None and abs(hell_f[0] - 1.0) < 0.05)
 
     print()
     if FAIL:

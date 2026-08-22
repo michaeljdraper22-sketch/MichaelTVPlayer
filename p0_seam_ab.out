@@ -1,0 +1,26 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.3s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    calibration m0=-1.47s (143 samples)
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift -3.8 s)
+    drift: painted=431 n=341 |err| p50=0.16 p95=0.37 max=0.54 maxstop=0.2s rebases=1 text=314/341
+  ok   a: drift keeps cues within 1.5 s (p95)   [p95=0.37]
+  ok   a: no silent-stop over 6 s during drift   [max=0.2s]
+  ok   a: wedge applied
+    post-wedge: painted=581 n=491 |err| p50=0.12 p95=0.32 max=0.54 maxstop=0.2s rebases=1 text=464/491
+  FAIL a: watchdog fired during the freeze   [rebases 1->1]
+  ok   a: wedge stop recovered within ~6 s   [stretch=0.0s]
+  ok   a: post-wedge cues within 1.5 s (p95)   [p95=0.32]
+  ok   a: no pipeline exceptions
+
+== scenario d: provider bursts, frontier under-credits ==
+captions: no window hit the clock for 15.9 s while cues kept arriving — anchor rebased (shift +23.9 s)
+    d: painted=416 n=337 |err| p50=0.18 p95=0.37 max=0.55 maxstop=5.1s rebases=4 text=313/337
+  ok   d: frontier really under-credited (>=10 s at some point)   [max edge-frontier gap=27.0s]
+  ok   d: cues within 1.5 s through bursts (p95)   [p95=0.37]
+  ok   d: no silent-stop beyond watchdog window (~5+4 s)   [max=5.1s]
+  ok   d: no pipeline exceptions
+
+10/11 checks passed
+  FAILED: a: watchdog fired during the freeze

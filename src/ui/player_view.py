@@ -27,6 +27,15 @@ from .worker import AsyncRunner, FileDownloader
 log = logging.getLogger("mtp")
 
 
+def now_s() -> float:
+    """Wall-clock seconds for every timing gate in the playback/caption
+    pipeline (dead-reckoned caption clock, caption watchdog, DVR content
+    crediting, rescue/reopen cooldowns). Tests drive a virtual clock by
+    rebinding this one function — the sanctioned seam; nothing in this
+    module may read time.time() directly."""
+    return time.time()
+
+
 def _decode(text: str) -> str:
     """Xtream EPG strings are often URL/HTML encoded."""
     if not text:
@@ -367,6 +376,9 @@ class PlayerView(QtWidgets.QWidget):
         # profanity filter (live TV: captions from the DVR buffer + engine)
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
+        self._cap_relay_gen = 0       # session the attached relay belongs
+        #                              # to (stale-delivery guard, see
+        #                              # _cap_relay_live)
         self._relay_start_offset = 0  # byte offset for the NEXT relay start
         #                                 # (resume / mid-movie subtitle
         #                                 # engage — consumed by
@@ -374,6 +386,8 @@ class PlayerView(QtWidgets.QWidget):
         # caption overlay: app-rendered subtitles, one style for every
         # text source (live CC via CCExtractor, VOD SRT via the relay)
         self._cap_cues = CueStore()   # every cue, both sources
+        self._cap_tick_errs = set()   # distinct _caption_tick errors
+        #                              # already logged (once-per-error)
         self._cap_on = False          # the overlay owns caption rendering
         self._cap_want = False        # user picked a text track (sticky)
         self._cap_fail = False        # source dead this media: VLC renders
@@ -996,6 +1010,7 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_fail = False
         self._stop_profanity()
         self._cap_cues.clear()
+        self._cap_tick_errs.clear()   # a new media logs its own errors
         # fresh live-CC arrival anchor + tracked caption clock per media
         self._cc_off = None
         self._cc_last_c = None
@@ -1175,7 +1190,7 @@ class PlayerView(QtWidgets.QWidget):
             return
         if size <= 0:
             return
-        now = time.time()
+        now = now_s()
         if self._dvr_first_data is None:
             self._dvr_first_data = now
             self._dvr_content_s = 0.0
@@ -1287,7 +1302,7 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not (self._mode == "chase" and self.dvr):
             return
-        now = time.time()
+        now = now_s()
         raw = self._sync_raw_s()
         fr = self._frontier_s()
         cc = self._cap_clock_s
@@ -1392,13 +1407,13 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_clock_s = float(target_s)
         self._cap_raw_s = None
         self._cap_raw_wall = 0.0
-        self._cap_wall = time.time()
+        self._cap_wall = now_s()
 
     def _cc_probe_head_pcr(self):
         """Absolute PCR at the buffer's write head, throttled to ~4/s
         (probe cost ~20 ms; cue bursts arrive faster). The value lives on
         the renumber-immune PCR content axis."""
-        now = time.time()
+        now = now_s()
         if self._cc_head_pcr is not None \
                 and now - self._cc_head_pcr[1] < 0.25:
             return self._cc_head_pcr[0]
@@ -1576,7 +1591,7 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_paused = False
         self._chase_started = False   # re-armed by the first playing tick
         self._stall_ticks = 0
-        self._last_reopen = time.time()
+        self._last_reopen = now_s()
         self._vid_s = target
         self._cap_seed_transport(target, jump_live=jump_live)
         self.vlc.play_at(buf, vlc_t)
@@ -1713,7 +1728,7 @@ class PlayerView(QtWidgets.QWidget):
         self._session += 1   # deferred chase callbacks from before are stale
         if self._mode == "chase" and self.dvr and self.dvr.running:
             return            # already chasing (e.g. REC engaged it)
-        self._dvr_t0 = time.time()
+        self._dvr_t0 = now_s()
         self._dvr_base = 0.0
         self._reset_dvr_clock()
         self._stall_ticks = 0
@@ -1835,7 +1850,7 @@ class PlayerView(QtWidgets.QWidget):
             target = self._vid_s if at is None else float(at)
             self._chase_started = False
             self._stall_ticks = 0
-            self._last_reopen = time.time()
+            self._last_reopen = now_s()
             # a (re)open AT a position is a transport event: it seeds the
             # caption clock and the live-edge backlog by construction
             self._cap_seed_transport(target)
@@ -1958,7 +1973,7 @@ class PlayerView(QtWidgets.QWidget):
         self._note_dvr_data()
         if tries_left < 0:
             tries_left = 50          # ~20 s: provider throttling recovery
-        waited = 0.0 if self._dvr_t0 is None else (time.time() - self._dvr_t0)
+        waited = 0.0 if self._dvr_t0 is None else (now_s() - self._dvr_t0)
         ready = self.dvr.buffer_file() is not None and waited >= 2.5
         if ready:
             self._set_dvr_status(None)
@@ -2444,7 +2459,7 @@ class PlayerView(QtWidgets.QWidget):
             self._note_dvr_data()
             frontier = self._frontier_s()
             raw = self.vlc.get_time() / 1000.0
-            now = time.time()
+            now = now_s()
             dt = 0.4 if self._tick_t is None else min(1.0, now - self._tick_t)
             self._tick_t = now
             if playing:
@@ -2543,7 +2558,7 @@ class PlayerView(QtWidgets.QWidget):
         # speed stay honestly DISABLED — the pill explains why, and a retry
         # or the next channel change re-engages chase and re-enables them.
         prev_tick = self._tick_t
-        now = time.time()
+        now = now_s()
         self._tick_t = now
         length = self.vlc.get_length()
         raw = self.vlc.get_time()
@@ -3019,7 +3034,7 @@ class PlayerView(QtWidgets.QWidget):
             return self._cap_clock_s if self._cap_clock_s > 0.0 \
                 else self._vid_s
         # chase: dead-reckoned, delta-locked (garbage-absolute-proof)
-        now = time.time()
+        now = now_s()
         frontier = self._frontier_s()
         dt = 0.0 if self._cap_wall <= 0.0 \
             else max(0.0, min(2.0, now - self._cap_wall))
@@ -3133,8 +3148,9 @@ class PlayerView(QtWidgets.QWidget):
         return self._cap_clock_s
 
     def _caption_tick(self):
-        """100 ms: paint the cue active at the playback position (+ the
-        user's delay — pure arithmetic, so the delay applies live)."""
+        """100 ms: paint the cue active at the playback position shifted
+        by the user's delay (positive = LATER — pure arithmetic, so the
+        delay applies live)."""
         if self._closing or not self._cap_on:
             return
         try:
@@ -3149,16 +3165,20 @@ class PlayerView(QtWidgets.QWidget):
                 return
             delay_ms = int(self.config.subtitle_appearance.get(
                 "delay_ms", 0) or 0)
-            lines = self._cap_cues.text_at(t + delay_ms / 1000.0)
+            # POSITIVE delay = show cues LATER, like every other path
+            # (config.py's wording, the +/- tooltip, VLC's spu delay via
+            # video_set_spu_delay): query the store delay seconds in the
+            # PAST, which holds each cue back by the delay.
+            lines = self._cap_cues.text_at(t - delay_ms / 1000.0)
             if lines and _SYNC_ON:
-                blank = time.time() - (self._sync_last_show_t
-                                        or time.time())
+                blank = now_s() - (self._sync_last_show_t
+                                        or now_s())
                 if blank > 2.0:
                     synclog.info("PAINT after %.1f s blank (t=%.2f)",
                                  blank, t)
-                self._sync_last_show_t = time.time()   # captions ARE painting
+                self._sync_last_show_t = now_s()   # captions ARE painting
             if chase:
-                now = time.time()
+                now = now_s()
                 if lines:
                     self._cc_last_active = now
                 elif self._cc_off is not None:
@@ -3179,8 +3199,21 @@ class PlayerView(QtWidgets.QWidget):
                 words = self._filter_engine.words
                 lines = [prof_mod.mask_text(ln, words) for ln in lines]
             self._cap_wid.set_lines(lines)
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:  # noqa: BLE001
+            # keep the 100 ms caption timer alive whatever happens, but
+            # never swallow errors SILENTLY: log each DISTINCT error once
+            # (identical repeats suppressed; a new error logs once more)
+            key = "%s:%s" % (type(exc).__name__, exc)
+            if key not in self._cap_tick_errs:
+                if len(self._cap_tick_errs) >= 64:
+                    self._cap_tick_errs.clear()   # bound the memory
+                self._cap_tick_errs.add(key)
+                try:
+                    log.warning("captions: tick failed (%s: %s) — "
+                                "identical errors now suppressed",
+                                type(exc).__name__, exc)
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _cc_watchdog_fire(self, now: float):
         """Cues arrived within the last seconds yet NO window intersected
@@ -3251,7 +3284,8 @@ class PlayerView(QtWidgets.QWidget):
         hand back to VLC's spu — playback keeps streaming whatever the
         relay has cached. Start-time failures never reach here (the relay
         isn't attached yet); _effective_url handles those."""
-        if self._closing or self._cap_fail or self._vod_relay is None:
+        if self._closing or self._cap_fail or self._vod_relay is None \
+                or not self._cap_relay_live():
             return
         try:
             log.warning("captions: relay failed (%s) — VLC renders", why)
@@ -3604,6 +3638,7 @@ class PlayerView(QtWidgets.QWidget):
         relay.cue.connect(self._on_vod_cue)
         relay.failed.connect(self._cap_relay_failed)
         self._vod_relay = relay
+        self._cap_relay_gen = self._session   # stale-delivery guard mark
         if want_caps:
             self._set_cap_on(True)
             # a few seconds in, verify the file actually HAS a text track
@@ -3614,8 +3649,30 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_timer.start()
         return local
 
+    def _cap_relay_live(self) -> bool:
+        """Stale-delivery guard for the VOD relay's queued cue/failed
+        signals.
+
+        VodRelay emits from worker threads over queued connections, and
+        play_media's teardown (disconnect + stop + store clear + session
+        bump) races emissions that were already in flight — ``failed``
+        isn't disconnected at all — so a delivery from the PREVIOUS
+        media's relay can land after the new media attached its own
+        relay (stray caption, phantom profanity-mute window, cap_fail
+        latched against a healthy relay). Accept a delivery only from
+        the relay the CURRENT media attached; with no sender (direct
+        call, or a delivery whose sender was already destroyed) fall
+        back to the session marker set at attach time."""
+        try:
+            snd = self.sender()
+        except Exception:  # noqa: BLE001
+            snd = None
+        if snd is not None:
+            return snd is self._vod_relay
+        return self._cap_relay_gen == self._session
+
     def _on_vod_cue(self, start: float, end: float, text: str):
-        if self._closing:
+        if self._closing or not self._cap_relay_live():
             return
         # VOD subtitle tracks are pre-timed — no caption-lag lead, but the
         # measured ~0.5 s late-mute trim applies (see _VOD_MUTE_LEAD_S)
@@ -3762,7 +3819,7 @@ class PlayerView(QtWidgets.QWidget):
         with them (see _cc_rebase); smaller ones EWMA-settle."""
         if self._closing:
             return
-        now = time.time()
+        now = now_s()
         self._cc_last_arrival = now
         off_before = self._cc_off
         last_c = self._cc_last_c
@@ -3932,6 +3989,12 @@ class PlayerView(QtWidgets.QWidget):
         if self._vod_relay is not None and not self._cap_on:
             try:
                 self._vod_relay.cue.disconnect()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                # `failed` was never disconnected here — a stale delivery
+                # used to latch _cap_fail against the NEXT media's relay
+                self._vod_relay.failed.disconnect()
             except Exception:  # noqa: BLE001
                 pass
             try:

@@ -15,11 +15,15 @@ CCExtractor, dead caption source) — see PlayerView._cap_fail.
 """
 
 import re
+from bisect import bisect_left
+from collections import deque
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 # cues kept per source (a 2 h movie carries ~1-3k; a long live session
-# similar) — bounded memory, and rewinds still find their captions
+# similar) — bounded memory, and rewinds still find their captions (the
+# cap evicts by ARRIVAL order, so re-received rewound cues stay while
+# stale forward-flow ones leave)
 _MAX_CUES = 5000
 _ROLLUP_LINES = 3          # broadcast roll-up caption window height
 _CUE_GRACE_S = 0.25        # hold a cue briefly past its end (anti-flicker)
@@ -78,14 +82,22 @@ class CueStore:
 
     def __init__(self):
         self.cues = []          # sorted by start
-        self._seen = set()
+        self._seen = set()      # (round(start, 3), text) of STORED cues
+        self._order = deque()   # (start, text) in arrival order — the
+        #                         eviction queue (rewinds re-receive cues)
+        self._max_span = 0.0    # upper bound on any stored end - start
 
     def clear(self):
         self.cues = []
         self._seen = set()
+        self._order.clear()
+        self._max_span = 0.0
 
     def add(self, start: float, end: float, text: str):
-        """One cue. Duplicates (relay re-parse after a rebase) drop out."""
+        """One cue. Duplicates (relay re-parse after a rebase) drop out —
+        but only while the cue is actually STORED: eviction prunes the
+        dedupe memory with it, so a rewind that re-receives evicted cues
+        re-enters them instead of painting nothing."""
         text = (text or "").strip()
         if not text or not visible_lines(text):
             return      # nothing paintable (padding-only lines) — skip
@@ -93,14 +105,38 @@ class CueStore:
         if key in self._seen:
             return
         self._seen.add(key)
-        self.cues.append((float(start), max(float(start), float(end)), text))
+        s = float(start)
+        e = max(s, float(end))
+        self.cues.append((s, e, text))
+        self._order.append((s, text))
+        if e - s > self._max_span:
+            self._max_span = e - s
         # keep the list sorted even if sources interleave; a source that
         # only ever appends (the common case) pays a cheap already-sorted
         # check
         if len(self.cues) > 1 and self.cues[-2][0] > self.cues[-1][0]:
             self.cues.sort(key=lambda c: c[0])
-        if len(self.cues) > _MAX_CUES:
-            del self.cues[:len(self.cues) - _MAX_CUES]
+        while len(self.cues) > _MAX_CUES:
+            self._evict_one()
+
+    def _evict_one(self):
+        """Drop the oldest-ARRIVED cue — and its dedupe key with it.
+
+        Evicting by arrival rather than by start is what keeps rewinds
+        alive: a re-received old cue is a fresh arrival, so it stays
+        (the oldest stale arrival leaves instead), while the forward
+        live/VOD flow — where arrival order IS start order — evicts
+        exactly the cues the old front-truncate did."""
+        if not self._order:
+            return
+        s, txt = self._order.popleft()
+        i = bisect_left(self.cues, (s,))    # first cue with start >= s
+        while i < len(self.cues) and self.cues[i][0] <= s:
+            if self.cues[i][2] == txt:      # (start, text) is unique
+                del self.cues[i]
+                self._seen.discard((round(s, 3), txt))
+                return
+            i += 1
 
     def shift(self, delta: float):
         """Move every stored window by ``delta`` content seconds (same
@@ -113,19 +149,33 @@ class CueStore:
         self.cues = [(max(0.0, s + delta), max(0.0, e + delta), txt)
                      for s, e, txt in self.cues]
         self._seen = {(round(s, 3), txt) for s, _e, txt in self.cues}
+        self._order = deque((s, txt) for s, _e, txt in self.cues)
+        # the max(0.0, ...) clamp can only shrink windows, so _max_span
+        # remains a valid upper bound
 
     def text_at(self, t: float):
-        """Lines to display at content time ``t`` (newest active cue wins —
-        roll-up screens repeat the previous lines, so the newest cue IS the
-        whole window). Returns [] when nothing is active."""
+        """Lines to display at content time ``t``. Overlap policy: the
+        NEWEST covering cue wins — the one with the greatest start, ties
+        broken by latest arrival (roll-up screens repeat the previous
+        lines, so the newest cue IS the whole window). Returns [] when
+        nothing is active.
+
+        The backward scan breaks early only once no OLDER cue could
+        still be active: cues are sorted by start but ENDS are not (a
+        song or a description can run minutes past newer cues' starts),
+        and every stored window fits within ``_max_span``, so a cue
+        starting before ``t - grace - _max_span`` cannot reach ``t``.
+        The old fixed 60 s horizon abandoned such still-active long cues
+        mid-display."""
         t = float(t)
         active = None
+        cutoff = t - _CUE_GRACE_S - self._max_span
         for start, end, text in reversed(self.cues):
             if start <= t <= end + _CUE_GRACE_S:
                 active = text
                 break
-            if start < t - 60.0:
-                break           # cues are sorted: everything older is dead
+            if start < cutoff:
+                break       # sorted by start: older windows cannot reach t
         if active is None:
             return []
         return visible_lines(active)[-_ROLLUP_LINES:]

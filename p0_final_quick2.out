@@ -1,0 +1,68 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.2s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    L(t) profile: const(1.5s)
+    calibration m0=-0.17s m0r=-0.17s (150 samples)
+    drift: painted=577 n=577 |perr| p50=0.26 p95=1.48 max=1.78 exact=519/577 ambig=436 nomatch=0 maxstop=0.8s rebases=0 diag[neighbor=577/577]
+  ok   a: drift painted displacement p95 <= 1.5 s   [p95=1.48]
+  ok   a: drift exact-window text >= 85%   [519/577 ambig=436 nomatch=0]
+  ok   a: no silent-stop over 6 s during drift   [max=0.8s]
+  ok   a: wedge applied (+5 s anchor & store)
+  ok   a: no blank beyond the watchdog window after data returns   [max=0.2s]
+    post-wedge verify: painted=100 n=100 |perr| p50=0.07 p95=0.69 max=0.98 exact=100/100 ambig=100 nomatch=0 maxstop=0.0s rebases=1 diag[neighbor=1104/1104]
+  ok   a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)   [backlog=13s rebased=True walkoff_within1.5=100% of 279 heal_within1.5=100% of 148 verify_p95=0.69 verify_within1.5=100%]
+  ok   a: no pipeline exceptions
+
+== scenario b: pause 60 s -> resume +25 s step (3 cycles) ==
+    L(t) profile: const(1.5s)
+    b (3 cycles): painted=4334 n=4334 |perr| p50=0.03 p95=0.85 max=1.78 exact=4233/4334 ambig=3118 nomatch=0 maxstop=0.7s rebases=0 diag[neighbor=4334/4334]
+  ok   b: divergence recorded for each +25 s step (accumulates to ~75)   [div=+74.7 want~+75]
+  ok   b: painted cues coherent through pause/resume/step (p95 <= 1.5)   [p95=0.85]
+  ok   b: no silent-stop beyond watchdog window (~5+3 s)   [max=0.7s]
+  ok   b: 3 pause cycles executed
+  ok   b: no pipeline exceptions
+
+== scenario c: jump-to-live, L swells 1 -> 20 s ==
+    L(t) profile: swell(1->20s over 21s, drain to 1.5s)
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift -3.6 s)
+    c (whole run, incl. L transient — WP3 feed): painted=117 n=117 |perr| p50=0.08 p95=2.51 max=3.14 exact=99/117 ambig=6 nomatch=0 maxstop=0.3s rebases=2 diag[neighbor=99/99]
+    c: after lag recovery: painted=21 n=21 |perr| p50=1.33 p95=1.83 max=1.88 exact=3/21 ambig=21 nomatch=0 maxstop=2.2s rebases=2 diag[neighbor=123/123]
+  ok   c: jump landed ~5 s behind the true edge   [clock@jump=28.1 edge@jump=33.1 true_head=33.1]
+  ok   c: painted cues re-settle after the L swing and stay put (p95 <= 2.0)   [data-limited]   [p95=1.83 settled_in=4s L=1.5s rebases=2 (post-swing snap-rebase wander — WP3 target)]
+  ok   c: blank stretches stay data-limited (<= L swell + margin)   [data-limited]   [max=0.3s]
+  ok   c: no pipeline exceptions
+
+== scenario d: provider bursts, frontier under-credits ==
+    L(t) profile: const(1.5s) + 30 s burst/stall cadence
+captions: no window hit the clock for 15.9 s while cues kept arriving — anchor rebased (shift +23.9 s)
+    d (whole run, incl. burst transients — WP2/WP3 feed): painted=416 n=416 |perr| p50=0.15 p95=15.62 max=15.66 exact=267/416 ambig=111 nomatch=0 maxstop=5.1s rebases=4 diag[neighbor=392/416]
+  ok   d: frontier really under-credited (>=10 s at some point)   [max edge-frontier gap=27.0s]
+    d: post-burst quiescent tail: painted=120 n=120 |perr| p50=0.49 p95=0.75 max=0.78 exact=120/120 ambig=120 nomatch=0 maxstop=0.0s rebases=4 diag[neighbor=871/938]
+  ok   d: painted cues re-settle after the bursts and stay put (p95 <= 1.5, >= 85% within 1.5 s)   [data-limited]   [p95=0.75 within1.5=100% settled_in=48s]
+  ok   d: no silent-stop beyond watchdog window (~5+4 s)   [data-limited]   [max=5.1s]
+  ok   d: no pipeline exceptions
+
+== scenario e: CCX caption axis runs 2x wall ==
+    L(t) profile: const(1.5s) on a 2x warped caption axis
+    warp-axis calibration m0=-0.12s m0r=-0.18s (150 samples)
+    e: painted=575 n=575 |perr| p50=2.00 p95=4.73 max=5.71 exact=175/575 ambig=158 nomatch=0 maxstop=0.0s rebases=11 diag[neighbor=506/575]
+  ok   e: 2x caption axis displacement contained (p95 <= 6 s)   [p95=4.73 rebases=11]
+  ok   e: no silent-stop beyond watchdog window (~5+3 s)   [max=0.0s]
+  ok   e: painted text exact-matched within the warp trail bound (+-8 s, >= 85%)   [within8=100% of 575 exact-text matches (ambig=158)]
+  ok   e: no pipeline exceptions
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    L(t) profile: const(1.5s)
+    f: steady: painted=694 n=694 |perr| p50=0.06 p95=0.54 max=0.92 exact=694/694 ambig=80 nomatch=0 maxstop=0.9s rebases=0 diag[neighbor=694/694]
+  ok   f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=0.54 max=0.92]
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+    f: scrubbed-back region: painted=200 n=200 |perr| p50=0.08 p95=0.50 max=0.54 exact=200/200 ambig=75 nomatch=0 maxstop=0.5s rebases=0 diag[neighbor=894/894]
+  ok   f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=0.50]
+  ok   f: scrubbed-back exact-window text >= 85%   [200/200 ambig=75]
+    f: post-rebase stability: painted=81 n=81 |perr| p50=0.26 p95=1.07 max=1.07 exact=75/81 ambig=81 nomatch=0 maxstop=2.4s rebases=2 diag[neighbor=975/975]
+  ok   f: rebased store stays coherent behind the head (outcome)   [p95=1.07 exact=75/81]
+  ok   f: delay_ms shifts the painted cue live (+1.5 s, direction-neutral)   [probe@+0.0s base=2ln shifted=2ln]
+  ok   f: no pipeline exceptions
+
+31/31 checks passed (mechanism 27/27, data-limited 4/4)

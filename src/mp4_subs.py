@@ -33,8 +33,11 @@ Timestamps: sample start = cumulative stts deltas, duration = the
 sample's own stts delta (ffmpeg's mov_text muxer pads gaps with EMPTY
 tx3g samples, so deltas are true display durations and the empty
 samples are skipped here). Times are trak media times in mdhd's
-timescale; with the media_time=0 edit lists every writer emits, media
-time == presentation time == VLC's playback clock.
+timescale; an edit-list media_time (the initial skip a writer declares)
+is honored — samples inside the skipped span never display and the rest
+shift earlier by media_time. With the media_time=0 edit lists every
+writer emits by default, media time == presentation time == VLC's
+playback clock.
 
 tx3g sample layout: 2-byte big-endian text length, that many UTF-8
 bytes, then optional styling atoms ('styl', 'hlit', 'dlay', ...) — the
@@ -104,6 +107,7 @@ class _Trak:
     def __init__(self):
         self.meta = {"codec": "", "lang": "und", "name": ""}
         self.timescale = 1
+        self.elst_media = 0    # edit-list media_time (media ticks)
         self.sizes = []       # stsz, per sample
         self.deltas = []      # stts, per sample (media timescale ticks)
         self.chunk_offs = []  # stco/co64, file-absolute
@@ -319,14 +323,19 @@ class Mp4SubParser:
     def _parse_trak(self, body):
         tid = None
         mdia = None
+        edts = None
         for typ, s, e in _boxes(body, 0, len(body)):
             if typ == b"tkhd" and tid is None:
                 tid = _u32(body, s + (12 if body[s] == 0 else 20))
             elif typ == b"mdia" and mdia is None:
                 mdia = body[s:e]
+            elif typ == b"edts" and edts is None:
+                edts = (s, e)
         if tid is None or mdia is None:
             return
         trak = _Trak()
+        if edts is not None:
+            self._parse_edts(trak, body, edts[0], edts[1])
         handler = b""
         for typ, s, e in _boxes(mdia, 0, len(mdia)):
             if typ == b"mdhd":
@@ -355,6 +364,37 @@ class Mp4SubParser:
             trak.meta["codec"] = handler.decode("ascii", "replace").upper()
         self._traks[tid] = trak
         self._track_meta[tid] = trak.meta
+
+    @staticmethod
+    def _parse_edts(trak, buf, s, e):
+        """edts -> elst: honor the first non-empty edit's media_time —
+        the initial skip the writer declared (media_time > 0 shifts the
+        whole track earlier; samples inside the skipped span never
+        display, see _expand). Empty edits (media_time = -1, pure
+        timeline delays) are out of scope and read as no skip."""
+        for typ, s2, e2 in _boxes(buf, s, e):
+            if typ != b"elst":
+                continue
+            ver = buf[s2]
+            n = _u32(buf, s2 + 4) or 0
+            p = s2 + 8
+            for _ in range(min(n, 16)):
+                if ver >= 1:
+                    if p + 20 > e2:
+                        return
+                    mt = int.from_bytes(buf[p + 8:p + 16], "big",
+                                        signed=True)
+                    p += 20
+                else:
+                    if p + 12 > e2:
+                        return
+                    mt = int.from_bytes(buf[p + 4:p + 8], "big",
+                                        signed=True)
+                    p += 12
+                if mt >= 0:
+                    trak.elst_media = mt
+                    return
+            return
 
     def _parse_stbl(self, trak, body):
         """stbl body -> the four sample tables, eagerly materialized
@@ -435,7 +475,10 @@ class Mp4SubParser:
     def _expand(trak):
         """Sample tables -> [(file_off, size, start_s, end_s)] in file
         order: walk stsc's chunk runs, carving per-sample offsets out of
-        each chunk, and accumulate stts deltas for starts/durations."""
+        each chunk, and accumulate stts deltas for starts/durations.
+        Cue times are PRESENTATION times: the edit-list media_time skips
+        the track's first media ticks, so samples inside the span are
+        dropped and the rest shift earlier by media_time/timescale."""
         samples = []
         si = 0
         t = 0
@@ -447,11 +490,15 @@ class Mp4SubParser:
                     if si >= nsizes:
                         break
                     dur = trak.deltas[si] if si < len(trak.deltas) else 0
-                    start_s = t / trak.timescale
+                    t0 = t
                     t += dur
-                    end_s = start_s + (dur / trak.timescale
-                                       if dur > 0 else _FALLBACK_CUE_S)
-                    samples.append((off, trak.sizes[si], start_s, end_s))
+                    if t0 >= trak.elst_media:
+                        start_s = (t0 - trak.elst_media) / trak.timescale
+                        end_s = start_s + (dur / trak.timescale
+                                           if dur > 0
+                                           else _FALLBACK_CUE_S)
+                        samples.append(
+                            (off, trak.sizes[si], start_s, end_s))
                     off += trak.sizes[si]
                     si += 1
             if si >= nsizes:

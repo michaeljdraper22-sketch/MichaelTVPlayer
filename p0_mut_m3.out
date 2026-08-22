@@ -1,0 +1,20 @@
+  [m3] rebases no longer shift the cue store (stale store)
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.1s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    L(t) profile: const(1.5s)
+    calibration m0=-0.17s m0r=-0.17s (150 samples)
+    drift: painted=577 n=577 |perr| p50=0.26 p95=1.48 max=1.78 exact=519/577 ambig=436 nomatch=0 maxstop=0.8s rebases=0 diag[neighbor=577/577]
+  ok   a: drift painted displacement p95 <= 1.5 s   [p95=1.48]
+  ok   a: drift exact-window text >= 85%   [519/577 ambig=436 nomatch=0]
+  ok   a: no silent-stop over 6 s during drift   [max=0.8s]
+  ok   a: wedge applied (+5 s anchor & store)
+  ok   a: no blank beyond the watchdog window after data returns   [max=0.6s]
+    post-wedge verify: painted=100 n=100 |perr| p50=0.07 p95=0.69 max=0.98 exact=100/100 ambig=100 nomatch=0 maxstop=0.0s rebases=1 diag[neighbor=1099/1100]
+  FAIL a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)   [backlog=13s rebased=True walkoff_within1.5=56% of 275 heal_within1.5=100% of 148 verify_p95=0.69 verify_within1.5=100%]
+  ok   a: no pipeline exceptions
+
+6/7 checks passed (mechanism 6/7, data-limited 0/0)
+  FAILED: a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)
+mutation m3 on scenarios a: 6 passed, 1 failed (exit 1)

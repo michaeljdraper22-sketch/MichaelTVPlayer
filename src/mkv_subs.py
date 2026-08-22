@@ -9,9 +9,12 @@ WEBVTT. Video/audio payloads are counted past, never buffered. This
 exists because ffmpeg's text muxers only flush subtitle output at EOF,
 which is useless for live filtering.
 
-Timestamps: MKV cluster/block timecodes are in milliseconds (the
-TimecodeScale default). Cue end: the BlockGroup's BlockDuration when the
-writer supplied one (subrip/ASS writers do), else start + 3 s —
+Timestamps: MKV cluster/block timecodes are in TimecodeScale units
+(Info element, default 1e6 ns = milliseconds); a non-default scale is
+honored, and mid-stream parsers take it as a constructor argument (they
+join past the Info element and can never see it). Cue end: the
+BlockGroup's BlockDuration when the writer supplied one (subrip/ASS
+writers do; durations are in the same scale units), else start + 3 s —
 SimpleBlock carries no duration field at all.
 """
 
@@ -22,6 +25,7 @@ _EBML = 0x1A45DFA3
 _SEGMENT = 0x18538067
 _SEEKHEAD = 0x114D9B74
 _INFO = 0x1549A966
+_TIMECODE_SCALE = 0x2AD7B1
 _TRACKS = 0x1654AE6B
 _TRACK_ENTRY = 0xAE
 _CLUSTER = 0x1F43B675
@@ -48,11 +52,20 @@ _FALLBACK_CUE_S = 3.0      # SimpleBlocks carry no duration — assume this
 _DRAW_RE = re.compile(r"\{\\p[0-9]+\}.*?(?:\{\\p0\}|$)", re.S)
 _TAG_RE = re.compile(r"<[^>]+>")            # <i>, <b>, <font ...>
 _OVERRIDE_RE = re.compile(r"\{[^}]*\}")     # {\an8}, {\k20}, {\pos(...)}
-# ffmpeg's matroska muxer stores the Dialogue line's fixed fields
-# (Layer/Style/Name/Margins/Effect) with the "Dialogue:" prefix stripped;
-# mkvmerge stores the text alone and never matches this rigid pattern
-_FIELD_PREFIX_RE = re.compile(
+# ffmpeg's matroska muxer stores ASS events in the Matroska convention:
+# the Dialogue line with the "Dialogue:" prefix AND the Start/End
+# timestamps stripped -> ReadOrder,Layer,Style,Name,MarginL,MarginR,
+# MarginV,Effect,Text (9 fields, Name normally EMPTY). A bare FULL
+# Dialogue line (10 fields: Layer,Start,End,Style,Name,Margins,Effect,
+# Text, Start/End clock-shaped) appears in payloads that kept their
+# timestamps. Both must reduce to the Text field — the old single
+# pattern demanded digits right after the fourth field, which only the
+# 9-field shape satisfied by accident (its margins landed there), so
+# every real 10-field line fell through and rendered raw.
+_MATROSKA_FIELDS_RE = re.compile(
     r"^\d+,[^,]*,[^,]*,[^,]*,\d+,\d+,\d+,[^,]*,")
+_BARE_DIALOGUE_RE = re.compile(
+    r"^\d+,[^,]*:[^,]*,[^,]*:[^,]*,[^,]*,[^,]*,\d+,\d+,\d+,[^,]*,")
 
 
 # ---- language matching (CC-menu words vs MKV Language elements) ----
@@ -107,21 +120,24 @@ def is_language_name(word: str) -> bool:
 
 def lang_matches(hint: str, lang: str, name: str = "") -> bool:
     """Does the CC-menu hint (a language word) refer to this track?
-    Full words substring-match the track's lang+name; every spelling
-    (full word, ISO 639-2, two-letter) equal-matches through the alias
-    table, against the language element AND the track name (rippers
-    often leave one of them empty). Short ISO codes never
-    substring-match ('en' inside 'french' would be nonsense)."""
+    Full words match whole WORDS of the track's lang+name (a bare
+    substring let 'english' hit a track named 'Non-English Comments' —
+    hyphenated compounds count as one word). Every spelling (full word,
+    ISO 639-2, two-letter) equal-matches through the alias table,
+    against the language element AND the track name (rippers often
+    leave one of them empty). Short ISO codes never word-match ('en'
+    inside 'french' would be nonsense)."""
     hint = (hint or "").strip().lower()
     if not hint:
         return False
     words = f"{lang or ''} {name or ''}".lower().replace(",", " ").split()
-    if len(hint) >= 4 and hint in " ".join(words):
+    toks = {w.strip("()[]{}.,;:!?'\u2019\"") for w in words}
+    if len(hint) >= 4 and hint in toks:
         return True
     h = _LANG_ALIAS.get(hint)
     if h is None:
         return False
-    return any(_LANG_ALIAS.get(tok) == h for tok in words)
+    return any(_LANG_ALIAS.get(tok) == h for tok in toks)
 
 
 def is_text_codec(codec: str) -> bool:
@@ -157,16 +173,20 @@ def flatten_ass_text(raw: str) -> str:
     r"""ASS/SSA payload (or plain subrip text) -> clean text. Drawing
     payloads (vector commands between {\p1}..{\p0}) and override blocks
     are dropped, \N/\n become line breaks, \h a space. mkvmerge stores
-    only a Dialogue line's Text field; ffmpeg stores the line with its
-    fixed fields (with or without the "Dialogue:" prefix) — all three
-    shapes are handled (a stored Comment: event is skipped)."""
+    only a Dialogue line's Text field; ffmpeg/matroska stores the line
+    with its fixed fields — with the "Dialogue:" prefix, or bare in the
+    9-field Matroska convention (timestamps stripped), or bare with the
+    full 10 fields — all four shapes are handled (a stored Comment:
+    event is skipped)."""
     low = raw[:9].lower()
     if low.startswith("dialogue:") or low.startswith("comment:"):
         parts = raw.split(",", 9)
         if len(parts) < 10 or low.startswith("comment:"):
             return ""
         raw = parts[9]
-    elif _FIELD_PREFIX_RE.match(raw):
+    elif _BARE_DIALOGUE_RE.match(raw):
+        raw = raw.split(",", 9)[-1]
+    elif _MATROSKA_FIELDS_RE.match(raw):
         raw = raw.split(",", 8)[-1]
     raw = _DRAW_RE.sub("", raw)
     raw = _OVERRIDE_RE.sub("", raw)
@@ -199,7 +219,8 @@ class MkvSubParser:
     """Feed bytes; collect cues in ``self.cues`` (also returned by feed)."""
 
     def __init__(self, prefer_language: str = "eng",
-                 mid_stream: bool = False):
+                 mid_stream: bool = False,
+                 timecode_scale_ns: int = 0):
         self.prefer_language = (prefer_language or "").lower()
         self.cues = []
         self.buf = bytearray()
@@ -208,7 +229,8 @@ class MkvSubParser:
         self._stack = [_CTX_ROOT]
         self._track_meta = {}      # number -> {codec, lang, name}
         self._selected = None
-        self._cluster_tc = 0       # ms
+        self._cluster_tc = 0       # in TimecodeScale units
+        self._tc_scale_ns = int(timecode_scale_ns) or 1_000_000
         self._saw_tracks = False
         if mid_stream:
             # joining mid-file: wait for the next Cluster header (cluster
@@ -275,6 +297,13 @@ class MkvSubParser:
                 continue
 
             # ---- payload elements ----
+            if ctx == _CTX_SEG and eid == _INFO:
+                if avail < size:
+                    break                       # wait, fully buffered
+                self._parse_info(
+                    bytes(self.buf[header:header + size]))
+                del self.buf[:header + size]
+                continue
             if ctx == _CTX_SEG and eid == _TRACKS:
                 if avail < size:
                     break                       # wait, fully buffered
@@ -353,6 +382,27 @@ class MkvSubParser:
                 self._parse_track_entry(body)
             pos += header + size
 
+    def _parse_info(self, blob):
+        """Segment Info: the TimecodeScale (default 1e6 ns). Every
+        cluster/block timecode and BlockDuration counts in these units,
+        so a non-default scale must scale cue times — ignored, a 2x-scale
+        file lands every cue at half its true position."""
+        pos = 0
+        while pos < len(blob):
+            eid, ilen = _vint_size(blob, pos, keep_marker=True)
+            if eid is None:
+                break
+            size, slen = _vint_size(blob, pos + ilen, keep_marker=False)
+            if size is None:
+                break
+            header = ilen + slen
+            if eid == _TIMECODE_SCALE and 0 < size <= 8:
+                v = int.from_bytes(blob[pos + header:pos + header + size],
+                                   "big")
+                if v:
+                    self._tc_scale_ns = v
+            pos += header + size
+
     def _parse_track_entry(self, body):
         meta = {"codec": "", "lang": "eng", "name": ""}
         number = None
@@ -427,7 +477,8 @@ class MkvSubParser:
                 bytes(buf[payload_start:payload_start + payload_len])
                 .decode("utf-8", "replace"))
             if text:
-                start_s = (self._cluster_tc + rel_tc) / 1000.0
+                start_s = (self._cluster_tc + rel_tc) \
+                    * self._tc_scale_ns / 1e9
                 end_s = start_s + (duration_s if duration_s
                                    else _FALLBACK_CUE_S)
                 out.append(self._finish(start_s, end_s, text))
@@ -452,9 +503,9 @@ class MkvSubParser:
             if eid == _BLOCK and block_at is None:
                 block_at = (pos, header, size)
             elif eid == _BLOCK_DURATION and 0 < size <= 8:
-                ms = int.from_bytes(blob[pos + header:pos + header + size],
-                                    "big")
-                duration_s = ms / 1000.0
+                ticks = int.from_bytes(
+                    blob[pos + header:pos + header + size], "big")
+                duration_s = ticks * self._tc_scale_ns / 1e9
             pos += header + size
         if block_at is None:
             return []
