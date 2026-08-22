@@ -1,0 +1,29 @@
+Work in D:\Coding\MichaelTVPlayer. FIRST read `subtitle_attack_plan.md` —
+you own ONLY package WP3; WP0/WP1/WP2 are merged. Keep console output
+brief; details go to `p3_report.md`.
+
+Fix caption anchor/store coherence under provider lag swings, in
+`src/ui/player_view.py` (+`CueStore.shift` in `src/ui/caption_overlay.py`
+if needed). Two measured problems: (1) anchor corrections with
+|target − off| ≤ `_CC_REBASE_S` (4 s) settle via EWMA on `off` only —
+already-stored cues keep their old positions, so successive small
+corrections leave a mixed-axis store (scrubbed regions misplace captions);
+a recent run's START phase alone logged 23 anchor-snap rebases of ±4–8 s
+while provider lag L grew 27→136 s over 10 minutes. (2) The L EWMA
+(`_CC_LAG_ALPHA` 0.18 per batch) trails a growing/draining L, so the pin
+`edge − L` runs early during growth and late during drain — the "captions
+ahead of speech" symptom. Evaluate with `sync_stage3_retune.py` (constant
+retune simulation over logged per-cue anchor targets): (a) shift the store
+on every accepted correction (weighted) vs per-batch anchor snapshots with
+lazy re-map; (b) lead-compensated L (EWMA + derivative term) vs adaptive α
+with burst gating. FIRST pin the corpus: copy
+`%APPDATA%\MichaelTVPlayer\sync_debug.log` to `sync_retune_input.log` in
+the repo and point the sim at it, and extend the sim beyond anchor bias
+to simulate the stored cue windows (that is what the jitter criterion
+measures). HARD CRITERION: the chosen store mechanism must not
+introduce visible caption jitter at steady state (windows sliding ±1–2 s
+while watching) — include a steady-regime segment in the simulation to
+prove zero jitter. Implement the winner, add harness scenarios for L
+ramp/drain cycles gated on the painted-cue exact-window metric, mutation-
+proof them, run the full harness --quick twice + offline suites.
+`p3_report.md` must include the retune comparison table.

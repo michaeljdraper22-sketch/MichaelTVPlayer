@@ -1,0 +1,46 @@
+Work in D:\Coding\MichaelTVPlayer. FIRST read `subtitle_attack_plan.md` —
+you own ONLY package WP2; WP0/WP1 are merged. Keep console output brief;
+details go to your report files.
+
+PHASE 1 (do this now, then STOP and wait for my approval): write
+`p2_design.md` — a design doc for the live-edge wedge cluster, the
+measured cause of "playback freezes at live, skips stop working, captions
+run ahead". Verified evidence (2026-08-21 sync_debug.log / player.log /
+sync_diag_e2e_live.out): after jump-to-live landed the PCR-true edge
+(target 89.2 vs frontier 57.4 — the frontier under-credits by design), VLC
+wedged at the buffer tail while still reporting "playing"; `set_time`
+no-ops in that state (`chase_seek target=−17.3 → raw unchanged at 94.2 one
+second later`); the revive path in `_chase_seek`
+(`src/ui/player_view.py:1553`) only triggers on state ∈
+ended/stopped/error; the `_tick` rescue (~line 2491) requires
+`frontier − current > 10`, NEGATIVE when the viewer sits past the
+under-credited frontier — structurally unreachable at the true edge (no
+rescue rows in player.log all night); the dead-reckoned caption clock
+integrated wall time through sub-6-s freeze/thaw trickles
+(`_CC_STALL_FREEZE_S` needs 6 s CONTINUOUS freeze) and ran 8.5 s ahead of
+VLC's raw position. Evaluate at minimum: (a) seek-verify-escalate (verify
+raw reached the set_time target within a tolerance — consider
+target-proportional, VLC may legally take >1.5 s on big buffers — else
+escalate to the play_at revive; MUST be hysteresis/cooldown-gated against
+reopen loops), (b) wedge detection independent of the frontier (raw frozen
+>N s while "playing" AND head-PCR content exists past raw), (c)
+freeze-aware clock (hold when raw advanced <~0.3× wall over a rolling
+window while "playing"; fold on thaw). Recommend one combination with
+rationale, failure modes, and the exact acceptance tests (adversarial
+scenarios g: 0.2x-delivery trickle with <6 s freeze/thaw cycles — clock
+stays within ~1.5 s of raw, seeks land; h: injected set_time no-op —
+escalation revives). Note which E2E driver checks (`sync_stage3_run.py`)
+each option changes. Do NOT implement yet — stop after the doc.
+
+PHASE 2 (only after I reply "proceed with option X"): implement the
+approved design, PLUS the two WP4 product decisions (defaults approved
+unless I said otherwise): D1 adaptive jump-to-live (target
+`edge − max(_CHASE_SAFETY_S, L+3)` while measured L > ~8 s, true edge
+otherwise) and D2 near-play caption join (remove the
+`frontier >= _CC_JOIN_MIN_FRONTIER_S` gate in `_start_cc_when_buffer` so
+a mid-show engage joins near the playback position at ANY frontier).
+Add scenarios g/h to `test_sync_adversarial.py`, mutation-proof each new
+detection (temporarily disable → its scenario fails), update any E2E
+driver checks the design or landing policy changes, run the full harness
+--quick twice + all offline suites. `p2_report.md`: design summary,
+implementation notes, before/after scenario output.

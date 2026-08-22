@@ -1,0 +1,21 @@
+Work in D:\Coding\MichaelTVPlayer. FIRST read `subtitle_attack_plan.md` —
+you own ONLY package WP5; all prior packages are merged. Make sure the app
+itself isn't streaming during the live runs (the account allows one
+provider connection). All media muted, minimized, never focused.
+
+Run the full verification matrix and write `p5_report.md`: (1)
+`test_sync_adversarial.py` full duration AND `--quick` twice (de-flake
+proof) on the new metrics; (2) all offline suites; (3) live E2E via
+`sync_stage3_run.py live` in TWO windows chosen to sample different
+provider delivery (classify the regime early via frontier growth; if the
+first window is degenerate, note it and retry later); (4) live exercise
+of BOTH caption-engage paths: captions ON from the start (cold join), and
+Off→On mid-show at frontier ≥ 90 s and also < 90 s — with D2 in, first
+paint after a mid-show engage should arrive within ~15 s (no byte-0
+replay); (5) verify D1 adaptive landing live: with high measured L,
+jump-to-live lands ~L+3 behind the head with timely captions; with low L
+it lands near the true edge; (6) VOD E2E (`sync_stage3_run.py vod`)
+only if the CDN accepts (probe first; HTTP 551 = skip with a note).
+`p5_report.md`: per-symptom scoreboard (slow-load, live sync, VOD sync,
+skip-stability, ahead-of-speech) with before/after evidence and the
+regime context for every number.

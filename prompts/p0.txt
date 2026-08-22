@@ -1,0 +1,51 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`subtitle_attack_plan.md` in the repo root — you own ONLY package WP0; do
+not do any other package's work. If `git diff` shows partial WP0 work
+already, finish it. Keep console output brief; write details to
+`p0_report.md` at the end.
+
+The offline adversarial harness `test_sync_adversarial.py` (run:
+`.venv\Scripts\python.exe -X utf8 test_sync_adversarial.py --quick`,
+~12 min; scenarios via `--only:a,b,…`) has a broken central metric that
+must be fixed BEFORE any mechanism work. Two proven defects: (1)
+`Harness.truth_cue()` (~line 578) only returns released cues that already
+COVER the display position within [s−0.3, e+0.55], so the error
+`disp − clamp(disp, s, e)` in `sample()` (~line 591) is bounded ≤0.55 s by
+construction — the "p95 ≤ 1.5 s" checks can never fail, and every recorded
+"p95 0.29" is saturation, not sync quality. (2) The code under test
+(`src/ui/player_view.py`) gates its caption watchdog/cooldowns/stall logic
+on `time.time()` while the harness drives a virtual clock `VT` — so
+wall-gated behavior (e.g. scenario a's "watchdog fired during the freeze",
+which passed in a recorded run but fails 30/31 today) depends on real
+CCExtractor pacing.
+
+Do: (a) new painted-cue metric — for each sampled tick where the overlay
+painted lines, identify which released cue was painted (match text) and
+score |disp − clamp(disp, that cue's window)|; roll-up screens repeat
+lines, so when several released cues match the painted text, score the
+minimum error over matches and count the sample as ambiguous in
+diagnostics; keep unpainted-while-truth-active as the stop metric; make
+exact-window text match the primary assertion and demote the ±3-s
+neighbor/substring match to diagnostics. (b) Replace mechanism-count
+assertions with outcome assertions where applicable (post-fault painted
+text correct within N s; no blank beyond the watchdog window) — scenario a
+is the template. (c) Make wall-gated logic deterministic: add a minimal
+`now_s()` seam in player_view covering every wall-gated path the harness
+exercises (caption clock, watchdog, rescue/reopen cooldowns; production
+maps it to time.time(), the harness maps it to VT) — a seam, NOT a
+behavior change; leave `_note_dvr_data` frontier crediting consistent
+with the harness's buffer growth (compare quick-mode results before and
+after the seam). (d) Parameterize scenarios with L(t) profiles and
+label checks mechanism vs data-limited; when you touch scenario f's delay
+check, keep it direction-NEUTRAL (a +1.5 s delay must change the painted
+cue) — the delay SIGN fix belongs to a later package; do not encode
+either sign as correct. Then prove the harness can fail —
+mutation test: temporarily inject (i) `view._cc_off += 5` + store shift at
+a fixed virtual time, (ii) a constant +3 s caption-clock skew, (iii) a
+stale (un-shifted) store after a forced rebase; each must FAIL the new
+checks. Revert the injections and confirm 31/31 in --quick mode twice AND
+in full mode once — quick and full must agree scenario-by-scenario (that
+cross-mode agreement is the determinism proof).
+Do not change production behavior, do not run any live/network tests,
+keep everything headless (offscreen Qt). `p0_report.md`: metric design,
+what each mutation caught, before/after outputs.

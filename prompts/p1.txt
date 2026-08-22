@@ -1,0 +1,88 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`subtitle_attack_plan.md` — do ONLY package WP1; WP0 is already merged.
+Spawn three parallel subagents with the briefs below (this keeps your
+context small); they run concurrently in one working tree, so the briefs
+point them at separate files. Merge their work, run the full offline
+suites at the end, and write `p1_report.md` summarizing all three. Tests
+are standalone scripts: `.venv\Scripts\python.exe -X utf8 <test>.py` (no
+pytest). Keep console output brief. Line numbers below are from the
+2026-08-21 diagnosis; WP0 may have shifted them a few lines — locate by
+description when they don't match.
+
+SUBAGENT 1a (owns `src/ui/player_view.py`, `test_caption_overlay.py`;
+report `p1a_report.md`): (1) Subtitle delay sign is inverted:
+`player_view.py:3152` does `self._cap_cues.text_at(t + delay_ms / 1000.0)`
+— querying the FUTURE shows cues EARLIER, but "+ = later" everywhere else
+(`src/config.py:19`, the + button tooltip in `src/ui/subtitle_dialog.py:58-
+62`, VLC's path `src/player.py:630-646` "positive = later" via
+video_set_spu_delay). Change to `t − delay_ms/1000.0` and fix
+`test_caption_overlay.py:549-554`, whose check name codifies the bug
+("positive delay shows the cue 2 s early-at-position"); also update
+`test_sync_adversarial.py` scenario f's delay check so it asserts the
+DIRECTION (with +1.5 s, the painted cue must be the one active 1.5 s
+EARLIER). (2) Stale-cue
+race: `VodRelay.cue` is a queued connection emitted from the relay's
+worker thread; `play_media` teardown (`player_view.py:995-998`)
+disconnects and clears the store, but already-posted events still deliver
+`_on_vod_cue` (`player_view.py:3617`) with only a `_closing` guard — so up
+to one batch of the previous movie's cues lands in the next movie's store
+(stray caption + phantom profanity-mute window); the same race on
+`failed` can fire `_cap_relay_failed` against the new media. Add a
+sender/generation guard to both, with a regression test that emits,
+disconnects+clears, then delivers the stale queued event. (3)
+`_caption_tick` ends in a bare `except: pass` (`player_view.py:3182`) —
+keep it non-fatal but log once per distinct error. Acceptance: each fix
+has a test that fails before and passes after; `test_caption_overlay.py`,
+`test_fixes.py`, `test_subtitles.py`, `test_sub_settings.py` green.
+
+SUBAGENT 1b (owns `src/ui/caption_overlay.py` + NEW `test_cuestore.py`;
+report `p1b_report.md`): (1) `CueStore.add` dedupes on
+`(round(start,3), text)` in `self._seen`, but eviction
+(`del self.cues[:len(self.cues) - _MAX_CUES]`) only truncates `cues` —
+`_seen` is never pruned except by `clear()`/`shift()`. After 5000+
+distinct cues, a rewind that re-receives evicted cues (the VOD relay
+re-parses on seek-back) has every re-add dropped as duplicate → captions
+permanently blank in rewound regions, profanity windows lost. Fix so
+re-added cues re-enter the store. (2) `CueStore.text_at` breaks out of the
+reversed scan when `start < t − 60` (~line 127) — a still-active cue longer
+than 60 s is abandoned mid-display; make the early-break safe for active
+long cues. Put new checks in a new `test_cuestore.py` (standalone style,
+offscreen Qt) — the 1a subagent is editing `test_caption_overlay.py`
+concurrently, so leave that file to it.
+Acceptance: new tests fail before / pass after.
+
+SUBAGENT 1c (owns `src/vod_splitter.py`, `src/mkv_subs.py`,
+`src/mp4_subs.py`, `test_vod_splitter.py`; report `p1c_report.md`):
+(1) MKV captions stop in the last ~2.5 MB: `_TAIL_PREFETCH` bytes at the
+file end are served to VLC directly from `_tail`, never entering
+`read_cache`, and the MKV tap (`_tap_cache`, ~line 670) parses ONLY the
+cache — while the MP4 tap has a head/tail fallback (`_tap_read`, ~line
+610, docstring documents this exact hole). Extend the tail (and head)
+fallback to the MKV tap; regression fixtures whose subtitle clusters land
+inside the tail prefetch, testing full-file play AND a seek directly into
+the tail region. (2) The ASS "bare fixed-fields" fallback
+(`src/mkv_subs.py:54-55`) is dead code: the regex demands `\d+` in the
+Dialogue line's Name field, normally EMPTY — real order is Layer, Start,
+End, Style, Name, MarginL, MarginR, MarginV, Effect, Text. Fix; add a
+fixture storing a Dialogue line without the "Dialogue:" prefix and assert
+clean caption text. (3) `lang_matches` (`mkv_subs.py:119-120`)
+substring-matches full-word hints anywhere: "english" matches a track
+named "Non-English Comments" — make ≥4-char hints word-boundary. (4) Honor
+MKV TimecodeScale (Info element, default 1e6) and MP4 edit-list
+media_time in cue timing (one ffmpeg fixture each). Optional if time
+permits: `server_close()` the relay's HTTP server in stop(); `_alive`
+check before opening a provider stream in `_acquire`; probe the
+async-startup-failure path (relay `failed` emitted from the startup
+thread AFTER VLC attached to the localhost URL — if playback wedges with
+no fallback, add a one-shot direct-URL handback; if VLC recovers by
+itself, document and skip). Acceptance: every
+fix fail-before/pass-after; `test_vod_splitter.py` fully green.
+
+Final step (orchestrator): run ALL offline suites
+(`test_caption_overlay test_cuestore test_vod_splitter test_profanity
+test_fixes test_always_chase test_dvr_e2e test_subtitles
+test_sub_settings test_bundled_ccx test_overlay_focus test_tab_resize
+test_temp_cleanup`), confirm zero regressions and that `git diff` touches
+only owned files — PLUS one `test_sync_adversarial.py --quick` run:
+1a flipped the production delay sign and rewrote scenario f's direction
+check, so the harness must be re-confirmed end-to-end (expect 31/31).

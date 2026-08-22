@@ -98,7 +98,9 @@ the symptoms.
    spends its context budget on the work, not on history.
 2. **First message: paste the prompt verbatim** from the pack below. Every
    prompt tells the session to read this plan first and own exactly one
-   package.
+   package. **Easiest: each prompt is saved ready-to-paste as
+   `prompts/p0.txt`, `p1.txt`, `p2.txt`, `p3.txt`, `p5.txt` — open the
+   file, select all, copy, paste into the fresh session.**
 3. **After the session finishes:** skim its `pN_report.md`, then tell it
    `commit this work` (it names the commit after the package). The next
    session starts from a clean tree, so `git diff` ownership checks stay
@@ -294,6 +296,9 @@ before/after evidence and regime context for every number.
 ---
 
 ## Prompt pack (paste one per FRESH session, verbatim)
+
+Each prompt below is ALSO saved ready-to-paste in `prompts/pN.txt`
+(no `>` quote marks to strip) — prefer copying from there.
 
 ### Prompt P0 — fix the harness metrics
 
