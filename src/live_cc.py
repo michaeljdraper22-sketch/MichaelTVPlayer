@@ -35,6 +35,98 @@ log = logging.getLogger("mtp")
 
 _TAIL_POLL_S = 0.25     # buffer growth poll
 _SRT_POLL_MS = 250      # finished-cue harvest
+_PCR_PROBE_BYTES = 262144   # tail window scanned for the newest PCR
+
+
+def _align_ts(data: bytes) -> int:
+    """Offset of the first 188-byte packet grid inside ``data`` (-1 if none).
+
+    The DVR buffer is packet-aligned, but a tail WINDOW read starts at an
+    arbitrary byte — three consecutive 0x47s one packet apart confirm the
+    grid before anything is parsed."""
+    n = len(data)
+    if n < 3 * 188:
+        return -1
+    for off in range(0, 188):
+        if data[off] == 0x47 and data[off + 188] == 0x47 \
+                and data[off + 376] == 0x47:
+            return off
+    return -1
+
+
+def _packet_pcr(data: bytes, p: int):
+    """(pid, pcr_seconds) of the TS packet at ``p`` (None when it carries
+    no PCR). Needs ≥ 7 adaptation-field bytes: flags + the 6-byte PCR."""
+    if data[p] != 0x47:
+        return None
+    if (data[p + 3] >> 4) & 0x3 < 2:          # no adaptation field
+        return None
+    afl = data[p + 4]
+    if afl < 7 or afl > 183:
+        return None
+    if not data[p + 5] & 0x10:                # PCR flag
+        return None
+    q = p + 6
+    base = ((data[q] << 25) | (data[q + 1] << 17) | (data[q + 2] << 9)
+            | (data[q + 3] << 1) | (data[q + 4] >> 7))
+    ext = ((data[q + 4] & 0x01) << 8) | data[q + 5]
+    pid = ((data[p + 1] & 0x1F) << 8) | data[p + 2]
+    return pid, base / 90000.0 + ext / 27000000.0
+
+
+def probe_tail_pcr(path: str, nbytes: int = _PCR_PROBE_BYTES):
+    """Newest PCR in the last ``nbytes`` of a growing TS file ->
+    (pid, pcr_seconds), or (None, None). This is the content time at the
+    WRITE HEAD of the buffer — same 90 kHz family CCX's cue times come
+    from, so (head PCR - join PCR) - cue_end measures CCX's true
+    processing lag."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, size - nbytes))
+            data = f.read()
+    except OSError:
+        return None, None
+    off = _align_ts(data)
+    if off < 0:
+        return None, None
+    found = None
+    for p in range(off, len(data) - 188 + 1, 188):
+        r = _packet_pcr(data, p)
+        if r is not None:
+            found = r          # keep going — the LAST PCR is the newest
+    return found if found else (None, None)
+
+
+def probe_first_pcr_at(path: str, offset: int = 0,
+                       nbytes: int = _PCR_PROBE_BYTES):
+    """First PCR at/after byte ``offset`` -> (pid, pcr_seconds), or
+    (None, None). Used to pin the PCR at CCExtractor's JOIN byte: the
+    content position where CCX's own (zero-based) cue axis begins."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None, None
+    start = max(0, int(offset))
+    if start >= size:
+        return None, None
+    try:
+        with open(path, "rb") as f:
+            f.seek(start)
+            data = f.read(nbytes)
+    except OSError:
+        return None, None
+    off = _align_ts(data)
+    if off < 0:
+        return None, None
+    for p in range(off, len(data) - 188 + 1, 188):
+        r = _packet_pcr(data, p)
+        if r is not None:
+            return r
+    return None, None
 
 
 def find_ccextractor() -> str:
@@ -138,6 +230,15 @@ class CCSource(QtCore.QObject):
         exe = find_ccextractor()
         if not exe:
             self.failed.emit("CCExtractor not found")
+            return False
+        if exe and bundled_ccextractor() and \
+                os.path.abspath(exe) == os.path.abspath(bundled_ccextractor()):
+            # The vendored 0.88 build reads stdin to EOF before emitting a
+            # single SRT byte (measured: 30 MB piped, 0 B out until close) —
+            # it cannot tail a growing buffer. Fail fast so the owner falls
+            # back to VLC's caption rendering instead of a pipeline that
+            # never produces a cue.
+            self.failed.emit("bundled CCExtractor 0.88 cannot stream")
             return False
         self.stop()
         self.parser = SrtParser(keep_lines=True)   # overlay renders the

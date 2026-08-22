@@ -23,6 +23,7 @@ _LOG_DIR = os.path.join(
     os.environ.get("APPDATA") or os.path.expanduser("~"), "MichaelTVPlayer"
 )
 LOG_PATH = os.path.join(_LOG_DIR, "player.log")
+SYNC_LOG_PATH = os.path.join(_LOG_DIR, "sync_debug.log")
 DUMP_PATH = os.path.join(_LOG_DIR, "crash.dump")
 DUMP_PREV_PATH = os.path.join(_LOG_DIR, "crash.dump.prev")
 
@@ -62,6 +63,33 @@ def _install_excepthook() -> None:
     sys.excepthook = _hook
 
 
+def _setup_sync_log() -> None:
+    """Dedicated DEBUG file for the "mtp.sync" timing-axis logger.
+
+    The main rotating log sits at 2 MB / INFO — a decision trace at 10-20
+    lines/s would rotate it away mid-run. "mtp.sync" therefore never
+    propagates to the root loggers and gets its own 8 MB file, attached
+    ONLY when MTP_SYNC_LOG is set in the environment (normal runs pay
+    nothing; the call sites are additionally guarded by _SYNC_ON).
+    """
+    try:
+        lg = logging.getLogger("mtp.sync")
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False
+        if not os.environ.get("MTP_SYNC_LOG"):
+            return
+        handler = logging.handlers.RotatingFileHandler(
+            SYNC_LOG_PATH, maxBytes=8 * 1024 * 1024, backupCount=1,
+            encoding="utf-8")
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(message)s", datefmt="%H:%M:%S"))
+        lg.addHandler(handler)
+        lg.info("=== sync diagnosis log enabled (pid=%s) ===", os.getpid())
+    except OSError:
+        pass  # best effort — diagnosis must never break playback
+
+
 def setup_logging() -> None:
     """Install rotating log + faulthandler + excepthook (idempotent, safe)."""
     global _configured
@@ -87,6 +115,8 @@ def setup_logging() -> None:
         logging.getLogger("mtp").setLevel(logging.DEBUG)
     except OSError:
         pass  # best effort -- the app must run even without a log file
+
+    _setup_sync_log()
 
     try:
         logging.getLogger("mtp").info(

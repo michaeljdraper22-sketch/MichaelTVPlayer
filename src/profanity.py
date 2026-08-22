@@ -322,6 +322,16 @@ class ProfanityEngine(QtCore.QObject):
         self.windows = []
         self.set_muted(False)
 
+    def shift_windows(self, delta: float):
+        """Move every mute window by ``delta`` content seconds — the live
+        arrival anchor rebases cue windows by whole seconds at once and the
+        mute windows must follow, or the filter mutes the wrong speech."""
+        if not self.windows or not delta:
+            return
+        self.windows = merge_windows(
+            [(max(0.0, ws + delta), max(0.0, we + delta))
+             for ws, we in self.windows], gap=0.05)
+
     # ---- evaluation ----
     def evaluate(self, play_s: float):
         """Apply the filter-mute state for the current playback position."""

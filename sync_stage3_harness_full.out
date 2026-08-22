@@ -1,0 +1,4 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.2s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==

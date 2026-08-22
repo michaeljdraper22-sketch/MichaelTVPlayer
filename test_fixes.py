@@ -225,7 +225,9 @@ def main():
     check("no 0.75x edge damping left", "0.75" not in src)
     rsrc = inspect.getsource(pv_mod.PlayerView._reopen_chase)
     check("watchdog reopen keeps the tracked position (no jump to live)",
-          "_safe_seek_target(self._vid_s)" in rsrc)
+          "_safe_seek_target(at)" in rsrc
+          and "_cap_clock_s if self._cap_clock_s > 0.0 else self._vid_s"
+          in rsrc)
     check("speeds capped at 4x (audio mute limit)",
           max(pv_mod._SPEEDS) <= 4.0)
     check("jump-to-beginning button exists + wired",

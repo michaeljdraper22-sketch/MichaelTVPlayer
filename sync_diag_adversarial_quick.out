@@ -1,0 +1,62 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.9s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    calibration m0=-1.47s (143 samples)
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift -3.8 s)
+    drift: painted=431 n=341 |err| p50=0.16 p95=0.37 max=0.54 maxstop=0.2s rebases=1 text=314/341
+  ok   a: drift keeps cues within 1.5 s (p95)   [p95=0.37]
+  ok   a: no silent-stop over 6 s during drift   [max=0.2s]
+  ok   a: wedge applied
+    post-wedge: painted=581 n=491 |err| p50=0.12 p95=0.32 max=0.54 maxstop=0.2s rebases=1 text=464/491
+  FAIL a: watchdog fired during the freeze   [rebases 1->1]
+  ok   a: wedge stop recovered within ~6 s   [stretch=0.0s]
+  ok   a: post-wedge cues within 1.5 s (p95)   [p95=0.32]
+  ok   a: no pipeline exceptions
+
+== scenario b: pause 60 s -> resume +25 s step (3 cycles) ==
+    b (3 cycles): painted=4334 n=4275 |err| p50=0.00 p95=0.29 max=0.55 maxstop=0.7s rebases=0 text=4275/4275
+  ok   b: divergence recorded for each +25 s step (accumulates to ~75)   [div=+74.7 want~+75]
+  ok   b: cues within 1.5 s through pause/resume/step (p95)   [p95=0.29]
+  ok   b: no silent-stop beyond watchdog window (~5+3 s)   [max=0.7s]
+  ok   b: 3 pause cycles executed
+  ok   b: no pipeline exceptions
+
+== scenario c: jump-to-live, L swells 1 -> 20 s ==
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift -3.6 s)
+    c: painted=117 n=88 |err| p50=0.18 p95=0.28 max=0.52 maxstop=0.0s rebases=2 text=88/88
+  ok   c: jump landed ~5 s behind the true edge   [clock@jump=28.1 edge@jump=33.1 true_head=33.1]
+  ok   c: cues within 1.5 s after lag recovery (p95)   [p95=0.28]
+  ok   c: blank stretches stay data-limited (<= L swell + margin)   [max=0.0s]
+  ok   c: no pipeline exceptions
+
+== scenario d: provider bursts, frontier under-credits ==
+captions: no window hit the clock for 15.9 s while cues kept arriving — anchor rebased (shift +21.1 s)
+    d: painted=433 n=354 |err| p50=0.19 p95=0.36 max=0.55 maxstop=3.6s rebases=4 text=319/354
+  ok   d: frontier really under-credited (>=10 s at some point)   [max edge-frontier gap=27.0s]
+  ok   d: cues within 1.5 s through bursts (p95)   [p95=0.36]
+  ok   d: no silent-stop beyond watchdog window (~5+4 s)   [max=3.6s]
+  ok   d: no pipeline exceptions
+
+== scenario e: CCX caption axis runs 2x wall ==
+    warp-axis calibration m0=-3.79s (150 samples)
+    e: painted=575 n=575 |err| p50=0.13 p95=0.29 max=0.30 maxstop=0.0s rebases=11 text=493/575
+  ok   e: 2x caption axis stays displayable (p95 <= 1.5)   [p95=0.29]
+  ok   e: no silent-stop beyond watchdog window (~5+3 s)   [max=0.0s]
+  ok   e: painted text stays local to the speech (>=80%)   [493/575 (warped axis: newest-arrived screen is shown up to backlog-L ahead — position gate is the p95)]
+  ok   e: no pipeline exceptions
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    f: steady: painted=694 n=465 |err| p50=0.18 p95=0.46 max=0.55 maxstop=0.2s rebases=0 text=465/465
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+    f: scrubbed-back region: painted=200 n=200 |err| p50=0.19 p95=0.30 max=0.30 maxstop=0.5s rebases=0 text=200/200
+  ok   f: scrubbed-back cues coherent (p95 <= 1.5)   [p95=0.30]
+  ok   f: scrubbed-back text matches (>=85%)   [200/200]
+    f: post-rebase stability: painted=279 n=79 |err| p50=0.19 p95=0.29 max=0.29 maxstop=2.6s rebases=2 text=279/279
+  ok   f: rebase round-tripped (forced + snap-back)   [rebases 0->2]
+  ok   f: rebased store stays coherent behind the head   [p95=0.29]
+  ok   f: delay_ms shifts the painted cue live (+1.5 s)   [base=2ln shifted=2ln]
+  ok   f: no pipeline exceptions
+
+30/31 checks passed
+  FAILED: a: watchdog fired during the freeze

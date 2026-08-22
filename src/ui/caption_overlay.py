@@ -102,6 +102,18 @@ class CueStore:
         if len(self.cues) > _MAX_CUES:
             del self.cues[:len(self.cues) - _MAX_CUES]
 
+    def shift(self, delta: float):
+        """Move every stored window by ``delta`` content seconds (same
+        direction). A snap-and-rebase of the live arrival anchor moves the
+        CCX->app offset by whole seconds; shifting the already-mapped cues
+        with it keeps the store's timeline coherent, so a scrub back after
+        a rebase shows captions placed where they actually play."""
+        if not self.cues or not delta:
+            return
+        self.cues = [(max(0.0, s + delta), max(0.0, e + delta), txt)
+                     for s, e, txt in self.cues]
+        self._seen = {(round(s, 3), txt) for s, _e, txt in self.cues}
+
     def text_at(self, t: float):
         """Lines to display at content time ``t`` (newest active cue wins —
         roll-up screens repeat the previous lines, so the newest cue IS the

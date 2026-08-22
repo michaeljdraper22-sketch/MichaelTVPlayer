@@ -211,6 +211,23 @@ def main():
     view._on_media_for_profanity("vod")
     check("VOD does not engage the live filter", CCStarts == [])
 
+    # VOD mute-lead trim (stage 3): pre-timed tracks still open their mute
+    # windows a fixed 0.4 s EARLY — movies measured ~0.5 s late mutes (the
+    # word is audible as the window opens). Same cue with/without the trim
+    # so the in-cue word-position estimate cancels out.
+    view._filter_engine.clear()
+    view._filter_engine.words = [("hell", "exact")]
+    view._on_vod_cue(10.0, 12.0, "what the hell is this")
+    vod_win = view._filter_engine.windows[0]
+    view._filter_engine.clear()
+    view._filter_engine.add_cue(10.0, 12.0, "what the hell is this",
+                                lead_s=0.0)
+    raw_win = view._filter_engine.windows[0]
+    check("VOD mute windows open lead-early (stage-3 trim)",
+          abs((raw_win[0] - vod_win[0]) - pv_mod._VOD_MUTE_LEAD_S) < 1e-9
+          and abs((raw_win[1] - vod_win[1]) - pv_mod._VOD_MUTE_LEAD_S) < 1e-9
+          and pv_mod._VOD_MUTE_LEAD_S <= 0.5)
+
     # VOD splitter glue: routing through the relay must ALSO start the
     # evaluation timer (the mute loop — the live CC reader is the only
     # other start() site)
@@ -265,17 +282,21 @@ def main():
     view.vlc.get_time = lambda: -1     # idle player: clock follows _vid_s
     view._on_cc_cue(50.0, 50.5, "warm-up")     # lone opener: untrusted
     view._on_cc_cue(50.5, 52.0, "what the hell is this")   # fresh: anchors
+    view._cc_flush_pending()                   # stage 3: deferred anchor
     off = view._cc_off
     check("live cue anchored onto the app clock (arrival)",
           off is not None and abs(off - (42.0 - pv_mod._CC_LAG_S - 52.0))
           < 1e-9)
     check("anchored caption cue became a window",
           len(view._filter_engine.windows) == 1)
-    view.vlc.get_time = lambda: int((51.6 + off) * 1000)   # in the word
+    # the dead-reckoned clock keys on transport seeds (stage 2): display
+    # at the anchored word, then past it
+    word_c = view._filter_engine.windows[0][0] + 0.05
+    view._cap_seed_transport(word_c)             # display inside the word
     view._filter_tick()
     check("chase tick muted inside the anchored word",
           mut and mut[-1] is True)
-    view.vlc.get_time = lambda: int((60.0 + off) * 1000)   # past it
+    view._cap_seed_transport(word_c + 5.0)       # display past it
     view._filter_tick()
     check("chase tick unmuted outside", mut[-1] is False)
 

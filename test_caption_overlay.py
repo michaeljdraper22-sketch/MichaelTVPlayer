@@ -423,15 +423,19 @@ check("VLC's own spu forced OFF under the overlay", fake.spu == -1)
 check("cap timer runs while the overlay owns captions",
       view._cap_timer.isActive())
 
-# ---- live cues: ARRIVAL-anchored times + tracked caption clock ----
-# CCX's SRT times live on their own drifting axis (probe: 12-32 s ahead
-# of VLC's clock with continuous drift), so every FRESH cue re-anchors a
-# running offset that maps them onto the app's frontier clock.
+# ---- live cues: TRUE-POSITION anchoring + dead-reckoned caption clock ----
+# Stage 2: the newest FRESH cue pins at edge - L on the app's content
+# axis (L = measured CCX lag; edge = dead-reckoned write head, falling
+# back to the frontier before a transport seeds the backlog). With no
+# PCR probe available here the lag falls back to _CC_LAG_S.
+# Stage 3: the decision is DEFERRED to the caption tick — _cc_flush_pending
+# applies ONE anchor per arrival batch, written by the batch's newest cue.
 view._frontier_s = lambda: 100.0           # mature buffer
 view._on_cc_cue(50.0, 52.0, "what the hell is this")
 check("lone first cue on a mature buffer does not anchor (untrusted)",
       view._cc_off is None and not view._cap_cues.cues)
 view._on_cc_cue(52.0, 54.0, "what the hell is this")   # fresh successor
+view._cc_flush_pending()
 LAG = pv_mod._CC_LAG_S
 off = view._cc_off
 check("fresh successor cue anchors the CCX->app clock",
@@ -439,17 +443,45 @@ check("fresh successor cue anchors the CCX->app clock",
 view._on_cc_cue(70.0, 120.0, "ancient catch-up burst")
 check("catch-up burst does not re-anchor (advance >> wall time)",
       view._cc_off == off)
-# EWMA smoothing: per-cue lag estimates jitter with the pipeline (burst
-# flushes, poll phase) — a fresh cue steps the anchor PART of the way
-# toward its own estimate instead of jumping the whole distance
+# snap-and-rebase: a fresh cue whose implied correction exceeds
+# _CC_REBASE_S sets the offset immediately (no EWMA crawl) AND slides
+# every stored window with it, so the store's timeline stays coherent
+# (the cue that ESTABLISHES the first anchor is not stored itself — its
+# batch arrived while no offset existed; roll-up re-delivers that text)
 view._cc_last_t = time.time() - 1.0        # plausible elapsed for advance
 view._on_cc_cue(118.0, 122.0, "fresh successor after the burst")  # fresh
+view._cc_flush_pending()
 target2 = 100.0 - LAG - 122.0
-expected2 = off + (target2 - off) * pv_mod._CC_ANCHOR_ALPHA
-check("fresh cue steps the anchor part-way (EWMA, not a jump)",
-      abs(view._cc_off - expected2) < 1e-9
-      and abs(view._cc_off - target2) > 1e-6)
-c0, c1 = 52.0 + off, 54.0 + off            # the anchored display window
+check("big correction snap-rebases the anchor (no EWMA crawl)",
+      abs(view._cc_off - target2) < 1e-9)
+w0 = [c for c in view._cap_cues.cues
+      if c[2] == "fresh successor after the burst"]
+check("stored windows slide with the rebase (coherent timeline)",
+      w0 and abs(w0[0][0] - (118.0 + target2)) < 1e-6
+      and abs(w0[0][1] - (122.0 + target2)) < 1e-6)
+# small corrections still EWMA part-way toward their estimate
+view._cc_last_t = time.time() - 1.0
+view._on_cc_cue(122.0, 123.0, "next line")      # fresh, ~1 s correction
+view._cc_flush_pending()
+target3 = 100.0 - LAG - 123.0
+expected3 = target2 + (target3 - target2) * pv_mod._CC_ANCHOR_ALPHA
+check("small correction steps the anchor part-way (EWMA, not a jump)",
+      abs(view._cc_off - expected3) < 1e-9
+      and abs(view._cc_off - target3) > 1e-6)
+# stage-3 batch whipsaw guard: a flush BURST of individually-fresh cues
+# (CCX stdout blocks) must anchor on the batch's NEWEST cue only — the
+# stale interior cues' targets (a full batch width low) may never land
+view._cc_last_t = time.time() - 1.0
+burst_off = view._cc_off
+for b in range(30):                        # 30 cues spanning ~6 s, one burst
+    view._on_cc_cue(123.0 + b * 0.2, 123.2 + b * 0.2, f"burst line {b}")
+check("burst delivery alone does not move the anchor (deferred)",
+      view._cc_off == burst_off)
+view._cc_flush_pending()
+target_burst = 100.0 - LAG - (123.2 + 29 * 0.2)
+check("arrival burst anchors on its newest cue (no interior whipsaw)",
+      abs(view._cc_off - target_burst) < 1e-9)
+c0, c1 = 118.0 + view._cc_off, 122.0 + view._cc_off  # anchored display window
 
 
 def _show_at(t):
@@ -463,18 +495,35 @@ def _show_at(t):
 
 
 check("arrival-anchored cue renders inside its window",
-      _show_at(c0 + 0.5) == ["what the hell is this"])
+      _show_at(c0 + 0.5) == ["fresh successor after the burst"])
+_all_end = max(c[1] for c in view._cap_cues.cues)
 check("cue clears after its anchored window",
-      _show_at(c1 + 5.0) == [])
+      _show_at(_all_end + 1.5) == [])
 
-# caption timing keys on VLC's DISPLAYED position when it reports one:
-# the tracked clock snaps to live readings (frozen / garbage broadcast
-# PTS is what desynced live captions before)
-fake.times["t"] = int((c0 + 0.5) * 1000)
-view._caption_tick()
-check("VLC's displayed position drives the caption clock",
-      abs(view._cap_clock_s - (c0 + 0.5)) < 0.01
-      and view._cap_wid._lines == ["what the hell is this"])
+# caption timing keys on the DISPLAYED position through outlier-rejected
+# DELTAS only: raw advancing ~rate x wall folds in (the clock follows
+# VLC's real timeline); absolute numbers are never snapped to
+before = view._cap_clock_s
+fake.times["t"] = int((c0 + 0.5) * 1000)    # baseline reading — only its
+view._caption_tick()                        # DELTA matters from here on
+time.sleep(0.12)
+fake.times["t"] = int((c0 + 0.65) * 1000)   # advanced ~wall since the
+view._caption_tick()                        # reading changed: fold it in
+check("raw deltas that agree with wall fold into the clock",
+      0.05 < view._cap_clock_s - before < 0.35)
+fake.times["t"] += 30_000                   # PTS renumbering: numbers jump,
+view._caption_tick()                        # frames keep playing 1:1
+after_renum = view._cap_clock_s
+check("renumbered raw cannot yank the clock (divergence recorded)",
+      after_renum - before < 1.0 and view._cap_div_ok
+      and abs(view._cap_div_s
+              - ((c0 + 30.65) - after_renum)) < 0.05)
+d = view._cap_div_s
+check("divergence converts content seeks to VLC numbers",
+      abs(view._cap_vlc_time_for(100.0) - (100.0 + d)) < 1e-9
+      and abs(view._cap_content_for_raw(130.0) - (130.0 - d)) < 1e-9)
+fake.times["t"] = -1                        # back to no-reading mode for
+#                                            # the _vid_s-seeded tests below
 for _ in range(2):                 # VLC's clock frozen at the same value:
     time.sleep(0.05)               # caption time integrates forward
     view._caption_tick()
@@ -502,7 +551,7 @@ cfg.subtitle_appearance = dict(cfg.subtitle_appearance, delay_ms=2000)
 view._vid_s = c0 - 1.5              # +2 s of delay lands inside the cue
 view._caption_tick()
 check("positive delay shows the cue 2 s early-at-position",
-      view._cap_wid._lines == ["what the hell is this"])
+      view._cap_wid._lines == ["fresh successor after the burst"])
 cfg.subtitle_appearance = dict(cfg.subtitle_appearance, delay_ms=0)
 
 # _enforce_spu keeps VLC's spu off while the overlay owns captions
@@ -700,6 +749,20 @@ try:
           fed2[:188] == _blob[188 * 50:188 * 51]
           and _blob[188 * 50:] in fed2)
     real_src2.stop()
+    # stage-3 guard: the vendored 0.88 build reads stdin to EOF before
+    # emitting a single SRT byte (verified: 30 MB piped, 0 B out until
+    # close) — it cannot tail a growing buffer, so start() must refuse
+    # it and emit failed so the app falls back to VLC caption rendering
+    bundled = live_cc_mod.bundled_ccextractor()
+    if bundled:
+        fails = []
+        src3 = live_cc_mod.CCSource()
+        src3.failed.connect(fails.append)
+        live_cc_mod.find_ccextractor = lambda: bundled
+        ok_bundled = src3.start(ts)
+        check("bundled 0.88 refused for live streaming",
+              ok_bundled is False and fails and "stream" in fails[0])
+        src3.stop()
     os.remove(ts)
 finally:
     live_cc_mod.subprocess.Popen = _real_popen
@@ -710,11 +773,14 @@ view._cap_fail = False
 view._select_spu(2, "Closed captions 1")
 view._filter_engine.enabled = True
 view._filter_engine.words = [("hell", "exact")]
+view._cap_cues.clear()                     # isolate: fresh anchor scenario
 view._cc_off = None                       # fresh anchor scenario
 view._cc_last_c = None
 view._on_cc_cue(70.0, 70.5, "warm-up")    # lone opener: untrusted, dropped
 view._on_cc_cue(70.5, 72.0, "what the hell is this")   # fresh: anchors
+view._cc_flush_pending()
 off6 = view._cc_off
+view._cap_cues.add(70.5 + off6, 72.0 + off6, "what the hell is this")
 shown6 = _show_at(71.0 + off6)             # inside the anchored window
 check("masked line rendered while the filter is on",
       shown6 == [mask_text("what the hell is this", [("hell", "exact")])]
@@ -722,6 +788,23 @@ check("masked line rendered while the filter is on",
 view._filter_engine.enabled = False
 check("unmasked once the filter is off",
       _show_at(70.5 + off6) == ["what the hell is this"])
+
+# stage-3: the VOD filter path opens mute windows ~0.4 s early (movies
+# were measured to miss mutes by ~0.5 s) without touching caption times
+view._filter_engine.clear()
+view._filter_engine.enabled = True
+view._cap_cues.clear()
+view._on_vod_cue(100.0, 104.0, "what the hell is this")
+wv = view._filter_engine.windows[0]
+_vtxt = "what the hell is this"
+_raw = 100.0 + _vtxt.find("hell") / len(_vtxt) * 4.0
+check("VOD mute window opens early by the mute-lead trim",
+      abs(wv[0] - (_raw - pv_mod._VOD_MUTE_LEAD_S)) < 0.01,
+      )
+check("VOD caption times unchanged by the filter trim",
+      view._cap_cues.cues
+      and abs(view._cap_cues.cues[0][0] - 100.0) < 1e-9)
+view._filter_engine.enabled = False
 
 view._set_cap_on(False)
 view._stop_cc_source()

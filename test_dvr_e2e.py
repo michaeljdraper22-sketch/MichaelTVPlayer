@@ -17,7 +17,7 @@ import time
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5 import QtWidgets  # noqa: E402
+from PyQt5 import QtCore, QtWidgets  # noqa: E402
 
 from src.config import Config  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
@@ -33,7 +33,13 @@ app = QtWidgets.QApplication(sys.argv)
 cfg = Config.load()
 view = PlayerView(cfg)
 view.resize(960, 540)
-view.show()
+# never steal focus or audio (the user is watching TV)
+view.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
+view.showMinimized()
+view.vol_slider.setValue(0)
+view.btn_mute.setChecked(True)
+view.vlc.set_mute(True)
+view.vlc.set_volume(0)
 
 PASS, FAIL = [], []
 
@@ -115,8 +121,11 @@ try:
     p5 = view.vlc.get_time() / 1000.0
     check(f"playhead moved forward ({p4:.1f}s -> {p5:.1f}s)",
           p5 > p4 + 4.0)
-    check("and never lands past the live edge",
-          p5 <= view._frontier_s() + 2.0)
+    # stage 2: the LIVE edge is the PCR-calibrated content head, which
+    # sits 20-35 s of content PAST the wall-credited frontier (cold-burst
+    # under-credit) — a clamped seek may land there, never beyond it
+    check("and never lands past the TRUE live edge",
+          p5 <= view._cap_edge_s() + 2.0)
 
     print("[6b] jump to BEGINNING", flush=True)
     view._jump_begin()

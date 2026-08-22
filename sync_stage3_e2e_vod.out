@@ -1,0 +1,59 @@
+
+== VOD movie: 4K-TOP - Jackass: Best and Last (2026) ==
+[16:16:23] PHASE VOD_MOVIE 4K-TOP - Jackass: Best and Last (2026)
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+
+== VOD movie: 4K-TOP - Superbad (2007) ==
+[16:17:09] PHASE VOD_MOVIE 4K-TOP - Superbad (2007)
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+
+== VOD movie: 4K-TOP - It Ends (2026) ==
+[16:17:55] PHASE VOD_MOVIE 4K-TOP - It Ends (2026)
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+  movie: nothing playable — skipping
+
+== VOD series episode: 4K-AR-DO - الفرنساوي - S01E01 - Episode 1 ==
+[16:18:41] PHASE VOD_SERIES 4K-AR-DO - الفرنساوي - S01E01 - Episode 1
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+
+== VOD series episode: 4K-AR-DO - الفرنساوي - S01E02 ==
+[16:19:27] PHASE VOD_SERIES 4K-AR-DO - الفرنساوي - S01E02
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+
+== VOD series episode: 4K-AR-DO - بطل العالم - S01E01 - Episode 1 ==
+[16:20:28] PHASE VOD_SERIES 4K-AR-DO - بطل العالم - S01E01 - Episode 1
+  (timeout waiting for playback after 45s)
+  playback never started — trying the next item
+  series episode: nothing playable — skipping
+
+checks: 0/0 passed
+  293.6s done — sync log: %APPDATA%\MichaelTVPlayer\sync_debug.log
+[000002c7c94c9e80] access stream error: HTTP 551 error
+[000002c7c94c9e80] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/movie/726352471c/d809266e91/2115626.mp4'. Check the log for details.
+[000002c7c94c9700] access stream error: HTTP 551 error
+[000002c7c94c9700] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/movie/726352471c/d809266e91/2108329.mp4'. Check the log for details.
+[000002c7c94c9e80] access stream error: HTTP 551 error
+[000002c7c94c9e80] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/movie/726352471c/d809266e91/2108328.mp4'. Check the log for details.
+[000002c7c94c9400] access stream error: HTTP 551 error
+[000002c7c94c9400] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/series/726352471c/d809266e91/1959125.mp4'. Check the log for details.
+[000002c7c94c9280] access stream error: HTTP 551 error
+[000002c7c94c9280] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/series/726352471c/d809266e91/1959126.mp4'. Check the log for details.
+[000002c7c94c9e80] access stream error: HTTP 551 error
+[000002c7c94c9e80] http stream error: error: HTTP/1.1 551 <none>
+[000002c7c94eb5a0] main input error: Your input can't be opened
+[000002c7c94eb5a0] main input error: VLC is unable to open the MRL 'http://cf.534842.xyz/series/726352471c/d809266e91/1794630.mp4'. Check the log for details.

@@ -368,7 +368,7 @@ fake.state = "ended"                # revive path reopens AT the target
 view._chase_started = True
 view._jump_live()
 app.processEvents()
-check("LIVE lands frontier - 5 s (not at the write head)",
+check("LIVE lands edge - 5 s (frontier fallback: no transport seeded yet)",
       fake.calls and fake.calls[-1][0] == "play_at"
       and abs(fake.calls[-1][2] - 95.0) < 0.5)
 

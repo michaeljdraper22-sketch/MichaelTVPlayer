@@ -15,7 +15,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from ..dvr import VlcRecorder
 from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
 from .. import profanity as prof_mod
-from ..live_cc import CCSource, find_ccextractor
+from ..live_cc import CCSource, find_ccextractor, probe_tail_pcr, \
+    probe_first_pcr_at
 from .. import vod_splitter
 from ..vod_splitter import VodRelay
 from ..mkv_subs import is_text_codec, is_language_name, lang_matches
@@ -61,19 +62,62 @@ _REOPEN_COOLDOWN_S = 5.0
 # The budget resets on every channel change (play_media).
 _CHASE_RETRY_DELAYS = (10.0, 30.0)
 
-# Live-CC pipeline lag (buffer-tail poll + CCExtractor processing + SRT
-# harvest), compensated when arrival-anchoring live cues: without it every
-# caption would display this much after its speech. ~1 s typical (250 ms
-# tail poll + CCX decode + 250 ms harvest + frontier tick quantization);
-# the subtitle delay setting (±) covers personal taste on top.
+# Live-CC pipeline lag FALLBACK (buffer-tail poll + CCExtractor processing
+# + SRT harvest) for when the tail-PCR probe cannot measure the real lag
+# (no PCR in the buffer yet, probe failure). Stage 2 measures L live and
+# uses this only until the first successful measurement.
 _CC_LAG_S = 1.0
 
-# Live anchor smoothing: each fresh cue re-derives the CCX->app offset,
-# but per-cue estimates jitter with the pipeline (burst flushes, poll
-# phase). An EWMA settles captions on the MEAN lag instead of wiggling
-# cue-to-cue; it converges within a handful of cues and still tracks
-# slow drift (fresh cues keep arriving).
-_CC_ANCHOR_ALPHA = 0.35
+# Live anchor smoothing: each flush of the caption stream re-derives the
+# CCX->app offset, but per-flush estimates jitter with the pipeline (burst
+# flushes, poll phase). An EWMA settles captions on the MEAN lag instead
+# of wiggling cue-to-cue. Stage 3 raised this from 0.35: the anchor
+# decision is now DEFERRED to one clean sample per arrival flush (see
+# _cc_flush_pending), so the sample rate fell ~3x while its per-sample
+# skew shrank (newest-cue probes only) — 0.50 keeps the same smoothing
+# per second while converging ~1.7x faster. The stage-2 matrices showed
+# a persistent -0.4 s signed innovation (anchor trailing its target)
+# across every phase; the faster EWMA halves that residual.
+_CC_ANCHOR_ALPHA = 0.50
+
+# ---- stage-2 single-axis caption timing (transport-aware, self-healing) ----
+# Video frames play 1:1 with wall time no matter what the timestamp numbers
+# do, so the caption clock dead-reckons on ONE app-owned content axis and
+# never mixes axes. Absolute snaps to VLC's raw get_time are gone: only
+# outlier-rejected DELTA nudges fold in (raw advancing ~rate x wall within
+# _CC_SYNC_TOL_S agrees that frames kept playing; bigger jumps are PTS
+# renumbering — the clock ignores them and remembers the divergence).
+_CC_SYNC_TOL_S = 2.0        # |raw delta - rate x wall delta| accepted as a nudge
+_CC_STALL_FREEZE_S = 6.0    # raw frozen this long while "playing" = underrun stall
+_CC_REBASE_S = 4.0          # anchor correction beyond this snaps (no EWMA crawl)
+_CC_LAG_ALPHA = 0.18        # EWMA over the measured CCX lag L (per-cue
+#                              # samples carry ~1 s of queue-skew jitter;
+#                              # the live matrix put innovation p95 at
+#                              # ~1.6-2.0 with 0.25 — 0.18 trades a
+#                              # little ramp lag for less anchor jitter)
+_CC_LAG_MAX_S = 240.0       # sanity bound on a single L sample (the 4K
+#                              # channel measured L>130 s one session —
+#                              # 90 froze the EWMA while the true lag
+#                              # grew past it)
+_CC_EDGE_ALPHA = 0.50       # edge pull toward the PCR head (this CDN
+#                              # bursts: 0.1x for tens of seconds, then
+#                              # 30 s of content at once — wall dead-
+#                              # reckoning alone swings 5-8 s off between
+#                              # probes, and every correction snapped the
+#                              # anchor; the PCR head is the truth)
+_CC_EDGE_SNAP_S = 2.5       # hard edge resync when the PCR head says we're off
+_CC_EDGE_PROBE_MS = 2000    # periodic head probe (caption-silent stretches)
+_CC_D_ALPHA = 0.30          # EWMA of (raw - clock) — the axis divergence
+# Caption-stopped watchdog: cues still arriving (within _CC_WATCH_CUE_S) but
+# NO window intersecting the clock for _CC_WATCH_GAP_S means the anchor
+# diverged from the stored windows — re-derive it from the newest cue.
+# The arrival window spans CCX's burst-parse stalls (a landed 30-s CDN
+# burst takes the parser ~20-30 s of silence) — safe because the instant-L
+# derivation in _cc_watchdog_fire yields ~0 during genuine speech pauses,
+# so widening it cannot fire on those.
+_CC_WATCH_CUE_S = 20.0
+_CC_WATCH_GAP_S = 5.0
+_CC_WATCH_COOLDOWN_S = 8.0
 
 # Long-buffer live engage: CCExtractor joins the DVR buffer this many
 # seconds behind the current playback position (see _start_cc_when_buffer)
@@ -83,10 +127,25 @@ _CC_ANCHOR_ALPHA = 0.35
 _CC_JOIN_BACK_S = 8.0
 _CC_JOIN_MIN_FRONTIER_S = 90.0   # below this, a byte-0 join is instant anyway
 
+# VOD profanity mute-lead: movies were measured to miss mutes by ~0.5 s
+# (the word already audible as the window opened). The word-position
+# estimate inside a cue is proportional to character share, and tracks
+# run their dialogue slightly ahead of the estimate — so the VOD filter
+# path opens each mute window this many seconds EARLY. VOD ONLY: live
+# cues are arrival-anchored to display times already.
+_VOD_MUTE_LEAD_S = 0.4
+
 # Playback speeds offered by the speed button (chase mode / VOD).
 # Capped at 4x: VLC mutes the audio output entirely above ~4x playback
 # speed ("fast forward 5x goes silent").
 _SPEEDS = (0.125, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
+
+# ---- stage-1 live-caption sync diagnosis (measurement only) ----
+# Every timing-axis sample / decision lands on the "mtp.sync" logger
+# (own DEBUG file when MTP_SYNC_LOG is set — see logging_setup). All call
+# sites are guarded by _SYNC_ON, so a normal run pays one boolean check.
+synclog = logging.getLogger("mtp.sync")
+_SYNC_ON = bool(os.environ.get("MTP_SYNC_LOG"))
 
 # Window flags for the on-video overlay layer (see PlayerView.__init__):
 # ToolTip = frameless, no taskbar entry, always above its owner window and
@@ -289,6 +348,8 @@ class PlayerView(QtWidgets.QWidget):
                                        # garbage broadcast PTS on these
                                        # streams — see _tick)
         self._last_raw = None         # previous raw VLC time (chase/VOD tracker)
+        self._raw_change_wall = 0.0   # wall time raw last CHANGED (wedge
+        #                              # detector: frozen-while-playing)
         self._tick_t = None           # wall clock of the previous _tick
         self._live_paused = False     # paused in plain LIVE mode (timeshift)
         self._scale_mode = config.scale_mode   # fit | stretch | crop
@@ -321,15 +382,58 @@ class PlayerView(QtWidgets.QWidget):
         #                              # position; see _caption_clock_s)
         self._cap_raw_s = None        # last raw get_time() seen by the
         #                              # caption clock (freeze/jump guard)
+        self._cap_raw_wall = 0.0      # wall time that raw reading first
+        #                              # appeared (delta validation window)
         self._cap_wall = 0.0          # wall time of the last caption-clock
         #                              # update (integration dt)
-        # live-CC arrival anchor: CCX's PTS axis drifts against VLC's
-        # clock (probe: 12-32 s, growing), so every FRESH cue re-anchors a
-        # running offset that maps CCX times onto the app's frontier axis
-        # (None until the first steady cue — catch-up bursts are untrusted)
+        self._cap_backlog_s = None    # live-edge backlog in content seconds
+        #                              # (edge = clock + backlog; None until
+        #                              # a transport event seeds it)
+        self._cap_div_s = 0.0         # EWMA of (raw get_time - dead-reckoned
+        self._cap_div_ok = False      # clock): the axis divergence used to
+        #                              # convert content-axis seek targets
+        #                              # into VLC set_time numbers
+        # live-CC arrival anchor: the newest FRESH cue is pinned at
+        # edge - L on the app's content axis (L = the MEASURED CCX lag
+        # from the tail-PCR probe; the old hardcoded 1 s was wrong by
+        # 1.5-2 orders of magnitude). CCX's own cue times only carry
+        # RELATIVE ordering; the offset below maps them onto the axis.
         self._cc_off = None           # live cue offset, CCX s -> app s
         self._cc_last_c = None        # end-time of the last anchored cue
         self._cc_last_t = 0.0         # wall time of the last anchor
+        self._cc_pend = None          # deferred anchor (end, head_rel):
+        #                              # applied once per arrival batch by
+        #                              # _cc_flush_pending (see _on_cc_cue)
+        self._cc_stash = []           # cues that arrived before the first
+        #                              # anchor: stored once an offset exists
+        self._cc_lag = None           # EWMA of the measured CCX lag L
+        self._cc_head_pcr = None      # (pcr_s, wall) of the last throttled
+        #                              # tail-PCR probe of the write head
+        self._cc_join_byte = 0        # buffer byte CCExtractor joined at
+        self._cc_join_app_s = 0.0     # content-axis position of that byte
+        #                              # (refined from PCR+bytes for
+        #                              # mid-session joins; 0 for cold ones)
+        # caption-stopped watchdog (see _caption_tick)
+        self._cc_last_arrival = 0.0   # wall time ANY live cue arrived
+        self._cc_last_active = 0.0    # wall time a window last hit the clock
+        self._cc_last_watchfire = 0.0 # watchdog cooldown
+        # periodic PCR-head probe: keeps the dead-reckoned live edge
+        # calibrated even through caption-silent stretches (this CDN
+        # bursts, so the edge must follow the head, not the wall clock)
+        self._cc_edge_timer = QtCore.QTimer(self)
+        self._cc_edge_timer.setInterval(_CC_EDGE_PROBE_MS)
+        self._cc_edge_timer.timeout.connect(self._cc_edge_probe_tick)
+        # stage-1 sync diagnosis bookkeeping (see mtp.sync logger)
+        self._sync_last_show_t = None  # wall time the overlay last painted
+        self._sync_pcr_join = None     # (pid, pcr_s) at CCX's join byte
+        self._sync_pcr_join_tries = 0
+        self._sync_credit_s = 0.0      # wall time credited to content clock
+        self._sync_capped_s = 0.0      # wall time thrown away by 15 s cap
+        self._sync_timer = QtCore.QTimer(self)
+        self._sync_timer.setInterval(5000)
+        self._sync_timer.timeout.connect(self._sync_tick)
+        if _SYNC_ON:
+            self._sync_timer.start()
         self._cap_timer = QtCore.QTimer(self)
         self._cap_timer.setInterval(100)
         self._cap_timer.timeout.connect(self._caption_tick)
@@ -896,8 +1000,28 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_off = None
         self._cc_last_c = None
         self._cc_last_t = 0.0
+        self._cc_pend = None
+        self._cc_stash = []
+        self._cc_lag = None
+        self._cc_head_pcr = None
+        self._cc_join_byte = 0
+        self._cc_join_app_s = 0.0
+        self._cc_last_arrival = 0.0
+        self._cc_last_active = 0.0
+        self._cc_last_watchfire = 0.0
         self._cap_clock_s = 0.0
         self._cap_raw_s = None
+        self._cap_raw_wall = 0.0
+        self._cap_backlog_s = None
+        self._cap_div_s = 0.0
+        self._cap_div_ok = False
+        self._sync_pcr_join = None      # new media -> new CCX join reference
+        self._sync_pcr_join_tries = 0
+        self._sync_credit_s = 0.0
+        self._sync_capped_s = 0.0
+        if _SYNC_ON:
+            if _SYNC_ON:
+                synclog.info("MEDIA kind=%s title=%r", kind, title)
         self._cap_wall = 0.0
         self.btn_rec.blockSignals(True)
         self.btn_rec.setChecked(False)
@@ -919,6 +1043,7 @@ class PlayerView(QtWidgets.QWidget):
         self._scrub_on = False
         self._vid_s = 0.0
         self._last_raw = None
+        self._raw_change_wall = 0.0
         self._video_wh = (0, 0)   # next media's size is unknown until the
                                   # tick polls it (captions re-anchor then)
         self._live_paused = False
@@ -975,19 +1100,24 @@ class PlayerView(QtWidgets.QWidget):
                 down = False
             if self._chase_paused:
                 # resume — unless the player died at the file edge meanwhile
+                self._sync_transport("resume")
                 if down:
                     cur = self.vlc.get_time()
-                    at = (cur / 1000.0) if cur >= 0 else self._frontier_s()
+                    at = self._cap_content_for_raw(cur / 1000.0) \
+                        if cur >= 0 else self._frontier_s()
                     self._chase_seek(at, resume=True)
                 else:
                     self._chase_paused = False
                     self.vlc.resume()
             elif down:
                 # stalled at the edge (not user-paused): play revives it
+                self._sync_transport("revive-resume")
                 cur = self.vlc.get_time()
-                at = (cur / 1000.0) if cur >= 0 else self._frontier_s()
+                at = self._cap_content_for_raw(cur / 1000.0) \
+                    if cur >= 0 else self._frontier_s()
                 self._chase_seek(at, resume=True)
             else:
+                self._sync_transport("pause")
                 self._chase_paused = True
                 self.vlc.pause()
             return
@@ -1057,6 +1187,9 @@ class PlayerView(QtWidgets.QWidget):
                          "(base=%.1fs)", self._dvr_base)
             except Exception:
                 pass
+            if _SYNC_ON:
+                synclog.info("DVRSTART base=%.2f size=%d",
+                             self._dvr_base, size)
             return
         if size > self._dvr_size:
             # growth since the last GROWTH sighting confirms the interval
@@ -1065,25 +1198,312 @@ class PlayerView(QtWidgets.QWidget):
             # bursts, so a tight cap here under-counted real content and
             # made jump-to-live land far behind the true edge.
             if self._dvr_last_growth is not None:
-                self._dvr_content_s += min(15.0, max(
-                    0.0, now - self._dvr_last_growth))
+                gap = max(0.0, now - self._dvr_last_growth)
+                credit = min(15.0, gap)
+                if _SYNC_ON:
+                    self._sync_credit_s += credit
+                    if gap > 15.0:
+                        self._sync_capped_s += gap - 15.0
+                        synclog.info(
+                            "DVRCLAMP gap=%.2f capped_away=%.2f "
+                            "cum_credit=%.1f cum_capped=%.1f fr=%.1f",
+                            gap, gap - 15.0, self._sync_credit_s,
+                            self._sync_capped_s, self._frontier_s())
+                self._dvr_content_s += credit
             self._dvr_last_growth = now
         self._dvr_size = size
         self._dvr_tick_t = now
 
+    # ---- stage-1 sync diagnosis helpers (measurement only) ----
+
+    def _sync_raw_s(self) -> float:
+        """Raw VLC get_time() in seconds (-1 when unreadable). Read-only."""
+        try:
+            ms = self.vlc.get_time()
+        except Exception:  # noqa: BLE001
+            ms = -1
+        return ms / 1000.0 if 0 <= ms < 86_400_000 else -1.0
+
+    def _sync_probe_head_pcr(self):
+        """(pid, pcr_s) of the newest PCR in the DVR buffer tail."""
+        buf = None
+        try:
+            if self.dvr:
+                buf = self.dvr.buffer_file()
+        except Exception:  # noqa: BLE001
+            buf = None
+        if not buf:
+            return None, None
+        return probe_tail_pcr(buf)
+
+    def _sync_transport(self, tag: str, target=None, extra: str = ""):
+        """Transport decision trace: commanded target, raw get_time before
+        the call and ~1 s after (did the player actually move there?)."""
+        if self._closing or not _SYNC_ON:
+            return
+        synclog.info("XPORT %s target=%s raw_pre=%.2f fr=%.2f cc=%.2f "
+                     "vid=%.2f rate=%.2f %s",
+                     tag, "-" if target is None else "%.2f" % target,
+                     self._sync_raw_s(), self._frontier_s(), self._cap_clock_s,
+                     self._vid_s, self._rate, extra)
+
+        def _after():
+            if self._closing:
+                return
+            synclog.info("XPORT1s %s raw=%.2f fr=%.2f cc=%.2f vid=%.2f",
+                         tag, self._sync_raw_s(), self._frontier_s(),
+                         self._cap_clock_s, self._vid_s)
+        QtCore.QTimer.singleShot(1000, _after)
+
+    def _sync_probe_join_at(self, join: int):
+        """Pin the PCR at CCExtractor's join byte — the zero point of CCX's
+        own cue axis. Retried a few times (a just-created buffer may not
+        have flushed a PCR past the join byte yet). Stage 2 needs this on
+        EVERY run (L is measured live), not only with sync logging."""
+        if self._closing or self._cc_source is None:
+            return
+        buf = None
+        try:
+            if self.dvr:
+                buf = self.dvr.buffer_file()
+        except Exception:  # noqa: BLE001
+            buf = None
+        if not buf:
+            return
+        pid, pcr = probe_first_pcr_at(buf, join)
+        if pcr is not None:
+            self._sync_pcr_join = (pid, pcr)
+            if _SYNC_ON:
+                synclog.info("PCRJOIN byte=%d pid=%s pcr=%.3f",
+                             join, pid, pcr)
+        elif self._sync_pcr_join_tries < 20:
+            self._sync_pcr_join_tries += 1
+            QtCore.QTimer.singleShot(500,
+                                     lambda: self._sync_probe_join_at(join))
+
+    def _sync_tick(self):
+        """5 s snapshot of every timing axis + the CCX lag estimate."""
+        if self._closing or not _SYNC_ON:
+            return
+        if not (self._mode == "chase" and self.dvr):
+            return
+        now = time.time()
+        raw = self._sync_raw_s()
+        fr = self._frontier_s()
+        cc = self._cap_clock_s
+        pid, pcr = self._sync_probe_head_pcr()
+        head_rel = lag = None
+        if pcr is not None and self._sync_pcr_join is not None:
+            head_rel = pcr - self._sync_pcr_join[1]
+            if self._cc_last_c is not None:
+                lag = head_rel - self._cc_last_c
+        fsize = feedpos = -1
+        if self._cc_source is not None:
+            feedpos = int(getattr(self._cc_source, "_ts_pos", -1) or -1)
+        try:
+            if self.dvr and self.dvr.file_path:
+                fsize = os.path.getsize(self.dvr.file_path)
+        except OSError:
+            pass
+        synclog.info(
+            "TICK fr=%.2f cc=%.2f raw=%.2f vid=%.2f playing=%s "
+            "started=%s stall=%d | d_fr_cc=%+.2f "
+            "d_fr_raw=%+.2f d_cc_raw=%+.2f | off=%s ccx_end=%s "
+            "since_show=%s since_cue=%s | pcr=%.3f pid=%s head_rel=%s "
+            "ccx_lag=%s | credit=%.1f capped=%.1f | fsize=%d feed=%d "
+            "feed_behind=%d | backlog=%s edge=%s div=%s lag_ewma=%s",
+            fr, cc, raw, self._vid_s,
+            int(self.vlc.is_playing()), int(self._chase_started),
+            self._stall_ticks,
+            fr - cc, fr - raw, cc - raw,
+            "-" if self._cc_off is None else "%.2f" % self._cc_off,
+            "-" if self._cc_last_c is None else "%.2f" % self._cc_last_c,
+            "-" if self._sync_last_show_t is None
+            else "%.1f" % (now - self._sync_last_show_t),
+            "-" if self._cc_last_t <= 0.0 else "%.1f" % (now - self._cc_last_t),
+            -1.0 if pcr is None else pcr, "-" if pid is None else pid,
+            "-" if head_rel is None else "%.2f" % head_rel,
+            "-" if lag is None else "%.2f" % lag,
+            self._sync_credit_s, self._sync_capped_s, fsize, feedpos,
+            max(0, fsize - feedpos),
+            "-" if self._cap_backlog_s is None
+            else "%.2f" % self._cap_backlog_s,
+            "%.2f" % self._cap_edge_s(),
+            ("%.2f" % self._cap_div_s) if self._cap_div_ok else "-",
+            "-" if self._cc_lag is None else "%.2f" % self._cc_lag)
+
+
     def _safe_seek_target(self, target: float) -> float:
-        """Clamp a chase seek so it can never land past the write frontier."""
-        limit = self._frontier_s() - _CHASE_SAFETY_S
+        """Clamp a chase seek so it can never land past real data. The
+        bound is the (PCR-calibrated) live edge, not the frontier — the
+        frontier under-credits the cold burst by 20-35 s of content that
+        the buffer really holds; frontier+60 caps pathological edge
+        over-estimates (a seek past EOF would stall-loop the watchdog)."""
+        limit = min(self._cap_edge_s(), self._frontier_s() + 60.0) \
+            - _CHASE_SAFETY_S
         return max(0.0, min(max(0.0, target), limit))
+
+    # ---- stage-2 single-axis caption timing helpers ----
+
+    def _cap_edge_s(self) -> float:
+        """Best content-axis estimate of the live write head: the
+        dead-reckoned clock plus backlog (PCR-calibrated), falling back to
+        the frontier before a transport event seeds the backlog."""
+        if self._cap_backlog_s is not None:
+            return self._cap_clock_s + self._cap_backlog_s
+        return self._frontier_s()
+
+    def _cap_vlc_time_for(self, content_s: float) -> float:
+        """Content-axis position -> VLC set_time NUMBER. When the raw axis
+        has diverged from the dead-reckoned clock (broadcast PTS
+        renumbering), the same content lives at a different number inside
+        VLC; seeks must use that number or they land in the wrong place."""
+        return content_s + self._cap_div_s if self._cap_div_ok else content_s
+
+    def _cap_content_for_raw(self, raw_s: float) -> float:
+        """VLC get_time number -> content-axis position (inverse map)."""
+        return raw_s - self._cap_div_s if self._cap_div_ok else raw_s
+
+    def _cap_seed_transport(self, target_s: float, jump_live: bool = False):
+        """A transport event defines the caption clock BY CONSTRUCTION:
+        the set_time target IS where playback lands, so the dead-reckoned
+        clock seeds there and the raw-delta baseline restarts. The
+        live-edge backlog reseeds with it: jump-to-live lands
+        ~_CHASE_SAFETY_S behind the edge; any other seek PRESERVES the
+        dead-reckoned edge (the recorder kept writing while the viewer
+        was elsewhere) and measures the new backlog against it."""
+        if not (self._mode == "chase" and self.dvr is not None):
+            return
+        prev_edge = None
+        if self._cap_backlog_s is not None:
+            prev_edge = self._cap_clock_s + self._cap_backlog_s
+        if jump_live:
+            self._cap_backlog_s = _CHASE_SAFETY_S
+        elif prev_edge is not None:
+            self._cap_backlog_s = max(_CHASE_SAFETY_S,
+                                      prev_edge - float(target_s))
+        else:
+            self._cap_backlog_s = max(_CHASE_SAFETY_S,
+                                      self._frontier_s() - float(target_s))
+        if _SYNC_ON:
+            synclog.info("SEED target=%.2f jump=%s backlog=%.2f edge=%.2f",
+                         target_s, jump_live, self._cap_backlog_s,
+                         float(target_s) + self._cap_backlog_s)
+        self._cap_clock_s = float(target_s)
+        self._cap_raw_s = None
+        self._cap_raw_wall = 0.0
+        self._cap_wall = time.time()
+
+    def _cc_probe_head_pcr(self):
+        """Absolute PCR at the buffer's write head, throttled to ~4/s
+        (probe cost ~20 ms; cue bursts arrive faster). The value lives on
+        the renumber-immune PCR content axis."""
+        now = time.time()
+        if self._cc_head_pcr is not None \
+                and now - self._cc_head_pcr[1] < 0.25:
+            return self._cc_head_pcr[0]
+        buf = None
+        try:
+            if self.dvr:
+                buf = self.dvr.buffer_file()
+        except Exception:  # noqa: BLE001
+            buf = None
+        if not buf:
+            return None
+        _pid, pcr = probe_tail_pcr(buf)
+        if pcr is not None:
+            self._cc_head_pcr = (pcr, now)
+        return pcr
+
+    def _cc_refine_join_app(self, head_pcr: float):
+        """After a MID-SESSION CCX join: derive the join byte's
+        content-axis position from the TS byte rate measured on the
+        join->head segment (seconds per byte = (head_pcr - join_pcr) /
+        bytes written since). Byte-0 joins are exactly 0 — nothing to
+        derive; without this a mid-session join's head_rel would sit tens
+        of seconds below the app axis and drag every anchor with it."""
+        if self._cc_join_app_s is not None or self._cc_join_byte <= 0 \
+                or self._sync_pcr_join is None or self.dvr is None \
+                or not self.dvr.file_path:
+            return
+        try:
+            size = os.path.getsize(self.dvr.file_path)
+        except OSError:
+            return
+        seg_s = head_pcr - self._sync_pcr_join[1]
+        seg_b = size - self._cc_join_byte
+        if seg_s > 5.0 and seg_b > 188:
+            self._cc_join_app_s = max(0.0,
+                                      self._cc_join_byte * seg_s / seg_b)
+            if _SYNC_ON:
+                synclog.info("JOINAPP byte=%d app=%.2f (seg %.2fs/%dB)",
+                             self._cc_join_byte, self._cc_join_app_s,
+                             seg_s, seg_b)
+
+    def _cc_calibrate_edge(self, head_rel: float) -> float:
+        """Keep the dead-reckoned live edge honest: the PCR head plus the
+        join byte's content position IS the write head, so pull the edge
+        toward it — gently for drift (wall dead-reckoning error, provider
+        rate wobble), hard when they come apart (cold-burst under-credit,
+        recorder restart hiccups). Anchors pin at edge - L, so this is
+        what keeps mapped cues at their true content positions.
+
+        Returns the SNAP correction applied (0.0 for a gentle pull): a
+        landed CDN burst moves the head AND CCX's lag by the same amount,
+        so callers advance the lag estimate with it — otherwise the pin
+        (edge - L) runs hot for the several seconds the lag EWMA needs to
+        catch up, and every burst forced a whole-store rebase."""
+        if self._cc_join_app_s is None:
+            return 0.0    # mid-session join not yet placed — wait for the
+            #               # join-app refinement (a wrong constant here would
+            #               # drag every anchor with it)
+        target = head_rel + self._cc_join_app_s
+        if self._cap_backlog_s is None:
+            self._cap_backlog_s = max(_CHASE_SAFETY_S,
+                                      target - self._cap_clock_s)
+            return 0.0
+        err = target - (self._cap_clock_s + self._cap_backlog_s)
+        if abs(err) > _CC_EDGE_SNAP_S:
+            self._cap_backlog_s += err
+            if _SYNC_ON:
+                synclog.info("EDGESNAP err=%+.2f edge->%.2f", err, target)
+            return err
+        self._cap_backlog_s += err * _CC_EDGE_ALPHA
+        return 0.0
+
+    def _cc_rebase(self, target_off: float, why: str):
+        """Snap-and-rebase: set the CCX->app offset immediately (no EWMA
+        crawl) AND slide every stored cue/filter window by the same delta
+        so the store's timeline stays coherent — a scrub back after the
+        rebase shows captions placed where they actually play."""
+        shift = target_off - (self._cc_off if self._cc_off is not None
+                              else 0.0)
+        self._cc_off = target_off
+        self._cap_cues.shift(shift)
+        self._filter_engine.shift_windows(shift)
+        if _SYNC_ON:
+            synclog.info("REBASE why=%s shift=%+.2f off=%.2f",
+                         why, shift, target_off)
+
+    def _cc_edge_probe_tick(self):
+        """2 s: re-probe the write head and pull the live edge onto it
+        (see _cc_calibrate_edge — the head bursts, the wall clock lies)."""
+        if self._closing or self._cc_source is None \
+                or not (self._mode == "chase" and self.dvr):
+            return
+        head_pcr = self._cc_probe_head_pcr()
+        if head_pcr is None or self._sync_pcr_join is None:
+            return
+        self._cc_refine_join_app(head_pcr)
+        self._cc_calibrate_edge(head_pcr - self._sync_pcr_join[1])
 
     def _seek_ms(self, ms):
         if self._mode == "chase" and self.dvr:
-            # Pure file seek inside the buffer — instant and exact, clamped
-            # to a safe distance behind the write position. Base on the
-            # TRACKED position: VLC timestamps on these streams can be
-            # garbage broadcast PTS (huge/jumping values) that would send
-            # every seek to the wrong place.
-            self._chase_seek(self._vid_s + ms / 1000.0)
+            # Skip relative to what's DISPLAYED (the content-axis clock),
+            # not to _vid_s — after PTS renumbering those disagree.
+            base = self._cap_clock_s if self._cap_clock_s > 0.0 \
+                else self._vid_s
+            self._chase_seek(base + ms / 1000.0)
             return
         # Live / VOD: normal seek (works for VOD; live streams ignore it).
         self.vlc.seek_ms(ms)
@@ -1093,11 +1513,13 @@ class PlayerView(QtWidgets.QWidget):
         the DVR buffer (or of the movie)."""
         if self._mode == "chase" and self.dvr:
             self._set_rate(1.0)
+            self._sync_transport("jump_begin", 0.0)
             self._chase_seek(0.0, resume=True)
         elif self.vlc.get_length() > 0:
             self.vlc.set_time(0)
 
-    def _chase_seek(self, target_s: float, resume: bool = False):
+    def _chase_seek(self, target_s: float, resume: bool = False,
+                    jump_live: bool = False):
         """Seek within the chase buffer — and revive a dead player.
 
         ``set_time()`` is a NO-OP once VLC ran into the end of the growing
@@ -1106,19 +1528,37 @@ class PlayerView(QtWidgets.QWidget):
         player is down (ended/stopped/error) the buffer file is reopened AT
         the target instead (~half a second) — a local file operation, so
         the single 8kstrong connection is never touched.
+
+        Targets arrive on the app's CONTENT axis; the set_time number is
+        converted via the measured axis divergence (broadcast PTS
+        renumbering moves VLC's numbers without moving the content).
+        ``jump_live=True`` targets the TRUE live edge (dead-reckoned +
+        PCR-calibrated head) instead of the frontier-clamped position —
+        the frontier under-credits the cold burst by 20-35 s of content.
         """
         if not (self._mode == "chase" and self.dvr):
             return
-        target = self._safe_seek_target(float(target_s))
+        target_s = float(target_s)
+        if jump_live:
+            target = max(0.0, min(self._cap_edge_s() - _CHASE_SAFETY_S,
+                                  self._frontier_s() + 120.0))
+        else:
+            target = self._safe_seek_target(target_s)
+        vlc_t = 0.0 if target <= 0.0 else self._cap_vlc_time_for(target)
+        self._sync_transport("chase_seek" if not jump_live else "jump_edge",
+                             target_s,
+                             extra="safe=%.2f vlc=%.2f resume=%s"
+                             % (target, vlc_t, resume))
         try:
             down = self.vlc.state_name() in ("ended", "stopped", "error")
         except Exception:  # noqa: BLE001
             down = False
         if not down:
-            self.vlc.set_time(int(target * 1000))
+            self.vlc.set_time(int(vlc_t * 1000))
             self._vid_s = target
-            self._cap_clock_s = float(target)   # captions jump with the
-            #                                   # seek, not a beat later
+            # the set_time target defines the caption clock BY CONSTRUCTION
+            # (and reseeds the live-edge backlog)
+            self._cap_seed_transport(target, jump_live=jump_live)
             if resume and self._chase_paused:
                 self._chase_paused = False
                 self.vlc.resume()
@@ -1138,8 +1578,8 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._last_reopen = time.time()
         self._vid_s = target
-        self._cap_clock_s = float(target)
-        self.vlc.play_at(buf, target)
+        self._cap_seed_transport(target, jump_live=jump_live)
+        self.vlc.play_at(buf, vlc_t)
         self._poke_audio()
         self._poke_rate()
 
@@ -1179,13 +1619,15 @@ class PlayerView(QtWidgets.QWidget):
             pass
         if self._mode == "chase" and self.dvr:
             self._set_rate(1.0)   # jumping to live always resumes normal speed
+            edge = self._cap_edge_s()
             try:
                 log.info("jump to live edge: target=%.1fs frontier=%.1fs",
-                         self._safe_seek_target(self._frontier_s()),
+                         max(0.0, edge - _CHASE_SAFETY_S),
                          self._frontier_s())
             except Exception:
                 pass
-            self._chase_seek(self._frontier_s(), resume=True)
+            self._sync_transport("jump_live", edge)
+            self._chase_seek(edge, resume=True, jump_live=True)
             return
         # Plain LIVE mode (timeshift) / VOD skip-to-end
         try:
@@ -1235,8 +1677,11 @@ class PlayerView(QtWidgets.QWidget):
         try:
             if self._mode == "chase" and self.dvr:
                 # never let a slider drag land on/past the write position
-                # (_chase_seek clamps and revives a stalled player)
-                self._chase_seek(self.slider.value() / 1000.0)
+                # (_chase_seek clamps and revives a stalled player); the
+                # slider speaks VLC's raw-axis numbers — convert to the
+                # content axis before clamping
+                self._chase_seek(
+                    self._cap_content_for_raw(self.slider.value() / 1000.0))
             else:
                 self.vlc.set_time(self.slider.value())
                 # Re-base the tracked position: the tick's snap guard
@@ -1391,7 +1836,10 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_started = False
             self._stall_ticks = 0
             self._last_reopen = time.time()
-            self.vlc.play_at(buf, target)
+            # a (re)open AT a position is a transport event: it seeds the
+            # caption clock and the live-edge backlog by construction
+            self._cap_seed_transport(target)
+            self.vlc.play_at(buf, self._cap_vlc_time_for(target))
             self._vid_s = target
             self._poke_audio()
             self._poke_rate()
@@ -1427,6 +1875,12 @@ class PlayerView(QtWidgets.QWidget):
                          self._dvr_base)
             except Exception:
                 pass
+            if _SYNC_ON:
+                synclog.info("REBASE base=%.2f run_credit=%.1f run_capped=%.1f",
+                             self._dvr_base, self._sync_credit_s,
+                             self._sync_capped_s)
+                self._sync_credit_s = 0.0
+                self._sync_capped_s = 0.0
         buf = self.dvr.buffer_file() if self.dvr else None
         url = self.current.get("url", "") if self.current else ""
         try:
@@ -1575,7 +2029,12 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not (self._mode == "chase" and self.dvr and self.dvr.buffer_file()):
             return
-        target = self._safe_seek_target(self._vid_s)
+        # revive where the viewer actually WAS: the caption clock is the
+        # display truth (it holds through VLC freezes via its stall
+        # detection), while _vid_s can lag behind (its snap guard rejects
+        # big raw jumps)
+        at = self._cap_clock_s if self._cap_clock_s > 0.0 else self._vid_s
+        target = self._safe_seek_target(at)
         try:
             log.warning("chase reopen: play_at %.1fs (frontier=%.1fs "
                         "was_at=%.1fs)", target, self._frontier_s(),
@@ -1996,38 +2455,60 @@ class PlayerView(QtWidgets.QWidget):
             # to VLC's clock only when it MOVED and agrees with the tracked
             # value; otherwise integrate from wall time. Snapping to a
             # frozen-but-plausible VLC clock was what made the time labels
-            # stall for 5-15 s at a time.
-            sane = 0.0 <= raw <= frontier + 30.0
+            # stall for 5-15 s at a time. The cap allows the TRUE-edge
+            # landing zone past the frontier (the buffer really holds that
+            # cold-burst content; see _safe_seek_target).
+            pos_cap = frontier + 60.0
+            sane = 0.0 <= raw <= frontier + 60.0
+            # meaningful-movement clock for the stuck-player rescue: a
+            # wedged player's get_time can oscillate by 1 ms — that must
+            # NOT count as movement (it kept the rescue disarmed for
+            # minutes on a frozen true-edge landing)
+            if sane and self._last_raw is not None \
+                    and abs(raw - self._last_raw) > 0.05:
+                self._raw_change_wall = now
             if (sane and raw != self._last_raw
                     and abs(raw - self._vid_s) <= 3.0):
-                self._vid_s = min(raw, frontier)
+                self._vid_s = min(raw, pos_cap)
             elif playing and not self._chase_paused and not self._seeking:
-                self._vid_s = min(frontier, self._vid_s + dt * self._rate)
+                self._vid_s = min(pos_cap, self._vid_s + dt * self._rate)
             self._last_raw = raw
             current = self._vid_s
-            # Frontier watchdog: VLC stops at the file's end — reopen just
-            # behind the write frontier so playback continues seamlessly.
-            # Only counts once playback has actually started (the open/seek
-            # phase of play_at reports "not playing" too), and debounced: a
-            # single "not playing" tick usually means VLC is just buffering
-            # mid-file, and reopening then caused jank/freezes.
-            if (not playing and not self._chase_paused and raw >= 0
+            # ---- stuck-player rescue (merged watchdogs) ----
+            # VLC at the ragged edge of the growing buffer file can end up
+            # ENDED (state) or demuxer-blocked while still "playing"; in
+            # both states set_time is a NO-OP and only reopening the
+            # buffer revives it. Two signatures, one rescue:
+            #   a) not playing for 3+ ticks (classic end-of-file stop)
+            #   b) raw frozen ~8+ s (jitter-proofed: sub-frame oscillation
+            #      must not refresh the timer) while the frontier has run
+            #      10+ s past us — data is available, playback is not.
+            if (not playing and not self._chase_paused
                     and self._chase_started):
                 self._stall_ticks += 1
-                if (self._stall_ticks >= 3
-                        and now - self._last_reopen > _REOPEN_COOLDOWN_S
-                        and self.dvr.buffer_file()):
-                    self._last_reopen = now
-                    try:
-                        log.warning(
-                            "chase watchdog reopen: frontier=%.1fs "
-                            "stall_ticks=%d", frontier, self._stall_ticks)
-                    except Exception:
-                        pass
-                    self._stall_ticks = 0
-                    self._reopen_chase(gen)
-                    return
-            self._stall_ticks = 0
+            else:
+                self._stall_ticks = 0
+            raw_frozen = (self._raw_change_wall > 0.0
+                          and now - self._raw_change_wall > 8.0)
+            if (not self._chase_paused
+                    and now - self._last_reopen > _REOPEN_COOLDOWN_S
+                    and self.dvr.buffer_file()
+                    and ((self._stall_ticks >= 3 and self._chase_started
+                          and not playing and raw >= 0)
+                         or (raw_frozen and frontier - current > 10.0))):
+                self._last_reopen = now
+                try:
+                    log.warning("chase rescue: playing=%s raw=%.1f "
+                                "frozen=%.1fs frontier=%.1fs — reopening",
+                                playing, raw,
+                                now - self._raw_change_wall
+                                if self._raw_change_wall else 0.0,
+                                frontier)
+                except Exception:
+                    pass
+                self._stall_ticks = 0
+                self._reopen_chase(gen)
+                return
             if not self._seeking:
                 self._set_scrub(int(frontier * 1000), int(current * 1000))
             # Self-heal: while chasing, every mode-gated control must be
@@ -2258,6 +2739,7 @@ class PlayerView(QtWidgets.QWidget):
         rate = max(0.125, min(5.0, float(rate)))
         if self._mode != "chase" and not self._is_vod():
             rate = 1.0   # speed control needs DVR or a seekable file
+        self._sync_transport("rate", None, extra="rate=%g" % rate)
         self._rate = rate
         try:
             self.vlc.set_rate(rate)
@@ -2510,16 +2992,19 @@ class PlayerView(QtWidgets.QWidget):
         """The playback position captions must key on: what VLC is
         DISPLAYING right now.
 
-        Chase mode: a TRACKED copy of VLC's clock on the buffer file. The
-        raw get_time() on these streams is often garbage broadcast PTS —
-        frozen for 5-15 s, or jumping — and keying captions on it made
-        captions freeze/repeat with it. The tracked clock snaps to VLC
-        whenever the reading is alive and sane (forward moves up to the
-        frontier are accepted: a genuine PTS discontinuity moves the cue
-        axis too), and otherwise integrates from wall time like _vid_s.
+        Chase mode: a DEAD-RECKONED clock on ONE app-owned content axis.
+        Every transport event (_chase_seek's set_time target) defines the
+        clock BY CONSTRUCTION; between transports it advances wall x rate
+        while playing and holds while paused/stalled. Raw get_time() is
+        never snapped to — its absolute numbers lie (broadcast PTS
+        renumbering, normalization glitches) — but its DELTAS are folded
+        in when they agree frames played ~1:1 with wall (outlier-rejected
+        nudge), keeping the clock locked to VLC's real timeline. Only a
+        loose sanity bound applies.
 
         VOD: the relay's cue times are the file's cluster timecodes — the
-        same axis as a healthy get_time(), used raw.
+        same axis as a healthy get_time(), used raw. None of the chase
+        logic runs here.
         """
         try:
             ms = self.vlc.get_time()
@@ -2533,33 +3018,117 @@ class PlayerView(QtWidgets.QWidget):
                 self._cap_raw_s = raw
             return self._cap_clock_s if self._cap_clock_s > 0.0 \
                 else self._vid_s
-        # chase: tracked clock (garbage-PTS-proof)
+        # chase: dead-reckoned, delta-locked (garbage-absolute-proof)
         now = time.time()
         frontier = self._frontier_s()
-        dt = 0.1 if self._cap_wall <= 0.0 else min(1.0, now - self._cap_wall)
-        alive = raw >= 0.0 and raw != self._cap_raw_s
-        had_reading = ((self._cap_raw_s is not None
-                        and self._cap_raw_s >= 0.0)
-                       or self._cap_clock_s > 0.0)
-        if alive and 0.0 <= raw <= frontier + 30.0 \
-                and raw >= self._cap_clock_s - 10.0:
-            self._cap_clock_s = min(raw, frontier)
-        elif had_reading:
-            # the clock exists but is silent (frozen broadcast PTS),
-            # jumped backward hard (garbage), or reads -1 mid-reopen —
-            # integrate while actually playing, hold while not
-            try:
-                playing = self.vlc.is_playing()
-            except Exception:  # noqa: BLE001
-                playing = True
-            if playing and not self._chase_paused:
-                self._cap_clock_s = min(frontier,
-                                        self._cap_clock_s + dt * self._rate)
+        dt = 0.0 if self._cap_wall <= 0.0 \
+            else max(0.0, min(2.0, now - self._cap_wall))
+        try:
+            playing = self.vlc.is_playing()
+        except Exception:  # noqa: BLE001
+            playing = True
+        playing = playing and not self._chase_paused
+        prev_clock = self._cap_clock_s
+        branch = reject = ""
+        # startup fallback: no transport seed and no reading yet — follow
+        # the UI-tracked position until one shows up (captured BEFORE the
+        # integration below, which would otherwise lift the zero clock
+        # past the <= 0 check)
+        no_clock_yet = self._cap_raw_s is None and prev_clock <= 0.0
+
+        # a plausible reading frozen for many seconds while "playing" is
+        # a buffer underrun at the edge, not playback: the frames have
+        # stopped even though VLC still reports playing
+        frozen_for = 0.0
+        if raw >= 0.0 and self._cap_raw_s == raw and self._cap_raw_wall > 0.0:
+            frozen_for = now - self._cap_raw_wall
+        stalled = playing and frozen_for > _CC_STALL_FREEZE_S
+
+        # wall dead-reckoning: frames play 1:1 with wall time
+        wall_adv = dt * self._rate if (playing and not stalled) else 0.0
+        fold = 0.0
+        if raw >= 0.0 and raw != self._cap_raw_s:
+            if self._cap_raw_s is not None and self._cap_raw_s >= 0.0 \
+                    and self._cap_raw_wall > 0.0:
+                d_raw = raw - self._cap_raw_s
+                d_wall = max(0.0, now - self._cap_raw_wall)
+                expected = d_wall * self._rate if playing else 0.0
+                residual = d_raw - expected
+                if abs(residual) <= _CC_SYNC_TOL_S:
+                    # raw advanced ~rate x wall: frames really played —
+                    # fold the small residual in (drift/jitter correction)
+                    fold = residual
+                    branch = "fold"
+                elif frozen_for > _CC_STALL_FREEZE_S \
+                        and abs(d_raw - frozen_for * self._rate) <= 3.0:
+                    # underrun catch-up: VLC starved at the edge, buffered
+                    # the gap, then really jumped its timeline forward by
+                    # it — snap onto it (minus the known axis divergence)
+                    self._cap_clock_s = raw - (self._cap_div_s
+                                               if self._cap_div_ok else 0.0)
+                    branch = "stallsnap"
+                else:
+                    # PTS renumbering / garbage jump: frames keep playing
+                    # 1:1, the clock stays — remember the axis divergence
+                    # so transport targets convert to VLC's numbers
+                    self._cap_div_s = raw - (prev_clock + wall_adv)
+                    self._cap_div_ok = True
+                    branch = "renum"
+                    reject = "jump(%+.2f)" % residual
+            else:
+                branch = "base"       # first reading after a seed
+            self._cap_raw_s = raw
+            self._cap_raw_wall = now
+        elif raw < 0.0:
+            branch = "noraw"
+        elif not playing:
+            branch = "hold"
+        elif stalled:
+            branch = "stall"
         else:
-            # no valid VLC reading yet at all (startup): follow the
+            branch = "integ"
+
+        if branch != "stallsnap":
+            self._cap_clock_s = prev_clock + wall_adv + fold
+        if no_clock_yet:
+            # no transport seed and no reading yet (startup): follow the
             # UI-tracked position until one shows up
             self._cap_clock_s = max(0.0, min(self._vid_s, frontier))
-        self._cap_raw_s = raw
+            branch = "seed"
+        if branch == "fold":
+            d_now = raw - self._cap_clock_s
+            if self._cap_div_ok:
+                self._cap_div_s += (d_now - self._cap_div_s) * _CC_D_ALPHA
+            else:
+                self._cap_div_s = d_now
+                self._cap_div_ok = True
+        # loose sanity bound only — real correctness comes from transport
+        # seeds and outlier-rejected deltas, never absolute snaps
+        self._cap_clock_s = max(0.0, min(self._cap_clock_s, frontier + 120.0))
+
+        # live-edge backlog: the write head advances 1:1 with wall no
+        # matter what playback does, so the edge (= clock + backlog)
+        # advances with wall while data flows — paused/stalled playback
+        # grows the backlog 1:1, fast-forward shrinks it by (rate-1) x dt
+        if self._cap_backlog_s is not None and prev_clock > 0.0:
+            growing = self._dvr_last_growth is None \
+                or (now - self._dvr_last_growth) < 8.0
+            if growing:
+                self._cap_backlog_s = max(
+                    0.0, self._cap_backlog_s + dt
+                    - (self._cap_clock_s - prev_clock))
+        if _SYNC_ON:
+            synclog.info(
+                "CLOCK %s raw=%.2f prev=%.2f new=%.2f d=%+.3f fr=%.2f "
+                "dt=%.3f rate=%.2f paused=%s backlog=%s edge=%.2f div=%s%s",
+                branch, raw, prev_clock, self._cap_clock_s,
+                self._cap_clock_s - prev_clock, frontier, dt, self._rate,
+                self._chase_paused,
+                "-" if self._cap_backlog_s is None
+                else "%.2f" % self._cap_backlog_s,
+                self._cap_clock_s + (self._cap_backlog_s or 0.0),
+                ("%.2f" % self._cap_div_s) if self._cap_div_ok else "-",
+                (" reject=" + reject) if reject else "")
         self._cap_wall = now
         return self._cap_clock_s
 
@@ -2569,19 +3138,89 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing or not self._cap_on:
             return
         try:
-            if (self._mode == "chase" and self.dvr) or self._is_vod():
+            chase = self._mode == "chase" and self.dvr
+            if chase or self._is_vod():
+                if chase:
+                    # the deferred arrival-batch anchor lands here (see
+                    # _cc_flush_pending) — before the paint decision
+                    self._cc_flush_pending()
                 t = self._caption_clock_s()
             else:
                 return
             delay_ms = int(self.config.subtitle_appearance.get(
                 "delay_ms", 0) or 0)
             lines = self._cap_cues.text_at(t + delay_ms / 1000.0)
+            if lines and _SYNC_ON:
+                blank = time.time() - (self._sync_last_show_t
+                                        or time.time())
+                if blank > 2.0:
+                    synclog.info("PAINT after %.1f s blank (t=%.2f)",
+                                 blank, t)
+                self._sync_last_show_t = time.time()   # captions ARE painting
+            if chase:
+                now = time.time()
+                if lines:
+                    self._cc_last_active = now
+                elif self._cc_off is not None:
+                    # Caption-stopped watchdog: cues keep arriving but no
+                    # window has intersected the clock for a while — the
+                    # anchor diverged from the stored windows (see
+                    # _cc_watchdog_fire)
+                    if (self._cc_last_arrival > 0.0
+                            and now - self._cc_last_arrival
+                            < _CC_WATCH_CUE_S
+                            and self._cc_last_active > 0.0
+                            and now - self._cc_last_active
+                            > _CC_WATCH_GAP_S
+                            and now - self._cc_last_watchfire
+                            > _CC_WATCH_COOLDOWN_S):
+                        self._cc_watchdog_fire(now)
             if lines and self._filter_engine.enabled:
                 words = self._filter_engine.words
                 lines = [prof_mod.mask_text(ln, words) for ln in lines]
             self._cap_wid.set_lines(lines)
         except Exception:  # noqa: BLE001
             pass
+
+    def _cc_watchdog_fire(self, now: float):
+        """Cues arrived within the last seconds yet NO window intersected
+        the clock for > _CC_WATCH_GAP_S: the stored windows and the clock
+        came apart (anchor divergence). Snap-derive the anchor from the
+        newest cue (edge - L - end) and rebase the stored windows with
+        it, so display resumes on the newest content within seconds.
+        L here is the INSTANTANEOUS head-probe lag (head_rel - cue end),
+        not the EWMA: the watchdog fires exactly when something jumped
+        (burst, wedge), which is when the EWMA is mid-transient and would
+        land the first correction short — the measured two-fire sequences
+        that stretched stops past the contract. The instant lag also
+        makes speech-pause derivations ~0 (edge grows, last cue doesn't,
+        L_now grows to match — target stays put), so the small-shift
+        suppression below stays honest."""
+        gap = now - self._cc_last_active if self._cc_last_active > 0.0 \
+            else 0.0
+        self._cc_last_watchfire = now
+        self._cc_last_active = now
+        if self._cc_last_c is None:
+            return
+        lag = None
+        head_pcr = self._cc_probe_head_pcr()
+        if head_pcr is not None and self._sync_pcr_join is not None:
+            lag = (head_pcr - self._sync_pcr_join[1]) - self._cc_last_c
+            if not (0.0 <= lag <= _CC_LAG_MAX_S):
+                lag = None
+        if lag is None:
+            lag = self._cc_lag if self._cc_lag is not None else _CC_LAG_S
+        target = self._cap_edge_s() - lag - self._cc_last_c
+        shift = target - (self._cc_off if self._cc_off is not None else 0.0)
+        if abs(shift) < 1.0:
+            return    # normal speech gap, not divergence — nothing to fix
+        try:
+            log.warning("captions: no window hit the clock for %.1f s "
+                        "while cues kept arriving — anchor rebased "
+                        "(shift %+.1f s)", gap, shift)
+        except Exception:
+            pass
+        self._cc_rebase(target, "watchdog")
 
     def _cap_note(self, text: str):
         """Brief on-video note (caption fallbacks etc.)."""
@@ -2978,8 +3617,10 @@ class PlayerView(QtWidgets.QWidget):
     def _on_vod_cue(self, start: float, end: float, text: str):
         if self._closing:
             return
-        # VOD subtitle tracks are pre-timed — no caption-lag lead
-        self._filter_engine.add_cue(start, end, text, lead_s=0.0)
+        # VOD subtitle tracks are pre-timed — no caption-lag lead, but the
+        # measured ~0.5 s late-mute trim applies (see _VOD_MUTE_LEAD_S)
+        self._filter_engine.add_cue(start, end, text,
+                                    lead_s=_VOD_MUTE_LEAD_S)
         self._cap_cues.add(start, end, text)
 
     def _on_media_for_profanity(self, kind: str = None):
@@ -3064,6 +3705,22 @@ class PlayerView(QtWidgets.QWidget):
                 src.failed.connect(self._cap_source_failed)
             if src.start(buf, join_bytes=join):
                 self._cc_source = src
+                # Join bookkeeping: the PCR at the join byte pins CCX's
+                # axis origin — every L measurement and edge calibration
+                # keys off it (see _on_cc_cue). Mid-session joins also
+                # need the join byte's content position (refined from the
+                # first head probe); byte-0 joins are exactly 0.
+                self._cc_join_byte = int(join)
+                self._cc_join_app_s = 0.0 if join <= 0 else None
+                self._sync_pcr_join = None
+                self._sync_pcr_join_tries = 0
+                if _SYNC_ON:
+                    synclog.info("CCSTART buf=%s join_byte=%d",
+                                 buf, join)
+                QtCore.QTimer.singleShot(
+                    50, lambda j=join: self._sync_probe_join_at(j))
+                # periodic head probe: edge calibration between cues
+                self._cc_edge_timer.start()
                 # evaluation loop for the caption windows (see
                 # _effective_url: nothing else starts this timer)
                 self._filter_timer.start()
@@ -3080,57 +3737,106 @@ class PlayerView(QtWidgets.QWidget):
             400, lambda: self._start_cc_when_buffer(tries_left - 1))
 
     def _on_cc_cue(self, start: float, end: float, text: str):
-        """One live cue arrived — remap it onto the app's clock by ARRIVAL.
+        """One live cue arrived — place it at its TRUE content position.
 
-        CCExtractor's SRT times live on its own PTS-derived axis, which
-        measured 12-32 s ahead of VLC's playback clock with continuous
-        drift (the provider's bursts/PTS jumps normalize differently in
-        each). So the cue's own timestamps are only used for RELATIVE
-        ordering; the absolute position comes from the arrival moment:
-        every FRESH cue (advancing no faster than wall time — a catch-up
-        burst over old content doesn't qualify) re-anchors
+        CCExtractor's SRT times are zero-based from its join byte and the
+        provider's caption axis drifts against the video axis (stage 1
+        measured 0-129 s and nonstationary), so a cue's own numbers only
+        carry RELATIVE ordering. The absolute position comes from two
+        live measurements: the tail-PCR probe gives the write head, and
+        L = head - cue_end is CCX's true lag — so the newest FRESH cue
+        pins at
 
-            offset = frontier(now) - _CC_LAG_S - cue_end
+            edge - L        (edge = dead-reckoned head, PCR-calibrated)
 
-        so the newest content sits a pipeline-lag behind the frontier
-        and older cues keep their relative spacing. The offset is
-        EWMA-smoothed across fresh cues (see _CC_ANCHOR_ALPHA) so burst
-        jitter does not wiggle individual captions. Residual error is a
-        fraction of the pipeline lag; the subtitle delay setting trims
-        taste on top."""
+        which is exactly where that cue's speech sits in the buffer.
+
+        The anchor decision itself is DEFERRED to the next caption tick
+        (``_cc_flush_pending``): CCX flushes its SRT in multi-second
+        bursts, and every cue inside a burst passes the per-cue
+        freshness test — anchoring per-cue let a burst's stale interior
+        cues snap-rebase the anchor by a full batch width (the live
+        matrix's "queue-skew" innovation tail, and a mid-pause store
+        shift that blanked captions at resume). Corrections beyond
+        _CC_REBASE_S snap immediately and slide every stored window
+        with them (see _cc_rebase); smaller ones EWMA-settle."""
         if self._closing:
             return
         now = time.time()
+        self._cc_last_arrival = now
+        off_before = self._cc_off
         last_c = self._cc_last_c
         elapsed = 1.0 if self._cc_last_t <= 0.0 else now - self._cc_last_t
         advance = None if last_c is None else end - last_c
         # Fresh = advancing no faster than a few times wall time. Some
         # providers' caption PTS axis legitimately runs ~2x wall (measured
-        # on a 4K channel), which the old advance<=elapsed+5 rule read as
-        # an eternal catch-up burst — anchors stopped refreshing and
-        # captions drifted late over every silent stretch. Real catch-up
-        # replays at 30-100x, far outside even this generous bound.
+        # on a 4K channel), which a tighter bound read as an eternal
+        # catch-up burst — anchors stopped refreshing and captions drifted
+        # late over every silent stretch. Real catch-up replays at
+        # 30-100x, far outside even this generous bound.
         fresh = (
             (last_c is None and self._frontier_s() < 20.0)
             or (advance is not None
                 and 0.0 < advance <= elapsed * 3.0 + 5.0)
         )
+        if fresh:
+            reason = "fresh"
+        elif last_c is None:
+            reason = "first-cue-fr>=20"
+        elif advance is None:
+            reason = "no-advance-info"
+        elif advance <= 0.0:
+            reason = "dup/regress"
+        else:
+            reason = "catchup(adv=%.1f>%.1f)" % (advance, elapsed * 3.0 + 5.0)
         if last_c is None or end > last_c:
             # baseline for the NEXT cue's advance judgment (never
             # regressed by CCX's duplicate re-emissions)
             self._cc_last_c = end
             self._cc_last_t = now
+        # -- calibrate the dead-reckoned edge on one head probe --
+        head_pcr = self._cc_probe_head_pcr()
+        head_rel = None
+        if head_pcr is not None and self._sync_pcr_join is not None:
+            head_rel = head_pcr - self._sync_pcr_join[1]
+            self._cc_refine_join_app(head_pcr)
+            # a landed CDN burst moves the head and the lag together —
+            # keep the pin (edge - L) stable across it
+            snap = self._cc_calibrate_edge(head_rel)
+            if snap and self._cc_lag is not None:
+                self._cc_lag += snap
         if fresh:
-            target = self._frontier_s() - _CC_LAG_S - end
-            if self._cc_off is None:
-                self._cc_off = target   # first anchor lands as-is (fast start)
-            else:
-                # EWMA: settle on the MEAN pipeline lag instead of jittering
-                # cue-to-cue with burst flushes and poll phase
-                self._cc_off += (target - self._cc_off) * _CC_ANCHOR_ALPHA
+            # deferred anchor (see the docstring): the caption tick
+            # applies ONE decision per arrival batch, written by its
+            # newest cue (last writer wins)
+            self._cc_pend = (end, head_rel)
         off = self._cc_off
+        if _SYNC_ON:
+            lag = self._cc_lag
+            mapped_end = None if off is None else end + off
+            synclog.info(
+                "CUE cx=[%.2f..%.2f] adv=%s el=%.2f %s | off=%s "
+                "fr=%.2f cc=%.2f raw=%.2f lead=%s | pcr=%.3f "
+                "head_rel=%s lag_ewma=%s | q=%.60s",
+                start, end,
+                "-" if advance is None else "%.2f" % advance,
+                elapsed, reason,
+                "-" if off is None else "%.2f" % off,
+                self._frontier_s(), self._cap_clock_s, self._sync_raw_s(),
+                "-" if mapped_end is None
+                else "%+.2f" % (mapped_end - self._cap_clock_s),
+                -1.0 if head_pcr is None else head_pcr,
+                "-" if head_rel is None else "%.2f" % head_rel,
+                "-" if lag is None else "%.2f" % lag,
+                (text or "").replace("\n", " / "))
         if off is None:
-            return          # still in a catch-up burst: untrusted times
+            # no anchor yet (catch-up burst / pre-first-flush): stash the
+            # cue — _cc_flush_pending stores the whole stash the moment
+            # the first anchor pins the offset
+            self._cc_stash.append((start, end, text))
+            if len(self._cc_stash) > 300:
+                del self._cc_stash[:150]
+            return
         start = max(0.0, start + off)
         end = max(start, end + off)
         # arrival-anchored times are already display times: no caption-lag
@@ -3138,8 +3844,58 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_engine.add_cue(start, end, text, lead_s=0.0)
         self._cap_cues.add(start, end, text)
 
+    def _cc_flush_pending(self):
+        """Apply the deferred anchor decision (see _on_cc_cue): one per
+        arrival batch — the batch's newest cue was the last writer, so
+        its target is the only one that lands. Takes ONE clean lag
+        sample per batch from that cue (interior cues' samples carried
+        the whole batch width and inflated the EWMA)."""
+        if self._cc_pend is None or self._closing:
+            return
+        end, head_rel = self._cc_pend
+        self._cc_pend = None
+        if head_rel is not None:
+            lag_now = head_rel - end
+            if 0.0 <= lag_now <= _CC_LAG_MAX_S:
+                if self._cc_lag is None:
+                    self._cc_lag = lag_now
+                else:
+                    self._cc_lag += (lag_now - self._cc_lag) * _CC_LAG_ALPHA
+        lag = self._cc_lag
+        target = self._cap_edge_s() \
+            - (lag if lag is not None else _CC_LAG_S) - end
+        if _SYNC_ON:
+            synclog.info("ANCHOR pend_end=%.2f L=%s target=%.2f off=%s",
+                         end, "-" if lag is None else "%.2f" % lag, target,
+                         "-" if self._cc_off is None
+                         else "%.2f" % self._cc_off)
+        if self._cc_off is None:
+            self._cc_off = target   # first anchor lands as-is (fast start)
+        elif abs(target - self._cc_off) > _CC_REBASE_S:
+            self._cc_rebase(target, "anchor-snap")
+        else:
+            # EWMA: settle on the MEAN pipeline lag instead of jittering
+            # cue-to-cue with burst flushes and poll phase
+            self._cc_off += (target - self._cc_off) * _CC_ANCHOR_ALPHA
+        if self._cc_stash:
+            # cues that arrived before the first anchor (or during a
+            # catch-up burst) become placeable now: same axis, so the
+            # offset maps them straight to their true positions — a cold
+            # join then keeps its first screens scrubbable
+            off = self._cc_off
+            for ss, se, stx in self._cc_stash:
+                ms = max(0.0, ss + off)
+                me = max(ms, se + off)
+                self._filter_engine.add_cue(ms, me, stx, lead_s=0.0)
+                self._cap_cues.add(ms, me, stx)
+            self._cc_stash = []
+
     def _stop_cc_source(self):
         """Tear down just the live caption reader (channel change etc.)."""
+        try:
+            self._cc_edge_timer.stop()
+        except Exception:  # noqa: BLE001
+            pass
         if self._cc_source is not None:
             try:
                 self._cc_source.cue.disconnect()
@@ -3197,15 +3953,6 @@ class PlayerView(QtWidgets.QWidget):
 
 
 
-
-
-
-
-
-
-
-
-
     def _on_focus_changed(self, _old, now):
         """Hide the on-video overlays when the app loses focus (another app
         took it, or the window was minimized): the ToolTip-style overlay
@@ -3225,14 +3972,6 @@ class PlayerView(QtWidgets.QWidget):
                 self.overlay.show()
                 self._layout_overlays()
             self._overlay_was_visible = False
-
-
-
-
-
-
-
-
 
 
 
