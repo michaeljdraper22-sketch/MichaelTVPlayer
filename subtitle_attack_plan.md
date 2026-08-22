@@ -17,6 +17,14 @@ uncommitted lines plus the untracked harness/driver), 1a's scenario-f
 instruction no longer contradicts the prompt pack, P1's final gate re-runs
 the adversarial harness + `test_dvr_e2e`, and P3 pins its retune corpus
 into the repo.**
+**v5 (2026-08-22, pre-P2 checkpoint): P0+P1 landed and independently
+reviewed, then committed as 6248965 — every report claim re-verified
+(all offline suites + harness 31/31 re-run green, mutation artifacts
+re-checked, seam A/B matches the recorded baseline line-for-line, the
+stale-relay guard's Qt event ordering traced safe). Decisions recorded
+below in WP4: D1 YES, D2 YES, D3 GO (findings pinned; new package WP4b +
+`prompts/p4.txt`). WP3's retune corpus is already pinned:
+`sync_retune_input.log` in the repo root.**
 **Diagnosis artifacts:** `sync_diag_adversarial_quick.out` (harness 30/31,
 twice, identical failure), `sync_diag_e2e_live.out` + `sync_debug.log` (live
 E2E 4 FAILs on a 0.17x-delivery night), `player.log` (no rescue rows during
@@ -99,8 +107,8 @@ the symptoms.
 2. **First message: paste the prompt verbatim** from the pack below. Every
    prompt tells the session to read this plan first and own exactly one
    package. **Easiest: each prompt is saved ready-to-paste as
-   `prompts/p0.txt`, `p1.txt`, `p2.txt`, `p3.txt`, `p5.txt` — open the
-   file, select all, copy, paste into the fresh session.**
+   `prompts/p0.txt`, `p1.txt`, `p2.txt`, `p3.txt`, `p4.txt`, `p5.txt` —
+   open the file, select all, copy, paste into the fresh session.**
 3. **After the session finishes:** skim its `pN_report.md`, then tell it
    `commit this work` (it names the commit after the package). The next
    session starts from a clean tree, so `git diff` ownership checks stay
@@ -119,8 +127,10 @@ the symptoms.
 
 ```
 P0 (metrics) ► P1 (surgical bugs; subagents in parallel)
-  ► [D1/D2: your call — default yes] ► P2 (design → you approve → implement,
+  ► [D1/D2 answered 2026-08-22: yes/yes] ► P2 (design → you approve → implement,
   incl. D1 adaptive landing + D2 near-play join) ► P3 (coherence) ► P5 (verify, live)
+  └─ WP4b (vendor streaming CCX, D3) — independent of the sync work; any
+     fresh session after P2, must not run concurrently with a live-E2E one
 ```
 
 ---
@@ -242,9 +252,9 @@ derivative) vs adaptive α with burst gating. **Steady-state criterion:** the
 chosen store mechanism must NOT introduce visible caption jitter (windows
 sliding ±1–2 s while watching live) — the retune simulation must include a
 steady-regime segment proving zero jitter. Pin the retune corpus into the
-repo first (copy `%APPDATA%\MichaelTVPlayer\sync_debug.log` to
-`sync_retune_input.log` and point the sim at it — appdata cleanup must not
-orphan this package) and note the script currently scores anchor bias
+repo first — DONE 2026-08-22: `sync_retune_input.log` (repo root, 4.9 MB,
+the full 2026-08-21 diagnosis matrix) is committed; point the sim at it —
+and note the script currently scores anchor bias
 only, so it must be extended to simulate the stored cue windows — that is
 what the jitter criterion measures. Re-run `sync_stage3_retune.py`
 against the alternatives before choosing. New scenarios: L ramp/drain
@@ -256,18 +266,54 @@ comparison table).
 
 ### WP4 — Product decisions (S each) — USER decides; D1/D2 needed before P2
 
-- **D1 Adaptive jump-to-live:** land `max(5, L+3)` behind the head while
-  L > ~8 s (timely captions, avoids the ragged edge), true edge otherwise.
-  *Recommendation: yes — directly targets "way off / way ahead on live".*
-- **D2 Join near the playback position at ANY frontier:** today a mid-show
-  engage with frontier < 90 s joins byte 0 and replays up to 90 s before
-  live cues flow. *Recommendation: yes — biggest chunk of "slow to load".*
-- **D3 Vendor a streaming-capable CCExtractor** (0.88 can't stream; zero-
-  install releases currently fall back to VLC's unstyled rendering).
-  *Recommendation: evaluate effort; not blocking.*
+**All answered 2026-08-22 — P2 may proceed on these.**
+
+- **D1 Adaptive jump-to-live: YES.** Land `max(5, L+3)` behind the head
+  while L > ~8 s; true edge otherwise — directly targets "way off / way
+  ahead on live".
+- **D2 Join near the playback position at ANY frontier: YES.** Kills the
+  byte-0 replay delay when engaging mid-show — biggest chunk of "slow to
+  load".
+- **D3 Vendor a streaming-capable CCExtractor: GO** (user chose
+  evaluate/vendor over skip). Findings pinned 2026-08-22: the vendored
+  0.88 win build reads stdin to EOF before emitting a single SRT byte
+  (measured, `live_cc.py` `CCSource.start` fail-fast), so zero-install
+  releases get no live captions. Latest upstream is **v0.96.6 (Feb
+  2026)** with an official **`CCExtractor.0.96.6_win_portable.zip`**
+  (88 MB x64; current static 0.88 exe is 1.9 MB — the package must
+  extract the minimal runtime subset, not vendor the whole zip). Work
+  defined as **WP4b** below; `prompts/p4.txt` ready to paste.
 - **D4 VOD CDN HTTP 551:** provider-side; retry/skip logic only.
 
-Defaults if unanswered when P2 starts: D1 yes, D2 yes, D3 skip.
+### WP4b — Vendor a streaming-capable CCExtractor (D3) (S–M) — independent
+
+Zero-install releases only; dev machines with a user-installed CCX are
+unaffected (`find_ccextractor()` prefers the installed one — keep that
+order). No dependency on P2/P3; run any fresh session after P2, never
+concurrently with a live-E2E session (one provider connection).
+
+1. Download `CCExtractor.0.96.6_win_portable.zip` (official GitHub
+   release) and inventory it: which files are actually needed at runtime
+   for `-in=ts --stdin --stdout` (exe + required ffmpeg/etc DLLs)? Vendor
+   the MINIMAL subset into `vendor/` (the whole zip is 88 MB vs today's
+   1.9 MB static exe — keep the release sane; record the final size).
+2. **Acceptance = the streaming test 0.88 provably fails:** pipe a
+   growing TS into stdin and require SRT bytes on stdout BEFORE EOF
+   (0.88: 30 MB piped, 0 B out until close — see `live_cc.py`'s
+   fail-fast). Headless, local fixture TS only (the repo's test
+   recording), no network.
+3. Wire it in: `bundled_ccextractor()` paths + `ccx_args()` (the long
+   `--stdin/--stdout` flags are the non-0.88 form — now also correct for
+   the new binary), drop 0.88's fail-fast branch if the new binary
+   passes the streaming test, update `MichaelTVPlayer.spec`/build datas
+   if the file set changed, refresh `vendor/COPYING-ccextractor.txt`
+   (GPL-2; the portable zip's DLLs are part of CCExtractor's official
+   distribution — vendor them together with the license).
+4. Update `test_bundled_ccx.py`: the fail-before is its current
+   expectation that the bundled binary cannot stream; pass-after = the
+   new vendored binary passes the streaming test and the old checks
+   (detection order, args) still hold. `p4b_report.md`: inventory,
+   sizes, streaming-test evidence.
 
 ### WP5 — Verification night (M) — main session only, alone
 
@@ -526,6 +572,46 @@ Each prompt below is ALSO saved ready-to-paste in `prompts/pN.txt`
 > proof them, run the full harness --quick twice + offline suites.
 > `p3_report.md` must include the retune comparison table.
 
+### Prompt P4b — vendor a streaming-capable CCExtractor (D3)
+
+> (Identical to `prompts/p4.txt`.) Work in D:\Coding\MichaelTVPlayer
+> (Python/PyQt5 IPTV player). FIRST read `subtitle_attack_plan.md` — you
+> own ONLY package WP4b (decision D3: vendor a streaming-capable
+> CCExtractor); P0/P1 are merged, P2/P3/P5 belong to other sessions. Keep
+> console output brief; write `p4b_report.md` at the end. No live/network
+> tests beyond downloading the release; every playback/pipe test uses the
+> repo's local test recording, headless.
+>
+> Context: the vendored CCExtractor 0.88 win build (`vendor/
+> ccextractorwin.exe`, 1.9 MB static) reads stdin to EOF before emitting a
+> single SRT byte (measured: 30 MB piped, 0 B out until close), so
+> zero-install releases get no live captions — `src/live_cc.py`
+> `CCSource.start` fail-fasts on it ("bundled CCExtractor 0.88 cannot
+> stream") and falls back to VLC's unstyled rendering. Decision D3 is GO
+> (2026-08-22).
+>
+> Do: (1) download the official `CCExtractor.0.96.6_win_portable.zip`
+> (GitHub release v0.96.6, x64) and inventory it — which files are
+> actually needed at runtime for `-in=ts --stdin --stdout` (exe + required
+> DLLs)? Vendor the MINIMAL subset into `vendor/` (the whole zip is 88 MB;
+> keep the release size sane and record final sizes). (2) THE acceptance
+> test (the one 0.88 provably fails): pipe the local test TS into stdin as
+> a GROWING stream (append chunks with pauses, do not close) and require
+> SRT bytes on stdout BEFORE EOF; make it a regression test. (3) Wire it
+> in: `bundled_ccextractor()` / `ccx_args()` in `src/live_cc.py` (the long
+> --stdin/--stdout flags are now also the bundled binary's form), remove
+> or keep the 0.88 fail-fast branch accordingly, update the PyInstaller
+> spec datas if the vendored file set changed, refresh the GPL-2 license
+> file (vendor the official distribution's files together with its
+> license). (4) Update `test_bundled_ccx.py` fail-before/pass-after:
+> before, the bundled binary is expected NOT to stream; after, it streams
+> and the detection-order / args checks still hold. User-installed CCX
+> must keep winning `find_ccextractor()` — zero-install machines are the
+> only consumers of the vendored binary. Acceptance: streaming regression
+> fails before / passes after; `test_bundled_ccx.py`, `test_fixes.py`,
+> `test_profanity.py` green. `p4b_report.md`: inventory table, sizes,
+> streaming-test evidence, build/spec deltas.
+
 ### Prompt P5 — verification night
 
 > Work in D:\Coding\MichaelTVPlayer. FIRST read `subtitle_attack_plan.md` —
@@ -550,11 +636,10 @@ Each prompt below is ALSO saved ready-to-paste in `prompts/pN.txt`
 > skip-stability, ahead-of-speech) with before/after evidence and the
 > regime context for every number.
 
-## What I need from you (the user) before P2
+## What I need from you (the user) before P2 — ANSWERED 2026-08-22
 
-- **D1:** adopt adaptive jump-to-live (sit `max(5, L+3)` behind the head
-  while L > ~8 s)? Recommended: yes.
-- **D2:** join the CC reader near the playback position at ANY frontier
-  (kills the byte-0 replay delay when engaging mid-show)? Recommended: yes.
-- **D3:** spend effort vendoring a streaming-capable CCExtractor? (Optional;
-  affects zero-install releases only.)
+- **D1:** adopt adaptive jump-to-live? **YES.**
+- **D2:** join the CC reader near the playback position at ANY frontier?
+  **YES.**
+- **D3:** spend effort vendoring a streaming-capable CCExtractor?
+  **YES — GO** (findings + package WP4b above, `prompts/p4.txt` ready).

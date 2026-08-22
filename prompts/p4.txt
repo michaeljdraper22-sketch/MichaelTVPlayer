@@ -1,0 +1,36 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`subtitle_attack_plan.md` — you own ONLY package WP4b (decision D3:
+vendor a streaming-capable CCExtractor); P0/P1 are merged, P2/P3/P5
+belong to other sessions. Keep console output brief; write `p4b_report.md`
+at the end. No live/network tests beyond downloading the release; every
+playback/pipe test uses the repo's local test recording, headless.
+
+Context: the vendored CCExtractor 0.88 win build (`vendor/
+ccextractorwin.exe`, 1.9 MB static) reads stdin to EOF before emitting a
+single SRT byte (measured: 30 MB piped, 0 B out until close), so
+zero-install releases get no live captions — `src/live_cc.py`
+`CCSource.start` fail-fasts on it ("bundled CCExtractor 0.88 cannot
+stream") and falls back to VLC's unstyled rendering. Decision D3 is GO
+(2026-08-22).
+
+Do: (1) download the official `CCExtractor.0.96.6_win_portable.zip`
+(GitHub release v0.96.6, x64) and inventory it — which files are actually
+needed at runtime for `-in=ts --stdin --stdout` (exe + required DLLs)?
+Vendor the MINIMAL subset into `vendor/` (the whole zip is 88 MB; keep
+the release size sane and record final sizes). (2) THE acceptance test
+(the one 0.88 provably fails): pipe the local test TS into stdin as a
+GROWING stream (append chunks with pauses, do not close) and require SRT
+bytes on stdout BEFORE EOF; make it a regression test. (3) Wire it in:
+`bundled_ccextractor()` / `ccx_args()` in `src/live_cc.py` (the long
+--stdin/--stdout flags are now also the bundled binary's form), remove or
+keep the 0.88 fail-fast branch accordingly, update the PyInstaller spec
+datas if the vendored file set changed, refresh the GPL-2 license file
+(vendor the official distribution's files together with its license).
+(4) Update `test_bundled_ccx.py` fail-before/pass-after: before, the
+bundled binary is expected NOT to stream; after, it streams and the
+detection-order / args checks still hold. User-installed CCX must keep
+winning `find_ccextractor()` — zero-install machines are the only
+consumers of the vendored binary. Acceptance: streaming regression fails
+before / passes after; `test_bundled_ccx.py`, `test_fixes.py`,
+`test_profanity.py` green. `p4b_report.md`: inventory table, sizes,
+streaming-test evidence, build/spec deltas.
