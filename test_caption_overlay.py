@@ -503,9 +503,16 @@ check("cue clears after its anchored window",
 # caption timing keys on the DISPLAYED position through outlier-rejected
 # DELTAS only: raw advancing ~rate x wall folds in (the clock follows
 # VLC's real timeline); absolute numbers are never snapped to
-before = view._cap_clock_s
+# WP2 (c): park the clock coherently with the baseline reading first —
+# the anti-lead clamp now bounds a playing clock to raw + _CC_LEAD_MAX_S,
+# and the old setup (clock left ~5 s past the reading by the _show_at
+# seeds above) clamps instead of folding.
 fake.times["t"] = int((c0 + 0.5) * 1000)    # baseline reading — only its
-view._caption_tick()                        # DELTA matters from here on
+view._cap_raw_s = None                      # DELTA matters from here on
+view._cap_clock_s = c0 + 0.5
+view._cap_wall = time.time()
+before = view._cap_clock_s
+view._caption_tick()                        # baseline tick (branch: base)
 time.sleep(0.12)
 fake.times["t"] = int((c0 + 0.65) * 1000)   # advanced ~wall since the
 view._caption_tick()                        # reading changed: fold it in

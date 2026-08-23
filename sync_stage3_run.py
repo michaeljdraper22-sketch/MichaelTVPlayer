@@ -41,7 +41,10 @@ import logging  # noqa: E402
 synclog = logging.getLogger("mtp.sync")
 
 from src.config import Config  # noqa: E402
-from src.ui.player_view import PlayerView  # noqa: E402
+from src.ui.player_view import (PlayerView,  # noqa: E402
+                                _CHASE_SAFETY_S,
+                                _CC_ADAPTIVE_MIN_L_S,
+                                _CC_ADAPTIVE_PAD_S)
 from src.xtream import XtreamClient  # noqa: E402
 
 app = QtWidgets.QApplication(sys.argv)
@@ -124,6 +127,12 @@ class Health:
         self.in_stop = None
         self.paints = 0
         self.samples = 0
+        # WP2 monitors (computed driver-side, independent of the
+        # mechanisms under test): unrecovered raw freezes with real data
+        # ahead (the wedge), and the caption clock leading VLC's raw
+        self.raw_moved_at = None    # wall time raw last changed
+        self.max_freeze_ahead = 0.0  # longest frozen-raw stretch w/ data
+        self.max_lead = -99.0        # max (clock - raw_content) playing
 
     def tick(self):
         try:
@@ -135,6 +144,32 @@ class Health:
             return
         self.samples += 1
         now = time.time()
+        try:
+            raw = view.vlc.get_time() / 1000.0
+            if raw >= 0.0:
+                if self.raw_moved_at is None \
+                        or abs(raw - getattr(self, "_raw_prev", -99.0)) > 0.05:
+                    self.raw_moved_at = now
+                self._raw_prev = raw
+                playing = view.vlc.is_playing() and not view._chase_paused
+                if playing and view._mode == "chase":
+                    self.max_lead = max(
+                        self.max_lead,
+                        clock - view._cap_content_for_raw(raw))
+                    head = view._cc_head_pcr
+                    if head is not None \
+                            and view._sync_pcr_join is not None \
+                            and view._cc_join_app_s is not None \
+                            and self.raw_moved_at is not None:
+                        ahead = (head[0] - view._sync_pcr_join[1]
+                                 + view._cc_join_app_s
+                                 - view._cap_content_for_raw(raw))
+                        if ahead > 10.0:
+                            self.max_freeze_ahead = max(
+                                self.max_freeze_ahead,
+                                now - self.raw_moved_at)
+        except Exception:
+            pass
         if showing:
             self.paints += 1
             self.last_paint = now
@@ -226,23 +261,47 @@ def run_live():
     phase("JUMPLIVE", "jump to live + 2.5 min")
     fr_pre = view._frontier_s()
     edge_pre = view._cap_edge_s()
+    lag_pre = view._cc_lag
+    raw_pre = raw_s()
+    # D1 policy INLINED (not shared with the production helper) so the
+    # check cannot self-neutralize against a mutated landing formula
+    back = max(_CHASE_SAFETY_S, lag_pre + _CC_ADAPTIVE_PAD_S) \
+        if (lag_pre is not None and lag_pre > _CC_ADAPTIVE_MIN_L_S) \
+        else _CHASE_SAFETY_S
     view._jump_live()
     hush()
-    pump(3)
+    want_land = edge_pre - back
+    landed = wait_until(
+        lambda: abs(view._cap_content_for_raw(raw_s()) - want_land) <= 4.0,
+        8, "raw at the landing target")
     p3 = raw_s()
-    check("jump-live lands at the TRUE edge",
-          p3 > fr_pre - 2.0 and abs(p3 - (edge_pre - 5.0)) < 8.0,
-          f"raw={p3:.1f} fr={fr_pre:.1f} edge={edge_pre:.1f}")
-    health_pump(147)
+    # "already there" must mean PLAYING there, not frozen at the buffer
+    # tail (the 2026-08-21 wedge passed the old check vacuously: raw
+    # equaled the target because it was pinned there)
+    pump(3)
+    p6 = raw_s()
+    check("jump-live lands per the adaptive policy (raw moved/tracks)",
+          landed and (abs(p3 - raw_pre) > 0.05 or p6 - p3 > 0.5),
+          f"raw={p3:.1f}->{p6:.1f} want~{want_land:.1f} "
+          f"edge={edge_pre:.1f} fr={fr_pre:.1f} "
+          f"L={'-' if lag_pre is None else '%.1f' % lag_pre} "
+          f"back={back:.0f}")
+    health_pump(144)
 
     phase("SCRUBBACK", "seek -120 s")
     s0 = view._cap_clock_s
+    want = s0 - 117.0
+    raw_pre_sb = raw_s()
     view._seek_ms(-120000)
     hush()
-    pump(3)
-    check("scrub back lands ~120 s behind",
-          abs(view._cap_clock_s - (s0 - 117.0)) < 8.0,
-          f"landed={view._cap_clock_s:.1f} want~{s0 - 117.0:.1f}")
+    landed_sb = wait_until(
+        lambda: abs(view._cap_content_for_raw(raw_s()) - want) <= 4.0,
+        8, "raw at the scrub target")
+    pump(1)
+    check("scrub back lands ~120 s behind (clock AND raw reaches it)",
+          landed_sb and abs(view._cap_clock_s - want) < 8.0,
+          f"landed={view._cap_clock_s:.1f} want~{want:.1f} "
+          f"raw={raw_s():.1f} raw_pre={raw_pre_sb:.1f}")
     health_pump(20)
     phase("SCRUBFWD", "seek +120 s")
     view._seek_ms(120000)
@@ -257,6 +316,13 @@ def run_live():
           health.samples > 100
           and health.paints / max(1, health.samples) >= 0.60,
           f"{health.paints}/{health.samples}")
+    # WP2: the wedge cluster, encoded driver-side (independent of the
+    # mechanisms under test)
+    check("no unrecovered raw freeze > 15 s while PCR data ahead",
+          health.max_freeze_ahead <= 15.0,
+          f"max={health.max_freeze_ahead:.1f}s")
+    check("caption clock never leads VLC raw > 1.5 s while playing",
+          health.max_lead <= 1.5, f"max_lead={health.max_lead:.2f}s")
 
 
 def vod_pick(client, kind, used):

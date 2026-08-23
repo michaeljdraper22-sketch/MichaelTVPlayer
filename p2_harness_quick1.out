@@ -1,0 +1,103 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.2s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    L(t) profile: const(1.5s)
+    calibration m0=-0.17s m0r=-0.17s (150 samples)
+    drift: painted=577 n=577 |perr| p50=0.26 p95=1.48 max=1.78 exact=519/577 ambig=436 nomatch=0 maxstop=0.8s rebases=0 diag[neighbor=577/577]
+  ok   a: drift painted displacement p95 <= 1.5 s   [p95=1.48]
+  ok   a: drift exact-window text >= 85%   [519/577 ambig=436 nomatch=0]
+  ok   a: no silent-stop over 6 s during drift   [max=0.8s]
+  ok   a: wedge applied (+5 s anchor & store)
+  ok   a: no blank beyond the watchdog window after data returns   [max=0.2s]
+    post-wedge verify: painted=100 n=100 |perr| p50=0.07 p95=0.69 max=0.98 exact=100/100 ambig=100 nomatch=0 maxstop=0.0s rebases=1 diag[neighbor=1104/1104]
+  ok   a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)   [backlog=13s rebased=True walkoff_within1.5=100% of 279 heal_within1.5=100% of 148 verify_p95=0.69 verify_within1.5=100%]
+  ok   a: no pipeline exceptions
+
+== scenario b: pause 60 s -> resume +25 s step (3 cycles) ==
+    L(t) profile: const(1.5s)
+    b (3 cycles): painted=4334 n=4334 |perr| p50=0.03 p95=0.85 max=1.78 exact=4233/4334 ambig=3118 nomatch=0 maxstop=0.7s rebases=0 diag[neighbor=4334/4334]
+  ok   b: divergence recorded for each +25 s step (accumulates to ~75)   [div=+74.7 want~+75]
+  ok   b: painted cues coherent through pause/resume/step (p95 <= 1.5)   [p95=0.85]
+  ok   b: no silent-stop beyond watchdog window (~5+3 s)   [max=0.7s]
+  ok   b: 3 pause cycles executed
+  ok   b: no pipeline exceptions
+
+== scenario c: jump-to-live, L swells 1 -> 20 s ==
+    L(t) profile: swell(1->20s over 21s, drain to 1.5s)
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift -3.6 s)
+    c (whole run, incl. L transient — WP3 feed): painted=292 n=292 |perr| p50=0.14 p95=4.92 max=6.58 exact=259/292 ambig=51 nomatch=0 maxstop=0.6s rebases=2 diag[neighbor=259/259]
+    c: after lag recovery: painted=120 n=120 |perr| p50=0.52 p95=1.39 max=1.52 exact=99/120 ambig=120 nomatch=0 maxstop=0.0s rebases=2 diag[neighbor=419/419]
+  ok   c: jump landed max(5, L+3) behind the true edge (D1 adaptive)   [clock@jump=17.8 edge@jump=33.1 true_head=33.1 L@jump=12.241020558392526 back=15.241020558392526]
+  ok   c: the landing gap seeds the live-edge backlog (no double count)   [backlog@jump=15.2 want~15.2]
+  ok   c: painted cues re-settle after the L swing and stay put (p95 <= 2.0)   [data-limited]   [p95=1.39 settled_in=4s L=1.5s rebases=2 (post-swing snap-rebase wander — WP3 target)]
+  ok   c: blank stretches stay data-limited (<= L swell + margin)   [data-limited]   [max=0.6s]
+  ok   c: no pipeline exceptions
+
+== scenario d: provider bursts, frontier under-credits ==
+    L(t) profile: const(1.5s) + 30 s burst/stall cadence
+captions: no window hit the clock for 15.9 s while cues kept arriving — anchor rebased (shift +24.7 s)
+    d (whole run, incl. burst transients — WP2/WP3 feed): painted=476 n=476 |perr| p50=0.24 p95=22.38 max=22.72 exact=267/476 ambig=84 nomatch=0 maxstop=1.2s rebases=4 diag[neighbor=436/476]
+  ok   d: frontier really under-credited (>=10 s at some point)   [max edge-frontier gap=27.0s]
+    d: post-burst quiescent tail: painted=120 n=120 |perr| p50=0.52 p95=0.78 max=0.79 exact=120/120 ambig=120 nomatch=0 maxstop=0.0s rebases=4 diag[neighbor=916/1014]
+  ok   d: painted cues re-settle after the bursts and stay put (p95 <= 1.5, >= 85% within 1.5 s)   [data-limited]   [p95=0.78 within1.5=100% settled_in=52s]
+  ok   d: no silent-stop beyond watchdog window (~5+4 s)   [data-limited]   [max=1.2s]
+  ok   d: no pipeline exceptions
+
+== scenario e: CCX caption axis runs 2x wall ==
+    L(t) profile: const(1.5s) on a 2x warped caption axis
+    warp-axis calibration m0=-0.12s m0r=-0.18s (150 samples)
+    e: painted=575 n=575 |perr| p50=2.00 p95=4.73 max=5.71 exact=175/575 ambig=158 nomatch=0 maxstop=0.0s rebases=11 diag[neighbor=506/575]
+  ok   e: 2x caption axis displacement contained (p95 <= 6 s)   [p95=4.73 rebases=11]
+  ok   e: no silent-stop beyond watchdog window (~5+3 s)   [max=0.0s]
+  ok   e: painted text exact-matched within the warp trail bound (+-8 s, >= 85%)   [within8=100% of 575 exact-text matches (ambig=158)]
+  ok   e: no pipeline exceptions
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    L(t) profile: const(1.5s)
+    f: steady: painted=694 n=694 |perr| p50=0.06 p95=0.54 max=0.92 exact=694/694 ambig=80 nomatch=0 maxstop=0.9s rebases=0 diag[neighbor=694/694]
+  ok   f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=0.54 max=0.92]
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+    f: scrubbed-back region: painted=200 n=200 |perr| p50=0.08 p95=0.50 max=0.54 exact=200/200 ambig=75 nomatch=0 maxstop=0.5s rebases=0 diag[neighbor=894/894]
+  ok   f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=0.50]
+  ok   f: scrubbed-back exact-window text >= 85%   [200/200 ambig=75]
+    f: post-rebase stability: painted=81 n=81 |perr| p50=0.26 p95=1.07 max=1.07 exact=75/81 ambig=81 nomatch=0 maxstop=2.4s rebases=2 diag[neighbor=975/975]
+  ok   f: rebased store stays coherent behind the head (outcome)   [p95=1.07 exact=75/81]
+  ok   f: +1.5 s delay paints the cue active 1.5 s EARLIER   [probe@+0.0s base=2ln shifted=2ln earlier=2ln]
+  ok   f: no pipeline exceptions
+
+== scenario g: 0.2x-delivery trickle, <6 s freeze/thaw cycles ==
+    L(t) profile: const(1.5s) + 0.2x growth (1 s appended every 5 s)
+    g: steady pre-trickle: painted=37 n=37 |perr| p50=0.14 p95=0.53 max=0.53 exact=37/37 ambig=0 nomatch=0 maxstop=0.3s rebases=0 diag[neighbor=106/106]
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift +3.3 s)
+captions: no window hit the clock for 8.1 s while cues kept arriving — anchor rebased (shift -2.1 s)
+    g: trickle (incl. seek — WP2 (c) feed): painted=327 n=327 |perr| p50=0.53 p95=1.24 max=1.30 exact=286/327 ambig=9 nomatch=0 maxstop=0.5s rebases=2 diag[neighbor=396/396]
+    g: post-trickle recovery: painted=118 n=118 |perr| p50=0.03 p95=0.78 max=0.98 exact=118/118 ambig=118 nomatch=0 maxstop=0.2s rebases=4 diag[neighbor=1919/1931]
+  ok   g: caption clock tracks raw within ~1.5 s through the trickle (p95, never leading > 1.5 s)   [n=1094 p95=1.00 max_lead=1.00]
+  ok   g: mid-trickle seek lands ~30 s behind the DISPLAYED position   [raw 40.7 -> 12.0 want~10.7]
+  ok   g: painted displacement contained through the trickle (p95 <= 2.5 — L-drain residual is WP3's feed)   [data-limited]   [p95=1.24]
+  ok   g: no spurious reopen during the trickle (wedge rescue quiet)   [play_at 1 -> 1]
+  ok   g: pipeline re-settles after the trickle   [data-limited]   [p95=0.78 settled_in=144s]
+  ok   g: no pipeline exceptions
+
+== scenario h: injected set_time no-op (wedge at the true edge)==
+    L(t) profile: const(1.5s); wedge staged past the under-credited frontier (the 2026-08-21 geometry)
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift +1.3 s)
+captions: no window hit the clock for 8.1 s while cues kept arriving — anchor rebased (shift -1.1 s)
+chase rescue: playing=True raw=58.6 frozen=8.4s frontier=53.7s head_ahead=11.0 — reopening
+chase reopen: play_at 59.6s (frontier=53.7s was_at=60.6s)
+  ok   h0: wedged player at the true edge is rescued autonomously (<= 15 VT s) — head-ahead, not frontier   [revived after 8.6s (wedge@58.6 fr=44.9 head=63.6 raw_after=71.1)]
+chase revive (seek-escalate): player wedged/down — play_at 14.6s
+  ok   h1: a user seek on the wedged player escalates to play_at within the verify deadline + 2 s   [escalated after 6.3s (deadline 6.0 for a ~60 s jump)]
+  ok   h2: the escalated play_at lands the SEEK TARGET (not the wedge point), raw reaches it   [raw@esc=14.7 want~14.6 (clock@seek=74.6)]
+captions: no window hit the clock for 5.1 s while cues kept arriving — anchor rebased (shift +1.7 s)
+  ok   h-starved: no autonomous reopen while no data is ahead   [play_at_fired=False wedged=True]
+chase rescue: playing=True raw=94.4 frozen=12.0s frontier=93.3s head_ahead=64.0 — reopening
+chase reopen: play_at 35.4s (frontier=93.3s was_at=35.4s)
+  ok   h-starved: user seek still escalates and lands (data exists behind in the buffer)   [raw@esc=35.9 want~35.4]
+  ok   h: bounded rescue attempts (revive + escalations, no loop)   [play_at during wedge phases: 3]
+    h: post-revive recovery: painted=118 n=118 |perr| p50=0.37 p95=0.63 max=0.95 exact=118/118 ambig=118 nomatch=0 maxstop=0.2s rebases=3 diag[neighbor=921/921]
+  ok   h3: painted cues re-settle after the revives   [data-limited]   [p95=0.63 settled_in=16s (absolute-axis drift = L inertia, WP3 feed)]
+  ok   h: no pipeline exceptions
+
+46/46 checks passed (mechanism 39/39, data-limited 7/7)

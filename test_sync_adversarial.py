@@ -73,7 +73,8 @@ from PyQt5 import QtWidgets  # noqa: E402
 from src.config import Config  # noqa: E402
 from src import live_cc as live_cc_mod  # noqa: E402
 from src.ui import player_view as pv_mod  # noqa: E402
-from src.ui.player_view import PlayerView  # noqa: E402
+from src.ui.player_view import (PlayerView,  # noqa: E402
+                                _CHASE_SAFETY_S)
 from src.ui.caption_overlay import visible_lines  # noqa: E402
 
 RECORDING = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -287,6 +288,18 @@ class FakeVLC:
         self.state = "playing"
         self.max_content = None       # cannot display past the write head
         self.commanded = []
+        self.wedged = False           # WP2 h: set_time no-ops, raw frozen,
+        #                              # still "playing"; play_at clears it
+
+    def wedge(self):
+        """WP2 scenario h: demuxer-blocked at the tail of the growing
+        buffer while still reporting "playing" (the 2026-08-21 night:
+        raw pinned at 94.18 for 7 minutes across pause/resume/jump/seeks).
+        set_time becomes a no-op and get_time freezes where it was; only
+        play_at (a fresh open of the buffer file) recovers."""
+        self.base_content = self.get_time() / 1000.0 - self.axis_offset
+        self.base_T = VT.t
+        self.wedged = True
 
     def renumber(self, step):
         """VLC numbers jump by `step`; the frames on screen do not move."""
@@ -294,6 +307,7 @@ class FakeVLC:
 
     def play_at(self, url, t, record_path=None, timeshift=False):
         self.commanded.append(("play_at", t))
+        self.wedged = False           # a fresh open revives the wedge
         self.base_content = float(t) - self.axis_offset
         self.base_T = VT.t
         self.paused = False
@@ -301,10 +315,14 @@ class FakeVLC:
 
     def set_time(self, ms):
         self.commanded.append(("set_time", ms / 1000.0))
+        if self.wedged:
+            return                    # the no-op under test
         self.base_content = ms / 1000.0 - self.axis_offset
         self.base_T = VT.t
 
     def get_time(self):
+        if self.wedged:
+            return int((self.base_content + self.axis_offset) * 1000)
         adv = 0.0 if self.paused else \
             (VT.t - self.base_T) * self.rate * self.speed_warp
         c = self.base_content + adv
@@ -646,6 +664,8 @@ class Harness:
                       f" lag={v._cc_lag if v._cc_lag is None else round(v._cc_lag, 2)}"
                       f" store={len(v._cap_cues.cues)}"
                       f" painted={len(v._cap_wid._lines)}"
+                      f" hold={v._trickle_hold} bl={v._cap_backlog_s:.2f}"
+                      f" rawrate={v._raw_win_rate(t):.2f}"
                       f" arr_age={la:.1f}", flush=True)
             self.starve_guard()
             _real_time.sleep(step / pace)
@@ -1049,7 +1069,8 @@ def scenario_c():
     h = fresh_harness(CueQueue(prof), backlog=10.0)
     prof.t0 = VT.t                    # profile el anchors at scenario start
     print(f"    L(t) profile: {prof}", flush=True)
-    jumped = {"done": False, "edge": 0.0, "clock": 0.0, "true_head": 0.0}
+    jumped = {"done": False, "edge": 0.0, "clock": 0.0, "true_head": 0.0,
+              "lag": None, "backlog": 0.0}
     t0 = VT.t
 
     def script(t):
@@ -1058,8 +1079,10 @@ def scenario_c():
             jumped["done"] = True
             jumped["edge"] = h.view._cap_edge_s()
             jumped["true_head"] = h.head
+            jumped["lag"] = h.view._cc_lag
             h.view._jump_live()               # real jump path
             jumped["clock"] = h.view._cap_clock_s
+            jumped["backlog"] = h.view._cap_backlog_s
     h.run(swell_end + 160 * DUR, script=script)
     h.report("c (whole run, incl. L transient — WP3 feed)")
     maxstop_run = h.max_stop
@@ -1067,12 +1090,25 @@ def scenario_c():
     h.reset_metrics()
     h.run(12)                             # recovered regime: must STAY put
     st = h.report("c: after lag recovery")
-    check("c: jump landed ~5 s behind the true edge",
+    # D1 adaptive landing: the jump target is max(5, L+3) behind the edge
+    # while the measured L exceeds 8 s (at the swell peak the EWMA reads
+    # mid-ramp — whatever it reads IS the policy input, so the expectation
+    # keys off the same reading), true edge (-5) otherwise. The policy is
+    # INLINED here (not shared with the production helper) so a mutation
+    # of _chase_jump_back_s cannot self-neutralize the check.
+    lag_at = jumped["lag"]
+    back = max(_CHASE_SAFETY_S, lag_at + 3.0) \
+        if (lag_at is not None and lag_at > 8.0) else _CHASE_SAFETY_S
+    check("c: jump landed max(5, L+3) behind the true edge (D1 adaptive)",
           jumped["done"]
-          and abs(jumped["clock"] - (jumped["true_head"] - 5.0)) < 3.0
-          and abs(jumped["clock"] - (jumped["edge"] - 5.0)) < 2.0,
+          and abs(jumped["clock"] - (jumped["true_head"] - back)) < 3.0
+          and abs(jumped["clock"] - (jumped["edge"] - back)) < 2.0,
           f"clock@jump={jumped['clock']:.1f} edge@jump="
-          f"{jumped['edge']:.1f} true_head={jumped['true_head']:.1f}")
+          f"{jumped['edge']:.1f} true_head={jumped['true_head']:.1f} "
+          f"L@jump={lag_at} back={back}")
+    check("c: the landing gap seeds the live-edge backlog (no double count)",
+          jumped["done"] and abs(jumped["backlog"] - back) <= 2.0,
+          f"backlog@jump={jumped['backlog']:.1f} want~{back:.1f}")
     check("c: painted cues re-settle after the L swing and stay put "
           "(p95 <= 2.0)",
           settle_s < 150.0 and st is not None and st["p95"] <= 2.0,
@@ -1261,6 +1297,277 @@ def scenario_f():
     h.teardown()
 
 
+def scenario_g():
+    print("\n== scenario g: 0.2x-delivery trickle, <6 s freeze/thaw cycles ==",
+          flush=True)
+    h = fresh_harness(CueQueue(lag_const(1.5)))
+    print(f"    L(t) profile: {lag_const(1.5)} + 0.2x growth "
+          f"(1 s appended every 5 s)", flush=True)
+    leads = []                     # (clock - raw_content) while playing
+    state = {"last": None, "raw_pre_seek": None, "want": 0.0,
+             "landed": None, "n_play_at0": 0}
+
+    def lead_sample():
+        try:
+            if h.fake.is_playing() and not h.view._chase_paused:
+                raw = h.fake.get_time() / 1000.0
+                leads.append(h.view._cap_clock_s
+                             - h.view._cap_content_for_raw(raw))
+        except Exception:
+            pass
+
+    def trickle_growth(t):
+        # 0.2x delivery: 1.0 s of content every 5.0 VT s. raw freezes
+        # ~4.3 s between appends (never reaching the 6 s continuous-freeze
+        # stall), and the frontier OVER-credits (wall-anchored per
+        # sighting) — both measured properties of the 2026-08-21 night
+        if state["last"] is None or t - state["last"] >= 5.0:
+            h.grow_to(h.head + 1.0)
+            state["last"] = t
+
+    def script(t):
+        lead_sample()
+
+    # healthy 1:1 start (paint baseline), then the trickle. Settling is
+    # METRIC-DETECTED, not DUR-scaled: the L EWMA leaves cold-start
+    # (CCX's parse backlog pumps it to ~30) at CCX's real-time parse pace
+    # — a fixed 20*DUR window converges in full mode but not in --quick.
+    h.run(20 * DUR)
+    run_until_settled(h, max_s=150.0 * DUR + 40.0)
+    st0 = h.report("g: steady pre-trickle")
+    state["last"] = None
+    h.diag = bool(os.environ.get("MTP_G_DIAG"))
+    # NOTE on what g3 can and cannot prove: in the harness's 1:1 phases
+    # the starve guard lets real CCX trail the feed by up to 8 content s,
+    # so the L EWMA legitimately settles ~5-6 (the anchor compensates;
+    # painted stays correct). In the trickle regime the release spacing
+    # narrows but L drains at 0.18/batch with a batch only every ~10 VT s
+    # — the pin runs early by (L - spacing) until it drains. That
+    # residual is L-tracking inertia (WP3's assigned target: adaptive α /
+    # lead compensation), NOT the freeze-aware clock: g1/g2 prove the
+    # WP2 mechanism contract; g3 asserts the containment bound.
+    h.run(45 * DUR, growth=trickle_growth, script=script)
+    h.diag = False
+    # mid-trickle seek: the contract is against what is DISPLAYED (raw),
+    # not the internal clock — a clock running ahead lands the seek that
+    # much off the user's intent. Ensure enough buffer exists behind the
+    # viewer first: in the full matrix g runs ~26 content s younger than
+    # standalone (fresh_harness skips its own calibration when scenario a
+    # already measured M0), and a -30 s seek from raw 26 wanted -3.7.
+    drain_guard = VT.t
+    while h.view._cap_content_for_raw(
+            h.fake.get_time() / 1000.0) < 40.0 and VT.t - drain_guard < 200.0:
+        h.run(2.0, growth=trickle_growth, script=script)
+    raw_pre = h.fake.get_time() / 1000.0
+    state["raw_pre_seek"] = h.view._cap_content_for_raw(raw_pre)
+    state["want"] = max(0.0, state["raw_pre_seek"] - 30.0)
+    state["n_play_at0"] = sum(1 for c in h.fake.commanded
+                              if c[0] == "play_at")
+    h.view._seek_ms(-30000)
+    h.run(0.5, growth=trickle_growth, script=script, sample=False)
+    raw_post = h.view._cap_content_for_raw(h.fake.get_time() / 1000.0)
+    h.run(9.5, growth=trickle_growth, script=script)
+    n_play_at = sum(1 for c in h.fake.commanded if c[0] == "play_at")
+    h.run(45 * DUR, growth=trickle_growth, script=script)
+    st1 = h.report("g: trickle (incl. seek — WP2 (c) feed)")
+    # recovery on a healthy 1:1 feed: re-settle and stay put
+    h.reset_metrics()
+    settle_s = run_until_settled(h)
+    h.reset_metrics()
+    h.run(12)
+    st2 = h.report("g: post-trickle recovery")
+
+    import statistics as _st
+    abs_leads = sorted(abs(x) for x in leads)
+    p95 = abs_leads[min(len(abs_leads) - 1, int(len(abs_leads) * 0.95))] \
+        if abs_leads else 99.0
+    max_lead = max((x for x in leads), default=99.0)
+    check("g: caption clock tracks raw within ~1.5 s through the trickle "
+          "(p95, never leading > 1.5 s)",
+          len(leads) >= 100 and p95 <= 1.5 and max_lead <= 1.5,
+          f"n={len(leads)} p95={p95:.2f} max_lead={max_lead:.2f}")
+    check("g: mid-trickle seek lands ~30 s behind the DISPLAYED position",
+          abs(raw_post - state["want"]) <= 3.0,
+          f"raw {state['raw_pre_seek']:.1f} -> {raw_post:.1f} "
+          f"want~{state['want']:.1f}")
+    check("g: painted displacement contained through the trickle "
+          "(p95 <= 2.5 — L-drain residual is WP3's feed)",
+          st1 is not None and st1["p95"] <= 2.5,
+          f"p95={(st1['p95'] if st1 else -1):.2f}",
+          kind="data-limited")
+    check("g: no spurious reopen during the trickle (wedge rescue quiet)",
+          n_play_at == state["n_play_at0"],
+          f"play_at {state['n_play_at0']} -> {n_play_at}")
+    check("g: pipeline re-settles after the trickle",
+          settle_s < 150.0 and st2 is not None and st2["p95"] <= 1.5,
+          f"p95={(st2['p95'] if st2 else -1):.2f} settled_in={settle_s:.0f}s",
+          kind="data-limited")
+    check("g: no pipeline exceptions", not h.exceptions)
+    h.teardown()
+
+
+def scenario_h():
+    print("\n== scenario h: injected set_time no-op (wedge at the true edge)==",
+          flush=True)
+    h = fresh_harness(CueQueue(lag_const(1.5)))
+    print(f"    L(t) profile: {lag_const(1.5)}; wedge staged past the "
+          f"under-credited frontier (the 2026-08-21 geometry)", flush=True)
+    n_pa = lambda: sum(1 for c in h.fake.commanded  # noqa: E731
+                       if c[0] == "play_at")
+
+    # -- phase 1: healthy start, then a provider stall + one landed burst
+    # under-credits the frontier (min(15, gap) credit per sighting). The
+    # burst is (stall + 15) content s so the harness's wall-axis and the
+    # content head stay ~15 s apart afterwards in BOTH modes (a fixed +60
+    # burst on a DUR-scaled stall left the head 39 s past the wall axis in
+    # --quick, grow_1to1 then appended nothing and the wedge ran against
+    # a FROZEN head) — the 15-s deficit is waited out explicitly below.
+    stall = 60.0 * DUR
+    h.run(30 * DUR)
+    h.run(stall, growth=lambda t: None)              # stall: nothing lands
+    h.grow_to(h.head + stall + 15.0)                 # one burst sighting
+    h.run(18.0, sample=False)                        # wall axis catches the
+    #                                                 # head; edge calibrates
+    # -- jump to live: lands ~5 s behind the TRUE head, PAST the
+    # under-credited frontier — the legacy frontier rescue is blind here
+    h.view._jump_live()
+    h.run(2, sample=False)
+    raw_at_wedge = h.view._cap_content_for_raw(h.fake.get_time() / 1000.0)
+    fr_at_wedge = h.view._frontier_s()
+    head_at_wedge = h.head
+
+    # -- h0: autonomous wedge rescue (WP2 (b)) — nobody presses anything
+    pa0 = n_pa()
+    h.fake.wedge()
+    wedge_t = VT.t
+    revived_at = {"t": None}
+
+    def h0_script(t):
+        if revived_at["t"] is None and n_pa() > pa0:
+            revived_at["t"] = t
+        if os.environ.get("MTP_H_DEBUG") and (t - wedge_t) % 2.0 < 0.1:
+            v = h.view
+            hp = v._cc_head_pcr
+            jp = v._sync_pcr_join
+            print(f"    HDBG t+{t - wedge_t:5.1f} raw={v._sync_raw_s():6.1f} "
+                  f"vid={v._vid_s:6.1f} head={h.head:6.1f} "
+                  f"pcr={'-' if hp is None else '%.1f' % hp[0]} "
+                  f"age={'-' if hp is None else '%.1f' % (t - hp[1])} "
+                  f"join={'-' if jp is None else '%.1f' % jp[1]} "
+                  f"japp={v._cc_join_app_s} "
+                  f"ahead={v._head_ahead_s(v._vid_s)} "
+                  f"frz={0 if not v._raw_change_wall else t - v._raw_change_wall:.1f} "
+                  f"reopen_age={t - v._last_reopen:.1f} "
+                  f"pa={n_pa()}", flush=True)
+
+    h.run(20, script=h0_script)                     # 1:1 growth continues
+    raw_after = h.view._cap_content_for_raw(h.fake.get_time() / 1000.0)
+    check("h0: wedged player at the true edge is rescued autonomously "
+          "(<= 15 VT s) — head-ahead, not frontier",
+          revived_at["t"] is not None
+          and revived_at["t"] - wedge_t <= 15.0
+          and not h.fake.wedged
+          and raw_after > raw_at_wedge,
+          f"revived after {(revived_at['t'] or 1e9) - wedge_t:.1f}s "
+          f"(wedge@{raw_at_wedge:.1f} fr={fr_at_wedge:.1f} "
+          f"head={head_at_wedge:.1f} raw_after={raw_after:.1f})")
+
+    # -- h1/h2: interactive escalation (WP2 (a)) — user seeks while wedged.
+    # The player was revived at the edge by h0 and plays 1:1; re-wedge and
+    # seek. raw is captured AT the escalation (a sample seconds later
+    # measures legitimate playback advance, not the landing).
+    h.run(10 * DUR)                                 # clean window (strikes)
+    pa1 = n_pa()
+    h.fake.wedge()
+    clock_pre = h.view._cap_clock_s
+    want = clock_pre - 60.0
+    seek_t = VT.t
+    h.view._seek_ms(-60000)                         # set_time no-ops
+    esc_at = {"t": None, "raw": None}
+
+    def h1_script(t):
+        if esc_at["t"] is None and n_pa() > pa1:
+            esc_at["t"] = t
+            esc_at["raw"] = h.view._cap_content_for_raw(
+                h.fake.get_time() / 1000.0)
+
+    h.run(0.5, sample=False)
+    h.run(10, script=h1_script)
+    raw_esc = esc_at["raw"] if esc_at["raw"] is not None \
+        else h.view._cap_content_for_raw(h.fake.get_time() / 1000.0)
+    check("h1: a user seek on the wedged player escalates to play_at "
+          "within the verify deadline + 2 s",
+          esc_at["t"] is not None and esc_at["t"] - seek_t <= 8.0,
+          f"escalated after {(esc_at['t'] or 1e9) - seek_t:.1f}s "
+          f"(deadline 6.0 for a ~60 s jump)")
+    check("h2: the escalated play_at lands the SEEK TARGET (not the wedge "
+          "point), raw reaches it",
+          esc_at["t"] is not None and not h.fake.wedged
+          and abs(raw_esc - want) <= 3.0,
+          f"raw@esc={raw_esc:.1f} want~{want:.1f} "
+          f"(clock@seek={clock_pre:.1f})")
+
+    # -- h-starved: wedge with NO data ahead — autonomy must stay SILENT
+    # (no reopen loop against a dead provider), a user seek still lands
+    h.view._jump_live()                             # back to the true edge
+    h.run(2, sample=False)
+    pa2 = n_pa()
+    h.fake.wedge()
+    quiet = {"fired": False}
+
+    def hs_script(t):
+        if n_pa() > pa2:
+            quiet["fired"] = True
+
+    h.run(12, growth=lambda t: None, script=hs_script)   # provider stalled
+    check("h-starved: no autonomous reopen while no data is ahead",
+          not quiet["fired"] and h.fake.wedged,
+          f"play_at_fired={quiet['fired']} wedged={h.fake.wedged}")
+    clock_pre2 = h.view._cap_clock_s
+    want2 = clock_pre2 - 60.0
+    h.view._seek_ms(-60000)
+    esc2 = {"raw": None}
+
+    def hs2_script(t):
+        if esc2["raw"] is None and n_pa() > pa2:
+            esc2["raw"] = h.view._cap_content_for_raw(
+                h.fake.get_time() / 1000.0)
+
+    h.run(0.5, sample=False)
+    h.run(10, growth=lambda t: None, script=hs2_script)
+    raw_esc2 = esc2["raw"] if esc2["raw"] is not None \
+        else h.view._cap_content_for_raw(h.fake.get_time() / 1000.0)
+    check("h-starved: user seek still escalates and lands (data exists "
+          "behind in the buffer)",
+          not h.fake.wedged and abs(raw_esc2 - want2) <= 3.0,
+          f"raw@esc={raw_esc2:.1f} want~{want2:.1f}")
+
+    # -- loop bound + recovery
+    total_pa = n_pa() - pa0
+    check("h: bounded rescue attempts (revive + escalations, no loop)",
+          total_pa <= 4, f"play_at during wedge phases: {total_pa}")
+    h.run(20 * DUR, growth=h.grow_1to1)             # provider recovered
+    h.reset_metrics()
+    settle_s = run_until_settled(h)
+    # Re-anchor the metric on h's OWN post-revive axis: the stall/burst/
+    # wedge history leaves the L EWMA mid-drain, and the anchor's mean
+    # offset vs scenario a's calibration axis is exactly the L-inertia
+    # displacement WP3 owns (same class as g3's residual). h3's contract
+    # is that captions RE-SETTLE and STAY PUT on a coherent axis after
+    # the revives — self-calibrate, then the 12-s window must be tight.
+    h.calibrate(20)
+    h.reset_metrics()
+    h.run(12)
+    st = h.report("h: post-revive recovery")
+    check("h3: painted cues re-settle after the revives",
+          settle_s < 150.0 and st is not None and st["p95"] <= 1.5,
+          f"p95={(st['p95'] if st else -1):.2f} settled_in={settle_s:.0f}s "
+          f"(absolute-axis drift = L inertia, WP3 feed)",
+          kind="data-limited")
+    check("h: no pipeline exceptions", not h.exceptions)
+    h.teardown()
+
+
 def main():
     global STREAM, TMPROOT
     if not os.path.isfile(RECORDING):
@@ -1301,7 +1608,8 @@ def main():
     try:
         for name, fn in (("a", scenario_a), ("b", scenario_b),
                          ("c", scenario_c), ("d", scenario_d),
-                         ("e", scenario_e), ("f", scenario_f)):
+                         ("e", scenario_e), ("f", scenario_f),
+                         ("g", scenario_g), ("h", scenario_h)):
             if ONLY and name not in ONLY:
                 continue
             fn()
