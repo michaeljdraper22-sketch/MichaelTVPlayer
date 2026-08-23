@@ -470,18 +470,44 @@ check("small correction steps the anchor part-way (EWMA, not a jump)",
       and abs(view._cc_off - target3) > 1e-6)
 # stage-3 batch whipsaw guard: a flush BURST of individually-fresh cues
 # (CCX stdout blocks) must anchor on the batch's NEWEST cue only — the
-# stale interior cues' targets (a full batch width low) may never land
+# stale interior cues' targets (a full batch width low) may never land.
+# WP3 robust snap: the burst's correction lands out-of-band but < HARD,
+# so the FIRST flush rides the EWMA (no snap, store unmoved — sample
+# noise must not slam the store); a SECOND batch still out-of-band
+# confirms a real jump and snaps.
 view._cc_last_t = time.time() - 1.0
 burst_off = view._cc_off
 for b in range(30):                        # 30 cues spanning ~6 s, one burst
     view._on_cc_cue(123.0 + b * 0.2, 123.2 + b * 0.2, f"burst line {b}")
 check("burst delivery alone does not move the anchor (deferred)",
       view._cc_off == burst_off)
+burst_store = [c[:2] for c in view._cap_cues.cues]
 view._cc_flush_pending()
 target_burst = 100.0 - LAG - (123.2 + 29 * 0.2)
-check("arrival burst anchors on its newest cue (no interior whipsaw)",
-      abs(view._cc_off - target_burst) < 1e-9)
-c0, c1 = 118.0 + view._cc_off, 122.0 + view._cc_off  # anchored display window
+check("lone out-of-band burst correction rides the EWMA (robust snap)",
+      abs(view._cc_off - (burst_off + (target_burst - burst_off)
+                           * pv_mod._CC_ANCHOR_ALPHA)) < 1e-9)
+# WP3 pin-time store: the ride moves the anchor only — stored cues keep
+# their pin positions (whole-store shifts happen on rebase snaps only)
+check("the ride leaves stored cues at their pin positions",
+      [c[:2] for c in view._cap_cues.cues] == burst_store)
+view._cc_last_t = time.time() - 1.0
+view._on_cc_cue(132.0, 132.2, "still shifted regime")   # fresh successor
+view._cc_flush_pending()
+target_2nd = 100.0 - LAG - 132.2
+check("confirmed out-of-band correction snaps (no EWMA crawl)",
+      abs(view._cc_off - target_2nd) < 1e-9)
+w_shift = [c for c in view._cap_cues.cues
+           if c[2] == "still shifted regime"]
+check("the confirming snap slides stored windows with it",
+      w_shift and abs(w_shift[0][0] - (132.0 + target_2nd)) < 1e-6
+      and abs(w_shift[0][1] - (132.2 + target_2nd)) < 1e-6)
+view._frontier_s = lambda: 1000.0          # un-clamp the seed for show checks
+# the anchor-establishing cue's window after the ride + confirm-snap
+# (stored at its DELIVERY-time off, then slid by the rebase deltas)
+w_fs = next(c for c in view._cap_cues.cues
+            if c[2] == "fresh successor after the burst")
+c0, c1 = w_fs[0], w_fs[1]
 
 
 def _show_at(t):

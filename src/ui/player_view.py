@@ -155,15 +155,40 @@ _CC_ANCHOR_ALPHA = 0.50
 _CC_SYNC_TOL_S = 2.0        # |raw delta - rate x wall delta| accepted as a nudge
 _CC_STALL_FREEZE_S = 6.0    # raw frozen this long while "playing" = underrun stall
 _CC_REBASE_S = 4.0          # anchor correction beyond this snaps (no EWMA crawl)
-_CC_LAG_ALPHA = 0.18        # EWMA over the measured CCX lag L (per-cue
-#                              # samples carry ~1 s of queue-skew jitter;
-#                              # the live matrix put innovation p95 at
-#                              # ~1.6-2.0 with 0.25 — 0.18 trades a
-#                              # little ramp lag for less anchor jitter)
+# WP3 robust anchor-snap: a large gap alone is NOT snap evidence — the
+# 2026-08-21 corpus showed most >4 s snaps were single-batch noise spikes
+# round-tripping within 20 s (35-50 per session), each slamming the whole
+# stored timeline. A REAL correction is either huge, PERSISTENT, or lands
+# on a STABLE target (the pre-WP3 scenario-f contract: a wrong forced
+# rebase must snap back as soon as the true target re-asserts itself —
+# its target is rock-stable while the anchor sits 6 s away).
+_CC_REBASE_HARD_S = 8.0     # beyond this the snap is immediate (real jump)
+_CC_REBASE_CONFIRM_N = 2    # consecutive out-of-band batches confirm a snap
+_CC_REBASE_STABLE_S = 0.8   # |target - prev_target| <= this = stable target
+_CC_LAG_ALPHA = 0.35        # EWMA over the measured CCX lag L (per-batch).
+#                              # WP3 retune (sync_stage3_retune.py over the
+#                              # pinned 2026-08-21 corpus, 249 batches):
+#                              # 0.18 trailed regime swings by p95 13.1 s
+#                              # on ramps; 0.35 halves it (7.4) AND cuts the
+#                              # steady-state error (p95 2.16 -> 1.49). The
+#                              # fancier candidates LOST to the plain faster
+#                              # EWMA: per-batch speech-skew noise (p95
+#                              # 3.6 s) dwarfs the ramp signal, so
+#                              # derivative lead and adaptive-alpha terms
+#                              # amplified noise (ramp p95 14.6 / steady
+#                              # 2.4-2.6).
 _CC_LAG_MAX_S = 240.0       # sanity bound on a single L sample (the 4K
 #                              # channel measured L>130 s one session —
 #                              # 90 froze the EWMA while the true lag
 #                              # grew past it)
+# WP3 store coherence: stored cues keep their PIN-TIME positions. Each
+# cue is placed at edge - L_est when it arrives — its true position to
+# within the tracker trail — and NO later small correction improves that
+# (the harness's raw-window ground truth shows whole-store shifts on
+# small corrections only drag correctly-pinned cues with the swing: an
+# L oscillation of +-12 s displaced 40-s-old cues by ~8 s p95). The
+# store moves ONLY on a rebase snap (a confirmed real correction), which
+# slides every window by the full delta — coherent before and after.
 _CC_ADAPTIVE_MIN_L_S = 8.0  # D1 adaptive jump-to-live: while the measured
 _CC_ADAPTIVE_PAD_S = 3.0    # CCX lag L exceeds this, LIVE lands
 #                              # max(_CHASE_SAFETY_S, L+3) behind the head
@@ -505,6 +530,10 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_pend = None          # deferred anchor (end, head_rel):
         #                              # applied once per arrival batch by
         #                              # _cc_flush_pending (see _on_cc_cue)
+        self._cc_prev_target = None   # last anchor target (WP3 stable-
+        #                              # target snap evidence — see the
+        #                              # _CC_REBASE_* constants)
+        self._cc_oob_run = 0          # consecutive out-of-band anchor gaps
         self._cc_stash = []           # cues that arrived before the first
         #                              # anchor: stored once an offset exists
         self._cc_lag = None           # EWMA of the measured CCX lag L
@@ -1103,6 +1132,8 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_last_c = None
         self._cc_last_t = 0.0
         self._cc_pend = None
+        self._cc_prev_target = None
+        self._cc_oob_run = 0
         self._cc_stash = []
         self._cc_lag = None
         self._cc_head_pcr = None
@@ -1643,6 +1674,7 @@ class PlayerView(QtWidgets.QWidget):
         shift = target_off - (self._cc_off if self._cc_off is not None
                               else 0.0)
         self._cc_off = target_off
+        self._cc_oob_run = 0
         self._cap_cues.shift(shift)
         self._filter_engine.shift_windows(shift)
         if _SYNC_ON:
@@ -3343,14 +3375,6 @@ class PlayerView(QtWidgets.QWidget):
                     # fold the small residual in (drift/jitter correction)
                     fold = residual
                     branch = "fold"
-                elif frozen_for > _CC_STALL_FREEZE_S \
-                        and abs(d_raw - frozen_for * self._rate) <= 3.0:
-                    # underrun catch-up: VLC starved at the edge, buffered
-                    # the gap, then really jumped its timeline forward by
-                    # it — snap onto it (minus the known axis divergence)
-                    self._cap_clock_s = raw - (self._cap_div_s
-                                               if self._cap_div_ok else 0.0)
-                    branch = "stallsnap"
                 else:
                     # PTS renumbering / garbage jump: frames keep playing
                     # 1:1, the clock stays — remember the axis divergence
@@ -3374,8 +3398,7 @@ class PlayerView(QtWidgets.QWidget):
         else:
             branch = "integ"
 
-        if branch != "stallsnap":
-            self._cap_clock_s = prev_clock + wall_adv + fold
+        self._cap_clock_s = prev_clock + wall_adv + fold
         if no_clock_yet:
             # no transport seed and no reading yet (startup): follow the
             # UI-tracked position until one shows up
@@ -3402,7 +3425,7 @@ class PlayerView(QtWidgets.QWidget):
             if self._cap_clock_s > lead_cap:
                 self._cap_clock_s = max(0.0, lead_cap)
         # fold baseline stored AFTER all clock mutations this tick (clamp,
-        # stallsnap, seeding) — it is the clock's position AT this reading
+        # seeding) — it is the clock's position AT this reading
         if raw_changed:
             self._cap_raw_clock = self._cap_clock_s
 
@@ -3535,6 +3558,17 @@ class PlayerView(QtWidgets.QWidget):
         shift = target - (self._cc_off if self._cc_off is not None else 0.0)
         if abs(shift) < 1.0:
             return    # normal speech gap, not divergence — nothing to fix
+        # WP3 data-limited guard: the clock sits far PAST the newest
+        # delivered cue's pinned position — the caption for what is on
+        # screen has not left the pipeline yet (provider lag exceeds the
+        # viewer's backlog). No rebase can cover it (the pin is still ~L
+        # behind the clock); rebasing only drags the stored region — the
+        # harness measured a ~1-2 s whole-store slam every cooldown
+        # through a 1->60 L ramp (~50 rebases, scrubbed regions left ~9 s
+        # off). Wait for delivery to catch up instead.
+        newest_end = self._cc_last_c + (self._cc_off or 0.0)
+        if self._cap_clock_s - newest_end > _CC_WATCH_CUE_S:
+            return
         try:
             log.warning("captions: no window hit the clock for %.1f s "
                         "while cues kept arriving — anchor rebased "
@@ -4101,8 +4135,10 @@ class PlayerView(QtWidgets.QWidget):
         cues snap-rebase the anchor by a full batch width (the live
         matrix's "queue-skew" innovation tail, and a mid-pause store
         shift that blanked captions at resume). Corrections beyond
-        _CC_REBASE_S snap immediately and slide every stored window
-        with them (see _cc_rebase); smaller ones EWMA-settle."""
+        _CC_REBASE_S snap only when the evidence is real (huge,
+        persistent, or a stable target — see _cc_flush_pending); smaller
+        ones EWMA-settle, and stored cues keep their pin-time positions
+        (the store re-coheres through rebase snaps only)."""
         if self._closing:
             return
         now = now_s()
@@ -4192,11 +4228,19 @@ class PlayerView(QtWidgets.QWidget):
         arrival batch — the batch's newest cue was the last writer, so
         its target is the only one that lands. Takes ONE clean lag
         sample per batch from that cue (interior cues' samples carried
-        the whole batch width and inflated the EWMA)."""
+        the whole batch width and inflated the EWMA).
+
+        The pin uses the FRESH sample, not the EWMA: smoothing L first
+        and pinning second compounds the EWMA's transient — a delivery
+        pause through a fast L jump left the first post-pause pin 10.6 s
+        off (65% of the accumulated jump; p3_repro_osc.py). The anchor's
+        own a=0.5 EWMA on the target provides the smoothing; the L EWMA
+        (WP3: 0.18 -> 0.35) serves D1 landing and diagnostics."""
         if self._cc_pend is None or self._closing:
             return
         end, head_rel = self._cc_pend
         self._cc_pend = None
+        lag_now = None
         if head_rel is not None:
             lag_now = head_rel - end
             if 0.0 <= lag_now <= _CC_LAG_MAX_S:
@@ -4204,22 +4248,55 @@ class PlayerView(QtWidgets.QWidget):
                     self._cc_lag = lag_now
                 else:
                     self._cc_lag += (lag_now - self._cc_lag) * _CC_LAG_ALPHA
+            else:
+                lag_now = None
         lag = self._cc_lag
-        target = self._cap_edge_s() \
-            - (lag if lag is not None else _CC_LAG_S) - end
+        pin_lag = lag_now if lag_now is not None \
+            else (lag if lag is not None else _CC_LAG_S)
+        target = self._cap_edge_s() - pin_lag - end
         if _SYNC_ON:
-            synclog.info("ANCHOR pend_end=%.2f L=%s target=%.2f off=%s",
-                         end, "-" if lag is None else "%.2f" % lag, target,
+            synclog.info("ANCHOR pend_end=%.2f L=%s pinL=%s target=%.2f "
+                         "off=%s", end,
+                         "-" if lag is None else "%.2f" % lag,
+                         "-" if lag_now is None else "%.2f" % lag_now,
+                         target,
                          "-" if self._cc_off is None
                          else "%.2f" % self._cc_off)
         if self._cc_off is None:
             self._cc_off = target   # first anchor lands as-is (fast start)
-        elif abs(target - self._cc_off) > _CC_REBASE_S:
-            self._cc_rebase(target, "anchor-snap")
+            self._cc_prev_target = target
+            self._cc_oob_run = 0
         else:
-            # EWMA: settle on the MEAN pipeline lag instead of jittering
-            # cue-to-cue with burst flushes and poll phase
-            self._cc_off += (target - self._cc_off) * _CC_ANCHOR_ALPHA
+            gap = target - self._cc_off
+            prev = self._cc_prev_target
+            self._cc_prev_target = target
+            if abs(gap) > _CC_REBASE_S:
+                # WP3 robust snap: a big gap alone is not snap evidence
+                # (sample spikes round-tripped the store 35-50x per
+                # session on the 2026-08-21 corpus). Snap only when the
+                # correction is REAL: huge outright, persistent across
+                # batches, or the target itself is stable — a lone spike
+                # MOVES the target, a genuine correction (incl. the
+                # snap-back after a wrong forced rebase) re-asserts a
+                # steady one.
+                self._cc_oob_run += 1
+                stable = prev is not None \
+                    and abs(target - prev) <= _CC_REBASE_STABLE_S
+                if abs(gap) > _CC_REBASE_HARD_S \
+                        or self._cc_oob_run >= _CC_REBASE_CONFIRM_N \
+                        or stable:
+                    self._cc_rebase(target, "anchor-snap")
+                    gap = 0.0        # fully applied by the snap
+            else:
+                self._cc_oob_run = 0
+            if gap:
+                # EWMA: settle on the MEAN pipeline lag instead of jittering
+                # cue-to-cue with burst flushes and poll phase. Stored cues
+                # keep their pin-time positions (see the WP3 note above the
+                # constants): they are already at their true windows to
+                # within the tracker trail, and the store re-coheres only
+                # through rebase snaps.
+                self._cc_off += gap * _CC_ANCHOR_ALPHA
         if self._cc_stash:
             # cues that arrived before the first anchor (or during a
             # catch-up burst) become placeable now: same axis, so the
