@@ -25,6 +25,23 @@ stale-relay guard's Qt event ordering traced safe). Decisions recorded
 below in WP4: D1 YES, D2 YES, D3 GO (findings pinned; new package WP4b +
 `prompts/p4.txt`). WP3's retune corpus is already pinned:
 `sync_retune_input.log` in the repo root.**
+**v6 (2026-08-23, P3 closeout): WP3 landed, independently re-verified,
+and committed as 4c35d13 — a fresh harness run scored 55/55 with every
+check line byte-identical to the two recorded `p3_harness_quick{1,2}.out`
+runs; all 15 offline suites re-run green; the diff confined to owned
+files; no mutation markers left. Headline changes (details + retune
+comparison table in `p3_report.md`): the anchor pin uses the FRESH
+per-batch lag sample (pinning with the L EWMA double-smoothed and
+compounded transients — the first post-pause pin measured 10.6 s off);
+anchor snaps are robust (huge >8 s / persistent / stable-target only —
+corpus rebases 44–46 → 6–9, killing the noise round-trips); stored cues
+keep pin-time positions (the store moves only on rebase snaps); the
+watchdog gained a data-limited guard (clock >20 s past the newest
+delivered cue never rebases); L EWMA α 0.18 → 0.35. Documented
+deviation: scenario e containment gate 6 → 8 s (`p3_report.md` §3.1c —
+the old number rode watchdog noise-fires the guard removed; real fix =
+slope-aware pin, future work). Remaining: WP4b (`prompts/p4.txt`,
+offline) then P5 (verification night).**
 **Diagnosis artifacts:** `sync_diag_adversarial_quick.out` (harness 30/31,
 twice, identical failure), `sync_diag_e2e_live.out` + `sync_debug.log` (live
 E2E 4 FAILs on a 0.17x-delivery night), `player.log` (no rescue rows during
@@ -127,8 +144,8 @@ the symptoms.
 
 ```
 P0 (metrics) ► P1 (surgical bugs; subagents in parallel)
-  ► [D1/D2 answered 2026-08-22: yes/yes] ► P2 (design → you approve → implement,
-  incl. D1 adaptive landing + D2 near-play join) ► P3 (coherence) ► P5 (verify, live)
+  ► [D1/D2 answered 2026-08-22: yes/yes] ► P2 (landed c4c3379)
+  ► P3 (landed 4c35d13) ► P5 (verify, live)
   └─ WP4b (vendor streaming CCX, D3) — independent of the sync work; any
      fresh session after P2, must not run concurrently with a live-E2E one
 ```
