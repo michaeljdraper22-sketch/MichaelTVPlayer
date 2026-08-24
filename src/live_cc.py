@@ -131,8 +131,9 @@ def probe_first_pcr_at(path: str, offset: int = 0,
 
 def find_ccextractor() -> str:
     """Locate CCExtractor: an INSTALLED copy first (PATH, then the winget/
-    MSI default location), then the static build vendored in vendor/ as
-    the zero-install fallback (bundled into the PyInstaller release)."""
+    MSI default location), then the minimal portable subset vendored in
+    vendor/ as the zero-install fallback (bundled into the PyInstaller
+    release)."""
     for name in ("ccextractorwinfull", "ccextractor"):
         try:
             from shutil import which
@@ -157,20 +158,26 @@ def find_ccextractor() -> str:
 
 
 def bundled_ccextractor() -> str:
-    """Path of the vendored static CCExtractor (0.88 win build — a
-    self-contained exe, unlike the modern MSI build whose ffmpeg DLLs
-    it must not ship without). Checked LAST on purpose: whatever the
-    user installed wins; this only serves machines with nothing, so
-    releases get captions without any install step."""
+    """Path of the vendored CCExtractor (the 0.96.6 win portable
+    build's minimal runtime subset: exe + the DLLs it statically
+    imports — inventory and provenance in vendor/
+    CCEXTRACTOR-VENDORED.txt). The DLLs sit next to the exe in
+    vendor/, and the Windows loader searches the executable's own
+    directory first, so the dev tree, the PyInstaller _MEIPASS
+    extraction and a dist/ drop all load them without PATH setup.
+    Checked LAST on purpose: whatever the user installed wins; this
+    only serves machines with nothing, so releases get captions
+    without any install step."""
     try:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        cands = [os.path.join(root, "vendor", "ccextractorwin.exe")]
+        name = "ccextractorwinfull.exe"
+        cands = [os.path.join(root, "vendor", name)]
         mep = getattr(sys, "_MEIPASS", None)   # PyInstaller onefile data
         if mep:
-            cands.append(os.path.join(mep, "vendor", "ccextractorwin.exe"))
+            cands.append(os.path.join(mep, "vendor", name))
         if getattr(sys, "frozen", False):      # dropped next to the exe
             cands.append(os.path.join(os.path.dirname(sys.executable),
-                                      "vendor", "ccextractorwin.exe"))
+                                      "vendor", name))
         for c in cands:
             if os.path.isfile(c):
                 return c
@@ -180,13 +187,18 @@ def bundled_ccextractor() -> str:
 
 
 def ccx_args(exe: str) -> list:
-    """CLI for streaming captions through pipes. The vendored 0.88 build
-    predates the long flags — it wants the old single-dash form (and '-'
-    as the positional input for stdin)."""
-    if exe and bundled_ccextractor() and \
-            os.path.abspath(exe) == os.path.abspath(bundled_ccextractor()):
-        return ["-in=ts", "-srt", "-utf8", "-", "-stdout"]
-    return ["-in=ts", "-srt", "-utf8", "--stdin", "--stdout"]
+    """CLI for streaming captions through pipes — one modern form for
+    the vendored build and current user installs. ``--no-codec
+    dvbsub`` is load-bearing, not cosmetic: on US ATSC-style streams
+    the modern build otherwise latches onto the PMT's DVB-subtitle
+    track and OCRs bitmaps — that path needs tessdata the vendor set
+    does not ship (without it CCX finds "no captions" at all), parses
+    at roughly 1x realtime, and emits 32-ms micro-cues; the clean
+    CEA-608 data riding the H.264 SEI is ~35x faster and is what this
+    pipeline wants. (The ancient static 0.88 rejected every long flag
+    including this one; it is no longer vendored.)"""
+    return ["-in=ts", "-srt", "-utf8", "--stdin", "--stdout",
+            "--no-codec", "dvbsub"]
 
 
 class CCSource(QtCore.QObject):
@@ -230,15 +242,6 @@ class CCSource(QtCore.QObject):
         exe = find_ccextractor()
         if not exe:
             self.failed.emit("CCExtractor not found")
-            return False
-        if exe and bundled_ccextractor() and \
-                os.path.abspath(exe) == os.path.abspath(bundled_ccextractor()):
-            # The vendored 0.88 build reads stdin to EOF before emitting a
-            # single SRT byte (measured: 30 MB piped, 0 B out until close) —
-            # it cannot tail a growing buffer. Fail fast so the owner falls
-            # back to VLC's caption rendering instead of a pipeline that
-            # never produces a cue.
-            self.failed.emit("bundled CCExtractor 0.88 cannot stream")
             return False
         self.stop()
         self.parser = SrtParser(keep_lines=True)   # overlay renders the
@@ -339,7 +342,13 @@ class CCSource(QtCore.QObject):
         """Thread: collect SRT bytes from CCExtractor's stdout."""
         while self._alive and self.proc is not None:
             try:
-                chunk = self.proc.stdout.read(4096)
+                # read1, NOT read: buffered read(4096) blocks until the
+                # FULL count arrives, and the clean CEA-608 output is
+                # only ~2 KB per 13 s of TV — a full-block read would
+                # stall cue delivery in ~20 s lumps (the old DVB-OCR
+                # output was dense enough to mask this). read1 returns
+                # whatever one raw read gives, cue-by-cue.
+                chunk = self.proc.stdout.read1(4096)
             except Exception:  # noqa: BLE001
                 break
             if not chunk:

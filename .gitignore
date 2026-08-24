@@ -22,3 +22,6 @@ tess.log
 
 # Private bundled VLC runtime (full install copy, ~185 MB) — never commit
 /vlc/
+
+# PyInstaller staging (exe rebuild workpath)
+build_pyinstaller/

@@ -1,0 +1,12 @@
+  FAIL vendored exe exists in the repo
+  FAIL vendored DLL set complete (import closure)
+    missing: ['libgpac.dll', 'avcodec-60.dll', 'avformat-60.dll', 'avfilter-9.dll', 'avdevice-60.dll', 'avutil-58.dll', 'swscale-7.dll', 'swresample-4.dll', 'postproc-57.dll', 'libcryptoMD.dll', 'libsslMD.dll', 'OpenSVCDecoder.dll', 'vcruntime140.dll']
+  FAIL bundled_ccextractor() finds it (dev layout)
+  ok   find_ccextractor() returns something
+  ok   installed copy outranks the vendored fallback
+  FAIL bundled args are the modern streaming form
+  FAIL installed build gets the same streaming flags
+  FAIL vendored binary present for runtime checks
+
+FAILED 6: ['vendored exe exists in the repo', 'vendored DLL set complete (import closure)', 'bundled_ccextractor() finds it (dev layout)', 'bundled args are the modern streaming form', 'installed build gets the same streaming flags', 'vendored binary present for runtime checks']
+zero-install engage on OLD tree: start() -> False | failed -> ['bundled CCExtractor 0.88 cannot stream']

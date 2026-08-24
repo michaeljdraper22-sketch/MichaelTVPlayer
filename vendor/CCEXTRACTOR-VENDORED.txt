@@ -1,0 +1,57 @@
+Vendored CCExtractor — provenance and inventory (WP4b, 2026-08-23)
+=================================================================
+
+Source (official release, x64):
+  Release:      CCExtractor v0.96.6 (GitHub, published 2026-02-20)
+  Asset:        CCExtractor.0.96.6_win_portable.zip (88,026,547 bytes)
+  URL:          https://github.com/CCExtractor/ccextractor/releases/download/v0.96.6/CCExtractor.0.96.6_win_portable.zip
+  Zip SHA-256:  c9b14cd356c7ada66b294426ba25c52d7654396a31b8b115b789e4d5e73f62bc
+  Self-reports: CCExtractor 0.96.5, git 185631dcb0217b4ad09d43009cb69f0593996a5d
+                (the v0.96.6 tag ships binaries stamped 0.96.5; verified
+                byte-identical to the local MSI install of the same tag)
+
+Why only these files: the zip is a Flutter-GUI distribution (221 MB
+uncompressed). The CLI is ccextractorwinfull.exe, whose only
+non-system static import is libgpac.dll; libgpac eagerly imports the
+ffmpeg DLL set below, so the Windows loader requires all of them at
+process start (verified: exe alone and exe-minus-one-DLL both fail
+with exit 127; the full set below runs). Deliberately NOT vendored:
+  tessdata/          only needed to OCR DVB-subtitle bitmaps — the app
+                     never uses that path (see live_cc.ccx_args:
+                     --no-codec dvbsub forces the CEA-608 SEI path)
+  ccxgui.exe, flutter_windows.dll, data/, *_plugin.dll
+                     the GUI and its assets
+  msvcp140.dll, vcruntime140_1.dll
+                     not in the import closure (GUI-only)
+
+Layout note: the DLLs sit next to the exe in this folder; the Windows
+loader searches the executable's own directory first, so the dev tree,
+the PyInstaller _MEIPASS extraction, and a dist/ folder drop all work
+without PATH setup.
+
+License: CCExtractor is GPL-2.0-or-later. The portable zip ships no
+license file of its own, so COPYING-ccextractor.txt in this folder
+carries the GNU GPL v2 text (as before). Upstream source:
+https://github.com/CCExtractor/ccextractor (LICENSE.GPLv2)
+
+Inventory (SHA-256, bytes, file):
+  98d640e091c308c1e6fbd6c3020ef9d58e0769a7c2e8732439818cc40aedcaf9   32128512  ccextractorwinfull.exe
+  aa032b64efb69c180d64ceaa90dd49a5cca131a5a7731cb5231d288acccce942   11815936  libgpac.dll
+  b0499e553431cb4cd3be97beb92400491cbaa0c1075609788b429f17878fc29e   74749952  avcodec-60.dll
+  77465cec953b257deec08f1472b057d9b0f98200952b09ab9f2698d52f19d04d   17308160  avformat-60.dll
+  330785a2e07fe1d6d8fc9e554d7f82b024ef3ac75208ded9ae63cb0c0f8912c5   25419776  avfilter-9.dll
+  323fe325e7b76c9123868f90920150a69550b0308e7c909fc1bd579cccef66c4    4606464  avdevice-60.dll
+  fb65debbd7cfcb9a7e68bf904daf95c4a885c6ef2b05301e894cdac446a42a18    2299392  avutil-58.dll
+  a8b72de03fde0a9cd1738c668bb509b39eafcd4190877cc07276f9c2eb6180b3     644096  swscale-7.dll
+  b9494e359f286d66a6b71d8361fbda786460488eee75ec94ca167e965f31076b     642560  swresample-4.dll
+  00a5e6de4e4a0a1bd58d8cc7d82ccd4056839f2258d67177cefad9b5a3e7ddad      90112  postproc-57.dll
+  a1c6125af7f4d48c1e635b1b7cf55fad3d142ccde7e71c820911fcd1ceee1b29    2393600  libcryptoMD.dll
+  3d404648c0d10995f2541a29d465a01944f6c7cbaae6bc6b9ecaec531938cac5     490496  libsslMD.dll
+  e63721758e5c63aa7da21063cac22ecc3a538093d9cce998c88d6b1f6588a2ba     366080  OpenSVCDecoder.dll
+  d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066     124544  vcruntime140.dll
+                                                          total: 173,079,680 bytes (~165.1 MiB)
+
+Replaced: the static CCExtractor 0.88 win build (ccextractorwin.exe,
+1.9 MB) — it rejected every long CLI flag and its live pipeline was
+fail-fasted in live_cc.CCSource.start (it could not serve the
+--stdin/--stdout streaming topology).

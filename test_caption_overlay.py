@@ -907,10 +907,11 @@ try:
           fed2[:188] == _blob[188 * 50:188 * 51]
           and _blob[188 * 50:] in fed2)
     real_src2.stop()
-    # stage-3 guard: the vendored 0.88 build reads stdin to EOF before
-    # emitting a single SRT byte (verified: 30 MB piped, 0 B out until
-    # close) — it cannot tail a growing buffer, so start() must refuse
-    # it and emit failed so the app falls back to VLC caption rendering
+    # stage-3 guard, flipped by WP4b: the vendored binary is now the
+    # streaming-capable 0.96.6 subset, so a zero-install engage (only
+    # the bundled CCX exists) must be ACCEPTED. The old static 0.88
+    # build was refused here — it rejected the modern streaming flags
+    # outright; the new build emits SRT as cues complete.
     bundled = live_cc_mod.bundled_ccextractor()
     if bundled:
         fails = []
@@ -918,8 +919,8 @@ try:
         src3.failed.connect(fails.append)
         live_cc_mod.find_ccextractor = lambda: bundled
         ok_bundled = src3.start(ts)
-        check("bundled 0.88 refused for live streaming",
-              ok_bundled is False and fails and "stream" in fails[0])
+        check("bundled CCX accepted for live streaming",
+              ok_bundled is True and not fails)
         src3.stop()
     os.remove(ts)
 finally:

@@ -1,0 +1,20 @@
+  ok   vendored exe exists in the repo
+  ok   vendored DLL set complete (import closure)
+  ok   bundled_ccextractor() finds it (dev layout)
+  ok   find_ccextractor() returns something
+  ok   installed copy outranks the vendored fallback
+  ok   bundled args are the modern streaming form
+  ok   installed build gets the same streaming flags
+  ok   vendored binary present for runtime checks
+  ok   vendored exe runs standalone (exit 0)
+  ok   reports itself as CCExtractor
+    (vendored version 0.96)
+  ok   modern build (>= 0.96, not the ancient 0.88)
+  ok   modern flags accepted (no 'not understood' error)
+    (first SRT output after 2097152 bytes fed; 97 bytes on stdout; stdin-open alive=True)
+  ok   bundled CCX streams SRT before EOF (growing stdin)
+  ok   zero-install engage accepted (no 0.88-style fail-fast)
+    (delivered 5 cue(s), 0 failure signal(s) [])
+  ok   live cues delivered while the buffer grows
+
+all 15 checks passed

@@ -1,0 +1,17 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.2s)
+
+== scenario a: cold join, growing divergence, anchor wedge ==
+    L(t) profile: const(1.5s)
+    calibration m0=+0.00s m0r=+0.00s (150 samples)
+    drift: painted=595 n=595 |perr| p50=0.00 p95=0.00 max=0.00 exact=595/595 ambig=531 nomatch=0 maxstop=0.0s rebases=0 diag[neighbor=595/595]
+  ok   a: drift painted displacement p95 <= 1.5 s   [p95=0.00]
+  ok   a: drift exact-window text >= 85%   [595/595 ambig=531 nomatch=0]
+  ok   a: no silent-stop over 6 s during drift   [max=0.0s]
+  ok   a: wedge applied (+5 s anchor & store)
+  ok   a: no blank beyond the watchdog window after data returns   [max=0.0s]
+    post-wedge verify: painted=100 n=100 |perr| p50=0.00 p95=0.00 max=0.00 exact=100/100 ambig=100 nomatch=0 maxstop=0.0s rebases=1 diag[neighbor=1126/1126]
+  ok   a: post-wedge painted text correct by ~backlog+30 s (walkoff/heal/verify)   [backlog=13s rebased=True walkoff_within1.5=100% of 281 heal_within1.5=100% of 150 verify_p95=0.00 verify_within1.5=100%]
+  ok   a: no pipeline exceptions
+
+7/7 checks passed (mechanism 7/7, data-limited 0/0)
