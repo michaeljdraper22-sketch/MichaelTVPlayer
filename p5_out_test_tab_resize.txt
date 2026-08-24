@@ -1,0 +1,21 @@
+[1] Chrome-style tab shrinking (ChromeTabBar)
+  ok   wide: all 5 tabs laid out
+  ok   wide: tabs share the width equally
+  ok   wide: tabs wider than the minimum (140px > 80px)
+  ok   medium: tabs shrink with the width
+  ok   medium: tabs stay equal
+  ok   narrow: tabs clamp at the minimum width
+  ok   narrow: current tab fully visible
+  ok   tiny: current tab still fully visible
+[2] resize no longer calls libvlc per event (debounced)
+  ok   no libvlc scale call while resizing
+  ok   exactly one call after resizing settles
+  ok   a later resize applies again
+[3] _apply_scale_to skips no-op VLC round-trips
+  ok   first apply reaches the player
+  ok   identical repeat is skipped
+  ok   changed size is applied
+  ok   a fresh player gets the scale re-applied
+  ok   stretch mode sends the aspect ratio
+
+16 passed, 0 failed

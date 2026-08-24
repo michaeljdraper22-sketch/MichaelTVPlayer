@@ -1,0 +1,158 @@
+captions: source failed (CCExtractor exited) — VLC renders
+captions: relay failed (tap parser crashed: RuntimeError('boom')) — VLC renders
+vlc attach: set_window failed (attempt 1/3): AttributeError("'FakeVLC' object has no attribute 'set_window'")
+[1] CueStore: timing, newest-wins, roll-up window
+  ok   no cue before its time
+  ok   first cue active
+  ok   cue held briefly past its end (anti-flicker)
+  ok   roll-up window keeps the last 3 lines
+  ok   duplicate cues drop out
+  ok   store bounded (6000 adds -> <= 5000 cues)
+  ok   oldest evicted, newest kept
+  ok   invisible-only cue skipped (no empty box)
+  ok   invisible-only LINES dropped, visible ones kept
+  ok   zero-width marks stripped from visible text
+  ok   Arabic glyphs survive the cleanup
+  ok   soft-hyphen-only cue skipped (no empty box)
+  ok   LRM/RLM-only cue skipped (no empty box)
+  ok   ZWJ-only cue skipped (no empty box)
+  ok   soft hyphen/LRM stripped from visible text
+  ok   ZWJ kept inside Arabic text (shaping)
+[2] SrtParser keep_lines (roll-up line structure)
+  ok   line breaks preserved, tags/braces stripped
+  ok   default parser still collapses to one line
+[3] CaptionOverlay: style from the config
+  ok   font px scales with the surface (40 px @1080p on 1080p)
+  ok   font px scales with the surface (40 px @1080p on 540p)
+  ok   size 0 = auto (~5% of the height)
+  ok   long lines wrap to the width
+  ok   set_lines shows the widget
+  ok   empty set_lines hides the widget
+  ok   color parses hex + alpha
+  ok   invalid color falls back
+[3a] preview line (settings-dialog live feedback)
+  ok   preview shows the widget with no lines
+  ok   same preview is a no-op
+  ok   real cues take precedence over the preview
+  ok   preview survives cue gaps
+  ok   clearing the preview hides the widget again
+[3b] displayed-video rect math (captions anchor to the picture)
+  ok   16:9 video in a 16:9 surface fills it
+  ok   2.35:1 movie letterboxed in a 16:9 surface
+  ok   4:3 video pillarboxed in a 16:9 surface
+  ok   portrait video pillarboxed
+  ok   crop covers the whole surface
+  ok   stretch covers the whole surface
+  ok   unknown size (0,0) falls back to the whole surface
+  ok   degenerate surface doesn't crash
+  ok   16:9 and letterboxed captions share one size relative to the picture
+[3c] one painted caption size/position: 16:9 live vs letterboxed movie
+  ok   live-sized surface: picture fills it
+  ok   movie-sized surface: 2.35:1 letterboxed in 16:9
+  ok   font px pinned on the live picture (40 @1080p)
+  ok   font px pinned on the letterboxed picture (30 @817p)
+  ok   both pictures painted ink (live 40px, film 30px)
+  ok   painted text height identical relative to the picture (40/1080 vs 30/817)
+  ok   painted bottom anchor identical relative to the picture (45/1080 vs 34/817)
+[4] track classification
+  ok   live CEA-608 tracks are text
+  ok   DVB/teletext/PGS tracks are bitmap
+  ok   ASS tracks are ass
+  ok   plain language names are 'other'
+  ok   VobSub-named tracks are bitmap (VLC renders them)
+[4c] language matching (CC-menu word vs MKV ISO code)
+  ok   full word matches ISO code
+  ok   ISO code matches full word
+  ok   two-letter code matches ISO code
+  ok   mismatched languages never match
+  ok   short codes never substring-match
+  ok   known language words recognized
+  ok   junk hints rejected
+  ok   'english' hint selects the eng text track
+  ok   no wanted-language text -> first text track (UI then hands off)
+[4b] overlay eligibility by content kind (unified subtitles)
+  ok   ASS is overlay-eligible on VOD (the relay flattens it)
+  ok   ASS stays on VLC for live
+  ok   plain names are overlay-eligible on VOD (SRT MKVs carry them)
+  ok   plain names stay on VLC for live
+  ok   DVB bitmap tracks are never overlay-eligible
+  ok   CC/SRT text tracks are overlay-eligible everywhere
+[4d] CC-menu language hints (relay track re-selection)
+  ok   bracketed language extracted from 'Track N - [Language]'
+  ok   bracketed language works for any known language
+  ok   named tracks keep the head-word hint
+  ok   junk without a language falls through empty
+[5] view: live engagement + fallback to VLC rendering
+  ok   selecting a CC track turns the overlay on
+  ok   overlay claim is sticky
+  ok   CCSource started on the buffer
+  ok   VLC's own spu forced OFF under the overlay
+  ok   cap timer runs while the overlay owns captions
+  ok   lone first cue on a mature buffer does not anchor (untrusted)
+  ok   fresh successor cue anchors the CCX->app clock
+  ok   catch-up burst does not re-anchor (advance >> wall time)
+  ok   big correction snap-rebases the anchor (no EWMA crawl)
+  ok   stored windows slide with the rebase (coherent timeline)
+  ok   small correction steps the anchor part-way (EWMA, not a jump)
+  ok   burst delivery alone does not move the anchor (deferred)
+  ok   lone out-of-band burst correction rides the EWMA (robust snap)
+  ok   the ride leaves stored cues at their pin positions
+  ok   confirmed out-of-band correction snaps (no EWMA crawl)
+  ok   the confirming snap slides stored windows with it
+  ok   arrival-anchored cue renders inside its window
+  ok   cue clears after its anchored window
+  ok   raw deltas that agree with wall fold into the clock
+  ok   renumbered raw cannot yank the clock (divergence recorded)
+  ok   divergence converts content seeks to VLC numbers
+  ok   frozen VLC clock keeps caption time moving (integration)
+  ok   garbage negative reading cannot yank the clock back
+  ok   transient -1 with the player down holds the clock
+  ok   positive delay holds the cue back at its true position (+ = later)
+  ok   positive delay shows the cue 2 s past its true window
+  ok   delay 0 paints the true window again
+  ok   caption tick survives the errors (paints again after)
+  ok   caption tick errors logged once per distinct error
+  ok   enforcement re-forces spu off under the overlay
+  ok   failure latch set
+  ok   overlay off after failure
+  ok   CCSource torn down after failure
+  ok   VLC spu restored by enforcement after failure
+  ok   re-engage after fresh media works
+  ok   Off stops the overlay + claim
+  ok   bitmap track stays on VLC
+  ok   ASS track stays on VLC (live)
+  ok   trackless stream still opens the CC menu
+  ok   ASS track engages the overlay on VOD
+  ok   relay failure hands captions back to VLC
+  ok   plain-name VOD pick engages the overlay
+  ok   Arabic-only text track hands captions back to VLC
+  ok   re-engage with a matching text track
+  ok   eng text track keeps the app overlay
+  ok   dead tap (no track metadata) hands captions back to VLC
+[5c] stale relay deliveries never touch the next movie's store
+  ok   stale cue from the previous relay never lands in the store
+  ok   stale cue opens no phantom profanity-mute window
+  ok   stale relay failure does not latch against the new media
+[5b] CCSource piping: whole buffer, and mid-buffer join
+  ok   CCSource starts on a non-empty buffer
+  ok   frontier offset ignored (offset 0, VLC-clock axis)
+  ok   piped from byte 0 through the ragged tail (whole buffer)
+  ok   joined start accepted
+  ok   join starts at the packet-aligned byte and carries the tail
+  ok   bundled CCX accepted for live streaming
+[6] view: profanity masking in the overlay render
+  ok   masked line rendered while the filter is on
+  ok   unmasked once the filter is off
+  ok   VOD mute window opens early by the mute-lead trim
+  ok   VOD caption times unchanged by the filter trim
+[7] view: overlay anchors to the displayed video rect
+  ok   view laid out: surface fills the 1920x1080 view
+  ok   unknown size keeps the whole-surface overlay
+  ok   letterboxed movie: overlay = displayed picture rect
+  ok   bottom inset clears the control bar from the picture bottom
+  ok   controls hidden -> plain 24 px inset above the picture
+  ok   crop mode: overlay back to the full surface
+  ok   16:9 channel: overlay = full surface
+  ok   16:9 and 2:1 overlays keep one caption scale relative to the picture
+
+138 passed, 0 failed

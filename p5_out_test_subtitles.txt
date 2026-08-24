@@ -1,0 +1,35 @@
+[1] config + button wiring
+  ok   'cc' is a known button key
+  ok   'cc' defaults to visible
+  ok   btn_cc lives in the control row
+  ok   btn_cc sits between sep2 and btn_scale
+[2] button state with no subtitle tracks
+  ok   always clickable (settings reachable without tracks)
+  ok   tooltip points at settings
+[3] VLC auto-select is forced off (want == -1)
+  ok   auto-selected track turned off
+[4] selecting a track from the menu
+  ok   track applied
+  ok   button enabled + lit
+  ok   tooltip shows the language
+[5] sticky re-match after a media change (DVR handoff)
+  ok   re-matched by name to the new id
+[6] sticky falls back to off when the language is gone
+  ok   want reset to -1 and stream forced off
+[7] C key cycles Off -> 1 -> 2 -> Off
+  ok   cycle 1: English
+  ok   cycle 2: Spanish
+  ok   cycle 3: back to Off
+  ok   no tracks -> cycle is a no-op
+[8] menu contents
+  ok   menu = Off + every track + settings
+  ok   current track is checked
+[9] settings visibility honours 'cc'
+  ok   btn_cc hidden when turned off in settings
+  ok   btn_cc shown again
+[10] _tick drives the enforcement (live mode)
+  ok   tick re-asserted Off
+[11] teardown safety
+  ok   guards after stop()
+
+all 22 checks passed

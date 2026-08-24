@@ -1,0 +1,34 @@
+[1] CueStore contract: windows, grace, newest-wins, dedupe, shift, clear
+  ok   no cue before its window
+  ok   cue active inside its window
+  ok   newest covering cue wins in an overlap
+  ok   cue held through the anti-flicker grace
+  ok   cue clears past the grace
+  ok   roll-up window keeps the last 3 lines
+  ok   re-received STORED cue still dedupes
+  ok   invisible-only cue never enters the store
+  ok   shift moves the window with it
+  ok   re-parse of a shifted cue dedupes (rebase coherence)
+  ok   clear empties the store
+  ok   re-add after clear re-enters (dedupe memory reset)
+[2] eviction keeps the rewind path alive (bug: eviction orphaned _seen)
+  ok   store bounded (5300 adds -> exactly 5000)
+  ok   oldest evicted, newest kept
+  ok   deep rewind: evicted cue re-enters the store
+  ok   deep rewind: evicted cue queryable again via text_at
+  ok   shallow rewind: just-evicted cue queryable again
+  ok   _seen matches exactly what is stored (pruned in step with eviction)
+  ok   rewind fix does not weaken in-store dedupe
+[3] text_at must not abandon still-active long cues (early-break bug)
+  ok   control: lone long cue paints deep inside its window
+  ok   long cue still paints under a dead newer cue (regression)
+  ok   long cue paints at start + 70 and right up to its end + grace
+  ok   long cue clears past its grace
+  ok   the short cue still shows inside its own window
+  ok   deep long cue found under many newer cues
+  ok   newer cues still win while they cover t
+[4] overlap policy (pinned)
+  ok   overlap: the cue with the greater start wins
+  ok   tie on start: the later-arrived cue wins
+
+28 passed, 0 failed

@@ -1,0 +1,138 @@
+[1] relay starts on MKV and refuses non-MKV
+  ok   mkv accepted, local URL returned
+  ok   track metadata ready before first serve (head fetch)
+  ok   tail prefetch covers VLC's ~2.3 MB Cues-index request
+  ok   non-mkv refused (falls back to direct)
+[2] byte fidelity + range requests through the relay
+  ok   full GET streams the whole file
+  ok   mkv relay serves video/x-matroska
+  ok   relayed bytes identical to the source file
+  ok   one provider connection serves the whole file (no reopen-per-chunk)
+  ok   range request served from cache
+  ok   open-ended range
+[3] subtitle tap extracts the embedded cues
+  ok   all three cues extracted
+  ok   cue timing matches the source srt
+[3b] unit: text-codec detection + ASS flattening
+  ok   text codecs detected
+  ok   bitmap codecs rejected
+  ok   override blocks stripped
+  ok   hard line breaks become newlines
+  ok   drawing payloads dropped
+  ok   full dialogue line reduced to its text
+  ok   ffmpeg field-style payload reduced to its text
+  ok   bare full dialogue (10 fields) reduced to its text
+  ok   plain comma text left alone
+  ok   comment events skipped
+  ok   plain srt text passes through clean
+  ok   bidi wrappers stripped from Latin lines (rip-house styling)
+  ok   Arabic lines keep their bidi controls
+  ok   ASS track selected over bitmap
+[3b2] rebase keeps the tap alive (metadata carry)
+  ok   head parse selects the text track
+  ok   sample has a cluster past the head elements
+  ok   seeded mid-stream parser extracts cues from mid-file bytes
+  ok   unseeded mid-stream parser stays trackless (regression proof)
+[3b-z] resync over a magic-less stretch returns (no spin)
+  ok   zero stretch after a cluster header doesn't spin
+  ok   parser recovers after the zero stretch
+[3c] e2e: ASS-only MKV flattens to text cues through the relay
+  ok   ass mkv accepted by the relay
+  ok   ass cues flattened to plain text
+  ok   ass cue timing matches the source srt
+[4] VLC plays through the relay (and seeks)
+  ok   playback runs through the relay
+  ok   duration sane (~12 s)
+    (seek debug: t=8502, provider_opens=0)
+  ok   seek lands through the relay
+  ok   seek needs no provider reopen (cached window)
+  ok   cache file cleaned up
+[4] unexpected start() failure must not leak the cache file
+  ok   crashed start returns '' (direct-playback fallback)
+  ok   crashed start leaves no mtp_split_* cache behind
+[4b] resume engage (start_offset): prefetch the tail only, VLC's walk + seek drive the provider
+  ok   resume engage accepted
+  ok   resume startup reaches ready (tail prefetched)
+  ok   NO provider stream pre-acquired on resume
+  ok   head walk GET served (opens the provider at 0)
+  ok   track metadata parsed from the walk-cached head
+  ok   seek index served from the tail prefetch
+  ok   resume seek GET served from a fresh provider stream
+  ok   cache window rebased to the seek target
+  ok   cues flow on the rebased window (mid-stream parser seeded)
+[5] MP4: ftyp probe + mov_text cues through the relay
+  ok   mp4 accepted by the probe (ftyp), local URL returned
+  ok   container detected as mp4
+  ok   moov index parsed from the prefetched tail before playback
+  ok   tail was actually prefetched (Content-Range total)
+  ok   relay serves MP4 as video/mp4
+  ok   mp4 byte fidelity through the relay
+  ok   mp4 range request served
+  ok   mp4 tail range served (prefetched moov region)
+  ok   parser saw the tx3g track (overlay check data)
+  ok   all three mp4 cues extracted as plain text
+  ok   two-line cue keeps its line break
+  ok   mp4 cue timing from the stts sample table
+  ok   gap-padding empty samples produce no cues
+    (mp4 provider hits: 3, relay provider_opens: 1)
+  ok   mp4 relay keeps the one-connection discipline
+[5b] unit: tx3g decode + re-parse dedupe
+  ok   mp4 text fourccs detected
+  ok   tx3g length prefix bounds the text (styling atoms stripped)
+  ok   tx3g CR line breaks normalized
+  ok   empty gap samples decode to nothing
+  ok   corrupt tx3g length clamped
+  ok   mp4 re-parse emits identical cues
+  ok   re-parsed mp4 cues dedupe on (start, text)
+[5c] faststart mp4 (moov at the head) over file://
+  ok   faststart mp4 accepted
+  ok   faststart moov found by the cache-head walk
+  ok   faststart byte fidelity
+  ok   faststart cues extracted with timing
+[5d] VLC plays the mp4 through the relay (and seeks)
+  ok   mp4 playback runs through the relay
+  ok   mp4 duration sane (~12 s)
+    (mp4 seek debug: t=8407, provider_opens=0)
+  ok   mp4 seek lands through the relay
+  ok   mp4 seek needs no provider reopen (cached window)
+  ok   mp4 cache file cleaned up
+[6] MKV tap sees the tail prefetch region (captions in the last ~2.5 MB)
+  ok   tail fixture: late cues inside the tail, early cue outside
+  ok   tail mkv accepted
+  ok   (a) tail fixture byte fidelity through the relay
+  ok   (a) full-file play taps the tail-region cues
+  ok   (a) tail cue times on the file's own clock
+  ok   (a) early (non-tail) cues still tapped via the cache
+  ok   (a) whole-file pull stays on one provider connection
+  ok   (b) tail-region seek GET served from the prefetch
+  ok   (b) seek into the tail region keeps captions tapped
+[6b] unit: _tap_read serves head/tail, refuses holes
+  ok   head bytes served below the window
+  ok   tail bytes served inside the tail region
+  ok   hole between head and tail returns EMPTY, not wrong bytes
+  ok   past the file end returns empty
+  ok   cache->tail straddling read stitched whole
+[6c] unit: no provider stream is opened after stop()
+  ok   stop-test relay started
+  ok   _acquire refused after stop() (no dead connection)
+[7] ASS bare fixed-fields fallback (ffmpeg-shaped payload)
+  ok   bare fixed-field dialogue (empty Name) reduced to its text
+  ok   bare fixed-field text keeps its commas
+[7b] lang_matches: full-word hints match on word boundaries
+  ok   'english' does NOT match 'Non-English Comments'
+  ok   'english' DOES match 'English Comments'
+  ok   'english' matches parenthesized '(English)'
+  ok   short codes keep alias behavior (en vs eng)
+[8] MKV TimecodeScale honored in cue timing
+  ok   non-default TimecodeScale (2x) shifts cue times
+  ok   default-scale files keep millisecond timing
+  ok   scale honored through the live relay tap
+[9] MP4 edit-list media_time honored in cue timing
+  ok   elst media_time (0.7 s skip) shifts cue times earlier
+  ok   media_time=0 edit lists leave timing alone
+
+all 108 checks passed
+[0000022fcbcf0480] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[0000022fcc584780] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[0000022fcbefe450] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[0000022fcbe8ed30] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4

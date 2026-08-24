@@ -1,0 +1,30 @@
+  ok   D1: no measured L / low L -> true edge (back = 5)   [back(None)=5.0 back(8)=5.0]
+  ok   D1: high L -> max(5, L+3) behind the head   [back(20)=23.0 back(240)=243.0]
+  ok   D1: just above the threshold adapts (8.1 -> 11.1)   [back(8.1)=11.1]
+  ok   D2: mid-show engage joins ~8 s behind the position (fr 400)   [join=954852 (~381.9 s)]
+  ok   D2: the old >=90 s frontier gate is GONE (fr 20 joins near play)   [join=349868 (~7.0 s; byte-0 would be 0)]
+  ok   D2: viewer past the frontier clamps to the frontier (no tail overshoot)   [join=859536]
+  ok   D2: degenerate inputs -> byte 0
+  ok   (a): small seeks verify fast (base window)   [1.50s]
+  ok   (a): deadline grows with jump distance, capped   [10s->3.0 60s->6.0 600s->6.0]
+  ok   (a): backoff ladder is strictly increasing and bounded   [(5.0, 15.0, 30.0)]
+chase revive (seek-escalate): player wedged/down — play_at 50.0s
+chase revive (seek-escalate): player wedged/down — play_at 51.0s
+chase revive (seek-escalate): player wedged/down — play_at 52.0s
+chase revive (seek-escalate): player wedged/down — play_at 53.0s
+  ok   (a): a confirmed no-op escalates to play_at at the seek target   [play_at targets: [50.0, 51.0, 52.0, 53.0]]
+chase revive (seek-escalate): player wedged/down — play_at 10.0s
+  ok   (a): escalation respects the reopen cooldown (no burst)   [play_at after 1st=1 after cd-violating 2nd=1]
+  ok   (a): clean verifies decay the strike ladder   [strikes=0]
+  ok   (b): head_ahead uses the PCR content axis (head - current)   [ahead=32.0 want 32]
+  ok   (b): head_ahead > data-ahead threshold at 32 (would rescue)
+  ok   (b): without PCR pins it falls back to the legacy frontier gap   [ahead=-10.0 want -10 (negative = unreachable)]
+  ok   (b): 0.125x slow-mo counts as movement in the tick (no false wedge)   [wall 0.00 -> 1000324.40 (advance 0.05 s/tick)]
+  ok   (c): a 0.2x trickle over the window -> hold   [raw_adv=0.4 wall=3.0 -> ratio 0.13]
+  ok   (c): healthy 1:1 playback -> no hold   [raw_adv=3.0 wall=3.0]
+  ok   (c): paused / not playing -> never holds
+  ok   (c): measured raw window rate ~0.13x   [rate=0.133]
+  ok   (c): raw rate clamps at the playback rate   [rate=1.000]
+  ok   (c): insane readings fall back to the playback rate
+
+23/23 checks passed

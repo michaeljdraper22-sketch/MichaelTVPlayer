@@ -1,0 +1,110 @@
+===== OFFLINE SUITES 19:25:17 =====
+--- test_always_chase ---
+  ok   VOD plays directly with timeshift off
+
+44 passed, 0 failed
+[test_always_chase rc=0]
+--- test_anchor_store ---
+  ok   watchdog: clock NEAR the newest cue still rebases (true divergence recovered)   [rebases=1 off=207.0 cue=(249.0, 251.0)]
+
+14/14 checks passed
+[test_anchor_store rc=0]
+--- test_bundled_ccx ---
+  ok   live cues delivered while the buffer grows
+
+all 15 checks passed
+[test_bundled_ccx rc=0]
+--- test_caption_overlay ---
+  ok   16:9 and 2:1 overlays keep one caption scale relative to the picture
+
+138 passed, 0 failed
+[test_caption_overlay rc=0]
+--- test_cuestore ---
+  ok   tie on start: the later-arrived cue wins
+
+28 passed, 0 failed
+[test_cuestore rc=0]
+--- test_dvr_e2e ---
+[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 10, expected 2) for PID 17
+[0000023a73523240] main decoder error: buffer deadlock prevented
+[0000023a735cfe70] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[test_dvr_e2e rc=0]
+--- test_fixes ---
+  ok   VOD clock advances with a frozen VLC time (0.90s > 0.7s)
+
+51 passed, 0 failed
+[test_fixes rc=0]
+--- test_overlay_focus ---
+  ok   pill visible with app foreground
+
+all 12 checks passed
+[test_overlay_focus rc=0]
+--- test_profanity ---
+p5_offline_chain.sh: line 9:  1166 Segmentation fault         $PY -X utf8 "$s.py" > "p5_out_$s.txt" 2>&1
+[test_profanity rc=139]
+--- test_sub_settings ---
+  ok   config back to defaults
+
+all 37 checks passed
+[test_sub_settings rc=0]
+--- test_subtitles ---
+  ok   guards after stop()
+
+all 22 checks passed
+[test_subtitles rc=0]
+--- test_tab_resize ---
+  ok   stretch mode sends the aspect ratio
+
+16 passed, 0 failed
+[test_tab_resize rc=0]
+--- test_temp_cleanup ---
+  ok   released cache removed on the next pass
+
+all 6 checks passed
+[test_temp_cleanup rc=0]
+--- test_vod_series ---
+[000002163f39cb60] main decoder error: failed to create audio output
+[000002163f39d9a0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000216408cffe0] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[test_vod_series rc=0]
+--- test_vod_splitter ---
+[0000022fcc584780] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[0000022fcbefe450] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[0000022fcbe8ed30] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[test_vod_splitter rc=0]
+--- test_wedge_cluster ---
+  ok   (c): insane readings fall back to the playback rate
+
+23/23 checks passed
+[test_wedge_cluster rc=0]
+===== HARNESS FULL 19:27:26 =====
+[full rc=1]
+    i: scrubbed into cycle-1 region: painted=450 n=450 |perr| p50=0.00 p95=0.00 max=0.00 exact=450/450 ambig=425 nomatch=0 maxstop=0.0s rebases=0 diag[neighbor=4551/4551]
+  ok   i: scrubbed-back cues coherent after the swings (p95 <= 2.0)   [p95=0.00]
+  ok   i: scrubbed-back exact-window text >= 85%   [450/450 ambig=425]
+  ok   i: blanks stay data-limited (<= L swing + margin)   [data-limited]   [max=0.0s]
+  ok   i: no pipeline exceptions
+
+54/55 checks passed (mechanism 42/43, data-limited 12/12)
+  FAILED: f: rebased store stays coherent behind the head (outcome)
+===== HARNESS QUICK 1 19:45:10 =====
+[quick1 rc=1]
+  ok   i: blanks stay data-limited (<= L swing + margin)   [data-limited]   [max=0.0s]
+  ok   i: no pipeline exceptions
+
+51/55 checks passed (mechanism 40/43, data-limited 11/12)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)
+  FAILED: g: painted displacement contained through the trickle (p95 <= 2.5 — L-drain residual is WP3's feed)
+===== HARNESS QUICK 2 20:02:29 =====
+[quick2 rc=1]
+  ok   i: blanks stay data-limited (<= L swing + margin)   [data-limited]   [max=0.0s]
+  ok   i: no pipeline exceptions
+
+51/55 checks passed (mechanism 40/43, data-limited 11/12)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)
+  FAILED: g: painted displacement contained through the trickle (p95 <= 2.5 — L-drain residual is WP3's feed)
+===== CHAIN DONE 20:18:30 =====

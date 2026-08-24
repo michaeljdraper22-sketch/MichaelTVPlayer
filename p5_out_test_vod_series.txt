@@ -1,0 +1,36 @@
+== VOD tab ==
+load seconds: 2.2
+default combo index: 2 (0=recent 1=All 2+=category)
+status: 34 of 34 items
+items in list: 34
+activated playable kind: vod
+url: http://cf.534842.xyz/movie/726352471c/d809266e91/2127010.mkv
+title: 4K-TOP - Toy Story 5 (2026)
+
+== Series episodes dialog (series_id=45515) ==
+status: 1 season(s), 10 episode(s)
+season nodes: 1 episode nodes: 10
+EPISODES FIXED!
+episode playable kind: series
+url: http://cf.534842.xyz/series/726352471c/d809266e91/1959125.mkv
+movie URL GET: 520 text/html; charset=UTF-8 7331 bytes
+
+== REAL VLC playback of a movie ==
+state: playing  time(s): 3.2  length(s): 6106.8  after 8.4s
+VLC MOVIE PLAYBACK WORKS
+
+== REAL VLC playback of a series episode ==
+state: playing  time(s): 3.1  length(s): 3033.4
+VLC EPISODE PLAYBACK WORKS
+[000002163f3ceb90] main audio output error: too low audio sample frequency (0)
+[000002163f1c0040] main decoder error: failed to create audio output
+[000002163f3ceb90] main audio output error: module not functional
+[000002163f1c0040] main decoder error: failed to create audio output
+[000002163f288080] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000216408269a0] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[00000216409a2a10] main audio output error: too low audio sample frequency (0)
+[000002163f39cb60] main decoder error: failed to create audio output
+[00000216409a2a10] main audio output error: module not functional
+[000002163f39cb60] main decoder error: failed to create audio output
+[000002163f39d9a0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000216408cffe0] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4

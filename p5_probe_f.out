@@ -1,0 +1,143 @@
+*** PROBE: dumping far-match painted samples ***
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.2s)
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    DIAG el=247.3 clock=4.1 off=0.0 edge=12.1 fr=0.1 lag=1.42 store=9 painted=2 hold=False bl=7.93 rawrate=1.00 arr_age=0.1
+    DIAG el=248.4 clock=5.2 off=0.0 edge=13.2 fr=0.9 lag=1.42 store=9 painted=2 hold=False bl=7.93 rawrate=0.73 arr_age=1.2
+    DIAG el=249.5 clock=6.3 off=-0.02 edge=14.4 fr=2.1 lag=1.44 store=11 painted=2 hold=False bl=8.04 rawrate=0.91 arr_age=0.8
+    DIAG el=250.6 clock=7.4 off=-0.02 edge=15.5 fr=3.3 lag=1.44 store=11 painted=2 hold=False bl=8.04 rawrate=0.97 arr_age=1.9
+    DIAG el=251.7 clock=8.5 off=-0.02 edge=16.6 fr=4.5 lag=1.59 store=13 painted=2 hold=False bl=8.08 rawrate=1.00 arr_age=0.7
+    DIAG el=252.8 clock=9.6 off=0.03 edge=17.6 fr=5.3 lag=1.5 store=15 painted=2 hold=False bl=7.99 rawrate=0.90 arr_age=0.3
+    DIAG el=253.9 clock=10.7 off=0.03 edge=18.8 fr=6.5 lag=1.5 store=15 painted=2 hold=False bl=8.02 rawrate=0.93 arr_age=1.4
+    DIAG el=255.0 clock=11.8 off=0.02 edge=19.8 fr=7.7 lag=1.46 store=17 painted=2 hold=False bl=8.00 rawrate=0.97 arr_age=0.0
+    DIAG el=256.1 clock=12.9 off=0.02 edge=21.0 fr=8.9 lag=1.46 store=17 painted=2 hold=False bl=8.04 rawrate=1.00 arr_age=1.1
+    DIAG el=257.2 clock=14.0 off=0.02 edge=22.1 fr=9.7 lag=1.46 store=17 painted=2 hold=False bl=8.04 rawrate=0.90 arr_age=2.2
+    L(t) profile: const(1.5s)
+    DIAG el=273.3 clock=30.1 off=-0.0 edge=38.2 fr=26.1 lag=1.75 store=41 painted=2 hold=False bl=8.02 rawrate=1.00 arr_age=0.1
+    DIAG el=274.4 clock=31.2 off=-0.01 edge=39.3 fr=26.9 lag=1.67 store=43 painted=2 hold=False bl=8.08 rawrate=0.91 arr_age=0.3
+    DIAG el=275.5 clock=32.3 off=-0.01 edge=40.4 fr=28.1 lag=1.67 store=43 painted=2 hold=False bl=8.06 rawrate=0.94 arr_age=1.4
+    DIAG el=276.6 clock=33.4 off=-0.01 edge=41.5 fr=29.3 lag=1.67 store=43 painted=2 hold=False bl=8.06 rawrate=0.97 arr_age=2.5
+    DIAG el=277.7 clock=34.5 off=-0.0 edge=42.6 fr=30.5 lag=1.87 store=47 painted=2 hold=False bl=8.07 rawrate=1.00 arr_age=0.7
+    DIAG el=278.8 clock=35.6 off=0.0 edge=43.7 fr=31.3 lag=1.71 store=49 painted=2 hold=False bl=8.03 rawrate=0.90 arr_age=1.0
+    DIAG el=279.9 clock=36.7 off=0.0 edge=44.8 fr=32.5 lag=1.71 store=49 painted=2 hold=False bl=8.03 rawrate=0.93 arr_age=2.1
+    DIAG el=281.0 clock=37.8 off=0.02 edge=45.9 fr=33.7 lag=1.71 store=53 painted=2 hold=False bl=8.03 rawrate=0.97 arr_age=0.3
+    DIAG el=282.1 clock=38.9 off=0.02 edge=47.0 fr=34.9 lag=1.71 store=53 painted=2 hold=False bl=8.03 rawrate=1.00 arr_age=1.4
+    DIAG el=283.2 clock=40.0 off=0.02 edge=48.1 fr=35.7 lag=1.71 store=53 painted=2 hold=False bl=8.03 rawrate=0.90 arr_age=2.5
+    DIAG el=284.3 clock=41.1 off=0.0 edge=49.2 fr=36.9 lag=1.78 store=55 painted=2 hold=False bl=8.08 rawrate=0.93 arr_age=0.7
+    DIAG el=285.4 clock=42.2 off=0.0 edge=50.3 fr=38.1 lag=1.78 store=55 painted=2 hold=False bl=8.09 rawrate=0.97 arr_age=1.8
+    DIAG el=286.5 clock=43.3 off=0.0 edge=51.4 fr=39.3 lag=1.78 store=55 painted=2 hold=False bl=8.09 rawrate=1.00 arr_age=2.9
+    DIAG el=287.6 clock=44.4 off=0.01 edge=52.3 fr=40.1 lag=1.84 store=59 painted=2 hold=False bl=7.87 rawrate=0.90 arr_age=0.1
+    DIAG el=288.7 clock=45.5 off=-0.03 edge=53.5 fr=41.3 lag=1.6 store=61 painted=2 hold=False bl=7.99 rawrate=0.93 arr_age=0.0
+    DIAG el=289.8 clock=46.6 off=-0.03 edge=54.7 fr=42.5 lag=1.6 store=61 painted=2 hold=False bl=8.04 rawrate=0.97 arr_age=1.1
+    DIAG el=290.9 clock=47.7 off=-0.03 edge=55.8 fr=43.7 lag=1.6 store=61 painted=2 hold=False bl=8.04 rawrate=1.00 arr_age=2.2
+    DIAG el=292.0 clock=48.8 off=-0.01 edge=56.8 fr=44.5 lag=1.59 store=65 painted=2 hold=False bl=7.99 rawrate=0.90 arr_age=0.6
+    DIAG el=293.1 clock=49.9 off=-0.02 edge=58.0 fr=45.7 lag=1.55 store=67 painted=2 hold=False bl=8.06 rawrate=0.93 arr_age=0.6
+    DIAG el=294.2 clock=51.0 off=-0.02 edge=59.1 fr=46.9 lag=1.55 store=67 painted=2 hold=False bl=8.06 rawrate=0.97 arr_age=1.7
+    DIAG el=295.3 clock=52.1 off=-0.01 edge=60.2 fr=48.1 lag=1.98 store=69 painted=2 hold=False bl=8.04 rawrate=1.00 arr_age=0.0
+    DIAG el=296.4 clock=53.2 off=0.01 edge=61.3 fr=48.9 lag=1.65 store=71 painted=2 hold=False bl=8.02 rawrate=0.90 arr_age=0.7
+    DIAG el=297.5 clock=54.3 off=0.01 edge=62.4 fr=50.1 lag=1.65 store=71 painted=2 hold=False bl=8.05 rawrate=0.93 arr_age=1.8
+    DIAG el=298.6 clock=55.4 off=0.01 edge=63.5 fr=51.3 lag=1.65 store=71 painted=2 hold=False bl=8.05 rawrate=0.97 arr_age=2.9
+    DIAG el=299.7 clock=56.5 off=0.0 edge=64.6 fr=52.5 lag=2.06 store=73 painted=2 hold=False bl=8.02 rawrate=1.00 arr_age=0.5
+    DIAG el=300.8 clock=57.6 off=0.0 edge=65.7 fr=53.3 lag=2.06 store=73 painted=2 hold=False bl=8.02 rawrate=0.90 arr_age=1.6
+    DIAG el=301.9 clock=58.7 off=0.0 edge=66.8 fr=54.5 lag=2.06 store=73 painted=2 hold=False bl=8.05 rawrate=0.93 arr_age=2.7
+    DIAG el=303.0 clock=59.8 off=0.0 edge=67.9 fr=55.7 lag=2.06 store=73 painted=2 hold=False bl=8.05 rawrate=0.97 arr_age=3.8
+    DIAG el=304.1 clock=60.9 off=-0.02 edge=69.0 fr=56.9 lag=2.01 store=77 painted=2 hold=False bl=8.05 rawrate=1.00 arr_age=0.7
+    DIAG el=305.2 clock=62.0 off=-0.02 edge=70.1 fr=57.7 lag=2.01 store=77 painted=2 hold=False bl=8.05 rawrate=0.90 arr_age=1.8
+    DIAG el=306.3 clock=63.1 off=-0.02 edge=71.2 fr=58.9 lag=2.01 store=77 painted=2 hold=False bl=8.07 rawrate=0.93 arr_age=2.9
+    DIAG el=307.4 clock=64.2 off=-0.01 edge=72.2 fr=60.1 lag=1.91 store=82 painted=2 hold=False bl=7.98 rawrate=0.97 arr_age=0.3
+    DIAG el=308.5 clock=65.3 off=-0.01 edge=73.3 fr=61.3 lag=1.91 store=82 painted=2 hold=False bl=7.98 rawrate=1.00 arr_age=1.4
+    DIAG el=309.6 clock=66.4 off=-0.02 edge=74.5 fr=62.1 lag=1.74 store=84 painted=2 hold=False bl=8.07 rawrate=0.90 arr_age=0.9
+    DIAG el=310.7 clock=67.5 off=-0.02 edge=75.6 fr=63.3 lag=1.74 store=84 painted=2 hold=False bl=8.07 rawrate=0.93 arr_age=2.0
+    DIAG el=311.8 clock=68.6 off=-0.01 edge=76.7 fr=64.5 lag=1.64 store=85 painted=2 hold=False bl=8.07 rawrate=0.97 arr_age=0.0
+    DIAG el=312.9 clock=69.7 off=-0.01 edge=77.8 fr=65.7 lag=1.58 store=86 painted=2 hold=False bl=8.07 rawrate=1.00 arr_age=0.7
+    DIAG el=314.0 clock=70.8 off=-0.01 edge=78.9 fr=66.5 lag=1.58 store=86 painted=2 hold=False bl=8.07 rawrate=0.90 arr_age=1.8
+    DIAG el=315.1 clock=71.9 off=-0.01 edge=80.0 fr=67.7 lag=1.58 store=86 painted=2 hold=False bl=8.07 rawrate=0.93 arr_age=2.9
+    DIAG el=316.2 clock=73.0 off=0.01 edge=81.1 fr=68.9 lag=1.49 store=88 painted=2 hold=False bl=8.03 rawrate=0.97 arr_age=0.3
+    DIAG el=317.3 clock=74.1 off=0.01 edge=82.2 fr=70.1 lag=1.49 store=88 painted=2 hold=False bl=8.05 rawrate=1.00 arr_age=1.4
+    DIAG el=318.4 clock=75.2 off=0.01 edge=83.3 fr=70.9 lag=1.49 store=88 painted=2 hold=False bl=8.05 rawrate=0.90 arr_age=2.5
+    DIAG el=319.5 clock=76.3 off=0.01 edge=84.4 fr=72.1 lag=1.49 store=88 painted=2 hold=False bl=8.04 rawrate=0.93 arr_age=3.6
+    DIAG el=320.6 clock=77.4 off=0.0 edge=85.5 fr=73.3 lag=1.48 store=90 painted=2 hold=False bl=8.08 rawrate=0.97 arr_age=0.3
+    DIAG el=321.7 clock=78.5 off=0.0 edge=86.6 fr=74.5 lag=1.48 store=90 painted=2 hold=False bl=8.08 rawrate=1.00 arr_age=1.4
+    DIAG el=322.8 clock=79.6 off=0.0 edge=87.7 fr=75.3 lag=1.48 store=90 painted=2 hold=False bl=8.08 rawrate=0.90 arr_age=2.5
+    DIAG el=323.9 clock=80.7 off=0.01 edge=88.7 fr=76.5 lag=1.45 store=92 painted=2 hold=False bl=7.97 rawrate=0.93 arr_age=0.5
+    DIAG el=325.0 clock=81.8 off=0.01 edge=89.8 fr=77.7 lag=1.45 store=92 painted=2 hold=False bl=7.97 rawrate=0.97 arr_age=1.6
+    DIAG el=326.1 clock=82.9 off=0.01 edge=91.0 fr=78.9 lag=1.45 store=92 painted=2 hold=False bl=8.02 rawrate=1.00 arr_age=2.7
+    DIAG el=327.2 clock=84.0 off=0.01 edge=92.1 fr=79.7 lag=1.45 store=92 painted=2 hold=False bl=8.02 rawrate=0.90 arr_age=3.8
+    DIAG el=328.3 clock=85.1 off=-0.0 edge=93.2 fr=80.9 lag=1.47 store=94 painted=2 hold=False bl=8.06 rawrate=0.93 arr_age=0.1
+    DIAG el=329.4 clock=86.2 off=-0.0 edge=94.3 fr=82.1 lag=1.47 store=94 painted=2 hold=False bl=8.05 rawrate=0.97 arr_age=1.2
+    DIAG el=330.5 clock=87.3 off=-0.0 edge=95.4 fr=83.3 lag=1.47 store=94 painted=2 hold=False bl=8.05 rawrate=1.00 arr_age=2.3
+    DIAG el=331.6 clock=88.4 off=-0.0 edge=96.4 fr=84.1 lag=1.46 store=96 painted=2 hold=False bl=8.00 rawrate=0.90 arr_age=0.4
+    DIAG el=332.7 clock=89.5 off=-0.0 edge=97.5 fr=85.3 lag=1.46 store=96 painted=2 hold=False bl=8.00 rawrate=0.93 arr_age=1.5
+    DIAG el=333.8 clock=90.6 off=-0.0 edge=98.7 fr=86.5 lag=1.46 store=96 painted=2 hold=False bl=8.02 rawrate=0.97 arr_age=2.6
+    DIAG el=334.9 clock=91.7 off=-0.01 edge=99.8 fr=87.7 lag=1.46 store=97 painted=2 hold=False bl=8.04 rawrate=1.00 arr_age=0.0
+    DIAG el=336.0 clock=92.8 off=0.01 edge=100.9 fr=88.5 lag=1.44 store=98 painted=2 hold=False bl=8.04 rawrate=0.90 arr_age=1.0
+    DIAG el=337.1 clock=93.9 off=0.01 edge=102.0 fr=89.7 lag=1.44 store=98 painted=2 hold=False bl=8.04 rawrate=0.93 arr_age=2.1
+    DIAG el=338.2 clock=95.0 off=0.01 edge=103.1 fr=90.9 lag=1.44 store=98 painted=2 hold=False bl=8.05 rawrate=0.97 arr_age=3.2
+    DIAG el=339.3 clock=96.1 off=0.03 edge=104.2 fr=92.1 lag=1.43 store=100 painted=2 hold=False bl=8.04 rawrate=1.00 arr_age=0.7
+    DIAG el=340.4 clock=97.2 off=0.03 edge=105.3 fr=92.9 lag=1.43 store=100 painted=2 hold=False bl=8.04 rawrate=0.90 arr_age=1.8
+    DIAG el=341.5 clock=98.3 off=0.03 edge=106.4 fr=94.1 lag=1.43 store=100 painted=2 hold=False bl=8.06 rawrate=0.93 arr_age=2.9
+    DIAG el=342.6 clock=99.4 off=0.03 edge=107.5 fr=95.3 lag=1.43 store=100 painted=2 hold=False bl=8.06 rawrate=0.97 arr_age=4.0
+    DIAG el=343.7 clock=100.5 off=0.01 edge=108.6 fr=96.5 lag=1.45 store=102 painted=2 hold=False bl=8.08 rawrate=1.00 arr_age=0.1
+    DIAG el=344.8 clock=101.6 off=0.01 edge=109.7 fr=97.3 lag=1.45 store=102 painted=2 hold=False bl=8.08 rawrate=0.90 arr_age=1.2
+    f: steady: painted=718 n=718 |perr| p50=0.00 p95=0.00 max=0.02 exact=718/718 ambig=657 nomatch=0 maxstop=0.0s rebases=0 diag[neighbor=718/718]
+  ok   f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=0.00 max=0.02]
+    DIAG el=345.1 clock=0.1 off=0.01 edge=110.0 fr=97.9 lag=1.45 store=102 painted=0 hold=True bl=109.93 rawrate=0.00 arr_age=1.5
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+    DIAG el=346.1 clock=1.1 off=0.01 edge=110.5 fr=98.9 lag=1.45 store=102 painted=1 hold=True bl=109.38 rawrate=0.00 arr_age=2.5
+    DIAG el=347.2 clock=2.2 off=-0.11 edge=111.2 fr=99.7 lag=1.44 store=104 painted=1 hold=True bl=108.99 rawrate=0.00 arr_age=0.6
+    DIAG el=348.3 clock=3.3 off=-0.11 edge=112.3 fr=100.9 lag=1.44 store=104 painted=2 hold=False bl=109.05 rawrate=0.94 arr_age=1.7
+    DIAG el=349.4 clock=4.4 off=-0.11 edge=113.4 fr=102.1 lag=1.44 store=104 painted=2 hold=False bl=109.05 rawrate=0.97 arr_age=2.8
+    DIAG el=350.5 clock=5.5 off=-0.21 edge=115.3 fr=103.3 lag=1.43 store=106 painted=2 hold=False bl=109.77 rawrate=1.00 arr_age=0.9
+    DIAG el=351.6 clock=6.6 off=-0.21 edge=116.4 fr=104.1 lag=1.43 store=106 painted=2 hold=False bl=109.77 rawrate=0.90 arr_age=2.0
+    DIAG el=352.7 clock=7.7 off=-0.11 edge=117.6 fr=105.3 lag=1.43 store=108 painted=2 hold=False bl=109.89 rawrate=0.93 arr_age=0.3
+    DIAG el=353.8 clock=8.8 off=-0.11 edge=118.7 fr=106.5 lag=1.43 store=108 painted=2 hold=False bl=109.89 rawrate=0.97 arr_age=1.4
+    DIAG el=354.9 clock=9.9 off=-0.11 edge=119.8 fr=107.7 lag=1.43 store=108 painted=2 hold=False bl=109.91 rawrate=1.00 arr_age=2.5
+    DIAG el=356.0 clock=11.0 off=-0.06 edge=120.9 fr=108.5 lag=1.44 store=110 painted=2 hold=False bl=109.93 rawrate=0.90 arr_age=0.7
+    DIAG el=357.1 clock=12.1 off=-0.06 edge=122.0 fr=109.7 lag=1.44 store=110 painted=2 hold=False bl=109.92 rawrate=0.93 arr_age=1.8
+    DIAG el=358.2 clock=13.2 off=-0.06 edge=123.1 fr=110.9 lag=1.44 store=110 painted=2 hold=False bl=109.89 rawrate=0.97 arr_age=2.9
+    DIAG el=359.3 clock=14.3 off=-0.06 edge=124.2 fr=112.1 lag=1.44 store=110 painted=2 hold=False bl=109.89 rawrate=1.00 arr_age=4.0
+    DIAG el=360.4 clock=15.4 off=-0.03 edge=125.3 fr=112.9 lag=1.44 store=112 painted=2 hold=False bl=109.90 rawrate=0.90 arr_age=0.7
+    DIAG el=361.5 clock=16.5 off=-0.03 edge=126.4 fr=114.1 lag=1.44 store=112 painted=2 hold=False bl=109.90 rawrate=0.93 arr_age=1.8
+    DIAG el=362.6 clock=17.6 off=0.01 edge=127.5 fr=115.3 lag=1.43 store=114 painted=2 hold=False bl=109.88 rawrate=0.97 arr_age=0.7
+    DIAG el=363.7 clock=18.7 off=0.01 edge=128.6 fr=116.5 lag=1.43 store=114 painted=2 hold=False bl=109.88 rawrate=1.00 arr_age=1.8
+    DIAG el=364.8 clock=19.8 off=0.01 edge=129.7 fr=117.3 lag=1.43 store=114 painted=2 hold=False bl=109.88 rawrate=0.90 arr_age=2.9
+    DIAG el=365.9 clock=20.9 off=0.03 edge=130.7 fr=118.5 lag=1.43 store=116 painted=2 hold=False bl=109.83 rawrate=0.93 arr_age=0.3
+    f: scrubbed-back region: painted=208 n=193 |perr| p50=0.00 p95=77.56 max=78.46 exact=113/208 ambig=193 nomatch=15 maxstop=0.0s rebases=0 diag[neighbor=834/834]
+  FAIL f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=77.56]
+  FAIL f: scrubbed-back exact-window text >= 85%   [113/208 ambig=193]
+    DIAG el=366.9 clock=0.1 off=-5.97 edge=131.8 fr=119.7 lag=1.43 store=116 painted=2 hold=True bl=131.68 rawrate=0.00 arr_age=1.3
+    DIAG el=367.9 clock=1.1 off=-0.19 edge=132.4 fr=120.7 lag=1.45 store=118 painted=0 hold=True bl=131.33 rawrate=0.00 arr_age=0.2
+    DIAG el=369.0 clock=2.2 off=-0.19 edge=132.4 fr=121.5 lag=1.45 store=118 painted=0 hold=True bl=130.23 rawrate=0.00 arr_age=1.3
+    DIAG el=369.9 clock=3.1 off=-0.38 edge=134.2 fr=122.7 lag=1.45 store=119 painted=0 hold=False bl=131.14 rawrate=1.00 arr_age=0.0
+    DIAG el=371.0 clock=4.2 off=-0.31 edge=135.6 fr=123.5 lag=1.44 store=120 painted=0 hold=False bl=131.37 rawrate=0.91 arr_age=1.0
+    DIAG el=372.1 clock=5.3 off=-0.31 edge=136.8 fr=124.7 lag=1.44 store=120 painted=0 hold=False bl=131.52 rawrate=0.93 arr_age=2.1
+    DIAG el=373.2 clock=6.4 off=-0.31 edge=137.9 fr=125.9 lag=1.44 store=120 painted=2 hold=False bl=131.52 rawrate=0.97 arr_age=3.2
+    DIAG el=374.3 clock=7.5 off=-0.18 edge=139.2 fr=127.1 lag=1.45 store=122 painted=2 hold=False bl=131.69 rawrate=1.00 arr_age=0.9
+    DIAG el=375.4 clock=8.6 off=-0.18 edge=140.3 fr=127.9 lag=1.45 store=122 painted=2 hold=False bl=131.69 rawrate=0.90 arr_age=2.0
+    DIAG el=376.5 clock=9.7 off=-0.09 edge=141.4 fr=129.1 lag=1.48 store=124 painted=2 hold=False bl=131.67 rawrate=0.93 arr_age=0.7
+    DIAG el=377.6 clock=10.8 off=-0.09 edge=142.5 fr=130.3 lag=1.48 store=124 painted=2 hold=False bl=131.67 rawrate=0.97 arr_age=1.8
+    DIAG el=378.7 clock=11.9 off=-0.09 edge=143.6 fr=131.5 lag=1.48 store=124 painted=2 hold=False bl=131.69 rawrate=1.00 arr_age=2.9
+    DIAG el=379.8 clock=13.0 off=-0.01 edge=144.7 fr=132.3 lag=1.45 store=126 painted=2 hold=False bl=131.67 rawrate=0.90 arr_age=0.4
+    f: post-rebase stability: painted=78 n=78 |perr| p50=75.73 p95=78.36 max=78.66 exact=33/78 ambig=78 nomatch=0 maxstop=0.0s rebases=2 diag[neighbor=867/867]
+  FAIL f: rebased store stays coherent behind the head (outcome)   [p95=78.36 exact=33/78]
+  ok   f: +1.5 s delay paints the cue active 1.5 s EARLIER   [probe@+4.0s base=2ln shifted=2ln earlier=2ln]
+  ok   f: no pipeline exceptions
+
+4/7 checks passed (mechanism 4/7, data-limited 0/0)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)
+*** PROBE DUMPS ***
+t=1000347.6 disp=   2.60 err= 72.56 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000347.7 disp=   2.70 err= 72.46 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000347.8 disp=   2.80 err= 72.36 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000347.9 disp=   2.90 err= 72.26 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.0 disp=   3.00 err= 72.16 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.1 disp=   3.10 err= 72.06 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.2 disp=   3.20 err= 71.96 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.3 disp=   3.30 err= 71.86 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.4 disp=   3.40 err= 71.76 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.5 disp=   3.50 err= 71.66 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.6 disp=   3.60 err= 71.56 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')
+t=1000348.7 disp=   3.70 err= 71.46 stored_cue=(2.5, 4.4) near_wins=[(75.2, 79.2), (75.6, 79.2)] painted=('of see it already tonight. you', 'know that run game getting')

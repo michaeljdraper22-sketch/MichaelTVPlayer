@@ -1,0 +1,35 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.4s)
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    L(t) profile: const(1.5s)
+    f: steady: painted=718 n=718 |perr| p50=0.00 p95=0.00 max=0.00 exact=718/718 ambig=657 nomatch=0 maxstop=0.0s rebases=0 diag[neighbor=718/718]
+  ok   f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=0.00 max=0.00]
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+
+*** P3 disp=2.60 err=72.56 clock=2.60
+cc_source type: <class 'src.live_cc.CCSource'>
+stash n=0 join_byte=0 join_app_s=0.0
+store n=104 — earliest 8:
+  (0.87,2.54) 'OF SEE IT ALREADY TONIGHT. YOU'
+  (2.50,4.34) 'OF SEE IT ALREADY TONIGHT. YOU\nKNOW THAT RUN GAME GETTING'
+  (2.54,4.37) 'OF SEE IT ALREADY TONIGHT. YOU\nKNOW THAT RUN GAME GETTING'
+  (4.34,6.61) 'KNOW THAT RUN GAME GETTING\nGOING. YOU KNOW MIKE HAVING'
+  (4.37,6.64) 'KNOW THAT RUN GAME GETTING\nGOING. YOU KNOW MIKE HAVING'
+  (6.61,8.17) 'GOING. YOU KNOW MIKE HAVING\nTHAT BIG RUN I THINK IN THE'
+  (6.64,8.21) 'GOING. YOU KNOW MIKE HAVING\nTHAT BIG RUN I THINK IN THE'
+  (8.18,10.51) 'THAT BIG RUN I THINK IN THE\nSECOND QUARTER. YOU KNOW SO'
+store cues with start<10: n=9
+raw releases with start<10: n=0
+    f: scrubbed-back region: painted=208 n=193 |perr| p50=0.00 p95=77.56 max=78.46 exact=113/208 ambig=193 nomatch=15 maxstop=0.0s rebases=0 diag[neighbor=834/834]
+  FAIL f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=77.56]
+  FAIL f: scrubbed-back exact-window text >= 85%   [113/208 ambig=193]
+    f: post-rebase stability: painted=78 n=78 |perr| p50=75.73 p95=78.36 max=78.66 exact=33/78 ambig=78 nomatch=0 maxstop=0.0s rebases=2 diag[neighbor=867/867]
+  FAIL f: rebased store stays coherent behind the head (outcome)   [p95=78.36 exact=33/78]
+  ok   f: +1.5 s delay paints the cue active 1.5 s EARLIER   [probe@+4.0s base=2ln shifted=2ln earlier=2ln]
+  ok   f: no pipeline exceptions
+
+4/7 checks passed (mechanism 4/7, data-limited 0/0)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)

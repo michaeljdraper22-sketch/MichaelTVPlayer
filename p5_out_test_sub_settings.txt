@@ -1,0 +1,47 @@
+[1] config defaults = VLC's current look + a concrete size
+  ok   no delay, numeric default size, default font
+  ok   no background, white text, black outline on
+  ok   defaults merge from empty config
+  ok   setter keeps unknown keys out and merges
+[2] argument builder — the default size is emitted explicitly
+  ok   all-default config -> just the size arg
+  ok   size 0 (Auto) -> no VLC args
+  ok   font/size/pos/color mapped
+  ok   negative position allowed (baseline still added)
+  ok   background color+opacity mapped
+  ok   outline off -> opacity 0
+  ok   outline color mapped, non-default thickness mapped
+  ok   default thickness emits nothing extra
+  ok   bad hex falls back silently (no arg)
+[3] VLCPlayer delay API (real libvlc, no media)
+  ok   constructed with style args + initial delay
+  ok   set/get round trip
+  ok   a swapped-in fresh player gets the delay re-applied
+[4] menu gains the settings entry
+  ok   menu = Off + track + settings entry
+  ok   view routes the live delay to the player
+[4b] _open_sub_settings: live apply, preview line, rebuild choice
+  ok   live style change reached the config mid-dialog
+  ok   preview line shown while the dialog is open
+  ok   preview line cleared after the dialog closes
+  ok   VLC-rendered captions rebuild once on close
+  ok   overlay-rendered captions never rebuild
+[5] dialog: delay nudge is instant and persists
+  ok   two + clicks -> +0.50 s applied twice
+  ok   label shows +0.50 s
+  ok   reset returns to 0 and applies
+  ok   delay persisted to config
+[6] dialog: style applies LIVE; Cancel reverts to dialog-open
+  ok   live: font applied without OK ('')
+  ok   live: size/position applied
+  ok   live: background applied on
+  ok   live: outline applied off
+  ok   apply_live fired per change
+  ok   OK keeps the live-applied values
+  ok   slider drag updates the config live
+  ok   cancel reverts to the dialog-open style
+  ok   cancel keeps the delay nudges but reverts the style
+[7] reset to defaults restores every control (live)
+  ok   config back to defaults
+
+all 37 checks passed

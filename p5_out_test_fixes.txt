@@ -1,0 +1,72 @@
+chase revive (chase_seek): player wedged/down — play_at 0.0s
+chase revive (chase_seek): player wedged/down — play_at 110.0s
+chase revive (chase_seek): player wedged/down — play_at 195.0s
+chase revive (jump_live): player wedged/down — play_at 195.0s
+[1] QSS / black plates removed
+  ok   no rgba(0,0,0,1) plates left in QSS
+  ok   buttons paint nothing at rest
+  ok   #ovStatus pill style present
+  ok   stylesheet re-applies cleanly
+[2] time scrubber appears in chase mode, above the buttons
+  ok   _scrub_on is True
+  ok   scrub_row is not hidden
+  ok   scrub_row sits above the button row (y=6+15 <= btn y=25)
+  ok   slider has a live range
+[3] scrubber self-heal inside _tick
+  ok   _tick re-shows the scrubber while chasing
+[4] DVR status pill
+  ok   pill visible + overlay kept alive
+  ok   pill text set
+  ok   pill hides again
+[5] seek clamping uses the safety margin
+  ok   target clamped to frontier-3 (100 -> 95)
+[6] content clock freezes when the buffer stops growing
+  ok   clock frozen while file idle (frontier=0.00s)
+  ok   clock advances only across growth (0.60s > 0.3s-ish)
+[7] revive path: buttons work on a dead (ended) player
+  ok   healthy player: rewind -> set_time(0)
+  ok   dead player: rewind revives via play_at(0)
+  ok   dead player: modest FF lands exactly (110s, no clamp needed)
+  ok   dead player: big FF revives clamped to frontier-safety
+  ok   LIVE from paused+dead resumes at frontier-safety
+  ok   pause while playing -> vlc.pause + flag
+  ok   resume while healthy -> vlc.resume
+[8] speed-aware catch-up + tracked-position reopen
+  ok   catch-up threshold scales with rate
+  ok   no 0.75x edge damping left
+  ok   watchdog reopen keeps the tracked position (no jump to live)
+  ok   speeds capped at 4x (audio mute limit)
+  ok   jump-to-beginning button exists + wired
+[9] chase entry is fast (no runway wait)
+  ok   tries default is 'compute' (-1)
+  ok   stale wait call is a silent no-op
+  ok   entry needs only buffer-ready + 2.5s
+  ok   no countdown or buffering pill text
+[10] watchdog gated on playback start
+  ok   _chase_started defaults False
+  ok   no stall counted before playback starts
+[11] JumpSlider: a click completes (seek runs, _seeking clears)
+  ok   click jumps to the clicked point (value=917)
+  ok   click emits sliderMoved
+  ok   click emits sliderReleased (the seek actually runs)
+[12] VOD: Record swaps to Download; speed/seek without live TV
+  ok   Record button hidden for VOD
+  ok   Download button shown + enabled for VOD
+  ok   speed button enabled for VOD
+  ok   seek buttons enabled for VOD
+  ok   VOD speed applies without live TV
+  ok   Record button back for live
+  ok   Download hidden for live
+  ok   rate resets to 1x leaving VOD
+  ok   LIVE enabled in plain live mode
+[13] volume: clicking the bar jumps the volume there
+  ok   volume click sets near-max (was 0, now 99)
+[14] control row compacts on narrow (half/quarter) windows
+  ok   row compacts (level=5)
+  ok   separators hidden when tight
+  ok   wide window restores the full layout
+[15] frozen VLC clock no longer freezes the timestamps
+  ok   chase clock advances past frozen VLC time (50.50s > 50.15s)
+  ok   VOD clock advances with a frozen VLC time (0.90s > 0.7s)
+
+51 passed, 0 failed

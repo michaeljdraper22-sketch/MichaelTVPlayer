@@ -1,0 +1,21 @@
+[1] backgrounded: cursor wake does not surface the overlay
+  ok   overlay stays hidden on _wake
+  ok   control bar stays hidden
+[2] backgrounded: DVR status pill must not surface it either
+  ok   overlay stays hidden on pill update
+[3] backgrounded: info banner doesn't surface it
+  ok   overlay stays hidden on show_info
+[4] foreground: wake works normally again
+  ok   overlay shows when app is foreground
+  ok   control bar shows
+[4b] latched suppression self-heals when the app is foreground
+  ok   poll self-heals a latched suppression
+  ok   wake works when app is truly foreground
+  ok   suppression cleared by wake
+  ok   still suppressed while another app is front
+[5] focus loss hides; focus regain restores
+  ok   focus regain restores the overlay
+[6] pill works in the foreground (no regression)
+  ok   pill visible with app foreground
+
+all 12 checks passed

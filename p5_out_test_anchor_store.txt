@@ -1,0 +1,17 @@
+  ok   snap: lone 4-8 s gap does NOT rebase (rides the EWMA)   [off=103.00 rebases=0]
+  ok   snap: lone spike leaves the STORE unmoved   [cues=[(50.0, 52.0, 'c1')]]
+  ok   snap: the spike round-trips with no rebase at all   [off=100.38 rebases=0]
+  ok   snap: SECOND consecutive out-of-band batch snaps   [rebases=1 off=108.00]
+  ok   snap: the confirmed snap resets the out-of-band run   [oob=0 off=108.00]
+  ok   snap: gap > _CC_REBASE_HARD_S snaps on the FIRST batch   [rebases=1 off=112.00 hard=8.0]
+  ok   store: sustained SMALL drift never moves stored cues (pin-time positions are true)   [cue=(50.0, 52.0) pin=(50.0, 52.0) rebases=0]
+  ok   store: 60 batches of +-2 s wobble never shift the store (zero steady-state jitter)   [rebases=0]
+  ok   stable-snap: the forced displacement shifted the store   [cue=(44.0, 46.0)]
+  ok   stable-snap: a stable target 5-6 s away snaps back immediately (no EWMA crawl)   [rebases=2 (forced + snap-back) off=99.00]
+  ok   stable-snap: the store slides back with it (coherent timeline)   [cue=(49.5, 51.5) (pin 50, forced -6, snap +5.5)]
+  ok   lag: EWMA a=0.35 covers >= 35% of an L step in ONE batch   [L=13.75 (a=0.35; step 5->30)]
+  ok   watchdog: data-limited (clock 40 s past the newest cue) does NOT rebase   [rebases=0 off=8.0]
+captions: no window hit the clock for 0.0 s while cues kept arriving — anchor rebased (shift +199.0 s)
+  ok   watchdog: clock NEAR the newest cue still rebases (true divergence recovered)   [rebases=1 off=207.0 cue=(249.0, 251.0)]
+
+14/14 checks passed

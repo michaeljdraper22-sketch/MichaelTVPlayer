@@ -1,0 +1,43 @@
+scanning US_NFL_NETWORK_HD_20260820_171631.ts ...
+  span=70.42s size=54,495,372 pcrs=998 edits=13455 (0.3s)
+
+== scenario f: scrub back 2 min, rebase coherence, delay_ms ==
+    L(t) profile: const(1.5s)
+    f: steady: painted=718 n=718 |perr| p50=0.00 p95=0.00 max=0.00 exact=718/718 ambig=657 nomatch=0 maxstop=0.0s rebases=0 diag[neighbor=718/718]
+  ok   f: steady painted cues stable (p95 <= 1.5, max <= 2.5)   [p95=0.00 max=0.00]
+  ok   f: scrub -120 s lands on target   [landed=1.0 want~0.0]
+
+*** P2 disp=2.60 err=72.56
+stored cue window=(2.54,4.37) fulltext='OF SEE IT ALREADY TONIGHT. YOU\nKNOW THAT RUN GAME GETTING'
+all wins for painted key: [(75.2, 79.2), (75.6, 79.2)]
+raw_released n=95 pending n=29
+first 6 raw releases:
+  (10.54,12.04) 'SECOND QUARTER. YOU KNOW SO\nJUST STICKING TO THE RUN GAME.'
+  (10.51,12.01) 'SECOND QUARTER. YOU KNOW SO\nJUST STICKING TO THE RUN GAME.'
+  (12.05,13.98) "JUST STICKING TO THE RUN GAME.\nAND YOU KNOW THAT'S GOING TO BE"
+  (12.01,13.95) "JUST STICKING TO THE RUN GAME.\nAND YOU KNOW THAT'S GOING TO BE"
+  (13.95,15.71) "AND YOU KNOW THAT'S GOING TO BE\nTHE IDENTITY OF THIS OFFENSE."
+  (13.98,15.75) "AND YOU KNOW THAT'S GOING TO BE\nTHE IDENTITY OF THIS OFFENSE."
+raw releases with window end < 20:
+  (10.54,12.04) 'SECOND QUARTER. YOU KNOW SO\nJUST STICKING TO THE RUN GAME.'
+  (10.51,12.01) 'SECOND QUARTER. YOU KNOW SO\nJUST STICKING TO THE RUN GAME.'
+  (12.05,13.98) "JUST STICKING TO THE RUN GAME.\nAND YOU KNOW THAT'S GOING TO BE"
+  (12.01,13.95) "JUST STICKING TO THE RUN GAME.\nAND YOU KNOW THAT'S GOING TO BE"
+  (13.95,15.71) "AND YOU KNOW THAT'S GOING TO BE\nTHE IDENTITY OF THIS OFFENSE."
+  (13.98,15.75) "AND YOU KNOW THAT'S GOING TO BE\nTHE IDENTITY OF THIS OFFENSE."
+  (15.75,18.29) 'THE IDENTITY OF THIS OFFENSE.\nSO SUPER EXCITED. AND OBVIOUSLY'
+  (15.72,18.25) 'THE IDENTITY OF THIS OFFENSE.\nSO SUPER EXCITED. AND OBVIOUSLY'
+  (18.25,19.82) 'SO SUPER EXCITED. AND OBVIOUSLY\nTO HAVE YOU KNOW ANOTHER'
+  (18.29,19.85) 'SO SUPER EXCITED. AND OBVIOUSLY\nTO HAVE YOU KNOW ANOTHER'
+    f: scrubbed-back region: painted=208 n=193 |perr| p50=0.00 p95=77.56 max=78.46 exact=113/208 ambig=193 nomatch=15 maxstop=0.0s rebases=0 diag[neighbor=834/834]
+  FAIL f: scrubbed-back painted cues coherent (p95 <= 1.5)   [p95=77.56]
+  FAIL f: scrubbed-back exact-window text >= 85%   [113/208 ambig=193]
+    f: post-rebase stability: painted=78 n=78 |perr| p50=75.73 p95=78.36 max=78.66 exact=33/78 ambig=78 nomatch=0 maxstop=0.0s rebases=2 diag[neighbor=867/867]
+  FAIL f: rebased store stays coherent behind the head (outcome)   [p95=78.36 exact=33/78]
+  ok   f: +1.5 s delay paints the cue active 1.5 s EARLIER   [probe@+4.0s base=2ln shifted=2ln earlier=2ln]
+  ok   f: no pipeline exceptions
+
+4/7 checks passed (mechanism 4/7, data-limited 0/0)
+  FAILED: f: scrubbed-back painted cues coherent (p95 <= 1.5)
+  FAILED: f: scrubbed-back exact-window text >= 85%
+  FAILED: f: rebased store stays coherent behind the head (outcome)

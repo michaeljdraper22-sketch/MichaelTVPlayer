@@ -1,0 +1,9 @@
+startup cleanup: C:\Users\micha\AppData\Local\Temp\mtp_sweeptest_yh8xdhq3\mtp_split_inuse.mkv failed: PermissionError(13, 'The process cannot access the file because it is being used by another process')
+  ok   dvr buffer dir removed
+  ok   caption tap dir removed
+  ok   splitter cache file removed
+  ok   unrelated files untouched
+  ok   in-use cache survives the pass (locked)
+  ok   released cache removed on the next pass
+
+all 6 checks passed

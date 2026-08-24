@@ -42,6 +42,23 @@ deviation: scenario e containment gate 6 → 8 s (`p3_report.md` §3.1c —
 the old number rode watchdog noise-fires the guard removed; real fix =
 slope-aware pin, future work). Remaining: WP4b (`prompts/p4.txt`,
 offline) then P5 (verification night).**
+**v7 (2026-08-23, P5 verification night): matrix run, `p5_report.md` for
+detail. Offline: 15 suites green, `test_profanity` intermittent 0-byte
+init segfault (3/6, passes on retry); harness RED (full 54/55, quick ×2
+51/55 identical) — root-caused to a HARNESS metric gap exposed by WP4b's
+`read1` pipe fix (the truth index never saw the real-CCSource early
+cues; painted placement proven correct — ±3 s neighbor 100%, p50=0,
+store windows on .srt ground truth), NOT a production regression; metric
+fix = follow-up. Live (both windows healthy, L 1.7-6.6, 0.98x): window
+A 10/12, window B 10/12 — every FAIL dissected: 2 driver bugs (vacuous
+`health.last_paint` checks, unclamped scrub want — both fixed in
+`sync_stage3_run.py`), 1 known P3 residual (RESUME snap-oscillation
+±9-10 s, self-corrected), 1 recovered 14 s post-jump blank. Engage
+matrix 20/21: <90 Off→On first paint 10.1 s (spec ~15); ≥90 joins at
+the playhead but the first-batch pin targets the DVR credit head
+(22-35 s to first paint — new finding, fix = pin at join position).
+D1 verified live on the low-L branch ×3 (high-L not sampled — provider
+healthy all night). VOD E2E skipped: CDN HTTP 520 on all probes.**
 **Diagnosis artifacts:** `sync_diag_adversarial_quick.out` (harness 30/31,
 twice, identical failure), `sync_diag_e2e_live.out` + `sync_debug.log` (live
 E2E 4 FAILs on a 0.17x-delivery night), `player.log` (no rescue rows during

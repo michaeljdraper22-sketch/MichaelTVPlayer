@@ -230,8 +230,11 @@ def run_live():
     ok = wait_until(lambda: view._cc_off is not None, 90, "first anchor")
     check("anchor lands within 90 s", ok)
     wait_until(lambda: view._cap_wid._lines, 60, "first paint")
-    check("captions paint at the cold join",
-          health.last_paint is not None)
+    # P5 fix: this used to test health.last_paint, but health.tick()
+    # only runs inside health_pump() — which starts AFTER this check —
+    # so it could never pass (vacuous on the 2026-08-21 diagnosis night
+    # too). The overlay lines are the thing wait_until just verified.
+    check("captions paint at the cold join", bool(view._cap_wid._lines))
     health_pump(150)                      # A: 2.5 min steady
 
     phase("DELAY", "+2 s delay shifts the painted cue live")
@@ -290,7 +293,10 @@ def run_live():
 
     phase("SCRUBBACK", "seek -120 s")
     s0 = view._cap_clock_s
-    want = s0 - 117.0
+    # P5 fix: clamp like the harness's scenario-f check — a shallow
+    # buffer (or a fresh content axis after edge renumbering) clamps at
+    # the buffer head and the old unclamped want went negative
+    want = max(0.0, s0 - 117.0)
     raw_pre_sb = raw_s()
     view._seek_ms(-120000)
     hush()
@@ -409,7 +415,9 @@ def run_vod():
         check(f"{label}: relay produced cues",
               len(view._cap_cues.cues) >= 5)
         ok = wait_until(lambda: view._cap_wid._lines, 45, "paint")
-        check(f"{label}: captions paint", health.last_paint is not None)
+        # P5 fix: was health.last_paint (vacuous before the first
+        # health_pump — see the cold-join check)
+        check(f"{label}: captions paint", bool(view._cap_wid._lines))
         # sync sample: painted cue's window should cover the clock
         hits = 0
         tot = 0
