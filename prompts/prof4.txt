@@ -1,11 +1,12 @@
 Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
-`profanity_attack_plan.md` — you own ONLY package WP4; all prior
-packages merged. Tests:
+`profanity_attack_plan.md` — you own ONLY package WP4; WP1/WP2 merged
+(WP3 is DEFERRED per plan v2 — skip it). Tests:
 `.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep console
 output brief; details to `prof4_report.md`.
 
 1. After the USER's labeled viewing session (their 5–10 ear-labeled
-   words per path: late / early / clean), correlate the labels against
+   words on movies/series — the reported miss path; a live show
+   optional: late / early / clean), correlate the labels against
    %APPDATA%\MichaelTVPlayer\prof_timing.log — ≥90% of labeled words
    fully covered and zero audible leaks is the pass bar.
 2. All offline suites + the timing fixture suite green; commit the

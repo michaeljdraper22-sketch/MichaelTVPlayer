@@ -1,5 +1,10 @@
 Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
 `profanity_attack_plan.md` — you own ONLY package WP3; WP1/WP2 merged.
+
+**NOTE (plan v2): WP3 is DEFERRED — the user reports profanity-mute
+misses on movies/series only, not live. Do not start this package unless
+the user explicitly says live mutes are now missing too.**
+
 Tests: `.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep
 console output brief; details to `prof3_report.md`.
 

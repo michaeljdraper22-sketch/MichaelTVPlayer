@@ -1,4 +1,4 @@
-# Profanity-mute timing — attack plan (v1)
+# Profanity-mute timing — attack plan (v2)
 
 **Written:** 2026-08-23, after the subtitle campaign (P0–P5) landed and the
 exe was rebuilt. Subtitle SYNC is now good (user: "perfectly synced with
@@ -6,6 +6,13 @@ movies"), which isolates the remaining complaint to the FILTER's mute
 timing: mutes miss the word by ~0.5–1 s. Same doctrine as the subtitle
 plan: nothing is "done" until a check that provably FAILED before the fix
 passes after it, and every number comes from a measurement, not a guess.
+**v2 (same day, user input): the misses are on MOVIES & SERIES — the VOD
+relay path. Live mutes are not a reported problem. Critical path is now
+WP1 → WP2 → WP4 (measure → fix VOD → verify+ship); WP3 (live) is
+DEFERRED until live misses are ever reported. Working assumption for
+direction: late-on leaks (the in-code measurement at `player_view.py:240`
+says "the word already audible as the window opened") — WP1's data
+confirms or corrects this.**
 
 ## Where the miss comes from (code-anchored error budget)
 
@@ -74,6 +81,11 @@ values as defaults.
 
 ### WP1 — Make the miss measurable (S–M) — FIRST
 
+**VOD is the reported miss path (v2): the tone fixture + one real
+movie's prof_timing.log are the deliverables that matter; keep the
+live/vod tag and live instrumentation anyway (they are cheap and WP3
+may return).**
+
 Files: `src/profanity.py` (timing log), `src/player.py` (aout probe),
 `src/ui/player_view.py` (log wiring), NEW `test_profanity_timing.py`.
 
@@ -104,7 +116,11 @@ Files: `src/profanity.py` (timing log), `src/player.py` (aout probe),
 Report: `prof1_report.md` (error decomposition table, fixture design,
 fail-today evidence).
 
-### WP2 — VOD: replace the guess (M)
+### WP2 — VOD: replace the guess (M) — THE CENTRAL FIX
+
+*This is the package the whole plan exists for (v2): the user-reported
+misses are movies/series, and this package replaces the estimate that
+causes them.*
 
 Files: `src/profanity.py`, `src/ui/player_view.py` (VOD call site),
 `test_profanity_timing.py`, `test_profanity.py`.
@@ -126,7 +142,11 @@ Files: `src/profanity.py`, `src/ui/player_view.py` (VOD call site),
    WP1 corpus reported; all offline suites green.
 Report: `prof2_report.md`.
 
-### WP3 — Live: honest lead + rebase-safe mutes (M) — decision gate inside
+### WP3 — Live: honest lead + rebase-safe mutes (M) — DEFERRED (v2)
+
+**DEFERRED 2026-08-23: the user reports misses on movies/series only.
+Run this package only if/when live misses are reported. (The dead
+`lead_ms` knob cleanup rides along here whenever it runs.)**
 
 Files: `src/profanity.py`, `src/ui/player_view.py`, harness/driver as
 needed.
@@ -154,10 +174,11 @@ Report: `prof3_report.md` (decision D1/D2 + evidence).
 
 ### WP4 — Verification night + ship (S–M)
 
-1. **Ear ground truth:** the user watches one movie and one live show
-   with the filter on and notes 5–10 words by ear ("mute was late /
-   early / clean"); correlate with `prof_timing.log` — ≥90% of labeled
-   words fully covered, zero audible leaks is the pass bar.
+1. **Ear ground truth:** the user watches TWO movies/series episodes
+   (the reported path; a live show optional) with the filter on and
+   notes 5–10 words by ear ("mute was late / early / clean"); correlate
+   with `prof_timing.log` — ≥90% of labeled words fully covered, zero
+   audible leaks is the pass bar.
 2. All offline suites + the timing fixture suite green; commit; rebuild
    `dist\MichaelTV.exe` (spec unchanged since WP4b); smoke-launch
    minimized, confirm alive, close.
@@ -182,7 +203,9 @@ Also saved in `prompts/prof1.txt` … `prof4.txt`.
 
 > **prof1:** Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player).
 > FIRST read `profanity_attack_plan.md` — you own ONLY package WP1; do
-> not do WP2/WP3 work. Headless/offscreen only, no live streams. Tests:
+> not do WP2/WP3 work. Headless/offscreen only, no live streams (VOD is
+> the reported miss path — the tone fixture + the measurement layer are
+> the deliverables). Tests:
 > `.venv\Scripts\python.exe -X utf8 <test>.py`. Keep console output
 > brief; details to `prof1_report.md`. Build the measurement layer the
 > rest of the plan depends on: (1) per-mute timing log in
@@ -231,9 +254,10 @@ Also saved in `prompts/prof1.txt` … `prof4.txt`.
 > output.
 
 > **prof4:** Work in D:\Coding\MichaelTVPlayer. FIRST read
-> `profanity_attack_plan.md` — you own ONLY package WP4; all prior
-> packages merged. (1) After the USER's labeled viewing session (their
-> 5–10 ear-labeled words per path), correlate labels against
+> `profanity_attack_plan.md` — you own ONLY package WP4; WP1/WP2 merged
+> (WP3 is DEFERRED — skip it). (1) After the USER's labeled viewing
+> session (their 5–10 ear-labeled words on movies/series; live
+> optional), correlate labels against
 > prof_timing.log — ≥90% fully covered, zero audible leaks is the pass
 > bar; (2) all offline suites + the timing fixture green; commit the
 > package; (3) rebuild dist\MichaelTV.exe
@@ -243,13 +267,14 @@ Also saved in `prompts/prof1.txt` … `prof4.txt`.
 > confirm alive in player.log, close. prof4_report.md: per-word label
 > table + verdict.
 
-## What I need from you (the user) — answer anytime before WP3
+## What I need from you (the user)
 
-1. **Where does it miss** — live TV, movies, or both? (WP1's log answers
-   this with data, but your prior steers emphasis.)
-2. **Which direction** — mutes start too late (word leaks) or too early
-   (mutes clean speech)? The plan assumes leaks are the painful
-   direction; say so if it's the opposite.
+1. **Where does it miss** — ANSWERED 2026-08-23: **movies & series**
+   (the VOD relay path). Live deferred accordingly (WP3).
+2. **Which direction** — still open; working assumption is late-on
+   leaks (per the in-code measurement note at `player_view.py:240`).
+   WP1's data confirms or corrects; say so anytime if it's the
+   opposite (mutes starting early / clipping clean speech).
 3. **WP4 labels:** during the verification viewing, note 5–10 words by
    ear (late / early / clean) — those labels are the acceptance of
    record.

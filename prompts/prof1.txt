@@ -1,6 +1,8 @@
 Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
 `profanity_attack_plan.md` in the repo root — you own ONLY package WP1; do
-not do WP2/WP3 work. Headless/offscreen only, no live streams. Tests:
+not do WP2/WP3 work. Headless/offscreen only, no live streams (VOD is the
+user-reported miss path — the tone fixture + the measurement layer are
+the deliverables; keep the live/vod tag in the log lines anyway). Tests:
 `.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep console
 output brief; details to `prof1_report.md`.
 
