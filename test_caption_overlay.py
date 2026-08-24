@@ -694,13 +694,14 @@ check("ASS track stays on VLC (live)", not view._cap_on and fake.spu == 4)
 # theirs seconds after start, some never) — regression: 'off' was only
 # bound inside `if tracks:` and the click crashed with UnboundLocalError,
 # leaving captions unselectable on live TV
-menus = []
-view._popup_above = lambda menu, btn: menus.append(menu)
 fake.tracks = []
+view._ctl_panel.close_panel()
 view._subs_menu()
-labels = [a.text() for a in menus[-1].actions()]
+labels = [r.get("main") for r in view._ctl_panel.rows()
+          if not r.get("sep")]
 check("trackless stream still opens the CC menu",
       "Off" in labels and "Subtitle settings\u2026" in labels)
+view._ctl_panel.close_panel()
 fake.tracks = [(2, "Closed captions 1")]
 
 # VOD: the relay's parser flattens ASS to text — the overlay renders it

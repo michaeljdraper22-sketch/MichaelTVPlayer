@@ -126,17 +126,18 @@ def main():
 
     print("[8] menu contents")
     fake.tracks = [(1, "English"), (2, "Spanish")]
-    captured = []
-    view._popup_above = lambda menu, btn: captured.append(menu)
+    view._ctl_panel.close_panel()
     view._spu_want = 2
     view._refresh_spu_button()
     view._subs_menu()
-    labels = [a.text() for a in captured[-1].actions()]
+    rows = view._ctl_panel.rows()
+    labels = [r.get("main") for r in rows if not r.get("sep")]
     check("menu = Off + every track + settings",
-          labels == ["Off", "English", "Spanish", "",
+          labels == ["Off", "English", "Spanish",
                      "Subtitle settings\u2026"])
-    checked = [a.text() for a in captured[-1].actions() if a.isChecked()]
+    checked = [r.get("main") for r in rows if r.get("checked")]
     check("current track is checked", checked == ["Spanish"])
+    view._ctl_panel.close_panel()
 
     print("[9] settings visibility honours 'cc'")
     cfg.data["control_buttons"] = dict(cfg.control_buttons, cc=False)

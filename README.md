@@ -35,7 +35,7 @@ through a single VLC connection.
   run on ONE connection to your provider (works with 1-connection accounts).
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
-  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ♪ · ⤢ · ⏱ | 🔊 ▁▁▁`
+  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ≋ · ⤢ · ⏱ | 🔊 ▁▁▁`
   - The row **compacts automatically** in half/quarter-screen windows
     (tighter spacing → no separators → shorter volume bar), and **clicking
     anywhere on the volume bar jumps the volume there**.
@@ -89,7 +89,14 @@ through a single VLC connection.
     raise still lifts them out. Turn it off with **"Use the black bar
     below the video"** in Subtitle settings. VLC-rendered image tracks
     always render over the picture (they can't be moved at runtime).
-  - **Audio tracks** (double-note icon) — opens a **track picker card**
+  - **Popup cards, one style** — CC, audio, scale and speed all open the
+    same Stremio-style dark-glass picker card above their button,
+    wherever the window sits on screen (the cards live in the on-video
+    overlay and anchor to the button itself; the old QMenus mislanded
+    far to the right once the window was moved or snapped). **Clicking
+    the same button again closes its card**, Esc or a click outside
+    works too, and long lists (the speed ladder) scroll inside the card.
+  - **Audio tracks** (waveform icon) — opens the **track picker card**
     over the video (Stremio-style: dark glass panel, one row per
     language with a checkmark on the selection, Auto first with its
     "English when available" sub-label, dimmed loading state that

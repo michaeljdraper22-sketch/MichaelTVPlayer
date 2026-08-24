@@ -322,13 +322,6 @@ _OVERLAY_QSS = """
                                                   width: 16px; height: 16px;
                                                   margin: -6px 0;
                                                   border-radius: 8px; }
-QMenu#ctlMenu { background-color: rgba(178,190,181,242); color: #17181a;
-                border-radius: 8px; padding: 5px; }
-QMenu#ctlMenu::item { padding: 5px 24px; border-radius: 5px; }
-QMenu#ctlMenu::item:selected { background-color: rgba(0,0,0,45); }
-QMenu#ctlMenu::item:disabled { color: rgba(23,24,26,110); }
-QMenu#ctlMenu::separator { height: 1px; background: rgba(0,0,0,40);
-                           margin: 4px 8px; }
 """
 
 
@@ -663,17 +656,22 @@ class PlayerView(QtWidgets.QWidget):
         self._btn_showpanel.hide()
         self._btn_showpanel.clicked.connect(self.request_toggle_channels.emit)
 
-        # Stremio-style audio-track picker card (dark glass, checkmark on
-        # the selected row) — same stacking rules as the other overlays:
+        # Stremio-style picker card (dark glass, checkmark on the selected
+        # row) shared by EVERY control-bar popup — audio tracks, subtitles,
+        # scale and speed — same stacking rules as the other overlays:
         # child of the overlay window, above the native video HWND, no
-        # focus. Refreshed once a second while open (VOD track lists can
-        # arrive seconds into playback).
-        self._audio_panel = TrackPanel(self.overlay)
-        self._audio_panel.picked.connect(self._select_audio)
-        self._audio_panel.closed.connect(self._audio_panel_closed)
-        self._audio_panel_timer = QtCore.QTimer(self)
-        self._audio_panel_timer.setInterval(1000)
-        self._audio_panel_timer.timeout.connect(self._refresh_audio_panel)
+        # focus. The opener button toggles it (same button = close), a
+        # 1 s refresh keeps the audio list filling while VLC surfaces
+        # late track lists.
+        self._ctl_panel = TrackPanel(self.overlay)
+        self._ctl_panel.picked.connect(self._on_ctl_panel_picked)
+        self._ctl_panel.closed.connect(self._ctl_panel_closed)
+        self._ctl_panel_btn = None     # the button that opened the card
+        self._ctl_panel_pick = None    # row-click callback for that open
+        self._ctl_panel_refresh = None  # 1 s content refresher, if any
+        self._ctl_panel_timer = QtCore.QTimer(self)
+        self._ctl_panel_timer.setInterval(1000)
+        self._ctl_panel_timer.timeout.connect(self._on_ctl_panel_tick)
 
         # transparent on-video playback controls (bottom of the video)
         self.ctl = QtWidgets.QWidget(self.overlay)
@@ -3090,34 +3088,60 @@ class PlayerView(QtWidgets.QWidget):
         self._set_scrub_visible(self._scrub_on)
         self._layout_overlays()
 
-    # ---- popup menus (speed / scale) ----
-    def _ctl_menu(self):
-        m = QtWidgets.QMenu(self)
-        m.setObjectName("ctlMenu")
-        m.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
-        m.aboutToShow.connect(lambda: setattr(self, "_popup_open", True))
-        m.aboutToHide.connect(self._ctl_menu_closed)
-        return m
+    # ---- control-bar popup cards (speed / scale / audio / subtitles) ----
+    def _open_ctl_panel(self, btn, header, rows, on_pick, refresh=None):
+        """Toggle-aware card opener for the control-bar buttons: the SAME
+        button closes its card; a different button swaps the content (the
+        click-outside closer already guarantees one card at a time)."""
+        if self._closing:
+            return
+        if self._ctl_panel.isVisible():
+            same_button = self._ctl_panel_btn is btn
+            self._ctl_panel.close_panel()
+            if same_button:
+                return              # plain toggle close
+            # (close_panel's closed signal already cleared the opener
+            # refs — fall through and re-open for the NEW button)
+        self._ctl_panel_btn = btn
+        self._ctl_panel_pick = on_pick
+        self._ctl_panel_refresh = refresh
+        self._ctl_panel.set_rows(rows, header=header)
+        self._ctl_panel.popup(btn)
+        self._popup_open = True      # keep the controls on while picking
+        if refresh:
+            self._ctl_panel_timer.start()
 
-    def _ctl_menu_closed(self):
+    def _on_ctl_panel_picked(self, row):
+        cb = self._ctl_panel_pick
+        if cb is not None:
+            cb(row)
+
+    def _on_ctl_panel_tick(self):
+        if self._ctl_panel_refresh is not None:
+            self._ctl_panel_refresh()
+
+    def _ctl_panel_closed(self):
+        """Card hid (pick / click outside / Escape / toggle): resume the
+        normal control auto-hide cycle. (_ctl_panel_pick deliberately
+        survives — a row pick closes the card BEFORE its callback runs,
+        e.g. Subtitle settings opens its modal with the card already
+        gone.)"""
+        self._ctl_panel_timer.stop()
+        self._ctl_panel_btn = None
+        self._ctl_panel_refresh = None
         self._popup_open = False
-        self._wake()
-
-    def _popup_above(self, menu, btn):
-        hint = menu.sizeHint()
-        pos = btn.mapTo(self, QtCore.QPoint(0, -hint.height() - 6))
-        menu.popup(self.mapToGlobal(pos))
+        if not self._closing:
+            self._wake()
 
     def _speed_menu(self):
         if not self.btn_speed.isEnabled():
             return
-        m = self._ctl_menu()
-        for s in _SPEEDS:
-            a = m.addAction(f"{s:g}\u00d7")
-            a.setCheckable(True)
-            a.setChecked(abs(s - self._rate) < 1e-9)
-            a.triggered.connect(lambda *_, s=s: self._set_rate(s))
-        self._popup_above(m, self.btn_speed)
+        rows = [{"id": s, "main": f"{s:g}\u00d7",
+                 "checked": abs(s - self._rate) < 1e-9}
+                for s in _SPEEDS]
+        self._open_ctl_panel(
+            self.btn_speed, "SPEED", rows,
+            lambda row: self._set_rate(row["id"]))
 
     def _set_rate(self, rate):
         rate = max(0.125, min(5.0, float(rate)))
@@ -3133,15 +3157,14 @@ class PlayerView(QtWidgets.QWidget):
             f"Playback speed — {rate:g}\u00d7 (live rewind, movies & series)")
 
     def _scale_menu(self):
-        m = self._ctl_menu()
-        for mode, label in (("fit", "Fit (letterbox)"),
-                            ("stretch", "Stretch to fill"),
-                            ("crop", "Crop to fill")):
-            a = m.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(self._scale_mode == mode)
-            a.triggered.connect(lambda *_, mm=mode: self._set_scale_mode(mm))
-        self._popup_above(m, self.btn_scale)
+        rows = [{"id": mode, "main": label,
+                 "checked": self._scale_mode == mode}
+                for mode, label in (("fit", "Fit (letterbox)"),
+                                    ("stretch", "Stretch to fill"),
+                                    ("crop", "Crop to fill"))]
+        self._open_ctl_panel(
+            self.btn_scale, "VIDEO", rows,
+            lambda row: self._set_scale_mode(row["id"]))
 
     def _set_scale_mode(self, mode):
         self._scale_mode = mode
@@ -3864,33 +3887,36 @@ class PlayerView(QtWidgets.QWidget):
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
             tracks = []
-        m = self._ctl_menu()
         # "Off" is ALWAYS offered: live caption tracks surface seconds
         # after playback starts (and some channels never list VLC tracks
         # at all — the CC pipeline needs no track id), so a trackless
-        # menu must still open with Off + settings
-        off = m.addAction("Off")
-        off.setCheckable(True)
-        off.setChecked(self._spu_want == -1)
-        off.triggered.connect(lambda *_, t=-1, n="": self._select_spu(t, n))
+        # card must still open with Off + settings
+        rows = [{"id": -1, "name": "", "main": "Off",
+                 "checked": self._spu_want == -1}]
         for tid, name in tracks:
-            label = name or f"Track {tid}"
             kind = self._cap_track_kind(name)
             if kind == "bitmap":
-                label += "  (image \u2014 not adjustable)"
+                sub = "image \u2014 not adjustable"
             elif self._cap_eligible(name):
-                label += "  (text \u2014 adjustable)"
+                sub = "text \u2014 adjustable"
             elif kind == "ass":
-                label += "  (ASS \u2014 VLC rendering)"
-            a = m.addAction(label)
-            a.setCheckable(True)
-            a.setChecked(tid == self._spu_want)
-            a.triggered.connect(lambda *_, t=tid, n=name:
-                                self._select_spu(t, n))
-        m.addSeparator()
-        a = m.addAction("Subtitle settings\u2026")
-        a.triggered.connect(self._open_sub_settings)
-        self._popup_above(m, self.btn_cc)
+                sub = "ASS \u2014 VLC rendering"
+            else:
+                sub = ""
+            rows.append({"id": tid, "name": name, "main": name or
+                         f"Track {tid}", "sub": sub,
+                         "checked": tid == self._spu_want})
+        rows.append({"sep": True})
+        rows.append({"id": "settings", "main": "Subtitle settings\u2026"})
+        self._open_ctl_panel(
+            self.btn_cc, "SUBTITLES", rows, self._on_spu_row_picked)
+
+    def _on_spu_row_picked(self, row):
+        rid = row.get("id")
+        if rid == "settings":
+            self._open_sub_settings()
+        else:
+            self._select_spu(rid, row.get("name", "") or "")
 
     def _open_sub_settings(self):
         from .subtitle_dialog import SubtitleDialog
@@ -4150,23 +4176,19 @@ class PlayerView(QtWidgets.QWidget):
         self._flash_audio(nxt, names.get(nxt, ""))
 
     def _audio_menu(self):
-        """Note button: open the Stremio-style audio track picker card
-        above the button (kept name for compatibility — the old flat
-        QMenu lived here)."""
+        """Waveform button: opens (or toggles closed) the Stremio-style
+        audio track picker card above the button."""
         if self._closing:
             return
-        self._refresh_audio_panel()
-        if not self._audio_panel.isVisible():
-            self._audio_panel.popup(self.btn_audio)
-        self._popup_open = True      # keep the controls on while picking
-        self._audio_panel_timer.start()
+        self._open_ctl_panel(
+            self.btn_audio, "AUDIO", self._refresh_audio_rows(),
+            lambda row: self._select_audio(row["id"], row.get("name", "")),
+            refresh=self._refresh_audio_rows)
 
-    def _refresh_audio_panel(self):
-        """(Re)build the picker rows from the current track list — called
-        on open and once a second while open (track lists can arrive
-        seconds into playback)."""
-        if self._closing:
-            return
+    def _refresh_audio_rows(self) -> list:
+        """Rebuild the picker rows from the current track list — runs on
+        open and once a second while open (track lists can arrive seconds
+        into playback). Returns them for the opener."""
         try:
             tracks = self.vlc.audio_tracks()
         except Exception:  # noqa: BLE001
@@ -4193,7 +4215,9 @@ class PlayerView(QtWidgets.QWidget):
                 "id": "empty", "name": "", "main": "No audio tracks yet",
                 "sub": "this stream is still loading\u2026", "enabled": False,
             })
-        self._audio_panel.set_rows(rows)
+        if self._ctl_panel.isVisible():
+            self._ctl_panel.set_rows(rows, header="AUDIO")
+        return rows
 
     @staticmethod
     def _audio_row_label(name: str, tid) -> tuple:
@@ -4216,14 +4240,6 @@ class PlayerView(QtWidgets.QWidget):
             if tail and not tail.isdigit():
                 return tail, head.strip()
         return raw, ""
-
-    def _audio_panel_closed(self):
-        """Picker hid (pick / click outside / Escape): resume the normal
-        control auto-hide cycle."""
-        self._audio_panel_timer.stop()
-        self._popup_open = False
-        if not self._closing:
-            self._wake()
 
     def _flash_audio(self, track_id, name: str):
         """Brief on-video confirmation while cycling with the keyboard."""
@@ -4864,8 +4880,8 @@ class PlayerView(QtWidgets.QWidget):
             self.ctl.hide()
             self._dvr_status.hide()
             self.info_overlay.hide()
-            self._audio_panel_timer.stop()
-            self._audio_panel.close_panel()
+            self._ctl_panel_timer.stop()
+            self._ctl_panel.close_panel()
             self.overlay.hide()
             self.unsetCursor()
         except Exception:
@@ -4878,8 +4894,8 @@ class PlayerView(QtWidgets.QWidget):
     def keyPressEvent(self, event):
         key = event.key()
         if key == QtCore.Qt.Key_Escape \
-                and self._audio_panel.isVisible():
-            self._audio_panel.close_panel()
+                and self._ctl_panel.isVisible():
+            self._ctl_panel.close_panel()
         elif key == QtCore.Qt.Key_Space:
             self._toggle_pause()
         elif key == QtCore.Qt.Key_Left:

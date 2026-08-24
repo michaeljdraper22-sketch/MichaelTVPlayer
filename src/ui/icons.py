@@ -214,20 +214,20 @@ def cc(on):
     return _icon("cc" + ("on" if on else "off"), draw)
 
 
-# ---- audio tracks (beamed double note) ----
+# ---- audio tracks (soundwave bars) ----
 def audio():
-    """Audio track picker: two beamed eighth notes — deliberately NOT a
-    speaker, so it never reads as the mute/volume control beside it."""
+    """Audio track picker: five rounded soundwave bars — the modern
+    audio-track glyph (waveform), deliberately NOT a speaker, so it never
+    reads as the mute/volume control beside it."""
     def draw(p, c):
-        _pen(p, c, 2.2)
-        p.drawLine(_F(8.2, 6.2), _F(8.2, 16.6))
-        p.drawLine(_F(16.2, 4.6), _F(16.2, 15.0))
-        _pen(p, c, 2.8)
-        p.drawLine(_F(8.2, 6.2), _F(16.2, 4.6))
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(c)
-        p.drawEllipse(QtCore.QRectF(5.0, 15.2, 6.4, 4.6))
-        p.drawEllipse(QtCore.QRectF(13.0, 13.6, 6.4, 4.6))
+        # own waveform pattern: short-tall-medium-medium-short, centered
+        # on the 24px grid, bars drawn with the house round-cap pen
+        heights = (7.0, 12.6, 17.8, 10.8, 5.4)
+        _pen(p, c, 2.5)
+        for i, h in enumerate(heights):
+            x = 4.2 + i * 3.9
+            y0 = 12.0 - h / 2.0
+            p.drawLine(_F(x, y0), _F(x, y0 + h))
     return _icon("audio", draw)
 
 # ---- video scaling (two arrows stretching diagonally apart) ----

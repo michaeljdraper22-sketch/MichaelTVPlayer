@@ -134,13 +134,14 @@ def main():
     view.vlc.set_spu = fake.set_spu
     view.vlc.set_spu_delay = fake.set_spu_delay
     view._refresh_spu_button()
-    captured = []
-    view._popup_above = lambda menu, btn: captured.append(menu)
+    view._ctl_panel.close_panel()
     view._subs_menu()
-    labels = [a.text() for a in captured[-1].actions()]
+    labels = [r.get("main") for r in view._ctl_panel.rows()
+              if not r.get("sep")]
     check("menu = Off + track + settings entry",
           "Off" in labels and "English" in labels
           and "Subtitle settings\u2026" in labels)
+    view._ctl_panel.close_panel()
     view._apply_sub_delay(250)
     check("view routes the live delay to the player",
           fake.delay_calls == [250])

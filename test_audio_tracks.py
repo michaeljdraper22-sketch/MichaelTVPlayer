@@ -9,10 +9,10 @@ import sys
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5 import QtWidgets  # noqa: E402
+from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from src.config import BUTTON_KEYS, Config  # noqa: E402
-from src.ui.player_view import PlayerView  # noqa: E402
+from src.ui.player_view import PlayerView, _SPEEDS  # noqa: E402
 
 PASS = []
 FAIL = []
@@ -138,7 +138,7 @@ def main():
     fake.active = 1
     reset_pick(view)
     view._audio_menu()
-    rows = view._audio_panel.rows()
+    rows = view._ctl_panel.rows()
     check("panel = Auto + English-first tracks",
           [r["main"] for r in rows] == ["Auto", "English", "Spanish"])
     check("Auto carries its English-when-available sub-label",
@@ -146,20 +146,20 @@ def main():
     check("Auto checked in auto mode (active track not checked)",
           [r["id"] for r in rows if r["checked"]] == [None])
     check("picker open keeps the controls on (_popup_open)",
-          view._popup_open and view._audio_panel.isVisible())
-    view._audio_panel.close_panel()
+          view._popup_open and view._ctl_panel.isVisible())
+    view._ctl_panel.close_panel()
     check("closing restores the auto-hide cycle + stops the refresh timer",
-          not view._popup_open and not view._audio_panel_timer.isActive())
+          not view._popup_open and not view._ctl_panel_timer.isActive())
 
     print("[8b] picked-mode checkmark + pick through the panel")
     view._select_audio(1, "Track 1 - [Spanish]")
     view._audio_menu()
-    rows = view._audio_panel.rows()
+    rows = view._ctl_panel.rows()
     check("the pick itself carries the only checkmark",
           [r["id"] for r in rows if r["checked"]] == [1])
     row2 = None
-    for i in range(view._audio_panel._host.count()):
-        w = view._audio_panel._host.itemAt(i).widget()
+    for i in range(view._ctl_panel._lay.count()):
+        w = view._ctl_panel._lay.itemAt(i).widget()
         if getattr(w, "_track_id", None) == 2:
             row2 = w
     check("track rows exist as clickable widgets", row2 is not None)
@@ -168,8 +168,8 @@ def main():
     check("row click routes into _select_audio",
           view._audio_want == 2 and fake.active == 2)
     check("panel hid itself after the pick",
-          not view._audio_panel.isVisible() and not view._popup_open)
-    view._audio_panel.close_panel()
+          not view._ctl_panel.isVisible() and not view._popup_open)
+    view._ctl_panel.close_panel()
     reset_pick(view)
 
     print("[8c] raw track names cleaned for the rows")
@@ -184,20 +184,78 @@ def main():
     check("empty name falls back to Track N",
           lbl("", 5) == ("Track 5", ""))
 
+    print("[8d] the SAME button toggles the card closed (click-outside "
+          "press on the opener is ignored)")
+    view._audio_menu()
+    check("first click opens", view._ctl_panel.isVisible()
+          and view._ctl_panel_btn is view.btn_audio)
+    # a press ON the opener button must NOT be treated as click-outside
+    # (its click toggles); synthesize one and deliver it through the app
+    gp = view.btn_audio.mapToGlobal(QtCore.QPoint(3, 3))
+    ev = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                           QtCore.QPointF(3, 3), QtCore.QPointF(gp),
+                           QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                           QtCore.Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(view.btn_audio, ev)
+    check("press on the opener leaves the card open",
+          view._ctl_panel.isVisible())
+    view._audio_menu()                      # the button's own click
+    check("second click on the same button closes the card",
+          not view._ctl_panel.isVisible() and not view._popup_open)
+    # a press elsewhere (another button) still closes it
+    view._audio_menu()
+    gp2 = view.btn_cc.mapToGlobal(QtCore.QPoint(3, 3))
+    ev2 = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                            QtCore.QPointF(3, 3), QtCore.QPointF(gp2),
+                            QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                            QtCore.Qt.NoModifier)
+    QtWidgets.QApplication.sendEvent(view.btn_cc, ev2)
+    check("press outside (not the opener) closes the card",
+          not view._ctl_panel.isVisible())
+    reset_pick(view)
+
+    print("[8e] scale + speed popups are cards too")
+    view._scale_menu()
+    rows = view._ctl_panel.rows()
+    check("scale card = fit/stretch/crop with the current one checked",
+          [r["id"] for r in rows] == ["fit", "stretch", "crop"]
+          and [r["id"] for r in rows if r["checked"]] == ["fit"])
+    view._ctl_panel.close_panel()
+    view.btn_speed.setEnabled(True)
+    view._sync_transport = lambda *a, **k: None
+    view._mode = "chase"   # _set_rate keeps the value only in chase/VOD
+    view._scale_menu()     # open something first so the toggle path covers
+    view._speed_menu()      # a DIFFERENT button swapping content
+    rows = view._ctl_panel.rows()
+    check("speed card lists the ladder with the current rate checked",
+          [r["main"] for r in rows] == [f"{s:g}\u00d7" for s in _SPEEDS]
+          and [r["main"] for r in rows if r["checked"]] == ["1\u00d7"])
+    check("speed card caps its height (scrolls, not past the video)",
+          view._ctl_panel.height() <= 400)
+    row_x = None
+    for i in range(view._ctl_panel._lay.count()):
+        w = view._ctl_panel._lay.itemAt(i).widget()
+        if getattr(w, "_track_id", None) == 2.0:
+            row_x = w
+    if row_x is not None:
+        row_x.triggered.emit()
+    check("speed pick routes into _set_rate", abs(view._rate - 2.0) < 1e-9)
+    view._ctl_panel.close_panel()
+
     print("[9] empty-track panel still opens with Auto")
     fake.tracks = []
     view._audio_menu()
-    rows = view._audio_panel.rows()
+    rows = view._ctl_panel.rows()
     check("panel = Auto + dim note",
           [r["main"] for r in rows] == ["Auto", "No audio tracks yet"])
     check("note row disabled (not pickable)",
           rows[-1].get("enabled") is False)
     fake.tracks = [(2, "English")]            # arrive late, as VOD rips do
-    view._refresh_audio_panel()
+    view._refresh_audio_rows()
     check("the 1 s refresh fills the list the moment tracks arrive",
-          [r["main"] for r in view._audio_panel.rows()]
+          [r["main"] for r in view._ctl_panel.rows()]
           == ["Auto", "English"])
-    view._audio_panel.close_panel()
+    view._ctl_panel.close_panel()
 
     print("[10] settings visibility honours 'audio'")
     cfg.data["control_buttons"] = dict(cfg.control_buttons, audio=False)
