@@ -22,10 +22,10 @@ class BaseBrowser(QtWidgets.QWidget):
     media_activated = QtCore.pyqtSignal(dict)
     favorite_changed = QtCore.pyqtSignal()
     RECENT_LABEL = "★ Recently Played"
-    # Libraries with tens of thousands of items (Movies / Series): open in
-    # the first CATEGORY, not "All" — the full list is a multi-MB download
-    # that can take minutes and looks like nothing is happening.
-    default_all = True
+    # Every browser opens on "All".  Movies / Series set ``big_library``
+    # because their full list is a multi-MB download that can take a while —
+    # those show a "big list" hint while it loads.
+    big_library = False
     country_prefix = None      # None = no country filtering
 
     def __init__(self, config, client, kind):
@@ -111,7 +111,7 @@ class BaseBrowser(QtWidgets.QWidget):
                 [r for r in self.config.recents if r.get("kind") == self.kind]
             )
             return
-        if key in (None, "all") and not self.default_all:
+        if key in (None, "all") and self.big_library:
             self.status.setText(
                 "Loading the full library… (big list — can take a minute)")
         else:
@@ -161,11 +161,9 @@ class BaseBrowser(QtWidgets.QWidget):
             cid = cat.get("category_id")
             name = cat.get("category_name", str(cid))
             self.cat_combo.addItem(name, cid)
-        # Default selection: "All" for Live, but the FIRST CATEGORY for the
-        # huge libraries (Movies / Series) — see ``default_all``. "All"
-        # stays available in the dropdown for power users.
-        idx = 1 if self.default_all or self.cat_combo.count() <= 2 else 2
-        self.cat_combo.setCurrentIndex(idx)
+        # Default selection: always "All" (index 1, right after the
+        # Recently Played entry) for Live, Movies and Series alike.
+        self.cat_combo.setCurrentIndex(1)
         self.cat_combo.blockSignals(False)
         # Always reload explicitly: if the index was already on "All" the
         # currentIndexChanged signal never fires and the list would stay stale
@@ -287,8 +285,9 @@ class LiveBrowser(BaseBrowser):
 
 
 class VodBrowser(BaseBrowser):
-    # Movie libraries can hold 100k+ items — open in the first category.
-    default_all = False
+    # Movie libraries can hold 100k+ items — the "All" fetch is slow, so it
+    # gets a long timeout and the "big list" loading hint.
+    big_library = True
     country_prefix = "vod_"
 
     def fetch_categories(self):
@@ -319,8 +318,9 @@ class VodBrowser(BaseBrowser):
 
 
 class SeriesBrowser(BaseBrowser):
-    # Series libraries can be as huge as the movie one — first category.
-    default_all = False
+    # Series libraries can be as huge as the movie one — long timeout and
+    # "big list" hint for the "All" fetch.
+    big_library = True
     country_prefix = "series_"
 
     def fetch_categories(self):

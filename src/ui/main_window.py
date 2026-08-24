@@ -602,9 +602,11 @@ class MainWindow(QtWidgets.QMainWindow):
         geo = self.config.window_geometry
         if isinstance(geo, list) and len(geo) == 4:
             self.setGeometry(*geo)
-        state = self.config.window_state
-        if state == "maximized":
-            self.showMaximized()
+        # Always open full-window.  Restoring the remembered geometry alone
+        # made the app launch into a half-screen snap from an earlier
+        # session; the geometry above is still applied first so restore-down
+        # returns to the last windowed size/position.
+        self.showMaximized()
         self.splitter.setSizes(self.config.splitter_sizes or [460, 880])
         idx = self.config.last_tab
         if 0 <= idx < self.tabs.count():
