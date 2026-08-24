@@ -79,11 +79,12 @@ through a single VLC connection.
     concrete 40 px; set 0 for Auto (scales with the video height).
   - **Audio tracks** (double-note icon) — programs carried in several
     languages list their dubs here; **English is the default**: a stream
-    with an English track selects it automatically, streams without one
-    keep the provider's own audio (audio is never muted by the picker).
-    **A** cycles Auto (English) → tracks, the button opens the menu, and
-    a manual pick is sticky by name across channel changes. Streams with
-    a single audio track simply show one entry.
+    with an English track selects it automatically (the moment the
+    player has parsed the track list — a few seconds into a movie's
+    load), streams without one keep the provider's own audio (audio is
+    never muted by the picker). **A** cycles Auto (English) → tracks,
+    the button opens the menu, and a manual pick lasts for the current
+    program only — every new program starts back at Auto/English.
   - **Playback speed** (speedometer; live rewind, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.

@@ -175,6 +175,22 @@ def main():
     view._tick()
     check("tick re-asserted the user pick", fake.active == 2)
 
+    print("[11b] picks are PER-PROGRAM: play_media resets to Auto")
+    view._select_audio(1, "Spanish")   # a wrong pick made while exploring
+    check("pick applied before the reset", view._audio_name == "Spanish")
+    view._attach_done = True
+    view._closing = False
+    played = []
+    view.vlc.play = lambda *a, **k: played.append(a)
+    view._engage_chase = lambda: None
+    view._on_media_for_profanity = lambda kind: None
+    view.play_media({"kind": "vod", "url": "http://x/v.mkv",
+                     "title": "t"}, start_at=0.0)
+    check("next program starts at Auto (pick cleared)",
+          view._audio_name == "" and view._audio_want is None
+          and view._audio_auto_tid is None)
+    check("playback was started", bool(played))
+
     print("[12] teardown safety")
     view._closing = True
     fake.set_calls.clear()

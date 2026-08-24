@@ -488,7 +488,9 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
         # audio tracks (mirror of the spu stack). _audio_name empty = AUTO
         # mode: no user pick — English is preferred by default; a non-empty
-        # name is a sticky user pick, re-matched like the subtitle one.
+        # name is the CURRENT program's pick, re-matched on player swaps
+        # and cleared by play_media (picks are per-program — every show
+        # starts at Auto/English).
         self._audio_want = None       # DESIRED audio track id (None = auto)
         self._audio_name = ""         # the pick's name ("" = auto mode)
         self._audio_ui = None         # (sticky, label, n) last painted tooltip
@@ -1199,6 +1201,16 @@ class PlayerView(QtWidgets.QWidget):
         self._video_wh = (0, 0)   # next media's size is unknown until the
                                   # tick polls it (captions re-anchor then)
         self._live_paused = False
+        # Audio track picks are PER-PROGRAM: every load starts at Auto
+        # (English default). Unlike subtitles, a manual pick must never
+        # follow the user into the next program — this provider's rips
+        # share identical track names across the catalog, so a sticky
+        # pick would re-select the same language on every later show
+        # (the pick still survives player swaps and chase reopens within
+        # THIS program via _enforce_audio's name re-match).
+        self._audio_want = None
+        self._audio_name = ""
+        self._audio_auto_tid = None
         self._set_rate(1.0)
         self._update_control_state()
         self._apply_scale()
@@ -3975,8 +3987,11 @@ class PlayerView(QtWidgets.QWidget):
               the current track's name doesn't word-match English and the
               stream HAS an English track, switch to it. Streams without
               one keep VLC's own selection — audio is never disabled.
-        pick  (menu / A-key choice): sticky by NAME across channels like
-              the subtitle choice; when the name is gone entirely the
+        pick  (menu / A-key choice): re-matched by NAME across player
+              swaps and chase reopens within THIS program; play_media
+              clears the pick, so every program starts at Auto/English
+              (a wrong pick must never follow the user into the next
+              show). If the name vanishes entirely mid-program the
               selector falls back to auto mode (never silence)."""
         if self._closing:
             return
