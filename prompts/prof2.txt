@@ -1,0 +1,22 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`profanity_attack_plan.md` — you own ONLY package WP2; WP1 is merged.
+Headless/offscreen only. Tests:
+`.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep console
+output brief; details to `prof2_report.md`.
+
+1. Replace char-share word timing in `windows_from_cues`
+   (src/profanity.py) with syllable-weighted timing (vowel clusters ≈
+   spoken duration; digits/punctuation fall back to char share) —
+   deterministic, pure, unit-tested.
+2. Duration-adaptive asymmetric pads (pad_before = a + b·cue_dur,
+   pad_after = c + d·cue_dur) with constants fit from WP1's measured
+   distribution in prof1_report.md — target zero leaks at p95,
+   over-mute p95 ≤ ~1 s. Defaults into src/config.py; the user's manual
+   pad settings still override.
+3. Absorb `_VOD_MUTE_LEAD_S` into the model and delete the constant,
+   leaving a comment pointing at the WP1 numbers.
+4. Acceptance: the WP1 fixture suite red→green (temporarily revert the
+   estimator to prove red), leak and over-mute numbers from the WP1
+   corpus in the report, all offline suites green.
+
+`prof2_report.md` with the fitted constants and their measured effect.

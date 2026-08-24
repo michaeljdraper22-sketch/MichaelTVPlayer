@@ -1,0 +1,27 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`profanity_attack_plan.md` in the repo root — you own ONLY package WP1; do
+not do WP2/WP3 work. Headless/offscreen only, no live streams. Tests:
+`.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep console
+output brief; details to `prof1_report.md`.
+
+Build the measurement layer the rest of the plan depends on:
+
+1. Per-mute timing log in `src/profanity.py` + `player_view.py` wiring
+   (fields per the plan's WP1.1, written to
+   %APPDATA%\MichaelTVPlayer\prof_timing.log, one line per window
+   open/close, live/vod path tag).
+2. Probe `audio_get_delay()` once per mute in `src/player.py`, degrade
+   gracefully if unavailable.
+3. NEW `test_profanity_timing.py`: ffmpeg tone-burst fixtures (300 ms
+   tone at a KNOWN instant + embedded text cue with a bad word at a
+   known char offset; sweep cue lengths 1–6 s × word positions
+   start/middle/end; build via `profanity.find_ffmpeg()`, skip with a
+   note if absent) played through the REAL VodRelay + VLC + engine
+   offscreen — assert when `set_filter_mute(True)` fires vs the tone's
+   known instant. The suite MUST show today's ~0.5–1 s miss — record it,
+   that is the fail-before.
+4. Run `test_profanity.py` + `test_caption_overlay.py`, zero
+   regressions.
+
+`prof1_report.md`: error decomposition table, fixture design, the
+fail-today numbers.

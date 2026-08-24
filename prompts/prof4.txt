@@ -1,0 +1,21 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`profanity_attack_plan.md` — you own ONLY package WP4; all prior
+packages merged. Tests:
+`.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep console
+output brief; details to `prof4_report.md`.
+
+1. After the USER's labeled viewing session (their 5–10 ear-labeled
+   words per path: late / early / clean), correlate the labels against
+   %APPDATA%\MichaelTVPlayer\prof_timing.log — ≥90% of labeled words
+   fully covered and zero audible leaks is the pass bar.
+2. All offline suites + the timing fixture suite green; commit the
+   package.
+3. Rebuild dist\MichaelTV.exe
+   (.venv\Scripts\pyinstaller --noconfirm --workpath build_pyinstaller
+   --distpath dist MichaelTVPlayer.spec, then
+   MSYS_NO_PATHCONV=1 robocopy vlc dist\vlc /E), verify the vendor
+   payload with pyi-archive_viewer -l, smoke-launch the exe minimized
+   (never focused, no audio), confirm alive via a fresh line in
+   %APPDATA%\MichaelTVPlayer\player.log, then close it.
+
+`prof4_report.md`: per-word label table + verdict.

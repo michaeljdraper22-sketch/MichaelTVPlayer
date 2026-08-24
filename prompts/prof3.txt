@@ -1,0 +1,21 @@
+Work in D:\Coding\MichaelTVPlayer (Python/PyQt5 IPTV player). FIRST read
+`profanity_attack_plan.md` — you own ONLY package WP3; WP1/WP2 merged.
+Tests: `.venv\Scripts\python.exe -X utf8 <test>.py` (no pytest). Keep
+console output brief; details to `prof3_report.md`.
+
+1. Record decision D1 or D2 (plan §WP3.1) with the WP1 evidence BEFORE
+   implementing: either delete the dead `lead_ms` knob entirely (anchor
+   already places windows at speech time) or wire it live with a
+   measured default (anchor places windows at caption-broadcast time).
+2. Implement the rebase-safe mute guard: extend-don't-truncate across
+   `shift_windows` when a window is open at shift time (a shift landing
+   mid-mute must never un-mute). Add the forced-rebase-mid-word
+   adversarial scenario, mutation-proof it (disable the guard → the
+   scenario fails).
+3. Size live pads from WP1's live distribution (roll-up cues carry more
+   uncertainty than VOD).
+4. One live sample with the timing log on (main session, ONE provider
+   connection, every playback muted + offscreen + never focused)
+   confirming the log records the fix.
+
+`prof3_report.md`: the D1/D2 decision + evidence + scenario output.
