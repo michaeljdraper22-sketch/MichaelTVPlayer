@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """Offscreen test: on-video controls must NEVER surface above other apps.
 
-The overlay window is ToolTip-style (Windows paints it above everything),
-so while the app is backgrounded (_overlay_suppressed, set by
-_on_focus_changed) no wake path may show it — cursor over the app's
-exposed area behind Chrome, DVR pill ticks, or info banners.
+The overlay window is an owned Qt.Tool top-level (stays above its owner,
+sinks below other apps' windows — see _OVERLAY_WIN_FLAGS), so while the
+app is backgrounded (_overlay_suppressed, set by _on_focus_changed) no
+wake path may show it: cursor over the app's exposed area behind Chrome,
+DVR pill ticks, or info banners.
 
 Run:  .venv\\Scripts\\python.exe test_overlay_focus.py
 """

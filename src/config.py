@@ -7,13 +7,15 @@ from pathlib import Path
 
 APP_NAME = "MichaelTVPlayer"
 
-# Subtitle appearance. Defaults reproduce VLC's own rendering exactly —
-# every value maps 1:1 onto a libvlc option (see player.subtitle_instance_args)
-# so an untouched config emits NO extra VLC arguments at all.
+# Subtitle appearance. Values map 1:1 onto a libvlc option (see
+# player.subtitle_instance_args) so an untouched config emits NO extra VLC
+# arguments at all — except prefer_bar, which steers the APP-rendered
+# overlay's placement (VLC-rendered tracks can't be moved at runtime).
 SUBTITLE_KEYS = (
     "delay_ms", "font", "size", "pos_pct", "text_color",
     "bg_enabled", "bg_color", "bg_opacity",
     "outline_enabled", "outline_color", "outline_thickness",
+    "prefer_bar",
 )
 SUBTITLE_DEFAULTS = {
     "delay_ms": 0,            # + shows subtitles LATER, − earlier (applied live)
@@ -27,6 +29,7 @@ SUBTITLE_DEFAULTS = {
     "outline_enabled": True,  # VLC's default look has a black outline
     "outline_color": "#000000",
     "outline_thickness": 4,   # VLC units, default 4 ("normal")
+    "prefer_bar": True,       # windowed letterbox: park subs in the black bar
 }
 
 # Profanity filter. Off by default (opt-in). Words are stored as a flat
@@ -39,6 +42,7 @@ PROFANITY_DEFAULTS = {
     "pad_after_ms": 250,        # mute ends N ms after the word
     "sync_ms": 0,               # + mute later, − mute earlier (track drift)
     "lead_ms": 1500,            # captions lag speech: mute EARLIER by this
+    "whole_cue": False,         # True = mute the whole line, not just the word
 }
 
 DEFAULTS = {
@@ -385,7 +389,7 @@ class Config:
         stored = self.data.get("profanity") or {}
         merged = dict(PROFANITY_DEFAULTS)
         for key in ("enabled", "pad_before_ms", "pad_after_ms", "sync_ms",
-                    "lead_ms"):
+                    "lead_ms", "whole_cue"):
             if key in stored:
                 merged[key] = stored[key]
         words = stored.get("words")
@@ -412,6 +416,7 @@ class Config:
                                            int(v.get("sync_ms", 0))))
         clean["lead_ms"] = max(0, min(10000,
                                       int(v.get("lead_ms", 1500))))
+        clean["whole_cue"] = bool(v.get("whole_cue", False))
         words = v.get("words")
         clean["words"] = []
         if isinstance(words, list):

@@ -202,6 +202,9 @@ class CaptionOverlay(QtWidgets.QWidget):
         self._preview = ""       # sample line while the settings dialog
         #                          is open (see set_preview)
         self._bottom_inset = 24      # px above the picture bottom (controls)
+        self._bar_top = None     # px from the widget top where the bottom
+        #                          letterbox bar starts — None parks the
+        #                          text over the picture (historic mode)
         self.hide()
 
     # ---- data ----
@@ -233,6 +236,16 @@ class CaptionOverlay(QtWidgets.QWidget):
             self._bottom_inset = px
             self.update()
 
+    def set_bar_top(self, px):
+        """Y (widget px) where the bottom letterbox bar starts — the
+        windowed pro-player placement parks the text inside that bar.
+        None = anchor over the picture bottom (fullscreen / no bar /
+        crop/stretch / the bar is too shallow)."""
+        px = None if px is None else max(0, int(px))
+        if px != self._bar_top:
+            self._bar_top = px
+            self.update()
+
     # ---- painting ----
     def paintEvent(self, _event):
         lines = self._lines or ([self._preview] if self._preview else [])
@@ -258,12 +271,28 @@ class CaptionOverlay(QtWidgets.QWidget):
 
         # geometry: stack bottom-up above (inset + position raise)
         pos = int(ap.get("pos_pct", 0) or 0)
-        bottom = self._bottom_inset + int(h * 0.04) \
-            + int((pos / 100.0) * h * 0.5)
-        bottom = min(bottom, int(h * 0.9))
         line_h = fm.height()
         block_h = line_h * len(wrapped)
-        y = h - bottom - block_h
+        if self._bar_top is not None:
+            # windowed letterbox: park the block inside the bottom black
+            # bar — vertically centered when it fits, a small margin off
+            # the window bottom otherwise (overflowing a shallow bar
+            # slightly BEATS sliding the text fully above it) — still
+            # clearing the control bar and honoring a manual raise
+            bar_h = h - self._bar_top
+            margin = max(4, int(h * 0.008))
+            y = self._bar_top + (bar_h - block_h) // 2
+            if y + block_h > h - margin:
+                y = h - margin - block_h
+            if self._bottom_inset:
+                y = min(y, h - self._bottom_inset - block_h)
+            if pos:
+                y -= int((pos / 100.0) * h * 0.5)
+        else:
+            bottom = self._bottom_inset + int(h * 0.04) \
+                + int((pos / 100.0) * h * 0.5)
+            bottom = min(bottom, int(h * 0.9))
+            y = h - bottom - block_h
         if y < int(h * 0.02):
             y = int(h * 0.02)
 

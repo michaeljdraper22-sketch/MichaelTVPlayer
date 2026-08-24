@@ -14,7 +14,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5 import QtCore, QtWidgets  # noqa: E402
 
-from src.config import Config  # noqa: E402
+from src.config import Config, PROFANITY_DEFAULTS  # noqa: E402
 from src.player import VLCPlayer  # noqa: E402
 from src.profanity import (DEFAULT_WORDS, SrtParser, find_matches,  # noqa: E402
                            mask_text, merge_windows, windows_from_cues)
@@ -160,6 +160,33 @@ def main():
     eng3.evaluate(12.5)
     check("unmuted after the shifted window", fp2.calls[-1] is False)
 
+    print("[5c] whole-cue mode: mute the whole line while the word shows")
+    w_word = windows_from_cues([(10.0, 20.0, "one damn dogs")],
+                               [("damn", "exact")])
+    w_line = windows_from_cues([(10.0, 20.0, "one damn dogs")],
+                               [("damn", "exact")], whole_cue=True)
+    check("default (mode off) keeps word-granularity windows",
+          abs(w_word[0][0] - (10 + 4 / 13 * 10)) < 0.01)
+    check("whole_cue covers the entire cue", w_line == [(10.0, 20.0)])
+    check("whole_cue ignores clean cues",
+          windows_from_cues([(1.0, 2.0, "a clean line")],
+                            [("damn", "exact")], whole_cue=True) == [])
+    fp3 = FakePlayer()
+    eng4 = ProfanityEngine(fp3)
+    eng4.enabled = True
+    eng4.words = [("hell", "exact")]
+    eng4.whole_cue = True
+    eng4.add_cue(10.0, 12.0, "what the hell is this", lead_s=0.0)
+    check("engine whole-cue window = the full cue",
+          eng4.windows == [(10.0, 12.0)])
+    eng4.evaluate(10.05)
+    check("muted right at cue start (the word itself is far later)",
+          fp3.calls[-1] is True)
+    eng4.evaluate(11.95)
+    check("still muted near the cue end", fp3.calls[-1] is True)
+    eng4.evaluate(12.3)
+    check("unmuted once the cue leaves the screen", fp3.calls[-1] is False)
+
     print("[6] VLCPlayer: filter mute layers under the user's mute")
     vp = VLCPlayer(timeshift=False)
     vp.set_filter_mute(True)
@@ -205,8 +232,10 @@ def main():
     pv_mod.find_ccextractor = lambda: "C:/fake/ccx.exe"
 
     cfg.data["chase_delay"] = 5
-    cfg.profanity = {"enabled": True}
+    cfg.profanity = {"enabled": True, "whole_cue": True}
     view._apply_profanity_config()
+    check("view propagates the whole-cue mode to the engine",
+          view._filter_engine.whole_cue is True)
     view.current = {"kind": "vod", "url": "http://x/m.mkv", "title": "M"}
     view._on_media_for_profanity("vod")
     check("VOD does not engage the live filter", CCStarts == [])
@@ -350,6 +379,51 @@ def main():
     dlg2.accept()
     check("restore defaults works",
           [w[0] for w in cfg2.profanity["words"]]
+          == [w[0] for w in DEFAULT_WORDS])
+
+    print("[8b] whole-line checkbox + reset ALL settings")
+    cfg3 = temp_config()
+    dlg3 = ProfanityDialog(cfg3, lambda: None)
+    check("whole-line checkbox defaults OFF (opt-in)",
+          not dlg3.ck_whole.isChecked())
+    dlg3.ck_on.setChecked(True)
+    dlg3.ck_whole.setChecked(True)
+    dlg3.accept()
+    prof3 = cfg3.profanity
+    check("whole-line preference persists", prof3["whole_cue"] is True)
+    check("config getter carries the key from defaults",
+          cfg3.profanity.get("whole_cue") is True)
+
+    # wreck every setting, then Reset all settings -> factory restore
+    dlg3 = ProfanityDialog(cfg3, lambda: None)
+    dlg3.sp_before.setValue(2000)
+    dlg3.sp_after.setValue(1500)
+    dlg3.sp_lead.setValue(0)
+    dlg3.sp_sync.setValue(-3000)
+    dlg3.ck_whole.setChecked(False)
+    dlg3._add_row("zzz", "partial")
+    dlg3._reset_all()
+    check("reset-all restores the enable state",
+          dlg3.ck_on.isChecked() is PROFANITY_DEFAULTS["enabled"])
+    check("reset-all restores the timing spinners",
+          dlg3.sp_before.value() == PROFANITY_DEFAULTS["pad_before_ms"]
+          and dlg3.sp_after.value() == PROFANITY_DEFAULTS["pad_after_ms"]
+          and dlg3.sp_lead.value() == PROFANITY_DEFAULTS["lead_ms"]
+          and dlg3.sp_sync.value() == PROFANITY_DEFAULTS["sync_ms"])
+    check("reset-all restores the whole-line checkbox",
+          dlg3.ck_whole.isChecked() is PROFANITY_DEFAULTS["whole_cue"])
+    check("reset-all restores the word table",
+          dlg3.table.rowCount() == len(DEFAULT_WORDS)
+          and not any(dlg3.table.item(r, 0).text() == "zzz"
+                      for r in range(dlg3.table.rowCount())))
+    dlg3.accept()
+    prof3 = cfg3.profanity
+    check("reset-all persists the factory set on save",
+          prof3["pad_before_ms"] == PROFANITY_DEFAULTS["pad_before_ms"]
+          and prof3["sync_ms"] == PROFANITY_DEFAULTS["sync_ms"]
+          and prof3["lead_ms"] == PROFANITY_DEFAULTS["lead_ms"]
+          and prof3["whole_cue"] is False
+          and [w[0] for w in prof3["words"]]
           == [w[0] for w in DEFAULT_WORDS])
 
     print()

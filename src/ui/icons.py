@@ -328,3 +328,10 @@ def download():
         _polyline(p, c, [(7.9, 9.5), (12.0, 13.6), (16.1, 9.5)])
         _polyline(p, c, [(4.7, 16.6), (4.7, 19.4), (19.3, 19.4), (19.3, 16.6)])
     return _icon("download", draw)
+
+
+def check():
+    """Checkmark — the selected row marker in the track picker panel."""
+    def draw(p, c):
+        _polyline(p, c, [(5.4, 12.6), (10.1, 17.2), (18.8, 7.4)], 2.6)
+    return _icon("check", draw)

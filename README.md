@@ -40,7 +40,11 @@ through a single VLC connection.
     (tighter spacing → no separators → shorter volume bar), and **clicking
     anywhere on the volume bar jumps the volume there**.
   - The controls (and the cursor) **appear when a stream starts / changes or
-    the mouse moves**, and **hide after 4 s of no movement**.
+    the mouse moves**, and **hide after 4 s of no movement**. The whole
+    on-video layer (controls, captions, notes) is an owned helper window:
+    it floats above the player but **sinks below other applications'
+    windows and the taskbar** — with the player in the background
+    nothing of it ever paints over your other apps.
   - **Subtitles (CC)** — text subtitles render through the app's own
     overlay: live-TV **closed captions** (read from the always-on DVR
     buffer) and the embedded text tracks of movies & series (SRT, plus
@@ -77,13 +81,27 @@ through a single VLC connection.
     (movies resume where they were; live
     restarts at the edge, the DVR buffer with it). Size defaults to a
     concrete 40 px; set 0 for Auto (scales with the video height).
-  - **Audio tracks** (double-note icon) — programs carried in several
-    languages list their dubs here; **English is the default**: a stream
+  - **Subtitles park in the black bar** (windowed playback) — when the
+    video letterboxes with empty black space below the picture, the
+    captions sit inside that bar (centered in it, like a pro player)
+    instead of over the picture's bottom edge; fullscreen keeps the
+    classic over-the-video placement, and a manual vertical-position
+    raise still lifts them out. Turn it off with **"Use the black bar
+    below the video"** in Subtitle settings. VLC-rendered image tracks
+    always render over the picture (they can't be moved at runtime).
+  - **Audio tracks** (double-note icon) — opens a **track picker card**
+    over the video (Stremio-style: dark glass panel, one row per
+    language with a checkmark on the selection, Auto first with its
+    "English when available" sub-label, dimmed loading state that
+    fills itself the moment the track list arrives). Programs carried
+    in several languages list their dubs here; **English is the
+    default**: a stream
     with an English track selects it automatically (the moment the
     player has parsed the track list — a few seconds into a movie's
     load), streams without one keep the provider's own audio (audio is
     never muted by the picker). **A** cycles Auto (English) → tracks,
-    the button opens the menu, and a manual pick lasts for the current
+    **Esc** or a click outside closes the card, and a manual pick lasts
+    for the current
     program only — every new program starts back at Auto/English.
   - **Playback speed** (speedometer; live rewind, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
@@ -134,7 +152,13 @@ through a single VLC connection.
   levels per word (**Exact**: `dog` → `*** in the doghouse`;
   **Partial**: `*** in the ***house`; **Whole**: `*** in the
   ********`), mute padding before/after each word, a **mute lead**
-  (live-caption lag compensation) and a sync offset. No external tools
+  (live-caption lag compensation) and a sync offset. The **Mute the
+  whole line** option keeps the audio muted for the entire time a
+  filtered word is anywhere in the subtitle (instead of only around
+  the word itself — catches everything at the cost of muting more),
+  and **Reset all settings** restores the factory defaults (enable
+  state, timing, whole-line mode and the word list) in one click.
+  No external tools
   are needed for movies & series; live TV needs **CCExtractor**, which
   ships bundled with the app (an installed copy is used instead when
   present). Coverage: live CC and VOD text tracks (SRT/ASS-style);

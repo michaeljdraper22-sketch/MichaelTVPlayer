@@ -133,30 +133,71 @@ def main():
     view._cycle_audio()
     check("no tracks -> cycle is a no-op", view._audio_want is None)
 
-    print("[8] menu contents")
+    print("[8] picker panel contents (Stremio-style card)")
     fake.tracks = [(1, "Track 1 - [Spanish]"), (2, "English")]
     fake.active = 1
     reset_pick(view)
-    captured = []
-    view._popup_above = lambda menu, btn: captured.append(menu)
     view._audio_menu()
-    labels = [a.text() for a in captured[-1].actions()]
-    check("menu = Auto + English-first tracks",
-          labels == ["Auto (English when available)", "English",
-                     "Track 1 - [Spanish]"])
-    checked = [a.text() for a in captured[-1].actions() if a.isChecked()]
+    rows = view._audio_panel.rows()
+    check("panel = Auto + English-first tracks",
+          [r["main"] for r in rows] == ["Auto", "English", "Spanish"])
+    check("Auto carries its English-when-available sub-label",
+          rows[0]["sub"] == "English when available")
     check("Auto checked in auto mode (active track not checked)",
-          checked == ["Auto (English when available)"])
+          [r["id"] for r in rows if r["checked"]] == [None])
+    check("picker open keeps the controls on (_popup_open)",
+          view._popup_open and view._audio_panel.isVisible())
+    view._audio_panel.close_panel()
+    check("closing restores the auto-hide cycle + stops the refresh timer",
+          not view._popup_open and not view._audio_panel_timer.isActive())
 
-    print("[9] empty-track menu still opens with Auto")
+    print("[8b] picked-mode checkmark + pick through the panel")
+    view._select_audio(1, "Track 1 - [Spanish]")
+    view._audio_menu()
+    rows = view._audio_panel.rows()
+    check("the pick itself carries the only checkmark",
+          [r["id"] for r in rows if r["checked"]] == [1])
+    row2 = None
+    for i in range(view._audio_panel._host.count()):
+        w = view._audio_panel._host.itemAt(i).widget()
+        if getattr(w, "_track_id", None) == 2:
+            row2 = w
+    check("track rows exist as clickable widgets", row2 is not None)
+    if row2 is not None:
+        row2.triggered.emit()               # a real row click
+    check("row click routes into _select_audio",
+          view._audio_want == 2 and fake.active == 2)
+    check("panel hid itself after the pick",
+          not view._audio_panel.isVisible() and not view._popup_open)
+    view._audio_panel.close_panel()
+    reset_pick(view)
+
+    print("[8c] raw track names cleaned for the rows")
+    lbl = PlayerView._audio_row_label
+    check("bracketed MKV style", lbl("Track 2 - [English]", 2)
+          == ("English", ""))
+    check("parenthesised qualifier -> sub-label",
+          lbl("English (United States)", 3) == ("English", "United States"))
+    check("dash style keeps the head as sub", lbl("1 - Slovenščina", 1)
+          == ("Slovenščina", "1"))
+    check("plain name passes through", lbl("Deutsch", 4) == ("Deutsch", ""))
+    check("empty name falls back to Track N",
+          lbl("", 5) == ("Track 5", ""))
+
+    print("[9] empty-track panel still opens with Auto")
     fake.tracks = []
     view._audio_menu()
-    labels = [a.text() for a in captured[-1].actions()]
-    check("menu = Auto + disabled note",
-          labels == ["Auto (English when available)", "",
-                     "No audio tracks on this stream yet"])
-    check("note entry disabled",
-          not captured[-1].actions()[-1].isEnabled())
+    rows = view._audio_panel.rows()
+    check("panel = Auto + dim note",
+          [r["main"] for r in rows] == ["Auto", "No audio tracks yet"])
+    check("note row disabled (not pickable)",
+          rows[-1].get("enabled") is False)
+    fake.tracks = [(2, "English")]            # arrive late, as VOD rips do
+    view._refresh_audio_panel()
+    check("the 1 s refresh fills the list the moment tracks arrive",
+          [r["main"] for r in view._audio_panel.rows()]
+          == ["Auto", "English"])
+    view._audio_panel.close_panel()
 
     print("[10] settings visibility honours 'audio'")
     cfg.data["control_buttons"] = dict(cfg.control_buttons, audio=False)

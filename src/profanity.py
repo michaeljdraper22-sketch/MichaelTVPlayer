@@ -214,16 +214,22 @@ def _finish_cue(lines, keep_lines: bool):
     return (span[0], span[1], text)
 
 
-def windows_from_cues(cues, words) -> list:
+def windows_from_cues(cues, words, whole_cue: bool = False) -> list:
     """Cues + word list -> sorted, merged mute windows [(start_s, end_s)].
 
     Word timing inside a cue is proportional to character share — the
     standard approximation when only cue timestamps exist.
+    whole_cue=True instead covers the ENTIRE cue (start..end) whenever any
+    word matches: mute for as long as the word is in the subtitle.
     """
     wins = []
     for start, end, text in cues or ():
         spans = find_matches(text, words)
         if not spans:
+            continue
+        if whole_cue:
+            if end > start:
+                wins.append((float(start), float(end)))
             continue
         n = len(text)
         dur = max(0.0, end - start)
@@ -297,6 +303,7 @@ class ProfanityEngine(QtCore.QObject):
         self.pad_after_s = 0.25
         self.sync_s = 0.0             # + = mute later, − = earlier
         self.lead_s = 1.5             # captions lag speech: mute EARLIER by this
+        self.whole_cue = False        # True = mute the whole cue, not the word
         self.windows = []             # sorted [(start, end)]
         self.enabled = False
         self.muted = False
@@ -310,7 +317,8 @@ class ProfanityEngine(QtCore.QObject):
         shifted EARLIER by lead_s (tunable per channel). VOD subtitle
         tracks are pre-timed — they pass lead_s=0."""
         shift = self.lead_s if lead_s is None else float(lead_s)
-        wins = windows_from_cues([(start, end, text)], self.words)
+        wins = windows_from_cues([(start, end, text)], self.words,
+                                 whole_cue=self.whole_cue)
         if not wins:
             return
         if shift:

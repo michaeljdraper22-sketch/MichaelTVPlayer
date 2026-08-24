@@ -124,6 +124,16 @@ class SubtitleDialog(QtWidgets.QDialog):
         gl.addWidget(wrap, r, 1)
         r += 1
 
+        self.ck_bar = QtWidgets.QCheckBox("Use the black bar below the video")
+        self.ck_bar.setChecked(bool(self.appearance.get("prefer_bar", True)))
+        self.ck_bar.setToolTip(
+            "Windowed playback, letterboxed video: park the subtitles in\n"
+            "the empty black bar under the picture (like a pro player)\n"
+            "instead of over the picture's bottom edge. Fullscreen always\n"
+            "uses the classic over-the-video placement.")
+        gl.addWidget(self.ck_bar, r, 0, 1, 2)
+        r += 1
+
         gl.addWidget(QtWidgets.QLabel("Text color"), r, 0)
         self.bt_text = self._color_btn(self.appearance.get("text_color",
                                                            "#FFFFFF"))
@@ -213,6 +223,7 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.sl_bg.valueChanged.connect(lambda _v: self._live_apply())
         self.ck_out.toggled.connect(lambda _on: self._live_apply())
         self.sl_out.valueChanged.connect(lambda _v: self._live_apply())
+        self.ck_bar.toggled.connect(lambda _on: self._live_apply())
 
     # ---- helpers ----
     def _color_btn(self, hex_color: str) -> QtWidgets.QPushButton:
@@ -296,6 +307,7 @@ class SubtitleDialog(QtWidgets.QDialog):
             "outline_enabled": bool(self.ck_out.isChecked()),
             "outline_color": str(self.bt_out.property("hex") or "#000000"),
             "outline_thickness": int(self.sl_out.value()),
+            "prefer_bar": bool(self.ck_bar.isChecked()),
         })
 
     def _live_apply(self) -> None:
@@ -326,6 +338,7 @@ class SubtitleDialog(QtWidgets.QDialog):
         self.sl_bg.setValue(int(SUBTITLE_DEFAULTS["bg_opacity"]))
         self.ck_out.setChecked(SUBTITLE_DEFAULTS["outline_enabled"])
         self.sl_out.setValue(int(SUBTITLE_DEFAULTS["outline_thickness"]))
+        self.ck_bar.setChecked(bool(SUBTITLE_DEFAULTS["prefer_bar"]))
         self._live_apply()          # color buttons carry no change signal
         # delay too — it applies immediately, like the +/- clicks
         self._nudge_delay(0, reset=True)

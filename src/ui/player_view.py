@@ -23,6 +23,7 @@ from ..mkv_subs import (is_text_codec, is_language_name, lang_matches,
                         lang_token, track_language_evidence)
 from . import icons as ic
 from .caption_overlay import (CaptionOverlay, CueStore, displayed_video_rect)
+from .track_panel import TrackPanel
 from .worker import AsyncRunner, FileDownloader
 
 log = logging.getLogger("mtp")
@@ -259,10 +260,16 @@ synclog = logging.getLogger("mtp.sync")
 _SYNC_ON = bool(os.environ.get("MTP_SYNC_LOG"))
 
 # Window flags for the on-video overlay layer (see PlayerView.__init__):
-# ToolTip = frameless, no taskbar entry, always above its owner window and
-# never steals focus from it (keyboard shortcuts keep working while the
-# on-video controls are clickable).
-_OVERLAY_WIN_FLAGS = QtCore.Qt.ToolTip | QtCore.Qt.FramelessWindowHint
+# Tool = frameless helper window with no taskbar entry. It is OWNED by the
+# main window — Windows keeps an owned window above its owner (so it can
+# float over the native video HWND) but NOT above other applications: a
+# foreground app's windows and the (topmost) taskbar cover it normally.
+# (The previous Qt.ToolTip flags made it WS_EX_TOPMOST on Windows, so
+# controls/captions painted over other apps' windows and the taskbar
+# whenever the player was buried behind them.) WindowDoesNotAcceptFocus +
+# WA_ShowWithoutActivating keep keyboard shortcuts on the main window
+# while the on-video controls stay clickable.
+_OVERLAY_WIN_FLAGS = QtCore.Qt.Tool | QtCore.Qt.FramelessWindowHint
 if hasattr(QtCore.Qt, "WindowDoesNotAcceptFocus"):   # Qt >= 5.10
     _OVERLAY_WIN_FLAGS |= QtCore.Qt.WindowDoesNotAcceptFocus
 
@@ -656,6 +663,18 @@ class PlayerView(QtWidgets.QWidget):
         self._btn_showpanel.hide()
         self._btn_showpanel.clicked.connect(self.request_toggle_channels.emit)
 
+        # Stremio-style audio-track picker card (dark glass, checkmark on
+        # the selected row) — same stacking rules as the other overlays:
+        # child of the overlay window, above the native video HWND, no
+        # focus. Refreshed once a second while open (VOD track lists can
+        # arrive seconds into playback).
+        self._audio_panel = TrackPanel(self.overlay)
+        self._audio_panel.picked.connect(self._select_audio)
+        self._audio_panel.closed.connect(self._audio_panel_closed)
+        self._audio_panel_timer = QtCore.QTimer(self)
+        self._audio_panel_timer.setInterval(1000)
+        self._audio_panel_timer.timeout.connect(self._refresh_audio_panel)
+
         # transparent on-video playback controls (bottom of the video)
         self.ctl = QtWidgets.QWidget(self.overlay)
         self.ctl.setObjectName("ctlOverlay")
@@ -781,10 +800,11 @@ class PlayerView(QtWidgets.QWidget):
                                       True)
         self._dvr_status.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self._dvr_status.hide()
-        # The overlay window is a ToolTip-style top-level: Windows keeps it
-        # above EVERYTHING (other apps included) even when the main window
-        # is minimized or buried. Suppress it whenever the app loses focus,
-        # so controls/captions can never float over other apps.
+        # Belt-and-suspenders for the Qt.Tool overlay window (see
+        # _OVERLAY_WIN_FLAGS): ownership already keeps it under other apps'
+        # windows, but hide it outright on focus loss anyway so a stale
+        # show() path can never float controls/captions over a foreground
+        # app (or over the taskbar) even for a frame.
         self._overlay_suppressed = False
         QtWidgets.QApplication.instance().focusChanged.connect(
             self._on_focus_changed)
@@ -914,20 +934,51 @@ class PlayerView(QtWidgets.QWidget):
         # as a 16:9 channel does at the same window size. Unknown video
         # size (nothing decoded yet): the whole surface, the historic
         # behavior (re-laid out the moment the size arrives).
+        # WINDOWED exception: when fit mode leaves a bottom black bar and
+        # the player is not fullscreen, the captions park INSIDE that bar
+        # (the professional-player placement) instead of over the
+        # picture's bottom edge — the widget then covers the whole
+        # surface and paints its text into the bar (see set_bar_top).
         vx, vy, vw, vh = displayed_video_rect(
             self._video_wh, self._scale_mode, g.width(), g.height())
-        cap = QtCore.QRect(g.left() + vx, g.top() + vy, vw, vh)
+        bar_top = None
+        if self._cap_bar_enabled() and self._scale_mode == "fit" \
+                and g.height() - (vy + vh) >= 48:
+            bar_top = vy + vh
+        if bar_top is not None:
+            cap = QtCore.QRect(g.left(), g.top(), g.width(), g.height())
+        else:
+            cap = QtCore.QRect(g.left() + vx, g.top() + vy, vw, vh)
         if self._cap_wid.geometry() != cap:
             self._cap_wid.setGeometry(cap)
+        self._cap_wid.set_bar_top(bar_top)
         if not self.ctl.isHidden():
-            # the control bar spans the whole SURFACE bottom — the inset is
-            # measured from the picture bottom, so a letterboxed picture
-            # (bottom above the bar) needs less of it to clear the bar
-            bar_top = g.height() - self.ctl.height() - 10
-            self._cap_wid.set_bottom_inset(
-                max(24, (vy + vh) - bar_top + 4))
+            # the control bar spans the whole SURFACE bottom — captions
+            # must clear it. Over the picture the inset is measured from
+            # the PICTURE bottom, so a letterboxed picture (bottom above
+            # the bar) needs less of it; in bar mode it is measured from
+            # the surface bottom (= the overlay's own bottom edge).
+            bar_rect_top = g.height() - self.ctl.height() - 10
+            if bar_top is None:
+                self._cap_wid.set_bottom_inset(
+                    max(24, (vy + vh) - bar_rect_top + 4))
+            else:
+                self._cap_wid.set_bottom_inset(
+                    max(0, g.height() - bar_rect_top + 4))
         else:
-            self._cap_wid.set_bottom_inset(24)
+            self._cap_wid.set_bottom_inset(24 if bar_top is None else 0)
+
+    def _cap_bar_enabled(self) -> bool:
+        """Park captions in the bottom letterbox bar? (windowed only —
+        fullscreen keeps the classic over-the-picture placement; the
+        setting lives in Subtitle settings so it can be turned off.)"""
+        if self._fullscreen:
+            return False
+        try:
+            return bool(self.config.subtitle_appearance.get("prefer_bar",
+                                                            True))
+        except Exception:  # noqa: BLE001
+            return True
 
     def set_client(self, client):
         self.client = client
@@ -2594,10 +2645,12 @@ class PlayerView(QtWidgets.QWidget):
         if self._overlay_suppressed:
             if not self._app_foreground():
                 # Another app truly has the foreground (see
-                # _on_focus_changed): the ToolTip-style overlay paints above
-                # OTHER apps' windows too, so a cursor passing over the
-                # app's exposed area behind them must not surface the
-                # controls over e.g. Chrome.
+                # _on_focus_changed): keep the overlay hidden — showing an
+                # owned Qt.Tool window while another app owns the
+                # foreground could raise it over that app's windows for a
+                # frame, and a cursor passing over the app's exposed area
+                # behind them must not surface the controls over e.g.
+                # Chrome.
                 return
             # our own process owns the foreground — the flag latched
             # spuriously (native dialog / video HWND swallowed the focus
@@ -3866,12 +3919,14 @@ class PlayerView(QtWidgets.QWidget):
         """A style control changed inside the settings dialog: repaint the
         app-rendered captions NOW — the overlay re-reads the config on
         every paint, so font/size/colors/position land mid-drag (the
-        dialog already wrote the config). VLC-rendered tracks cannot
-        restyle at runtime; the dialog-close path rebuilds the player
-        once for those."""
+        dialog already wrote the config). Re-layout too: the black-bar
+        placement toggle is geometry, not paint. VLC-rendered tracks
+        cannot restyle at runtime; the dialog-close path rebuilds the
+        player once for those."""
         if self._closing:
             return
         if self._cap_on:
+            self._layout_overlays()
             self._cap_wid.update()
 
     def _reapply_sub_style(self):
@@ -4095,29 +4150,80 @@ class PlayerView(QtWidgets.QWidget):
         self._flash_audio(nxt, names.get(nxt, ""))
 
     def _audio_menu(self):
+        """Note button: open the Stremio-style audio track picker card
+        above the button (kept name for compatibility — the old flat
+        QMenu lived here)."""
+        if self._closing:
+            return
+        self._refresh_audio_panel()
+        if not self._audio_panel.isVisible():
+            self._audio_panel.popup(self.btn_audio)
+        self._popup_open = True      # keep the controls on while picking
+        self._audio_panel_timer.start()
+
+    def _refresh_audio_panel(self):
+        """(Re)build the picker rows from the current track list — called
+        on open and once a second while open (track lists can arrive
+        seconds into playback)."""
+        if self._closing:
+            return
         try:
             tracks = self.vlc.audio_tracks()
         except Exception:  # noqa: BLE001
             tracks = []
-        m = self._ctl_menu()
-        auto = m.addAction("Auto (English when available)")
-        auto.setCheckable(True)
-        auto.setChecked(not self._audio_name)
-        auto.triggered.connect(lambda *_, t=None, n="": self._select_audio(t, n))
+        auto_on = not self._audio_name
+        rows = [{
+            "id": None, "name": "", "main": "Auto",
+            "sub": "English when available", "checked": auto_on,
+        }]
         # one checkmark only: Auto in auto mode (whatever track the English
         # default / VLC landed on), the pick itself in pick mode
         for tid, name in self._english_first(tracks):
-            a = m.addAction(name or f"Track {tid}")
-            a.setCheckable(True)
-            a.setChecked(bool(self._audio_name) and tid == self._audio_want)
-            a.triggered.connect(lambda *_, t=tid, n=name:
-                                self._select_audio(t, n))
+            main, sub = self._audio_row_label(name, tid)
+            rows.append({
+                "id": tid, "name": name, "main": main, "sub": sub,
+                "checked": bool(self._audio_name) and tid == self._audio_want,
+                "tip": name or f"Track {tid}",
+            })
         if not tracks:
             # tracks surface seconds after playback starts — say so rather
-            # than opening a menu with nothing but Auto
-            m.addSeparator()
-            m.addAction("No audio tracks on this stream yet").setEnabled(False)
-        self._popup_above(m, self.btn_audio)
+            # than showing a card with nothing but Auto (the 1 s refresh
+            # fills the list the moment they arrive)
+            rows.append({
+                "id": "empty", "name": "", "main": "No audio tracks yet",
+                "sub": "this stream is still loading\u2026", "enabled": False,
+            })
+        self._audio_panel.set_rows(rows)
+
+    @staticmethod
+    def _audio_row_label(name: str, tid) -> tuple:
+        """VLC's raw track name -> (main, sub) for the picker row: the
+        language word as the big label, the leftover qualifier as the dim
+        sub-label ('Track 2 - [English]' -> 'English'; 'English (United
+        States)' -> 'English' + 'United States')."""
+        raw = (name or "").strip()
+        if not raw:
+            return f"Track {tid}", ""
+        m = re.search(r"\[([^\]]+)\]", raw)
+        if m:
+            return m.group(1).strip(), ""
+        m = re.match(r"([^(]+?)\s*\((.+)\)\s*$", raw)
+        if m:
+            return m.group(1).strip(), m.group(2).strip()
+        if " - " in raw:
+            head, tail = raw.rsplit(" - ", 1)
+            tail = tail.strip()
+            if tail and not tail.isdigit():
+                return tail, head.strip()
+        return raw, ""
+
+    def _audio_panel_closed(self):
+        """Picker hid (pick / click outside / Escape): resume the normal
+        control auto-hide cycle."""
+        self._audio_panel_timer.stop()
+        self._popup_open = False
+        if not self._closing:
+            self._wake()
 
     def _flash_audio(self, track_id, name: str):
         """Brief on-video confirmation while cycling with the keyboard."""
@@ -4143,6 +4249,7 @@ class PlayerView(QtWidgets.QWidget):
             int(prof.get("pad_after_ms", 250)) / 1000.0
         self._filter_engine.sync_s = int(prof.get("sync_ms", 0)) / 1000.0
         self._filter_engine.lead_s = int(prof.get("lead_ms", 1500)) / 1000.0
+        self._filter_engine.whole_cue = bool(prof.get("whole_cue"))
         self._filter_engine.enabled = bool(prof.get("enabled"))
 
     def apply_profanity_settings(self):
@@ -4621,8 +4728,9 @@ class PlayerView(QtWidgets.QWidget):
 
     def _on_focus_changed(self, _old, now):
         """Hide the on-video overlays when the app loses focus (another app
-        took it, or the window was minimized): the ToolTip-style overlay
-        window would otherwise stay painted on top of OTHER apps."""
+        took it, or the window was minimized): the owned Qt.Tool overlay
+        window already sinks below the foreground app, but hiding outright
+        guarantees no stale show() path can paint it over other apps."""
         if self._closing:
             return
         if now is None and QtWidgets.QApplication.activeWindow() is None \
@@ -4756,6 +4864,8 @@ class PlayerView(QtWidgets.QWidget):
             self.ctl.hide()
             self._dvr_status.hide()
             self.info_overlay.hide()
+            self._audio_panel_timer.stop()
+            self._audio_panel.close_panel()
             self.overlay.hide()
             self.unsetCursor()
         except Exception:
@@ -4767,7 +4877,10 @@ class PlayerView(QtWidgets.QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
-        if key == QtCore.Qt.Key_Space:
+        if key == QtCore.Qt.Key_Escape \
+                and self._audio_panel.isVisible():
+            self._audio_panel.close_panel()
+        elif key == QtCore.Qt.Key_Space:
             self._toggle_pause()
         elif key == QtCore.Qt.Key_Left:
             self._seek_ms(-10000)

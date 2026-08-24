@@ -399,6 +399,18 @@ class FakeVLC:
     def is_playing(self):
         return self.times.get("playing", True)
 
+    def is_mute(self):
+        return False
+
+    def audio_tracks(self):
+        return []
+
+    def active_audio(self):
+        return -1
+
+    def apply_scale(self, w=0, h=0):
+        pass
+
     def stop_and_release(self):
         pass
 
@@ -973,6 +985,11 @@ view.dvr = None
 view.current = None
 
 print("[7] view: overlay anchors to the displayed video rect")
+# the 400 ms _tick timer keeps polling the (fake) player; these geometry
+# sections take longer than a tick window, so pause it — nothing here
+# depends on it (a due tick delivered by processEvents would touch fake
+# methods the FakeVLC doesn't carry)
+view.timer.stop()
 view.resize(1920, 1080)
 view.layout().activate()
 app.processEvents()
@@ -986,23 +1003,68 @@ fake.video_size = lambda: (0, 0)
 view._poll_video_size()
 check("unknown size keeps the whole-surface overlay",
       view._cap_wid.geometry() == QtCore.QRect(0, 0, 1920, 1080))
+check("unknown size: no bar mode", view._cap_wid._bar_top is None)
 
-# 2:1 movie letterboxed in the 16:9 view -> overlay shrinks to the picture
+# 2:1 movie letterboxed in the 16:9 view, WINDOWED with prefer_bar on (the
+# default): the caption widget covers the whole surface and the text parks
+# inside the 60px bottom black bar
 fake.video_size = lambda: (2000, 1000)
 view._poll_video_size()
-check("letterboxed movie: overlay = displayed picture rect",
-      view._cap_wid.geometry() == QtCore.QRect(0, 60, 1920, 960))
-
-# the inset clears the whole-surface control bar (picture bottom above it)
+check("windowed letterbox (bar mode): overlay = whole surface",
+      view._cap_wid.geometry() == QtCore.QRect(0, 0, 1920, 1080))
+check("bar top = picture bottom (1020)", view._cap_wid._bar_top == 1020)
 view._wake()
 view._layout_overlays()
 bar_top = 1080 - view.ctl.height() - 10
-check("bottom inset clears the control bar from the picture bottom",
+check("bar mode + controls: inset clears the bar measured from the "
+      "surface bottom",
+      view._cap_wid._bottom_inset == 1080 - bar_top + 4)
+view.ctl.hide()
+view._layout_overlays()
+check("bar mode + controls hidden: zero inset (the bar margin is painted)",
+      view._cap_wid._bottom_inset == 0)
+
+# shallow bar (< 48 px): not worth parking in -> classic picture anchor
+fake.video_size = lambda: (2000, 1040)
+view._poll_video_size()
+check("shallow 41 px bar: too shallow, picture-anchored overlay",
+      view._cap_wid.geometry() == QtCore.QRect(0, 41, 1920, 998)
+      and view._cap_wid._bar_top is None)
+
+# 4:3 pillarbox (side bars only, no bottom bar): classic anchor
+fake.video_size = lambda: (1440, 1080)
+view._poll_video_size()
+check("pillarbox: no bottom bar -> picture-anchored overlay",
+      view._cap_wid.geometry() == QtCore.QRect(240, 0, 1440, 1080))
+
+# prefer_bar off (Subtitle settings): the classic over-the-picture anchor
+fake.video_size = lambda: (2000, 1000)
+view._poll_video_size()
+cfg.data["subtitle_appearance"] = dict(cfg.subtitle_appearance,
+                                       prefer_bar=False)
+view._layout_overlays()
+check("prefer_bar off: overlay = displayed picture rect",
+      view._cap_wid.geometry() == QtCore.QRect(0, 60, 1920, 960)
+      and view._cap_wid._bar_top is None)
+view._wake()
+view._layout_overlays()
+check("prefer_bar off + controls: inset clears the control bar from the "
+      "picture bottom",
       view._cap_wid._bottom_inset >= (60 + 960) - bar_top + 4)
 view.ctl.hide()
 view._layout_overlays()
-check("controls hidden -> plain 24 px inset above the picture",
+check("prefer_bar off + controls hidden: plain 24 px inset above the picture",
       view._cap_wid._bottom_inset == 24)
+
+# fullscreen always uses the classic placement, whatever the setting says
+cfg.data["subtitle_appearance"] = dict(cfg.subtitle_appearance,
+                                       prefer_bar=True)
+view.set_fullscreen_mode(True)
+view._layout_overlays()
+check("fullscreen: overlay = displayed picture rect (no bar mode)",
+      view._cap_wid.geometry() == QtCore.QRect(0, 60, 1920, 960)
+      and view._cap_wid._bar_top is None)
+view.set_fullscreen_mode(False)
 
 # crop mode: picture covers the surface again
 view._set_scale_mode("crop")
@@ -1023,6 +1085,48 @@ check("16:9 and 2:1 overlays keep one caption scale relative to the picture",
       abs(view._cap_wid._font_px(ap, d169) / d169
           - view._cap_wid._font_px(ap, 960) / 960.0) < 0.001)
 fake.video_size = lambda: (0, 0)
+
+print("[7b] bar-mode paint: ink parks inside the bottom black bar")
+# reuse the [3c] overlay widget — proven stable for grab() in this process
+# (the PlayerView's 400 ms _tick keeps running: FakeVLC.is_mute above keeps
+# it alive through these longer sections)
+ov.bind_config(lambda: ap)
+ov.resize(1920, 1080)
+ov.set_bottom_inset(0)
+
+# 2.35:1 movie in a 16:9 window: 132 px bar below the picture
+ov.set_bar_top(948)
+ov.set_lines(["the quick brown fox"])
+app.processEvents()
+top, bot = _ink_rows(ov) or (-1, -1)
+check("2.35:1 windowed: ink sits inside the bar", top >= 948)
+check("2.35:1 windowed: ink clears the window-bottom margin",
+      bot <= 1080 - 4)
+
+# 2:1 movie: shallow-but-valid 60 px bar still fully contains the text
+ov.set_bar_top(1020)
+app.processEvents()
+top, bot = _ink_rows(ov) or (-1, -1)
+check("2:1 windowed: ink inside the 60 px bar", top >= 1019)  # 1 px AA slop
+check("2:1 windowed: ink clears the window-bottom margin", bot <= 1080 - 4)
+
+# controls visible (inset): the block clears the control bar
+ov.set_bottom_inset(1080 - bar_top + 4)
+app.processEvents()
+top, bot = _ink_rows(ov) or (-1, -1)
+check("bar mode + control-bar inset: ink clears the control bar",
+      bot <= 1080 - ov._bottom_inset)
+
+# a manual position raise still lifts the text out of the bar
+ap_pos = dict(ap, pos_pct=40)
+ov.bind_config(lambda: ap_pos)
+ov.set_bottom_inset(0)
+app.processEvents()
+top, bot = _ink_rows(ov) or (-1, -1)
+check("pos_pct raise lifts the block above the bar", top < 948)
+ov.set_lines([])
+ov.set_bar_top(None)
+ov.set_preview("")
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

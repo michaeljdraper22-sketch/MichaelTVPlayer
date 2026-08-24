@@ -82,6 +82,16 @@ class ProfanityDialog(QtWidgets.QDialog):
             "+ sync = mutes later"), 2, 0, 1, 4)
         lay.addLayout(tl)
 
+        self.ck_whole = QtWidgets.QCheckBox(
+            "Mute the whole line — keep audio muted for as long as a "
+            "filtered word is in the subtitle (instead of just around "
+            "the word itself)")
+        self.ck_whole.setChecked(bool(prof.get("whole_cue")))
+        self.ck_whole.setToolTip(
+            "Catches every word at the cost of muting more audio:\n"
+            "the mute spans the subtitle's full display time.")
+        lay.addWidget(self.ck_whole)
+
         # ---- word list ----
         lay.addWidget(QtWidgets.QLabel("Filtered words"))
         self.table = QtWidgets.QTableWidget(0, 2)
@@ -98,13 +108,19 @@ class ProfanityDialog(QtWidgets.QDialog):
         b_add = QtWidgets.QPushButton("Add word\u2026")
         b_del = QtWidgets.QPushButton("Remove selected")
         b_reset = QtWidgets.QPushButton("Restore default list")
+        b_reset_all = QtWidgets.QPushButton("Reset all settings")
         b_add.clicked.connect(self._add_word)
         b_del.clicked.connect(self._remove_selected)
         b_reset.clicked.connect(self._reset_words)
+        b_reset_all.clicked.connect(self._reset_all)
+        b_reset_all.setToolTip(
+            "Restore every setting here to its factory default\n"
+            "(enable state, timing, whole-line mode and the word list).")
         btns.addWidget(b_add)
         btns.addWidget(b_del)
         btns.addStretch(1)
         btns.addWidget(b_reset)
+        btns.addWidget(b_reset_all)
         lay.addLayout(btns)
 
         lvl_note = QtWidgets.QLabel(
@@ -156,6 +172,17 @@ class ProfanityDialog(QtWidgets.QDialog):
         for w in DEFAULT_WORDS:
             self._add_row(w[0], w[1])
 
+    def _reset_all(self):
+        """Every control back to factory defaults (the user can still
+        Cancel — nothing is written until OK)."""
+        self.ck_on.setChecked(bool(PROFANITY_DEFAULTS["enabled"]))
+        self.sp_before.setValue(int(PROFANITY_DEFAULTS["pad_before_ms"]))
+        self.sp_after.setValue(int(PROFANITY_DEFAULTS["pad_after_ms"]))
+        self.sp_lead.setValue(int(PROFANITY_DEFAULTS["lead_ms"]))
+        self.sp_sync.setValue(int(PROFANITY_DEFAULTS["sync_ms"]))
+        self.ck_whole.setChecked(bool(PROFANITY_DEFAULTS["whole_cue"]))
+        self._reset_words()
+
     def _collect_words(self):
         words = []
         seen = set()
@@ -180,6 +207,7 @@ class ProfanityDialog(QtWidgets.QDialog):
             "pad_after_ms": int(self.sp_after.value()),
             "sync_ms": int(self.sp_sync.value()),
             "lead_ms": int(self.sp_lead.value()),
+            "whole_cue": bool(self.ck_whole.isChecked()),
         }
         self.config.save()
         try:
