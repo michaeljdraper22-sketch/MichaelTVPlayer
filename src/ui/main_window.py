@@ -246,6 +246,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.reload_all)
         QtWidgets.QShortcut(QtGui.QKeySequence("C"), self,
                             activated=self.player_view._cycle_spu)
+        QtWidgets.QShortcut(QtGui.QKeySequence("A"), self,
+                            activated=self.player_view._cycle_audio)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
@@ -430,6 +432,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("live", "LIVE (jump to live edge)"),
             ("rec", "Record / Download"),
             ("cc", "Subtitles"),
+            ("audio", "Audio tracks"),
             ("scale", "Video scaling"), ("speed", "Playback speed"),
             ("mute", "Mute"), ("volume", "Volume slider"),
             ("timebar", "Time bar (live rewind)"),
@@ -678,6 +681,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "  ← / →  ............ Seek -10s / +10s\n"
             "  ↑ / ↓  ............ Seek -60s / +60s\n"
             "  M  ................. Mute / Unmute\n"
+            "  C  ................. Subtitles: Off -> English -> other tracks\n"
+            "  A  ................. Audio track: Auto (English) -> tracks\n"
             "  Mouse wheel ....... Volume (over the video)\n"
             "  Double-click video  Toggle fullscreen\n"
             "  ● LIVE button ..... Jump to the live edge / end of the movie\n"

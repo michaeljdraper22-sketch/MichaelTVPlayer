@@ -44,7 +44,7 @@ bytes, then optional styling atoms ('styl', 'hlit', 'dlay', ...) — the
 length prefix already excludes those from the text we slice out.
 """
 
-from .mkv_subs import is_text_codec, lang_matches
+from .mkv_subs import is_text_codec, lang_matches, track_language_evidence
 
 _FALLBACK_CUE_S = 3.0       # degenerate stts delta (0) — assume this
 _MAX_SAMPLES = 1 << 21      # corrupt-table guard: real text tracks
@@ -449,8 +449,11 @@ class Mp4SubParser:
                     (first, min(last, nchunks), max(1, per)))
 
     def _select_track(self):
-        """Pick ONE text track: preferred language/name match, else the
-        lowest track id — the same policy as MkvSubParser."""
+        """Pick ONE text track under the English-default policy (same
+        ladder as MkvSubParser): preferred language/name match, else the
+        lowest track with no language evidence (unlabeled = assumed
+        English), else NOTHING — a labeled non-English track is never
+        the automatic pick."""
         if self._selected is not None or not self._track_meta:
             return
         text = {tid: m for tid, m in self._track_meta.items()
@@ -467,9 +470,14 @@ class Mp4SubParser:
                     self._selected = tid
                     break
         if self._selected is None:
-            self._selected = min(text)
-        self._samples = self._expand(self._traks[self._selected])
-        self._cursor = 0
+            for tid in sorted(text):
+                m = text[tid]
+                if not track_language_evidence(m["lang"], m["name"]):
+                    self._selected = tid
+                    break
+        if self._selected is not None:
+            self._samples = self._expand(self._traks[self._selected])
+            self._cursor = 0
 
     @staticmethod
     def _expand(trak):

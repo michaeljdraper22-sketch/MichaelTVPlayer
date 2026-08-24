@@ -35,7 +35,7 @@ through a single VLC connection.
   run on ONE connection to your provider (works with 1-connection accounts).
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
-  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ⤢ · ⏱ | 🔊 ▁▁▁`
+  `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ♪ · ⤢ · ⏱ | 🔊 ▁▁▁`
   - The row **compacts automatically** in half/quarter-screen windows
     (tighter spacing → no separators → shorter volume bar), and **clicking
     anywhere on the volume bar jumps the volume there**.
@@ -55,8 +55,11 @@ through a single VLC connection.
     starts, and the arrival anchor is smoothed across cues so burst
     jitter never wiggles individual captions. The button
     lights blue while a track is active; **C** cycles
-    Off → track 1 → track 2 → …, and the choice is sticky by language
-    across channel changes. Turning captions off keeps the live reader
+    Off → English (when the stream has an English track) → the remaining
+    tracks, and the choice is sticky by language
+    across channel changes. English is the default language throughout:
+    a file whose text tracks are all labeled non-English never shows a
+    foreign track automatically. Turning captions off keeps the live reader
     alive, so turning them back on is instant. Image-based tracks
     (DVB/PGS subtitles) are
     handed to VLC's own renderer instead — bitmaps can't be restyled.
@@ -74,6 +77,13 @@ through a single VLC connection.
     (movies resume where they were; live
     restarts at the edge, the DVR buffer with it). Size defaults to a
     concrete 40 px; set 0 for Auto (scales with the video height).
+  - **Audio tracks** (double-note icon) — programs carried in several
+    languages list their dubs here; **English is the default**: a stream
+    with an English track selects it automatically, streams without one
+    keep the provider's own audio (audio is never muted by the picker).
+    **A** cycles Auto (English) → tracks, the button opens the menu, and
+    a manual pick is sticky by name across channel changes. Streams with
+    a single audio track simply show one entry.
   - **Playback speed** (speedometer; live rewind, movies & series): 0.125× … 4×
     (VLC mutes audio above ~4×, so the list stops there). Fast-forward
     drops back to 1× automatically at the live edge.
@@ -216,7 +226,8 @@ Before shipping changes to the caption pipeline, run this checklist by hand
 | ← / → | Seek −10s / +10s |
 | ↑ / ↓ | Seek −60s / +60s |
 | M | Mute / Unmute |
-| C | Cycle subtitles (Off → track 1 → track 2 → …) |
+| C | Cycle subtitles (Off → English first → remaining tracks) |
+| A | Cycle audio track (Auto (English) → tracks) |
 | Mouse wheel (over video) | Volume |
 | Double-click video | Toggle fullscreen |
 | ● LIVE button | Jump back to the live edge / end of the movie |

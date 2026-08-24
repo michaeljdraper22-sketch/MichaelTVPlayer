@@ -113,6 +113,17 @@ def main():
     view._cycle_spu()
     check("no tracks -> cycle is a no-op", fake.active == -1)
 
+    print("[7b] C key lands on the ENGLISH track first")
+    fake.tracks = [(1, "Spanish"), (2, "English"), (3, "French")]
+    fake.active = -1
+    view._spu_want = -1
+    view._cycle_spu()
+    check("cycle 1: English (track 2), not track 1",
+          view._spu_want == 2 and fake.active == 2)
+    view._cycle_spu()
+    check("cycle 2: track 1 next (stable order after English)",
+          view._spu_want == 1)
+
     print("[8] menu contents")
     fake.tracks = [(1, "English"), (2, "Spanish")]
     captured = []

@@ -140,6 +140,18 @@ def lang_matches(hint: str, lang: str, name: str = "") -> bool:
     return any(_LANG_ALIAS.get(tok) == h for tok in toks)
 
 
+def track_language_evidence(lang: str, name: str = "") -> bool:
+    """True when the track's lang/name carries ANY known language word.
+
+    No evidence = an unlabeled rip, assumed to carry the default-language
+    (English) subtitles; a track LABELED non-English must never be the
+    automatic pick — that fallback is what put e.g. Arabic subtitles on
+    the screen by default on multi-language rips."""
+    words = f"{lang or ''} {name or ''}".lower().replace(",", " ").split()
+    toks = {w.strip("()[]{}.,;:!?'\u2019\"") for w in words}
+    return any(is_language_name(t) for t in toks)
+
+
 def is_text_codec(codec: str) -> bool:
     """True when a subtitle-track codec carries flatten-able text. Covers
     BOTH parsers: MKV CodecIDs (subrip/ASS/SSA/WebVTT and their legacy
@@ -446,7 +458,16 @@ class MkvSubParser:
                 if lang_matches(self.prefer_language, m["lang"], m["name"]):
                     self._selected = n
                     return
-        self._selected = min(text_tracks)
+        # English-default policy: a track with NO language evidence is
+        # assumed to carry the default-language (English) subs — pick the
+        # lowest such track. A file whose text tracks are ALL labeled
+        # non-English selects nothing (the old min() fallback across all
+        # tracks is what showed a foreign track by default).
+        for n in sorted(text_tracks):
+            m = text_tracks[n]
+            if not track_language_evidence(m["lang"], m["name"]):
+                self._selected = n
+                return
 
     def _parse_block(self, header, size, duration_s=None):
         """Block at buf[0] (SimpleBlock or Block). Returns a cue list

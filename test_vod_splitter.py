@@ -400,6 +400,37 @@ def main():
     p._select_track()
     check("ASS track selected over bitmap", p._selected == 2)
 
+    print("[3b1b] English-default selection ladder (MKV)")
+    from src.mkv_subs import track_language_evidence
+    check("evidence helper: language words in names count",
+          track_language_evidence("", "Track 1 - [English]")
+          and track_language_evidence("eng", "")
+          and not track_language_evidence("", "SDH")
+          and not track_language_evidence("und", ""))
+    p1 = MkvSubParser(prefer_language="eng")
+    p1._track_meta = {
+        1: {"codec": "S_TEXT/WEBVTT", "lang": "ara", "name": ""},
+        2: {"codec": "S_TEXT/WEBVTT", "lang": "eng", "name": ""},
+    }
+    p1._select_track()
+    check("ladder 1: preferred language matched", p1._selected == 2)
+    p2 = MkvSubParser(prefer_language="eng")
+    p2._track_meta = {
+        1: {"codec": "S_TEXT/WEBVTT", "lang": "ara", "name": ""},
+        2: {"codec": "S_TEXT/WEBVTT", "lang": "", "name": ""},
+    }
+    p2._select_track()
+    check("ladder 2: unlabeled track picked over labeled non-English",
+          p2._selected == 2)
+    p3 = MkvSubParser(prefer_language="eng")
+    p3._track_meta = {
+        1: {"codec": "S_TEXT/WEBVTT", "lang": "ara", "name": ""},
+        2: {"codec": "S_TEXT/WEBVTT", "lang": "spa", "name": ""},
+    }
+    p3._select_track()
+    check("ladder 3: all labeled non-English -> NO selection",
+          p3._selected is None)
+
     print("[3b2] rebase keeps the tap alive (metadata carry)")
     # After a cache rebase the window no longer contains the Tracks
     # element (it lives only at the file head), so the fresh mid-stream
@@ -966,6 +997,31 @@ def main():
     hell_f = next((c for c in made_f if "hell" in c[2]), None)
     check("media_time=0 edit lists leave timing alone",
           hell_f is not None and abs(hell_f[0] - 1.0) < 0.05)
+
+    print("[9b] MP4 selection ladder (English-default policy)")
+    import types as _types
+
+    def _trak():
+        return _types.SimpleNamespace(chunk_runs=[], chunk_offs=[],
+                                      sizes=[], deltas=[], elst_media=0,
+                                      timescale=1)
+    m1 = Mp4SubParser(prefer_language="eng")
+    m1._track_meta = {
+        1: {"codec": "tx3g", "lang": "ara", "name": ""},
+        2: {"codec": "tx3g", "lang": "und", "name": ""},
+    }
+    m1._traks = {1: _trak(), 2: _trak()}
+    m1._select_track()
+    check("mp4 ladder: 'und' (undefined) counts as unlabeled -> picked",
+          m1._selected == 2)
+    m2 = Mp4SubParser(prefer_language="eng")
+    m2._track_meta = {
+        1: {"codec": "tx3g", "lang": "ara", "name": ""},
+        2: {"codec": "tx3g", "lang": "fra", "name": ""},
+    }
+    m2._select_track()
+    check("mp4 ladder: all labeled non-English -> NO selection",
+          m2._selected is None)
 
     print()
     if FAIL:

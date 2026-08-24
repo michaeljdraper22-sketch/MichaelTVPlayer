@@ -255,6 +255,14 @@ class VLCPlayer:
                     log.warning("play_at: add start-time failed: %r", exc)
                 except Exception:
                     pass
+        try:
+            # Prefer English audio at VLC's own ES selection (streams with
+            # several dubs otherwise open on the mux order, often not
+            # English). The UI's tick enforcement re-asserts a user pick
+            # or the English default once the track list is known.
+            self.media.add_option(":audio-language=en,eng")
+        except Exception:
+            pass
         branches = []
         if record_path:
             branches.append("dst=display")
@@ -695,6 +703,53 @@ class VLCPlayer:
         except Exception as exc:  # noqa: BLE001
             try:
                 log.debug("set_spu(%r) failed: %r", spu_id, exc)
+            except Exception:
+                pass
+
+    # ---- audio tracks (embedded stream tracks) ----
+    def audio_tracks(self) -> list:
+        """[(id, name), ...] audio tracks of the current media.
+
+        Same contract as spu_tracks(): empty until VLC has parsed the
+        elementary streams (poll, don't trust one early read), bytes names
+        decoded here, and VLC's leading "Disable" pseudo-track dropped —
+        for audio it carries id -1 (audio ids count from 1)."""
+        try:
+            desc = self.player.audio_get_track_description() or []
+            out = []
+            for track in desc:
+                try:
+                    tid = int(track[0])
+                    name = track[1]
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8", "replace")
+                    if tid < 1 or not name \
+                            or name.strip().lower() == "disable":
+                        continue
+                    out.append((tid, name))
+                except Exception:
+                    continue
+            return out
+        except Exception:
+            return []
+
+    def active_audio(self) -> int:
+        """Currently selected audio track id, -1 when none (or unknown)."""
+        try:
+            return int(self.player.audio_get_track())
+        except Exception:
+            return -1
+
+    def set_audio(self, track_id: int) -> None:
+        """Select an audio track by id. Thin call only — the desired state
+        is owned and re-asserted by the UI, exactly like set_spu (VLC
+        re-selects a stream's default track on media opens and ES updates,
+        and fresh players after hung-stop swaps lose the selection)."""
+        try:
+            self.player.audio_set_track(int(track_id))
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("set_audio(%r) failed: %r", track_id, exc)
             except Exception:
                 pass
 

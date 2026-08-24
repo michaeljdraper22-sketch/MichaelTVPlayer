@@ -75,8 +75,8 @@ DEFAULTS = {
     "control_buttons": {
         "back60": True, "back10": True, "play": True, "fwd10": True,
         "begin": True, "live": True, "rec": True,
-        "cc": True, "scale": True, "speed": True, "mute": True,
-        "volume": True, "timebar": True,
+        "cc": True, "audio": True, "scale": True, "speed": True,
+        "mute": True, "volume": True, "timebar": True,
     },
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
     "subtitle_appearance": dict(SUBTITLE_DEFAULTS),
@@ -85,7 +85,7 @@ DEFAULTS = {
 
 BUTTON_KEYS = (
     "back60", "back10", "play", "fwd10", "begin", "live", "rec",
-    "cc", "scale", "speed", "mute", "volume", "timebar",
+    "cc", "audio", "scale", "speed", "mute", "volume", "timebar",
 )
 
 

@@ -289,8 +289,10 @@ p2._track_meta = {
     4: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""},
 }
 p2._select_track()
-check("no wanted-language text -> first text track (UI then hands off)",
-      p2._selected == 3)
+check("no wanted-language text -> NO selection (English-default policy: "
+      "the UI reports 'no English text track', never shows the labeled "
+      "non-English track)",
+      p2._selected is None)
 
 print("[4b] overlay eligibility by content kind (unified subtitles)")
 

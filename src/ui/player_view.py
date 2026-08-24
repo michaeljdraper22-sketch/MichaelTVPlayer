@@ -19,7 +19,8 @@ from ..live_cc import CCSource, find_ccextractor, probe_tail_pcr, \
     probe_first_pcr_at
 from .. import vod_splitter
 from ..vod_splitter import VodRelay
-from ..mkv_subs import is_text_codec, is_language_name, lang_matches
+from ..mkv_subs import (is_text_codec, is_language_name, lang_matches,
+                        lang_token, track_language_evidence)
 from . import icons as ic
 from .caption_overlay import (CaptionOverlay, CueStore, displayed_video_rect)
 from .worker import AsyncRunner, FileDownloader
@@ -485,6 +486,13 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
         self._spu_name = ""           # its name — re-matched after media opens
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
+        # audio tracks (mirror of the spu stack). _audio_name empty = AUTO
+        # mode: no user pick — English is preferred by default; a non-empty
+        # name is a sticky user pick, re-matched like the subtitle one.
+        self._audio_want = None       # DESIRED audio track id (None = auto)
+        self._audio_name = ""         # the pick's name ("" = auto mode)
+        self._audio_ui = None         # (sticky, label, n) last painted tooltip
+        self._audio_auto_tid = None   # English id last auto-logged (log guard)
         # profanity filter (live TV: captions from the DVR buffer + engine)
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
@@ -721,6 +729,9 @@ class PlayerView(QtWidgets.QWidget):
         # subtitle tracks are discovered — movies/series almost always carry
         # SRT language tracks, live channels occasionally carry DVB ones)
         self.btn_cc = ctl_btn(ic.cc(False), "Subtitles (C)")
+        # audio track picker: opens the track menu (multi-language streams
+        # list their dubs; enabled always — Auto works without tracks)
+        self.btn_audio = ctl_btn(ic.audio(), "Audio tracks (A)")
         self.btn_scale = ctl_btn(ic.scale(), "Video scaling "
                                              "(fit / stretch / crop)")
         # a touch wider than the rest: the scale glyph is wide and its hit
@@ -747,8 +758,8 @@ class PlayerView(QtWidgets.QWidget):
         for w in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
                   self.btn_dl, self.btn_rec, self.sep2,
-                  self.btn_cc, self.btn_scale, self.btn_speed, self.sep3,
-                  self.btn_mute, self.vol_slider):
+                  self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
+                  self.sep3, self.btn_mute, self.vol_slider):
             rl.addWidget(w)
         ctl_lay.addWidget(row)
         # rewinds / jump buttons / speed work in DVR (chase) mode and for
@@ -784,6 +795,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_begin.clicked.connect(self._jump_begin)
         self.btn_live.clicked.connect(self._jump_live)
         self.btn_cc.clicked.connect(self._subs_menu)
+        self.btn_audio.clicked.connect(self._audio_menu)
         self.btn_scale.clicked.connect(self._scale_menu)
         self.btn_speed.clicked.connect(self._speed_menu)
         self.btn_mute.toggled.connect(self._on_mute)
@@ -2695,6 +2707,10 @@ class PlayerView(QtWidgets.QWidget):
         # entirely, and remote MKVs only report their SRT tracks a couple of
         # seconds after Playing — one-shot calls can cover none of that.
         self._enforce_spu()
+        # Audio tracks: same story (defaults re-applied by VLC on media
+        # opens / ES updates, lists arriving late) — plus the English
+        # default for streams that carry more than one language.
+        self._enforce_audio()
         mute = self.vlc.is_mute()
         if mute != self.btn_mute.isChecked():
             self.btn_mute.blockSignals(True)
@@ -2952,6 +2968,7 @@ class PlayerView(QtWidgets.QWidget):
         self._apply_scale()
         self._poke_audio()
         self._refresh_spu_button()
+        self._refresh_audio_button()
 
     # ---- per-button visibility (Settings ▸ Playback controls…) ----
     def apply_button_visibility(self):
@@ -2966,7 +2983,8 @@ class PlayerView(QtWidgets.QWidget):
             "play": self.btn_play, "fwd10": self.btn_fwd10,
             "begin": self.btn_begin,
             "live": self.btn_live, "rec": self.btn_rec,
-            "cc": self.btn_cc, "scale": self.btn_scale,
+            "cc": self.btn_cc, "audio": self.btn_audio,
+            "scale": self.btn_scale,
             "speed": self.btn_speed, "mute": self.btn_mute,
             "volume": self.vol_slider,
         }
@@ -3711,11 +3729,40 @@ class PlayerView(QtWidgets.QWidget):
                 sorted(set(tracks.values())))
             return
         sel = getattr(relay, "parser_selected", None)
+        if sel is None:
+            # Text tracks exist but the English-default policy matched none
+            # of them (all labeled non-English, none unlabeled): captions
+            # stay OFF. Deliberately NOT the VLC handoff — that re-enabled
+            # VLC's own track selection, which then rendered the non-English
+            # track (the "subtitles default to a foreign language" bug).
+            metas = getattr(relay, "parser_tracks_meta", None) or {}
+            langs = sorted({str(m.get("lang") or m.get("name") or "?")
+                            for m in metas.values()})
+            try:
+                log.info("captions: no English text track (langs=%s) — "
+                         "captions off", langs)
+            except Exception:
+                pass
+            self._cap_fail = True
+            self._set_cap_on(False)
+            self._spu_want = -1
+            self._spu_name = ""
+            self._refresh_spu_button()
+            self._cap_note("Captions: no English text track on this file")
+            return
         meta = (getattr(relay, "parser_tracks_meta", None) or {}).get(sel)
         hint = self._cap_lang_hint(self._spu_name)
+        # An EVIDENCE-FREE selection (unlabeled track) is the ladder's
+        # assumed-English pick: acceptable for an English hint, no matter
+        # what lang_matches says about empty lang/name (a mismatch handoff
+        # there would send a perfectly good default track back to VLC).
         if sel is not None and meta and hint and is_language_name(hint) \
                 and not lang_matches(hint, meta.get("lang", ""),
-                                     meta.get("name", "")):
+                                     meta.get("name", "")) \
+                and not (lang_token(hint) == "eng"
+                         and not track_language_evidence(
+                             meta.get("lang", ""),
+                             meta.get("name", ""))):
             self._cap_vod_handoff(
                 f"No {hint.capitalize()} text track — VLC renders",
                 "captions: picked %r but the only text tracks are %r "
@@ -3725,7 +3772,9 @@ class PlayerView(QtWidgets.QWidget):
                  if is_text_codec(m.get("codec", ""))})
 
     def _cycle_spu(self):
-        """C key: Off -> track 1 -> track 2 -> ... -> Off."""
+        """C key: Off -> English-first track -> ... -> Off. English is the
+        default language: when the stream has an English track, the first
+        press lands on it instead of whatever track happens to be first."""
         if self._closing:
             return
         try:
@@ -3734,6 +3783,7 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not tracks:
             return
+        tracks = self._english_first(tracks)
         ids = [-1] + [tid for tid, _ in tracks]
         names = {tid: name for tid, name in tracks}
         try:
@@ -3890,6 +3940,181 @@ class PlayerView(QtWidgets.QWidget):
                                  lambda: self._set_dvr_status("")
                                  if self._dvr_status.text() ==
                                  f"Subtitles: {text}" else None)
+
+    # ---- audio tracks (embedded stream tracks) ----
+    @staticmethod
+    def _is_english_name(name: str) -> bool:
+        """Does a VLC track NAME carry the English language? Word-matched
+        through the shared alias table, so 'English', 'Track 2 - [English]'
+        and 'en' all qualify while 'Audio 1' (no language evidence) and
+        'Spanish' do not."""
+        return lang_matches("english", "", name or "")
+
+    @classmethod
+    def _english_first(cls, tracks: list) -> list:
+        """[(id, name), ...] with the FIRST English-named track moved to
+        the front (stable otherwise) — cycle order and menus start at
+        English when the stream has one, per the English-default policy."""
+        for i, (_, name) in enumerate(tracks):
+            if cls._is_english_name(name):
+                if i:
+                    tracks = [tracks[i]] + tracks[:i] + tracks[i + 1:]
+                break
+        return tracks
+
+    def _enforce_audio(self):
+        """Re-assert the audio-track choice against the CURRENT media.
+
+        Runs from every tick for the same reasons as _enforce_spu: VLC
+        re-selects a stream's own default track on media opens and ES
+        updates, fresh players after hung-stop swaps lose the selection,
+        and the track list only exists once VLC has parsed the elementary
+        streams. Two modes:
+
+        auto  (no user pick — _audio_name empty): default English. When
+              the current track's name doesn't word-match English and the
+              stream HAS an English track, switch to it. Streams without
+              one keep VLC's own selection — audio is never disabled.
+        pick  (menu / A-key choice): sticky by NAME across channels like
+              the subtitle choice; when the name is gone entirely the
+              selector falls back to auto mode (never silence)."""
+        if self._closing:
+            return
+        try:
+            tracks = self.vlc.audio_tracks()
+            if tracks:
+                names = dict(tracks)
+                active = self.vlc.active_audio()
+                if not self._audio_name:
+                    if not self._is_english_name(names.get(active, "")):
+                        for tid, name in tracks:
+                            if self._is_english_name(name):
+                                if tid != self._audio_auto_tid:
+                                    self._audio_auto_tid = tid
+                                    try:
+                                        log.info("audio: defaulting to "
+                                                 "English track %r "
+                                                 "(was %r)", name,
+                                                 names.get(active, "?"))
+                                    except Exception:
+                                        pass
+                                self.vlc.set_audio(tid)
+                                break
+                elif self._audio_want not in names:
+                    # id unknown here: re-match by name (an EMPTY track
+                    # list never reaches this point — it skips the block)
+                    match = None
+                    for tid, name in tracks:
+                        if name and name == self._audio_name:
+                            match = (tid, name)
+                            break
+                    if match is None:
+                        low = self._audio_name.lower()
+                        for tid, name in tracks:
+                            if name and low in name.lower():
+                                match = (tid, name)
+                                break
+                    if match is None:
+                        # pick gone on this media: back to auto (English)
+                        self._audio_want = None
+                        self._audio_name = ""
+                    else:
+                        self._audio_want, self._audio_name = match
+                        self.vlc.set_audio(self._audio_want)
+                elif active != self._audio_want:
+                    self.vlc.set_audio(self._audio_want)
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_audio_button()
+
+    def _refresh_audio_button(self):
+        """Tooltip-only state on the audio button — this runs every tick
+        and the icon is state-neutral, so nothing repaints unless the
+        label changed. The button is ALWAYS clickable: with no tracks the
+        menu still opens with Auto."""
+        try:
+            n = len(self.vlc.audio_tracks())
+        except Exception:  # noqa: BLE001
+            n = 0
+        label = self._audio_name or "Auto (English)"
+        state = (bool(self._audio_name), label, n)
+        if state == self._audio_ui:
+            return
+        self._audio_ui = state
+        self.btn_audio.setToolTip(
+            f"Audio tracks \u2014 {label} (A)" if n else "Audio tracks (A)")
+
+    def _select_audio(self, track_id, name: str = ""):
+        """User picked an audio track from the menu (None/-1 = Auto)."""
+        try:
+            tid = None if track_id is None else int(track_id)
+        except (TypeError, ValueError):
+            tid = None
+        if tid is None or tid < 1:
+            self._audio_want = None
+            self._audio_name = ""
+        else:
+            self._audio_want = tid
+            self._audio_name = name or ""
+            self.vlc.set_audio(self._audio_want)
+        self._refresh_audio_button()
+
+    def _cycle_audio(self):
+        """A key: Auto -> English-first track -> ... -> Auto."""
+        if self._closing:
+            return
+        try:
+            tracks = self.vlc.audio_tracks()
+        except Exception:  # noqa: BLE001
+            return
+        if not tracks:
+            return
+        names = dict(tracks)
+        ids = [None] + [tid for tid, _ in self._english_first(tracks)]
+        try:
+            idx = ids.index(self._audio_want if self._audio_name else None)
+        except ValueError:
+            idx = 0
+        nxt = ids[(idx + 1) % len(ids)]
+        self._select_audio(nxt, names.get(nxt, ""))
+        self._flash_audio(nxt, names.get(nxt, ""))
+
+    def _audio_menu(self):
+        try:
+            tracks = self.vlc.audio_tracks()
+        except Exception:  # noqa: BLE001
+            tracks = []
+        m = self._ctl_menu()
+        auto = m.addAction("Auto (English when available)")
+        auto.setCheckable(True)
+        auto.setChecked(not self._audio_name)
+        auto.triggered.connect(lambda *_, t=None, n="": self._select_audio(t, n))
+        # one checkmark only: Auto in auto mode (whatever track the English
+        # default / VLC landed on), the pick itself in pick mode
+        for tid, name in self._english_first(tracks):
+            a = m.addAction(name or f"Track {tid}")
+            a.setCheckable(True)
+            a.setChecked(bool(self._audio_name) and tid == self._audio_want)
+            a.triggered.connect(lambda *_, t=tid, n=name:
+                                self._select_audio(t, n))
+        if not tracks:
+            # tracks surface seconds after playback starts — say so rather
+            # than opening a menu with nothing but Auto
+            m.addSeparator()
+            m.addAction("No audio tracks on this stream yet").setEnabled(False)
+        self._popup_above(m, self.btn_audio)
+
+    def _flash_audio(self, track_id, name: str):
+        """Brief on-video confirmation while cycling with the keyboard."""
+        if self._closing or not self._dvr_status.isHidden():
+            return   # the pill is busy with DVR start-up info
+        text = name if track_id else "Auto (English)"
+        self._set_dvr_status(f"Audio: {text}")
+        QtCore.QTimer.singleShot(1200,
+                                 lambda: self._set_dvr_status("")
+                                 if self._dvr_status.text() ==
+                                 f"Audio: {text}" else None)
+
 
     # ---- profanity filter (VOD subtitle track -> timed audio mute) ----
     def _apply_profanity_config(self):
@@ -4541,5 +4766,7 @@ class PlayerView(QtWidgets.QWidget):
             self.btn_mute.toggle()
         elif key == QtCore.Qt.Key_C:
             self._cycle_spu()
+        elif key == QtCore.Qt.Key_A:
+            self._cycle_audio()
         else:
             super().keyPressEvent(event)

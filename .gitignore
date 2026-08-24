@@ -25,3 +25,6 @@ tess.log
 
 # PyInstaller staging (exe rebuild workpath)
 build_pyinstaller/
+
+# ZCode agent session data
+.zcode/
