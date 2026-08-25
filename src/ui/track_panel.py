@@ -22,6 +22,18 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import icons as ic
 
+import logging
+
+log = logging.getLogger("mtp")
+
+
+def _log(fmt: str, *args) -> None:
+    """Logging can never break the UI (house rule — see logging_setup)."""
+    try:
+        log.info(fmt, *args)
+    except Exception:  # noqa: BLE001
+        pass
+
 _PANEL_W = 252          # fixed width keeps rows and the checkmark aligned
 _PANEL_MAX_H = 400      # longer lists scroll inside the card
 
@@ -77,19 +89,23 @@ class _OutsideCloser(QtCore.QObject):
                         anchor.size())
                     if arect.contains(gp):
                         return False    # the toggle button's press
-                p.close_panel()
+                _log("ctl panel: closed by outside press")
+                p.close_panel("outside press")
         return False
 
 
 class _Row(QtWidgets.QWidget):
     """One selectable row (main label + optional sub label + right-aligned
-    checkmark on the selected row)."""
+    checkmark on the selected row). Fires ``triggered`` on a completed
+    left click (press AND release inside the row) — button-style, so a
+    press that drags off the row cancels."""
 
     triggered = QtCore.pyqtSignal()
 
     def __init__(self, main: str, sub: str = "", selected: bool = False,
                  dim: bool = False, tip: str = "", parent=None):
         super().__init__(parent)
+        self._pressed = False
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
         self.setObjectName("tpRow")
         self.setProperty("sel", bool(selected))
@@ -115,6 +131,22 @@ class _Row(QtWidgets.QWidget):
         self.chk.setVisible(bool(selected))
         lay.addWidget(self.chk, 0, QtCore.Qt.AlignRight)
         self.setFixedHeight(42 if sub else 34)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self._pressed = True
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton and self._pressed:
+            self._pressed = False
+            if self.rect().contains(ev.pos()):
+                self.triggered.emit()
+            ev.accept()
+            return
+        super().mouseReleaseEvent(ev)
 
 
 class TrackPanel(QtWidgets.QWidget):
@@ -208,7 +240,8 @@ class TrackPanel(QtWidgets.QWidget):
             return                  # dimmed empty-state rows do nothing
         # close BEFORE the pick runs: some picks open modal dialogs
         # (Subtitle settings…) and the card must already be gone
-        self.close_panel()
+        self.close_panel("pick")
+        _log("ctl panel: picked %r", r.get("id"))
         self.picked.emit(dict(r))
 
     # ---- open/close ----
@@ -220,6 +253,7 @@ class TrackPanel(QtWidgets.QWidget):
         self._anchor = anchor
         host = anchor.window()
         if host is None:
+            _log("ctl panel: no host window — popup refused")
             return
         w = self.width()
         h = self.height()
@@ -235,11 +269,14 @@ class TrackPanel(QtWidgets.QWidget):
         self.raise_()
         QtWidgets.QApplication.instance().installEventFilter(self._closer)
 
-    def close_panel(self):
+    def close_panel(self, reason: str = "hide"):
+        """Hide the card. ``reason`` is only for the log line — the close
+        behavior is identical on every path."""
         if not self.isVisible():
             return
         self.hide()
         QtWidgets.QApplication.instance().removeEventFilter(self._closer)
+        _log("ctl panel: closed (%s)", reason)
         self.closed.emit()
 
     def hideEvent(self, event):

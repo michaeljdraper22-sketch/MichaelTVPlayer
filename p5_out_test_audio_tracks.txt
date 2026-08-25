@@ -1,0 +1,72 @@
+[1] config + button wiring
+  ok   'audio' is a known button key
+  ok   'audio' defaults to visible
+  ok   btn_audio lives in the control row
+  ok   btn_audio sits next to btn_cc (before btn_scale)
+[2] auto mode: no English track -> leave VLC's choice alone
+  ok   no switch, no set calls
+[3] auto mode: English default when the stream has one
+  ok   switched to the English track
+  ok   stable on the English track (exactly one set)
+[4] auto mode: already English -> untouched
+  ok   no redundant switch
+[5] user pick: applied + sticky re-match after a media change
+  ok   pick applied
+  ok   re-matched by name to the new id
+[6] user pick gone -> falls back to AUTO (never off)
+  ok   mode reverted to auto
+  ok   audio still playing (no off-state call)
+[7] A key cycles Auto -> English-first -> ... -> Auto
+  ok   cycle 1: the English track (not the first)
+  ok   cycle 2: next track (1)
+  ok   cycle 3: track 3
+  ok   cycle 4: back to Auto
+  ok   no tracks -> cycle is a no-op
+[8] picker panel contents (Stremio-style card)
+  ok   panel = Auto + English-first tracks
+  ok   Auto carries its English-when-available sub-label
+  ok   Auto checked in auto mode (active track not checked)
+  ok   picker open keeps the controls on (_popup_open)
+  ok   closing restores the auto-hide cycle + stops the refresh timer
+[8b] picked-mode checkmark + pick through the panel
+  ok   the pick itself carries the only checkmark
+  ok   track rows exist as clickable widgets
+  ok   row click routes into _select_audio
+  ok   panel hid itself after the pick
+[8b2] row click semantics: drag-off cancels, dim rows inert
+  ok   press dragged off the row does NOT pick
+  ok   press+release inside the row picks
+  ok   click on the dimmed empty-state row does nothing
+[8c] raw track names cleaned for the rows
+  ok   bracketed MKV style
+  ok   parenthesised qualifier -> sub-label
+  ok   dash style keeps the head as sub
+  ok   plain name passes through
+  ok   empty name falls back to Track N
+[8d] the SAME button toggles the card closed (click-outside press on the opener is ignored)
+  ok   first click opens
+  ok   press on the opener leaves the card open
+  ok   second click on the same button closes the card
+  ok   press outside (not the opener) closes the card
+[8e] scale + speed popups are cards too
+  ok   scale card = fit/stretch/crop with the current one checked
+  ok   speed card lists the ladder with the current rate checked
+  ok   speed card caps its height (scrolls, not past the video)
+  ok   speed pick routes into _set_rate
+[9] empty-track panel still opens with Auto
+  ok   panel = Auto + dim note
+  ok   note row disabled (not pickable)
+  ok   the 1 s refresh fills the list the moment tracks arrive
+[10] settings visibility honours 'audio'
+  ok   btn_audio hidden when turned off in settings
+  ok   btn_audio shown again
+[11] _tick drives the enforcement (VLC re-selected behind us)
+  ok   tick re-asserted the user pick
+[11b] picks are PER-PROGRAM: play_media resets to Auto
+  ok   pick applied before the reset
+  ok   next program starts at Auto (pick cleared)
+  ok   playback was started
+[12] teardown safety
+  ok   guards after stop()
+
+all 52 checks passed

@@ -3524,33 +3524,72 @@ class PlayerView(QtWidgets.QWidget):
     def _open_ctl_panel(self, btn, header, rows, on_pick, refresh=None):
         """Toggle-aware card opener for the control-bar buttons: the SAME
         button closes its card; a different button swaps the content (the
-        click-outside closer already guarantees one card at a time)."""
-        if self._closing:
-            return
-        if self._ctl_panel.isVisible():
-            same_button = self._ctl_panel_btn is btn
-            self._ctl_panel.close_panel()
-            if same_button:
-                return              # plain toggle close
-            # (close_panel's closed signal already cleared the opener
-            # refs — fall through and re-open for the NEW button)
-        self._ctl_panel_btn = btn
-        self._ctl_panel_pick = on_pick
-        self._ctl_panel_refresh = refresh
-        self._ctl_panel.set_rows(rows, header=header)
-        self._ctl_panel.popup(btn)
-        self._popup_open = True      # keep the controls on while picking
-        if refresh:
-            self._ctl_panel_timer.start()
+        click-outside closer already guarantees one card at a time).
+
+        Fully exception-trapped with logging: these run inside clicked
+        slots, where PyQt swallows a raise into a stderr that does not
+        exist in the windowed exe — without this trap a failing open is
+        a button that silently does nothing and leaves no log line."""
+        try:
+            if self._closing:
+                return
+            if self._ctl_panel.isVisible():
+                same_button = self._ctl_panel_btn is btn
+                self._ctl_panel.close_panel(
+                    "toggle" if same_button else "swap")
+                if same_button:
+                    return          # plain toggle close
+                # (close_panel's closed signal already cleared the opener
+                # refs — fall through and re-open for the NEW button)
+            self._ctl_panel_btn = btn
+            self._ctl_panel_pick = on_pick
+            self._ctl_panel_refresh = refresh
+            self._ctl_panel.set_rows(rows, header=header)
+            self._ctl_panel.popup(btn)
+            self._popup_open = True      # keep the controls on while picking
+            if refresh:
+                self._ctl_panel_timer.start()
+            try:
+                log.info("ctl panel: open %s (%d rows)", header, len(rows))
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            try:
+                log.exception("ctl panel: open failed (%s)", header)
+            except Exception:  # noqa: BLE001
+                pass
+            # still unwind to a sane state: a half-open card or a running
+            # refresh timer must never wedge the control bar
+            try:
+                self._ctl_panel_timer.stop()
+                self._ctl_panel.close_panel("open-error")
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_ctl_panel_picked(self, row):
         cb = self._ctl_panel_pick
-        if cb is not None:
+        if cb is None:
+            return
+        try:
             cb(row)
+        except Exception:  # noqa: BLE001
+            try:
+                log.exception("ctl panel: pick failed (%r)", row.get("id"))
+            except Exception:  # noqa: BLE001
+                pass
 
     def _on_ctl_panel_tick(self):
         if self._ctl_panel_refresh is not None:
-            self._ctl_panel_refresh()
+            try:
+                self._ctl_panel_refresh()
+            except Exception:  # noqa: BLE001
+                # the 1 s refresh timer is a slot too — same silent-death
+                # hole as the openers; log and stop rather than spam
+                try:
+                    log.exception("ctl panel: refresh failed — timer stopped")
+                except Exception:  # noqa: BLE001
+                    pass
+                self._ctl_panel_timer.stop()
 
     def _ctl_panel_closed(self):
         """Card hid (pick / click outside / Escape / toggle): resume the
@@ -5349,7 +5388,7 @@ class PlayerView(QtWidgets.QWidget):
             self._dvr_status.hide()
             self.info_overlay.hide()
             self._ctl_panel_timer.stop()
-            self._ctl_panel.close_panel()
+            self._ctl_panel.close_panel("teardown")
             self.overlay.hide()
             self.unsetCursor()
         except Exception:
@@ -5364,7 +5403,7 @@ class PlayerView(QtWidgets.QWidget):
         mods = event.modifiers()
         if key == QtCore.Qt.Key_Escape \
                 and self._ctl_panel.isVisible():
-            self._ctl_panel.close_panel()
+            self._ctl_panel.close_panel("Escape")
         elif key == QtCore.Qt.Key_Escape and self._win_sel:
             self._win_cancel()
         elif key == QtCore.Qt.Key_Space:

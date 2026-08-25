@@ -1,0 +1,80 @@
+[1] timeshift_url format (legacy streaming endpoint, UTC)
+  ok   uses the streaming/timeshift.php endpoint
+  ok   credentials quoted + stream + start + duration + extension
+  ok   duration floors at 1 minute
+  ok   duration ceils (90 s -> 2 min)
+  ok   start is UTC not local
+[2] decode_epg_text
+  ok   base64 decodes
+  ok   plain text survives
+  ok   empty stays empty
+[3] CatchupBrowser filters archive channels
+  ok   lists only the archive-capable channels
+  ok   archive depth shown in the row
+  ok   channel playable is a catchup_channel meta
+[4] CatchupPickerDialog: grouping / filtering / playable
+  ok   epg loaded
+  ok   exactly the 3 in-window programs kept (2 days)
+  ok   base64 titles decoded
+  ok   no raw base64 left
+  ok   in-progress program marked
+  ok   program playable kind/url/utc fields
+  ok   program URL asks for the full program
+[5] Config: download_folder + last_tab migration
+  ok   download_folder defaults empty
+  ok   download_folder persists
+  ok   last_tab 4 (Custom) migrates to 5
+  ok   last_tab 1 (Movies) unchanged
+  ok   explicit marker skips migration
+[6] PlayerView: gold < > window markers + button swap
+  ok   live: REC visible, DL + WIN hidden
+  ok   movie: DL visible, REC + WIN hidden
+  ok   catchup: WIN visible, REC + DL hidden
+  ok   catchup counts as VOD for scrub/transport
+  ok   x<->value round trip at 0 ms (±1 px)
+  ok   x<->value round trip at 1 ms (±1 px)
+  ok   x<->value round trip at 900000 ms (±1 px)
+  ok   x<->value round trip at 1799999 ms (±1 px)
+  ok   x<->value round trip at 1800000 ms (±1 px)
+  ok   window mode engaged
+  ok   markers visible + slider in win mode
+  ok   < starts at current position, > at the end
+  ok   start marker selected first
+  ok   pill explains the interaction
+  ok   markers positioned left-to-right
+  ok   < clamps at 0
+  ok   > clamps at < + 1 s gap
+  ok   pill still live
+  ok   bar click moves the NEAREST marker (>)
+  ok   bar click nearer to < moves it
+  ok   drag moves > to the dragged position
+  ok   arrow nudge moves the selected marker 1 s
+  ok   cancel hides markers + leaves win mode
+  ok   confirm exits select mode
+  ok   download started exactly once
+  ok   window start maps to utc_start + marker ms
+  ok   duration is ceil of the window (10 min for 600 s)
+  ok   download lands in the download folder as .ts
+  ok   window download finished pill shows the file
+  ok   btn_win re-enabled after finish
+  ok   no engage before the stream length is known
+  ok   play_media resets a live window selection
+  ok   stop() resets a live window selection
+  ok   Left/Right shortcuts route through seek_or_nudge
+[7] CatchupRelay: range-header normalization (localhost proxy)
+  ok   relay starts against a provider URL
+  ok   relay learned the total size
+  ok   plain GET: 200 + Accept-Ranges: bytes + full length
+  ok   ranged GET: 206 + Content-Range + exact bytes
+  ok   out-of-range GET answered (416), not hung
+  ok   relay.stop() closes the server
+[8] catch-up scrub: seeded length + fraction seek
+  ok   known duration derived from the EPG window
+  ok   _tick seeds the scrubber from the program window
+  ok   right-hand time label shows the program length
+  ok   seek converts ms to a byte fraction
+  ok   seek rebases the tracked position
+  ok   arrow/button seeks use the fraction axis too
+  ok   jump-to-begin seeks to fraction 0
+
+70 passed, 0 failed

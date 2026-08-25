@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
+from PyQt5.QtTest import QTest  # noqa: E402
 
 from src.config import BUTTON_KEYS, Config  # noqa: E402
 from src.ui.player_view import PlayerView, _SPEEDS  # noqa: E402
@@ -164,11 +165,53 @@ def main():
             row2 = w
     check("track rows exist as clickable widgets", row2 is not None)
     if row2 is not None:
-        row2.triggered.emit()               # a real row click
+        # a REAL click (press+release on the row widget): the 8/24 overhaul
+        # shipped rows with no mouse handling — every menu "did nothing"
+        # while this suite passed by emitting the signal by hand
+        QTest.mouseClick(row2, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                         row2.rect().center())
     check("row click routes into _select_audio",
           view._audio_want == 2 and fake.active == 2)
     check("panel hid itself after the pick",
           not view._ctl_panel.isVisible() and not view._popup_open)
+    view._ctl_panel.close_panel()
+    reset_pick(view)
+
+    print("[8b2] row click semantics: drag-off cancels, dim rows inert")
+    fake.tracks = [(1, "Track 1 - [English]"), (2, "Track 2 - [Spanish]")]
+    fake.active = 1
+    view._audio_menu()
+    victim = None
+    for i in range(view._ctl_panel._lay.count()):
+        w = view._ctl_panel._lay.itemAt(i).widget()
+        if getattr(w, "_track_id", None) == 2:
+            victim = w
+    if victim is not None:
+        QTest.mousePress(victim, QtCore.Qt.LeftButton,
+                         QtCore.Qt.NoModifier, victim.rect().center())
+        QTest.mouseRelease(victim, QtCore.Qt.LeftButton,
+                           QtCore.Qt.NoModifier,
+                           QtCore.QPoint(-50, -50))
+        check("press dragged off the row does NOT pick",
+              view._audio_want != 2 and view._ctl_panel.isVisible())
+        QTest.mouseClick(victim, QtCore.Qt.LeftButton,
+                         QtCore.Qt.NoModifier, victim.rect().center())
+        check("press+release inside the row picks",
+              view._audio_want == 2 and not view._ctl_panel.isVisible())
+    else:
+        check("row widgets present for click tests", False)
+    fake.tracks = []
+    view._audio_menu()
+    dim = None
+    for i in range(view._ctl_panel._lay.count()):
+        w = view._ctl_panel._lay.itemAt(i).widget()
+        if getattr(w, "_track_id", None) == "empty":
+            dim = w
+    if dim is not None:
+        QTest.mouseClick(dim, QtCore.Qt.LeftButton,
+                         QtCore.Qt.NoModifier, dim.rect().center())
+        check("click on the dimmed empty-state row does nothing",
+              view._ctl_panel.isVisible())
     view._ctl_panel.close_panel()
     reset_pick(view)
 
@@ -238,7 +281,8 @@ def main():
         if getattr(w, "_track_id", None) == 2.0:
             row_x = w
     if row_x is not None:
-        row_x.triggered.emit()
+        QTest.mouseClick(row_x, QtCore.Qt.LeftButton, QtCore.Qt.NoModifier,
+                         row_x.rect().center())
     check("speed pick routes into _set_rate", abs(view._rate - 2.0) < 1e-9)
     view._ctl_panel.close_panel()
 
