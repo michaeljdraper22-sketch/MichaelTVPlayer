@@ -1,0 +1,36 @@
+[relay] http://127.0.0.1:6715/c.ts total=11535 MB
+[dl] started
+  t+   6.9s  playing=True  vlc_time=4.3s  dl=19/193MB
+  t+   8.9s  playing=True  vlc_time=6.1s  dl=32/193MB
+  t+  10.9s  playing=True  vlc_time=8.2s  dl=46/193MB
+  t+  12.9s  playing=True  vlc_time=10.3s  dl=59/193MB
+  t+  14.9s  playing=True  vlc_time=12.1s  dl=73/193MB
+  t+  16.9s  playing=True  vlc_time=14.2s  dl=86/193MB
+  t+  18.9s  playing=True  vlc_time=16.3s  dl=100/193MB
+  t+  20.9s  playing=True  vlc_time=18.1s  dl=113/193MB
+  t+  22.9s  playing=True  vlc_time=20.2s  dl=127/193MB
+  t+  24.9s  playing=True  vlc_time=22.3s  dl=140/193MB
+  t+  26.9s  playing=True  vlc_time=24.1s  dl=154/193MB
+  t+  28.9s  playing=True  vlc_time=26.2s  dl=165/193MB
+  t+  30.9s  playing=True  vlc_time=28.3s  dl=179/193MB
+  t+  32.9s  playing=True  vlc_time=30.1s  dl=191/193MB
+  t+  34.9s  playing=True  vlc_time=32.2s  dl=193/193MB
+  post  playing=True  vlc_time=34.3s
+  post  playing=True  vlc_time=36.1s
+  post  playing=True  vlc_time=38.2s
+  post  playing=True  vlc_time=40.3s
+  post  playing=True  vlc_time=42.1s
+  post  playing=True  vlc_time=44.2s
+  post  playing=True  vlc_time=46.3s
+  post  playing=True  vlc_time=48.1s
+[dl] finished ok=True msg='C:\\Users\\micha\\AppData\\Local\\Temp\\mtp_winprobe_7atekn08\\window.ts'
+[dl] file=193MB promised=193MB
+[vlc] clock advanced during download: True (4.3s -> 32.2s)
+[vlc] still advancing AFTER download: True (34.3s -> 48.1s)
+PROBE PASS
+[0000018d90feecb0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[0000018d90feecb0] avcodec decoder error: hardware acceleration picture allocation failed
+[h264 @ 0000018d91086ec0] get_buffer() failed
+[h264 @ 0000018d91086ec0] thread_get_buffer() failed
+[h264 @ 0000018d91086ec0] decode_slice_header error
+[h264 @ 0000018d91086ec0] no frame!

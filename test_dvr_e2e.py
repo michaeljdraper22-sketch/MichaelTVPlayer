@@ -24,9 +24,13 @@ from src.ui.player_view import PlayerView  # noqa: E402
 
 CH = {
     "kind": "live",
-    "title": "US: NFL NETWORK HD",
-    "url": "http://cf.534842.xyz/live/726352471c/d809266e91/395713.ts",
-    "stream_id": 395713,
+    "title": "US: NFL NETWORK ᴴᴰ",
+    # 395713 (NFL NETWORK HD) went provider-broken on 2026-08-25: VLC
+    # receives data but the TS muxer writes zero sout bytes (direct reads
+    # still deliver), which starved this suite for non-app reasons.
+    # 1031378 is the same network and currently muxes fine.
+    "url": "http://cf.534842.xyz/live/726352471c/d809266e91/1031378.ts",
+    "stream_id": 1031378,
 }
 
 app = QtWidgets.QApplication(sys.argv)

@@ -600,6 +600,12 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
         self._catchup_relay = None    # catch-up range proxy (scrub-ability)
+        self._catchup_local_url = ""  # the relay URL VLC plays (rescue path)
+        self._cu_raw_wall = 0.0       # catch-up watchdog: wall time raw last
+        #                              # moved (freeze detection)
+        self._cu_raw_moved = False    # raw has advanced at least once this
+        #                              # media (never rescue on a never-moving
+        #                              # clock — garbage timestamps)
         self._cap_relay_gen = 0       # session the attached relay belongs
         #                              # to (stale-delivery guard, see
         #                              # _cap_relay_live)
@@ -863,7 +869,9 @@ class PlayerView(QtWidgets.QWidget):
         # catch-up programs get the WINDOW download instead of REC/DL: the
         # first press drops two gold < > markers on the time bar (drag /
         # arrow-key them, click the bar to place), the second press
-        # downloads exactly that stretch of the recording
+        # downloads exactly that stretch of the recording. The glyph is
+        # WHITE at rest like every other button and only turns GOLD while
+        # a window selection is live or a download is in flight.
         self.btn_win = ctl_btn(ic.download_window(),
                                "Download a time window of this program",
                                checkable=True)
@@ -1146,6 +1154,75 @@ class PlayerView(QtWidgets.QWidget):
         frac = max(0.0, min(0.999, float(target_ms) / dur))
         self.vlc.set_position(frac)
         self._vid_s = min(dur / 1000.0, max(0.0, float(target_ms) / 1000.0))
+        self._cu_raw_wall = now_s()   # a fresh seek must not look like a stall
+
+    # Catch-up stall watchdog: the provider's timeshift backend kills
+    # sibling connections mid-body (see CatchupRelay's _RESUME_* policy),
+    # and the relay's byte-exact resume bridges almost every kill — but if
+    # retries run out (or the whole relay died) VLC is left frozen/ended
+    # forever: catch-up has NO chase machinery to notice. Reopen the
+    # stream at the tracked position when the clock stops advancing
+    # mid-program.
+    _CU_FREEZE_S = 12.0      # raw frozen this long while "playing" = rescue
+    _CU_STOP_TICKS = 4       # not-playing ticks this many = rescue
+    _CU_END_MARGIN_S = 15.0  # this close to the program end, stopping is
+    #                          # natural (recording ran out) — never rescue
+
+    def _catchup_watchdog(self, now, playing, raw_s, dur_s, raw_moved):
+        if (self._closing or self._live_paused or self._seeking
+                or not self.current):
+            self._cu_raw_wall = now
+            return
+        if raw_moved:
+            self._cu_raw_wall = now
+            self._cu_raw_moved = True
+        elif not playing:
+            self._cu_raw_wall = now   # an idle player has no clock to watch
+        self._stall_ticks = 0 if playing else self._stall_ticks + 1
+        near_end = self._vid_s >= dur_s - self._CU_END_MARGIN_S
+        frozen = (playing and self._cu_raw_moved
+                  and self._cu_raw_wall > 0.0
+                  and now - self._cu_raw_wall > self._CU_FREEZE_S)
+        stopped = (self._stall_ticks >= self._CU_STOP_TICKS
+                   and self._vid_s > 5.0)
+        if near_end or not (frozen or stopped):
+            return
+        if now - self._last_reopen < _REOPEN_COOLDOWN_S:
+            return
+        freeze_s = max(0.0, now - self._cu_raw_wall) if frozen else 0.0
+        # _vid_s kept integrating through the freeze — hand the rescue the
+        # position the picture actually froze on
+        pos_ms = max(0.0, self._vid_s - freeze_s) * 1000.0
+        self._rescue_catchup(pos_ms, "frozen" if frozen else "stopped")
+
+    def _rescue_catchup(self, pos_ms: float, why: str):
+        """Reopen the catch-up stream where it stalled (watchdog fire)."""
+        self._last_reopen = now_s()
+        self._stall_ticks = 0
+        self._cu_raw_wall = now_s()
+        self._cu_raw_moved = False
+        url = self._catchup_local_url \
+            or (self.current or {}).get("url", "")
+        if not url:
+            return
+        try:
+            log.warning("catchup rescue: stream %s at %.1fs — reopening",
+                        why, pos_ms / 1000.0)
+        except Exception:
+            pass
+        self.vlc.play(url, timeshift=False)
+        sess = self._session
+
+        def _reseek():
+            # set_position before VLC finished opening is a silent no-op —
+            # re-apply the position once (and again a beat later) the media
+            # is actually playing
+            if self._closing or self._session != sess \
+                    or not self._is_catchup():
+                return
+            self._catchup_seek_to(pos_ms)
+        QtCore.QTimer.singleShot(1500, _reseek)
+        QtCore.QTimer.singleShot(3000, _reseek)
 
     def _is_dvrable(self) -> bool:
         """DVR/timeshift only makes sense for a live stream."""
@@ -1393,6 +1470,8 @@ class PlayerView(QtWidgets.QWidget):
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0
+        self._cu_raw_wall = 0.0
+        self._cu_raw_moved = False
         self._chase_started = False
         # fresh chase budget: a channel that gave up on the buffer gets to
         # try again from scratch (pending retry timers die on the session
@@ -2688,6 +2767,7 @@ class PlayerView(QtWidgets.QWidget):
         self._downloading = False
         self.btn_dl.setEnabled(self._is_vod())
         self.btn_win.setEnabled(self._is_catchup())
+        self.btn_win.setIcon(ic.download_window())
         if ok:
             self._set_dvr_status(f"Downloaded: {os.path.basename(msg)}")
         else:
@@ -2732,6 +2812,7 @@ class PlayerView(QtWidgets.QWidget):
             return
         self._win_sel = True
         self.btn_win.setChecked(True)
+        self.btn_win.setIcon(ic.download_window(ic.GOLD))
         self.btn_win.setToolTip("Confirm download window (Esc cancels)")
         # < lands at the current position, > at the end of the recording:
         # drag/nudge < back to 0 for the whole program
@@ -2760,6 +2841,9 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_win.blockSignals(True)
         self.btn_win.setChecked(False)
         self.btn_win.blockSignals(False)
+        if not self._downloading:
+            # a download in flight keeps the gold "active" icon
+            self.btn_win.setIcon(ic.download_window())
         self.btn_win.setToolTip("Download a time window of this program")
         if not silent:
             self._set_dvr_status(None)
@@ -2923,6 +3007,10 @@ class PlayerView(QtWidgets.QWidget):
         self._downloading = True
         self.btn_dl.setEnabled(False)
         self.btn_win.setEnabled(False)
+        # gold while the download runs — pinned into the icon's disabled
+        # mode so the state survives the button being greyed out
+        self.btn_win.setIcon(
+            ic.download_window(ic.GOLD, keep_disabled=True))
         self._set_dvr_status("Downloading window\u2026")
         self._dl = FileDownloader(self)
         self._dl.progress.connect(self._on_dl_progress)
@@ -3368,6 +3456,8 @@ class PlayerView(QtWidgets.QWidget):
             # froze the time labels with them.
             dt = 0.4 if prev_tick is None else min(1.0, now - prev_tick)
             raw_s = raw / 1000.0
+            raw_moved = (raw_s >= 0.0 and self._last_raw is not None
+                         and abs(raw_s - self._last_raw) > 0.02)
             if (0.0 <= raw_s <= length / 1000.0 + 5.0
                     and raw_s != self._last_raw
                     and abs(raw_s - self._vid_s) <= 3.0):
@@ -3377,6 +3467,9 @@ class PlayerView(QtWidgets.QWidget):
             self._last_raw = raw_s
             if not self._seeking:
                 self._set_scrub(int(length), int(self._vid_s * 1000))
+            if self._is_catchup():
+                self._catchup_watchdog(now, playing, raw_s,
+                                       length / 1000.0, raw_moved)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None
             self._vid_s = 0.0
@@ -4828,11 +4921,13 @@ class PlayerView(QtWidgets.QWidget):
         if not local:
             return ""
         self._catchup_relay = relay
+        self._catchup_local_url = local
         return local
 
     def _stop_catchup_relay(self):
         relay = self._catchup_relay
         self._catchup_relay = None
+        self._catchup_local_url = ""
         if relay is not None:
             try:
                 relay.stop()

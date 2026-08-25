@@ -21,6 +21,7 @@ to the provider URL directly (plays fine, just without the scrub bar).
 import logging
 import re
 import threading
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -28,6 +29,21 @@ log = logging.getLogger("mtp")
 
 _COPY_CHUNK = 1 << 18          # 256 KB relay chunks
 _RANGE_RE = re.compile(r"bytes=(\d*)-(\d*)")
+# This provider's timeshift backend REAPS sibling connections: while a
+# second timeshift URL is open for the same account (e.g. a window
+# download), one of the two gets killed mid-body ~15-30 s in — measured
+# 2026-08-25, full-speed AND throttled downloads alike, 4 kills in 6
+# trials; a lone playback connection ran 200 MB uninterrupted. When that
+# happens to the playback side, the EOF lands short of Content-Length —
+# so the relay re-dials the provider from the exact next byte and keeps
+# filling the SAME client response. VLC never notices.
+_RESUME_BACKOFF_S = 0.75       # pause between reconnect attempts
+_RESUME_STALLS = 4             # consecutive ZERO-byte dials before giving
+#                              # up (provider truly gone — VLC's watchdog
+#                              # then reopens the media)
+_RESUME_CREEP_N = 6            # ...and this many attempts must deliver at
+_RESUME_CREEP_BYTES = 1 << 16  # least this many bytes in total, else the
+#                              # re-dials are starving the client anyway
 
 
 class CatchupRelay:
@@ -211,13 +227,74 @@ class CatchupRelay:
                             "Content-Range",
                             f"bytes {start}-{end}/{relay.total}")
                     self.end_headers()
+                    # The body may span SEVERAL provider connections: the
+                    # CDN kills timeshift connections mid-body (see the
+                    # _RESUME_* constants above), and an EOF short of the
+                    # promised length is bridged with a byte-exact Range
+                    # re-dial — the client response is one continuous
+                    # stream. A WRITE failure (client went away: seek,
+                    # stop) is never retried.
                     sent = 0
-                    while sent < length:
-                        chunk = resp.read(min(_COPY_CHUNK, length - sent))
-                        if not chunk:
+                    dial_bytes = []          # bytes delivered per attempt
+                    first = True
+                    while True:
+                        if not first:
+                            time.sleep(_RESUME_BACKOFF_S)
+                            try:
+                                resp = relay._open_provider(start + sent,
+                                                            end)
+                            except Exception:  # noqa: BLE001
+                                resp = None   # counts as a zero-delivery
+                                               # attempt; the stall checks
+                                               # below gate the retries
+                        first = False
+                        before = sent
+                        if resp is not None:
+                            try:
+                                while sent < length:
+                                    try:
+                                        chunk = resp.read(
+                                            min(_COPY_CHUNK, length - sent))
+                                    except Exception:  # noqa: BLE001
+                                        break   # killed mid-body
+                                                # (IncompleteRead, reset)
+                                    if not chunk:
+                                        break   # clean EOF short of the
+                                                # length (the CDN reaping)
+                                    self.wfile.write(chunk)
+                                    sent += len(chunk)
+                            except Exception:  # noqa: BLE001
+                                return       # client went away
+                            relay._close_provider(resp)
+                            resp = None
+                            if dial_bytes and sent > before:
+                                try:
+                                    log.info(
+                                        "catchup relay: provider cut the "
+                                        "body at %d/%d — re-dial %d "
+                                        "delivered +%d bytes",
+                                        start + before, start + length,
+                                        len(dial_bytes), sent - before)
+                                except Exception:
+                                    pass
+                        if sent >= length or not relay._alive:
                             break
-                        self.wfile.write(chunk)
-                        sent += len(chunk)
+                        dial_bytes.append(sent - before)
+                        # keep re-dialing while bytes keep flowing; the
+                        # CDN's sibling-kill just makes this a moving
+                        # window of ~15 s connections. Only truly dead
+                        # providers (or a starved trickle) give up.
+                        stalls = dial_bytes[-_RESUME_STALLS:]
+                        if (len(stalls) >= _RESUME_STALLS
+                                and not any(stalls)) \
+                                or (len(dial_bytes) >= _RESUME_CREEP_N
+                                    and sum(dial_bytes[-_RESUME_CREEP_N:])
+                                    < _RESUME_CREEP_BYTES):
+                            break
+                    if sent < length:
+                        # could not complete: the client must not wait on
+                        # this keep-alive connection for the missing bytes
+                        self.close_connection = True
                 except Exception:  # noqa: BLE001 - client went away (seek)
                     pass
                 finally:

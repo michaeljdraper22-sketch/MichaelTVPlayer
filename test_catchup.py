@@ -26,7 +26,7 @@ from datetime import datetime, timezone
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5 import QtCore, QtWidgets  # noqa: E402
+from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from src.config import Config  # noqa: E402
 from src.models import EpgEntry  # noqa: E402
@@ -393,7 +393,6 @@ def main():
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from src.catchup_relay import CatchupRelay
     payload = bytes(range(256)) * 64            # 16 KB fake "recording"
-
     class FakeProvider(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -465,6 +464,117 @@ def main():
         prov.shutdown()
         prov.server_close()
 
+    print("[7b] CatchupRelay: byte-exact resume when the provider kills "
+          "the body mid-stream")
+    import src.catchup_relay as cr_mod
+    orig_backoff = cr_mod._RESUME_BACKOFF_S
+    orig_stalls = cr_mod._RESUME_STALLS
+    cr_mod._RESUME_BACKOFF_S = 0.01     # keep the test fast
+    payload2 = bytes(range(256)) * 1024            # 256 KB for this section
+
+    class TruncatingProvider(BaseHTTPRequestHandler):
+        """Mimics the real CDN's sibling-kill: every request is answered
+        with only the FIRST 32 KB of the asked range, then the connection
+        ends short of the promised Content-Range length. (32 KB per dial
+        keeps the deliveries comfortably above the relay's starvation
+        threshold, like the real CDN's ~15 s worth of bytes.)"""
+        protocol_version = "HTTP/1.1"
+        chunk = 32768
+        opens = []
+
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):
+            import re as _re
+            rng = self.headers.get("Range") or ""
+            m = _re.match(r"bytes=(\d+)-(\d*)", rng)
+            start = int(m.group(1)) if m else 0
+            end = (int(m.group(2)) if m and m.group(2)
+                   else len(payload2) - 1)
+            body = payload2[start:min(end, start + self.chunk - 1) + 1]
+            TruncatingProvider.opens.append((start, end, len(body)))
+            self.send_response(206 if m else 200)
+            self.send_header("Content-Type", "video/mp2t")
+            self.send_header("Content-Length", str(len(body)))
+            if m:
+                self.send_header(
+                    "Content-Range",
+                    f"bytes {start}-{start + len(body) - 1}/{len(payload2)}")
+            self.end_headers()
+            self.wfile.write(body)
+
+    prov2 = ThreadingHTTPServer(("127.0.0.1", 0), TruncatingProvider)
+    prov2.daemon_threads = True
+    _th.Thread(target=prov2.serve_forever, daemon=True).start()
+    try:
+        relay2 = CatchupRelay()
+        opens_before = len(TruncatingProvider.opens)
+        local2 = relay2.start(
+            f"http://127.0.0.1:{prov2.server_address[1]}/x.ts")
+        opens_before = len(TruncatingProvider.opens)   # skip the size probe
+        check("relay starts against the truncating provider", bool(local2))
+        with _url.urlopen(_url.Request(local2), timeout=15) as r:
+            body = r.read()
+        check("client receives the FULL recording despite per-request "
+              "truncation", body == payload2)
+        check("provider was re-dialed for the missing bytes",
+              len(TruncatingProvider.opens) >= len(payload2) // 32768
+              and relay2.provider_opens == len(TruncatingProvider.opens))
+        # every re-dial starts exactly where the previous body stopped
+        covered = 0
+        contiguous = True
+        for (s, _e, n) in TruncatingProvider.opens[opens_before:]:
+            if s != covered:
+                contiguous = False
+            covered += n
+        check("re-dials are byte-exact (no gaps, no repeats)",
+              contiguous and covered == len(payload2))
+        relay2.stop()
+
+        # give-up path: the provider serves one chunk, then every re-dial
+        # fails — the relay must stop retrying instead of hanging, and the
+        # client must not be left waiting on the keep-alive connection
+        class DeadThenGoneProvider(TruncatingProvider):
+            served = 0
+
+            def do_GET(self):
+                probe = self.headers.get("Range") == "bytes=0-0"
+                if DeadThenGoneProvider.served and not probe:
+                    self.close_connection = True
+                    return                  # connection just dies
+                if not probe:
+                    DeadThenGoneProvider.served = 1
+                super().do_GET()
+        TruncatingProvider.opens = []
+
+        prov2b = ThreadingHTTPServer(("127.0.0.1", 0), DeadThenGoneProvider)
+        prov2b.daemon_threads = True
+        _th.Thread(target=prov2b.serve_forever, daemon=True).start()
+        try:
+            relay2b = CatchupRelay()
+            local2b = relay2b.start(
+                f"http://127.0.0.1:{prov2b.server_address[1]}/x.ts")
+            got = b""
+            try:
+                with _url.urlopen(_url.Request(local2b), timeout=15) as r:
+                    got = r.read()
+            except Exception as exc:  # noqa: BLE001 - short body is the
+                partial = getattr(exc, "partial", None)  # point; keep bytes
+                if isinstance(partial, (bytes, bytearray)):
+                    got = bytes(partial)
+            check("dead provider: partial body served, no hang",
+                  0 < len(got) < len(payload2))
+            relay2b.stop()
+        finally:
+            prov2b.shutdown()
+            prov2b.server_close()
+    finally:
+        prov2.shutdown()
+        prov2.server_close()
+        cr_mod._RESUME_BACKOFF_S = orig_backoff
+        cr_mod._RESUME_STALLS = orig_stalls
+
     print("[8] catch-up scrub: seeded length + fraction seek")
     view2 = PlayerView(fresh_cfg())
     view2.show()
@@ -530,6 +640,294 @@ def main():
               stub.pos_calls and stub.pos_calls[-1] == 0.0)
     finally:
         view2.vlc = orig_vlc
+
+    print("[9] FileDownloader: survives mid-body kills, never fakes success")
+    from src.ui.worker import FileDownloader as RealDownloader
+
+    class KillOnceProvider(BaseHTTPRequestHandler):
+        """First GET promises the full size but dies at 60 % (the sibling
+        kill); the resume GET is answered properly with 206."""
+        protocol_version = "HTTP/1.1"
+        data = bytes(range(256)) * 256          # 64 KB
+        first_done = False
+        saw_range = None
+
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range") or ""
+            if not rng:
+                # full request: promise everything, deliver 60 %, close
+                import re as _re
+                m = _re.match(r"bytes=(\d+)-", rng)
+                start = int(m.group(1)) if m else 0
+                if m:
+                    self.send_response(206)
+                    self.send_header(
+                        "Content-Range",
+                        f"bytes {start}-{len(self.data) - 1}/"
+                        f"{len(self.data)}")
+                else:
+                    self.send_response(200)
+                cut = start + int(len(self.data) * 0.6)
+                self.send_header("Content-Length", str(len(self.data) - start))
+                self.end_headers()
+                self.wfile.write(self.data[start:cut])
+                self.close_connection = True
+                return
+            import re as _re
+            m = _re.match(r"bytes=(\d+)-$", rng)
+            KillOnceProvider.saw_range = rng
+            start = int(m.group(1))
+            body = self.data[start:]
+            self.send_response(206)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header(
+                "Content-Range",
+                f"bytes {start}-{len(self.data) - 1}/{len(self.data)}")
+            self.end_headers()
+            self.wfile.write(body)
+
+    prov3 = ThreadingHTTPServer(("127.0.0.1", 0), KillOnceProvider)
+    prov3.daemon_threads = True
+    _th.Thread(target=prov3.serve_forever, daemon=True).start()
+    try:
+        result = {}
+        dl = RealDownloader()
+        dl.finished.connect(lambda ok, msg: result.update(ok=ok, msg=msg))
+        tmpdir3 = tempfile.mkdtemp()
+        dl._BACKOFF_S = 0.01
+        dl.start(f"http://127.0.0.1:{prov3.server_address[1]}/f.bin",
+                 os.path.join(tmpdir3, "f.bin"))
+        ok = wait_until(lambda: "ok" in result, 10.0)
+        check("truncated body resumes to a complete download",
+              ok and result.get("ok") is True)
+        with open(result["msg"], "rb") as f:
+            check("resumed file is byte-identical to the source",
+                  f.read() == KillOnceProvider.data)
+        check("resume used a byte-exact Range request",
+              KillOnceProvider.saw_range
+              == f"bytes={int(len(KillOnceProvider.data) * 0.6)}-")
+    finally:
+        prov3.shutdown()
+        prov3.server_close()
+
+    class NoResumeProvider(BaseHTTPRequestHandler):
+        """Ignores Range on resume (answers 200 from byte 0)."""
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *_a):
+            pass
+
+        def do_GET(self):
+            body = b"x" * 4096
+            self.send_response(200)
+            self.send_header("Content-Length", "16384")   # dies at 25 %
+            self.end_headers()
+            self.wfile.write(body)
+            self.close_connection = True
+
+    prov4 = ThreadingHTTPServer(("127.0.0.1", 0), NoResumeProvider)
+    prov4.daemon_threads = True
+    _th.Thread(target=prov4.serve_forever, daemon=True).start()
+    try:
+        result4 = {}
+        dl4 = RealDownloader()
+        dl4.finished.connect(lambda ok, msg: result4.update(ok=ok, msg=msg))
+        dl4._BACKOFF_S = 0.01
+        dl4.start(f"http://127.0.0.1:{prov4.server_address[1]}/n.bin",
+                  os.path.join(tempfile.mkdtemp(), "n.bin"))
+        ok = wait_until(lambda: "ok" in result4, 10.0)
+        check("server that will not resume = loud failure, not a short file",
+              ok and result4.get("ok") is False
+              and "resume" in result4.get("msg", ""))
+    finally:
+        prov4.shutdown()
+        prov4.server_close()
+
+    print("[10] window button: white at rest, gold while engaged/downloading")
+    from src.ui import icons as ic_mod
+    white = ic_mod.download_window()
+    gold = ic_mod.download_window(ic_mod.GOLD)
+    gold_keep = ic_mod.download_window(ic_mod.GOLD, keep_disabled=True)
+    check("white and gold variants are distinct cached icons",
+          white is not gold and gold is not gold_keep)
+    pm_w = white.pixmap(24, 24)
+    img_w = pm_w.toImage()
+    # collect the solid glyph pixels (alpha > 200) and classify the color
+    def solid_pixels(img):
+        out = []
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                if c.alpha() > 200:
+                    out.append((c.red(), c.green(), c.blue()))
+        return out
+
+    glyph_w = solid_pixels(img_w)
+    check("default icon glyph is white, not gold",
+          glyph_w and all(r > 230 and g > 230 and b > 230
+                          for r, g, b in glyph_w))
+    glyph_g = solid_pixels(gold.pixmap(24, 24).toImage())
+    check("engaged icon glyph is gold",
+          glyph_g and all(abs(r - 245) < 25 and abs(g - 197) < 40 and b < 90
+                          for r, g, b in glyph_g))
+    img_n = gold_keep.pixmap(
+        24, 24, QtGui.QIcon.Normal).toImage()
+    img_d = gold_keep.pixmap(
+        24, 24, QtGui.QIcon.Disabled).toImage()
+    check("downloading icon carries an explicit disabled pixmap",
+          gold_keep.availableSizes(QtGui.QIcon.Disabled)
+          and img_n == img_d)
+    check("rest icon has none (state-free, graying left to the style)",
+          not white.availableSizes(QtGui.QIcon.Disabled))
+
+    # -- button state flow on the view (icons compared by cacheKey: a
+    #    setIcon copy shares the engine with the cached module icon) --
+    def icon_key(btn):
+        return btn.icon().cacheKey()
+
+    view3 = view                      # reuse the [6] view (catchup current)
+    view3._win_cancel(silent=True)
+    app.processEvents()
+    check("idle button shows the white icon",
+          icon_key(view3.btn_win) == white.cacheKey())
+    view3.slider.blockSignals(True)
+    view3.slider.setRange(0, 1800000)
+    view3.slider.blockSignals(False)
+    view3._win_engage()
+    check("engaged selection turns the icon gold",
+          icon_key(view3.btn_win) == gold.cacheKey())
+    view3._win_cancel()
+    check("cancel restores the white icon",
+          icon_key(view3.btn_win) == white.cacheKey())
+
+    captured2 = {}
+
+    class FakeDownloader2(QtCore.QObject):
+        progress = QtCore.pyqtSignal(int, int)
+        finished = QtCore.pyqtSignal(bool, str)
+
+        def start(self, url, path):
+            captured2["icon_at_start"] = view3.btn_win.icon().cacheKey()
+            self.finished.emit(True, path)
+
+    orig_fd2 = pv_mod.FileDownloader
+    pv_mod.FileDownloader = FakeDownloader2
+    try:
+        view3._win_engage()
+        view3._win_confirm()
+        app.processEvents()
+        check("download in flight keeps the gold icon (disabled-safe)",
+              captured2.get("icon_at_start") == gold_keep.cacheKey())
+        check("finished download restores the white icon",
+              icon_key(view3.btn_win) == white.cacheKey())
+    finally:
+        pv_mod.FileDownloader = orig_fd2
+
+    print("[11] catch-up stall watchdog: frozen / stopped -> rescue reopen")
+    view4 = PlayerView(fresh_cfg())
+    view4.show()
+    app.processEvents()
+
+    class WatchVlc:
+        """Clock we can freeze; records play() rescues + fraction seeks."""
+
+        def __init__(self):
+            self.pos_calls = []
+            self.plays = []
+            self._t = 0
+            self.frozen_at = None
+            self.playing = True
+
+        def set_position(self, frac):
+            self.pos_calls.append(frac)
+            self._t = int(frac * 1800000)
+
+        def play(self, url, timeshift=None, start_seconds=0.0):
+            self.plays.append(url)
+
+        def is_playing(self):
+            return self.playing
+
+        def get_length(self):
+            return 0
+
+        def get_time(self):
+            return self._t
+
+        def video_size(self):
+            return (0, 0)
+
+        def __getattr__(self, name):
+            def _stub(*_a, **_k):
+                return 0
+            return _stub
+
+    wstub = WatchVlc()
+    orig_vlc4 = view4.vlc
+    view4.vlc = wstub
+    orig_freeze = PlayerView._CU_FREEZE_S
+    orig_ticks = PlayerView._CU_STOP_TICKS
+    PlayerView._CU_FREEZE_S = 0.6
+    PlayerView._CU_STOP_TICKS = 3
+    try:
+        view4.current = {"kind": "catchup", "title": "W",
+                         "stream_id": 501, "utc_start": 1000,
+                         "utc_end": 1000 + 1800, "url": "http://relay/x"}
+        view4._catchup_local_url = "http://relay/x"
+        # healthy playback: clock advances, no rescue
+        for t in (0.0, 0.5, 1.0):
+            wstub._t = int(t * 1000)
+            view4._tick()
+        check("healthy playback never triggers a rescue",
+              wstub.plays == [])
+        # frozen mid-program (provider killed the connection). Walk the
+        # tracked position to 10:00 first — the tracker only snaps to VLC's
+        # clock when they AGREE (<=3 s apart), a 600 s teleport is rejected
+        # just like garbage broadcast PTS would be.
+        view4._vid_s = 600.0
+        wstub._t = 600000                       # playing at 10:00
+        view4._tick()
+        check("agreed clock snaps the tracked position",
+              abs(view4._vid_s - 600.0) < 1e-6)
+        wstub._t = 600000                       # ...and now it sticks
+        view4._tick()
+        time.sleep(0.8)
+        view4._tick()
+        ok = wait_until(lambda: len(wstub.plays) == 1, 3.0)
+        check("frozen stream is reopened through the relay URL",
+              ok and wstub.plays and wstub.plays[0] == "http://relay/x")
+        ok = wait_until(lambda: len(wstub.pos_calls) >= 1, 4.0)
+        check("rescue re-seeks to the frozen position",
+              ok and wstub.pos_calls
+              and abs(wstub.pos_calls[-1] * 1800.0 - 600.0) < 25.0)
+        # cooldown: an immediate second freeze must not re-rescue
+        n_plays = len(wstub.plays)
+        view4._tick()
+        check("rescue respects the reopen cooldown",
+              len(wstub.plays) == n_plays)
+        # stopped mid-program (VLC ended/error while the program continues)
+        view4._last_reopen = 0.0                # outside the cooldown
+        wstub.playing = False
+        for _ in range(4):
+            view4._tick()
+        ok = wait_until(lambda: len(wstub.plays) == n_plays + 1, 3.0)
+        check("dead player mid-program is reopened too", ok)
+        # near the program end, stopping is natural: no rescue
+        n_plays = len(wstub.plays)
+        view4._last_reopen = 0.0
+        view4._vid_s = 1790.0                   # 10 s before the end
+        wstub.playing = False
+        for _ in range(5):
+            view4._tick()
+        check("natural end-of-program never rescues",
+              len(wstub.plays) == n_plays)
+    finally:
+        PlayerView._CU_FREEZE_S = orig_freeze
+        PlayerView._CU_STOP_TICKS = orig_ticks
+        view4.vlc = orig_vlc4
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

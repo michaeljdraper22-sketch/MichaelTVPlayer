@@ -37,7 +37,10 @@ def _F(x, y):
     return QtCore.QPointF(x, y)
 
 
-def _icon(key, draw):
+def _icon(key, draw, keep_disabled=False):
+    """Render one glyph. ``keep_disabled`` pins the SAME pixmap into the
+    icon's Disabled mode (state-indicator glyphs — e.g. the window-download
+    button while a download runs — must not gray out; they carry meaning)."""
     icon = _cache.get(key)
     if icon is not None:
         return icon
@@ -55,7 +58,12 @@ def _icon(key, draw):
     pm = master.scaled(side, side, QtCore.Qt.KeepAspectRatio,
                        QtCore.Qt.SmoothTransformation)
     pm.setDevicePixelRatio(dpr)
-    icon = QtGui.QIcon(pm)
+    if keep_disabled:
+        icon = QtGui.QIcon()
+        icon.addPixmap(pm, QtGui.QIcon.Normal, QtGui.QIcon.Off)
+        icon.addPixmap(pm, QtGui.QIcon.Disabled, QtGui.QIcon.Off)
+    else:
+        icon = QtGui.QIcon(pm)
     _cache[key] = icon
     return icon
 
@@ -331,20 +339,27 @@ def download():
     return _icon("download", draw)
 
 
-def download_window():
-    """Catch-up window download (gold): a timeline segment between two
-    in-point markers with the download arrow below it — mirrors the two
-    gold < > markers the button drops onto the scrubber."""
+def download_window(color=None, keep_disabled=False):
+    """Catch-up window download: a timeline segment between two in-point
+    markers with the download arrow below it — mirrors the two gold < >
+    markers the button drops onto the scrubber. WHITE at rest like every
+    other control glyph; the GOLD variant marks the engaged states (window
+    markers active, download in flight)."""
+    gold = color is not None and color != WHITE
+
     def draw(p, c):
-        gold = GOLD
+        col = color or c
         # the timeline with the selected segment highlighted
-        _polyline(p, gold, [(3.0, 5.2), (21.0, 5.2)], 2.0)
-        _polyline(p, gold, [(6.6, 2.8), (6.6, 7.6), (17.4, 7.6), (17.4, 2.8)], 2.0)
+        _polyline(p, col, [(3.0, 5.2), (21.0, 5.2)], 2.0)
+        _polyline(p, col, [(6.6, 2.8), (6.6, 7.6), (17.4, 7.6), (17.4, 2.8)], 2.0)
         # the download arrow beneath
-        _polyline(p, gold, [(12.0, 10.6), (12.0, 16.6)])
-        _polyline(p, gold, [(8.9, 13.8), (12.0, 16.9), (15.1, 13.8)])
-        _polyline(p, gold, [(6.0, 19.6), (6.0, 21.4), (18.0, 21.4), (18.0, 19.6)], 2.0)
-    return _icon("download-window", draw)
+        _polyline(p, col, [(12.0, 10.6), (12.0, 16.6)])
+        _polyline(p, col, [(8.9, 13.8), (12.0, 16.9), (15.1, 13.8)])
+        _polyline(p, col, [(6.0, 19.6), (6.0, 21.4), (18.0, 21.4), (18.0, 19.6)], 2.0)
+    key = "download-window-gold" if gold else "download-window"
+    if keep_disabled:
+        key += "-keep"
+    return _icon(key, draw, keep_disabled=keep_disabled)
 
 
 def check():
