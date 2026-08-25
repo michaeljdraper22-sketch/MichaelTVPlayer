@@ -3,7 +3,7 @@
 PY=.venv/Scripts/python.exe
 cd /d/Coding/MichaelTVPlayer || exit 9
 
-SUITES="test_always_chase test_anchor_store test_bundled_ccx test_caption_overlay test_cuestore test_dvr_e2e test_fixes test_overlay_focus test_profanity test_sub_settings test_subtitles test_tab_resize test_temp_cleanup test_vod_series test_vod_splitter test_wedge_cluster"
+SUITES="test_always_chase test_anchor_store test_bundled_ccx test_caption_overlay test_catchup test_cuestore test_dvr_e2e test_fixes test_overlay_focus test_profanity test_startup_defaults test_sub_settings test_subtitles test_tab_resize test_temp_cleanup test_vod_series test_vod_splitter test_wedge_cluster"
 
 echo "===== OFFLINE SUITES $(date +%H:%M:%S) ====="
 for s in $SUITES; do

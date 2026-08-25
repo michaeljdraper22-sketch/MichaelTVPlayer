@@ -28,6 +28,11 @@
   ok   bidi wrappers stripped from Latin lines (rip-house styling)
   ok   Arabic lines keep their bidi controls
   ok   ASS track selected over bitmap
+[3b1b] English-default selection ladder (MKV)
+  ok   evidence helper: language words in names count
+  ok   ladder 1: preferred language matched
+  ok   ladder 2: unlabeled track picked over labeled non-English
+  ok   ladder 3: all labeled non-English -> NO selection
 [3b2] rebase keeps the tap alive (metadata carry)
   ok   head parse selects the text track
   ok   sample has a cluster past the head elements
@@ -43,7 +48,7 @@
 [4] VLC plays through the relay (and seeks)
   ok   playback runs through the relay
   ok   duration sane (~12 s)
-    (seek debug: t=8502, provider_opens=0)
+    (seek debug: t=8601, provider_opens=0)
   ok   seek lands through the relay
   ok   seek needs no provider reopen (cached window)
   ok   cache file cleaned up
@@ -92,7 +97,7 @@
 [5d] VLC plays the mp4 through the relay (and seeks)
   ok   mp4 playback runs through the relay
   ok   mp4 duration sane (~12 s)
-    (mp4 seek debug: t=8407, provider_opens=0)
+    (mp4 seek debug: t=8664, provider_opens=0)
   ok   mp4 seek lands through the relay
   ok   mp4 seek needs no provider reopen (cached window)
   ok   mp4 cache file cleaned up
@@ -130,9 +135,12 @@
 [9] MP4 edit-list media_time honored in cue timing
   ok   elst media_time (0.7 s skip) shifts cue times earlier
   ok   media_time=0 edit lists leave timing alone
+[9b] MP4 selection ladder (English-default policy)
+  ok   mp4 ladder: 'und' (undefined) counts as unlabeled -> picked
+  ok   mp4 ladder: all labeled non-English -> NO selection
 
-all 108 checks passed
-[0000022fcbcf0480] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
-[0000022fcc584780] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
-[0000022fcbefe450] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
-[0000022fcbe8ed30] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+all 114 checks passed
+[00000298de0a02e0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000298de15fcb0] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[00000298de58b470] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000298de692a80] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4

@@ -1,0 +1,20 @@
+[1] MainWindow._restore_state always maximizes
+  ok   window is maximized despite saved normal+half-snap
+[2] Live / Movies / Series all open on the "All" category
+  ok   Live TV: category dropdown filled (4 entries)
+  ok   Live TV: selection is 'All' (idx=1, data='all')
+  ok   Live TV: item list loaded for 'All' (cat_id=None)
+  ok   Live TV: list shows items
+  ok   Movies: category dropdown filled (4 entries)
+  ok   Movies: selection is 'All' (idx=1, data='all')
+  ok   Movies: item list loaded for 'All' (cat_id=None)
+  ok   Movies: list shows items
+  ok   Series: category dropdown filled (4 entries)
+  ok   Series: selection is 'All' (idx=1, data='all')
+  ok   Series: item list loaded for 'All' (cat_id=None)
+  ok   Series: list shows items
+[3] Movies / Series keep the big-library loading hint
+  ok   VOD 'All' fetch shows the big-list hint
+  ok   Live 'All' fetch uses the plain Loading… hint
+
+15 passed, 0 failed

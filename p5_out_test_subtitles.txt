@@ -21,6 +21,9 @@
   ok   cycle 2: Spanish
   ok   cycle 3: back to Off
   ok   no tracks -> cycle is a no-op
+[7b] C key lands on the ENGLISH track first
+  ok   cycle 1: English (track 2), not track 1
+  ok   cycle 2: track 1 next (stable order after English)
 [8] menu contents
   ok   menu = Off + every track + settings
   ok   current track is checked
@@ -32,4 +35,4 @@
 [11] teardown safety
   ok   guards after stop()
 
-all 22 checks passed
+all 24 checks passed

@@ -8,6 +8,7 @@ from ..config import Config
 from ..xtream import XtreamClient
 from . import icons as ic
 from .browsers import (
+    CatchupBrowser,
     CustomTab,
     FavoritesTab,
     LiveBrowser,
@@ -167,12 +168,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_tab = LiveBrowser(config, self.client, "live")
         self.vod_tab = VodBrowser(config, self.client, "vod")
         self.series_tab = SeriesBrowser(config, self.client, "series")
+        self.catchup_tab = CatchupBrowser(config, self.client, "catchup")
         self.fav_tab = FavoritesTab(config)
         self.custom_tab = CustomTab(config)
 
         self.tabs.addTab(self.live_tab, "Live TV")
         self.tabs.addTab(self.vod_tab, "Movies")
         self.tabs.addTab(self.series_tab, "Series")
+        self.tabs.addTab(self.catchup_tab, "Catch-Up")
         self.tabs.addTab(self.fav_tab, "★ Favorites")
         self.tabs.addTab(self.custom_tab, "➕ Custom")
 
@@ -191,7 +194,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.setCornerWidget(self.btn_hide_channels,
                                   QtCore.Qt.TopRightCorner)
 
-        for tab in (self.live_tab, self.vod_tab, self.series_tab):
+        for tab in (self.live_tab, self.vod_tab, self.series_tab,
+                    self.catchup_tab):
             tab.media_activated.connect(self.play)
             tab.favorite_changed.connect(self.fav_tab.refresh)
         self.fav_tab.media_activated.connect(self.play)
@@ -218,26 +222,38 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.save()
 
     def _exit_fullscreen_only(self):
-        """Esc: leave fullscreen, never re-enter it (F is the toggle)."""
+        """Esc: leave fullscreen, never re-enter it (F is the toggle).
+        A live download-window selection is cancelled first — Esc is its
+        dedicated escape hatch."""
+        if self.player_view._win_cancel_if_active():
+            return
         if getattr(self.player_view, "_fullscreen", False):
             self.toggle_fullscreen()
 
     def _on_countries_changed(self):
         """A country filter changed: reload every browser it can affect."""
-        for tab in (self.live_tab, self.vod_tab, self.series_tab):
+        for tab in (self.live_tab, self.vod_tab, self.series_tab,
+                    self.catchup_tab):
             tab._reload_categories()
 
     def _setup_shortcuts(self):
         QtWidgets.QShortcut(QtGui.QKeySequence("Space"), self,
                             activated=self.player_view.toggle_pause)
+        # Left/Right go through seek_or_nudge: with the catch-up download
+        # window markers active they nudge the selected gold marker (1 s,
+        # Shift = 10 s) instead of seeking playback
         QtWidgets.QShortcut(QtGui.QKeySequence("Left"), self,
-                            activated=lambda: self.player_view.seek_relative(-10000))
+                            activated=lambda: self.player_view.seek_or_nudge(-10, 1))
         QtWidgets.QShortcut(QtGui.QKeySequence("Right"), self,
-                            activated=lambda: self.player_view.seek_relative(10000))
+                            activated=lambda: self.player_view.seek_or_nudge(10, 1))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Left"), self,
+                            activated=lambda: self.player_view.seek_or_nudge(-10, 10))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+Right"), self,
+                            activated=lambda: self.player_view.seek_or_nudge(10, 10))
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Left"), self,
-                            activated=lambda: self.player_view.seek_relative(-60000))
+                            activated=lambda: self.player_view.seek_or_nudge(-60000, 60))
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Right"), self,
-                            activated=lambda: self.player_view.seek_relative(60000))
+                            activated=lambda: self.player_view.seek_or_nudge(60000, 60))
         QtWidgets.QShortcut(QtGui.QKeySequence("F"), self,
                             activated=self.toggle_fullscreen)
         QtWidgets.QShortcut(QtGui.QKeySequence("Escape"), self,
@@ -307,6 +323,8 @@ class MainWindow(QtWidgets.QMainWindow):
         act_pf.triggered.connect(self.edit_profanity)
         act_folder = QtWidgets.QAction("Recording folder…", self)
         act_folder.triggered.connect(self.choose_record_folder)
+        act_dlfolder = QtWidgets.QAction("Download folder…", self)
+        act_dlfolder.triggered.connect(self.choose_download_folder)
         act_dvr_window = QtWidgets.QAction("DVR buffer length…", self)
         act_dvr_window.triggered.connect(self.edit_dvr_window)
         act_delay = QtWidgets.QAction("Live delay (behind live)\u2026", self)
@@ -317,6 +335,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu.addAction(act_pf)
         settings_menu.addSeparator()
         settings_menu.addAction(act_folder)
+        settings_menu.addAction(act_dlfolder)
         settings_menu.addAction(act_dvr_window)
         settings_menu.addAction(act_delay)
         settings_menu.addAction(act_cache)
@@ -330,6 +349,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if playable.get("kind") == "series_meta":
             # A series entry was somehow activated directly; open its episodes.
             self.series_tab._open_series(playable)
+            return
+        if playable.get("kind") == "catchup_channel":
+            # Direct activation of an archive channel: open its program picker
+            self.catchup_tab._open_picker(playable)
             return
         self.player_view.play_media(playable)
         self.config.add_recent(playable)
@@ -348,7 +371,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def reload_all(self):
         self.fav_tab.refresh()
         self.countries_dialog._load()
-        for tab in (self.live_tab, self.vod_tab, self.series_tab):
+        for tab in (self.live_tab, self.vod_tab, self.series_tab,
+                    self.catchup_tab):
             tab._reload_categories()
 
     def add_custom(self):
@@ -421,6 +445,17 @@ class MainWindow(QtWidgets.QMainWindow):
         )
         if folder:
             self.config.record_folder = folder
+            self.config.save()
+
+    def choose_download_folder(self):
+        """Settings ▸ Download folder — where catch-up window downloads and
+        movie/episode downloads are saved."""
+        folder = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Choose where downloads are saved",
+            self.config.download_folder or self.config.record_folder or ""
+        )
+        if folder:
+            self.config.download_folder = folder
             self.config.save()
 
     def edit_control_buttons(self):
@@ -718,9 +753,19 @@ class MainWindow(QtWidgets.QMainWindow):
             "tab each for Live TV, Movies and Series; saved automatically and\n"
             "applied immediately.\n\n"
             "Movies & series: the REC button becomes a Download button (saves\n"
-            "the original file to your recordings folder); scrub, jump-to-\n"
+            "the original file to your downloads folder); scrub, jump-to-\n"
             "begin, LIVE (skip to end) and playback speed all work on a\n"
             "full file.\n\n"
+            "Catch-Up: channels with a provider archive (marked with their\n"
+            "archive depth). Click one and pick any recently-aired program\n"
+            "to watch the recording. While it plays, the REC/DL button\n"
+            "becomes the gold WINDOW button: press it once to drop two\n"
+            "gold < > markers on the time bar — drag them, click the bar to\n"
+            "place the nearest one, or click a marker and nudge it with\n"
+            "the \u2190/\u2192 arrow keys (Shift = 10 s, Ctrl = 60 s). Press\n"
+            "the gold button again to download exactly that stretch (Esc\n"
+            "cancels). Downloads land in the Downloads folder (Settings \u25b8\n"
+            "Download folder).\n\n"
             "Settings -> Network cache size adjusts buffering (0–50,000 ms).\n\n"
             "Your settings are saved in %APPDATA%\\MichaelTVPlayer.\n\n"
             "Bug reports: attach the log file, %APPDATA%\\MichaelTVPlayer"

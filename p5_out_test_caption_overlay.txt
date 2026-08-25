@@ -69,7 +69,7 @@ vlc attach: set_window failed (attempt 1/3): AttributeError("'FakeVLC' object ha
   ok   known language words recognized
   ok   junk hints rejected
   ok   'english' hint selects the eng text track
-  ok   no wanted-language text -> first text track (UI then hands off)
+  ok   no wanted-language text -> NO selection (English-default policy: the UI reports 'no English text track', never shows the labeled non-English track)
 [4b] overlay eligibility by content kind (unified subtitles)
   ok   ASS is overlay-eligible on VOD (the relay flattens it)
   ok   ASS stays on VLC for live
@@ -148,11 +148,26 @@ vlc attach: set_window failed (attempt 1/3): AttributeError("'FakeVLC' object ha
 [7] view: overlay anchors to the displayed video rect
   ok   view laid out: surface fills the 1920x1080 view
   ok   unknown size keeps the whole-surface overlay
-  ok   letterboxed movie: overlay = displayed picture rect
-  ok   bottom inset clears the control bar from the picture bottom
-  ok   controls hidden -> plain 24 px inset above the picture
+  ok   unknown size: no bar mode
+  ok   windowed letterbox (bar mode): overlay = whole surface
+  ok   bar top = picture bottom (1020)
+  ok   bar mode + controls: inset clears the bar measured from the surface bottom
+  ok   bar mode + controls hidden: zero inset (the bar margin is painted)
+  ok   shallow 41 px bar: too shallow, picture-anchored overlay
+  ok   pillarbox: no bottom bar -> picture-anchored overlay
+  ok   prefer_bar off: overlay = displayed picture rect
+  ok   prefer_bar off + controls: inset clears the control bar from the picture bottom
+  ok   prefer_bar off + controls hidden: plain 24 px inset above the picture
+  ok   fullscreen: overlay = displayed picture rect (no bar mode)
   ok   crop mode: overlay back to the full surface
   ok   16:9 channel: overlay = full surface
   ok   16:9 and 2:1 overlays keep one caption scale relative to the picture
+[7b] bar-mode paint: ink parks inside the bottom black bar
+  ok   2.35:1 windowed: ink sits inside the bar
+  ok   2.35:1 windowed: ink clears the window-bottom margin
+  ok   2:1 windowed: ink inside the 60 px bar
+  ok   2:1 windowed: ink clears the window-bottom margin
+  ok   bar mode + control-bar inset: ink clears the control bar
+  ok   pos_pct raise lifts the block above the bar
 
-138 passed, 0 failed
+152 passed, 0 failed

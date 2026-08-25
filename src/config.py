@@ -61,6 +61,7 @@ DEFAULTS = {
     "series_countries_configured": False,
     "dvr_max_minutes": 30,        # rolling DVR buffer window
     "record_folder": "",          # where permanent recordings are saved
+    "download_folder": "",        # where catch-up window / VOD downloads go
     # Seconds behind live the always-on DVR chase keeps live TV. 5 is the
     # floor: the caption cushion (profanity filter / app-rendered captions)
     # cannot mute/render in time with less.
@@ -137,6 +138,13 @@ class Config:
             if int(data.get("chase_delay", 5) or 5) == 15:
                 data["chase_delay"] = 5
             data["_chase_delay_migrated"] = True
+        # one-time migration: the Catch-Up tab was inserted after Series,
+        # which shifts the stored Favorites/Custom tab indices by one.
+        if not data.get("_catchup_tab_migrated"):
+            lt = data.get("last_tab")
+            if isinstance(lt, int) and lt >= 3:
+                data["last_tab"] = lt + 1
+            data["_catchup_tab_migrated"] = True
         return cls(data, path)
 
     def save(self) -> None:
@@ -443,6 +451,14 @@ class Config:
     @record_folder.setter
     def record_folder(self, value: str) -> None:
         self.data["record_folder"] = value or ""
+
+    @property
+    def download_folder(self) -> str:
+        return self.data.get("download_folder", "")
+
+    @download_folder.setter
+    def download_folder(self, value: str) -> None:
+        self.data["download_folder"] = value or ""
 
     @property
     def chase_delay(self) -> int:

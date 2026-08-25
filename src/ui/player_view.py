@@ -2,6 +2,7 @@
 
 import html
 import logging
+import math
 import os
 import re
 import shutil
@@ -9,12 +10,14 @@ import sys
 import tempfile
 import time
 import urllib.parse
+from datetime import datetime
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..dvr import VlcRecorder
 from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
 from .. import profanity as prof_mod
+from ..catchup_relay import CatchupRelay
 from ..live_cc import CCSource, find_ccextractor, probe_tail_pcr, \
     probe_first_pcr_at
 from .. import vod_splitter
@@ -328,9 +331,30 @@ _OVERLAY_QSS = """
 class JumpSlider(QtWidgets.QSlider):
     """QSlider where a CLICK anywhere on the groove jumps straight to that
     point (standard QSlider only page-steps). A click also enters drag
-    mode, so you can keep holding and fine-tune."""
+    mode, so you can keep holding and fine-tune.
+
+    ``_win_mode`` (set by PlayerView while a catch-up download window is
+    being selected) reroutes clicks: instead of seeking, the click emits
+    ``win_picked`` with the clicked value — the view moves the NEAREST
+    gold window marker there."""
+
+    win_picked = QtCore.pyqtSignal(int)
 
     def mousePressEvent(self, ev):
+        if (ev.button() == QtCore.Qt.LeftButton
+                and getattr(self, "_win_mode", False)):
+            st = self.style()
+            handle = st.pixelMetric(QtWidgets.QStyle.PM_SliderLength,
+                                    None, self)
+            span = max(1, self.width() - handle)
+            x = ev.pos().x() - handle // 2
+            frac = min(1.0, max(0.0, x / span))
+            val = self.minimum() + round(
+                (self.maximum() - self.minimum()) * frac)
+            val = max(self.minimum(), min(self.maximum(), val))
+            self.win_picked.emit(val)
+            ev.accept()
+            return
         if (ev.button() == QtCore.Qt.LeftButton
                 and self.orientation() == QtCore.Qt.Horizontal):
             st = self.style()
@@ -356,6 +380,83 @@ class JumpSlider(QtWidgets.QSlider):
             ev.accept()
             return
         super().mousePressEvent(ev)
+
+
+# gold used by the catch-up download-window markers + button
+_WIN_GOLD = QtGui.QColor(245, 197, 24, 255)
+_WIN_GOLD_HEX = "#f5c518"
+_WIN_GAP_MS = 1000          # smallest selectable window (1 s)
+
+
+class WinMarker(QtWidgets.QWidget):
+    """One gold < / > catch-up download-window handle on the scrubber.
+
+    Pure view widget: paints the gold chevron (filled when selected) plus
+    a guide line through the groove, and reports clicks/drags as
+    slider-local x positions — PlayerView owns the millisecond values and
+    the clamping."""
+
+    clicked = QtCore.pyqtSignal()
+    drag_moved = QtCore.pyqtSignal(int)   # slider-local x while dragging
+
+    def __init__(self, left_pointing: bool, parent=None):
+        super().__init__(parent)
+        self.left_pointing = left_pointing
+        self.selected = False
+        self._dragging = False
+        self.setFixedSize(16, 24)
+        self.setCursor(QtCore.Qt.SizeHorCursor)
+        self.setToolTip("Drag me, click to select me, then adjust with "
+                        "the \u2190/\u2192 arrow keys")
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self.clicked.emit()
+            self._dragging = True
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseMoveEvent(self, ev):
+        if self._dragging:
+            self.drag_moved.emit(ev.pos().x() + self.x())
+            ev.accept()
+            return
+        super().mouseMoveEvent(ev)
+
+    def mouseReleaseEvent(self, ev):
+        self._dragging = False
+        ev.accept()
+
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+        gold = _WIN_GOLD
+        glyph = QtCore.Qt.black if self.selected else gold
+        if self.selected:
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(gold)
+            p.drawRoundedRect(QtCore.QRectF(0.5, 0.5, 15.0, 16.5), 3.0, 3.0)
+        else:
+            p.setPen(QtCore.Qt.NoPen)
+            p.setBrush(QtGui.QColor(245, 197, 24, 40))
+            p.drawRoundedRect(QtCore.QRectF(0.5, 0.5, 15.0, 16.5), 3.0, 3.0)
+        pen = QtGui.QPen(glyph, 2.4)
+        pen.setCapStyle(QtCore.Qt.RoundCap)
+        pen.setJoinStyle(QtCore.Qt.RoundJoin)
+        p.setPen(pen)
+        if self.left_pointing:      # "<" marks the window START
+            p.drawPolyline(QtGui.QPolygonF([
+                QtCore.QPointF(10.4, 3.4), QtCore.QPointF(4.8, 8.4),
+                QtCore.QPointF(10.4, 13.4)]))
+        else:                        # ">" marks the window END
+            p.drawPolyline(QtGui.QPolygonF([
+                QtCore.QPointF(5.6, 3.4), QtCore.QPointF(11.2, 8.4),
+                QtCore.QPointF(5.6, 13.4)]))
+        # guide line through the groove below the glyph
+        pen = QtGui.QPen(gold, 1)
+        p.setPen(pen)
+        p.drawLine(QtCore.QPointF(8.0, 14.0), QtCore.QPointF(8.0, self.height()))
 
 
 class VideoSurface(QtWidgets.QWidget):
@@ -498,6 +599,7 @@ class PlayerView(QtWidgets.QWidget):
         # profanity filter (live TV: captions from the DVR buffer + engine)
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
+        self._catchup_relay = None    # catch-up range proxy (scrub-ability)
         self._cap_relay_gen = 0       # session the attached relay belongs
         #                              # to (stale-delivery guard, see
         #                              # _cap_relay_live)
@@ -726,6 +828,24 @@ class PlayerView(QtWidgets.QWidget):
         ctl_lay.addWidget(self.scrub_row)
         self.scrub_row.hide()
 
+        # gold < > download-window markers live ON the slider (hidden until
+        # a catch-up window selection starts).  The slider reports clicks
+        # while in window mode; PlayerView converts pixels <-> milliseconds.
+        self.slider.win_picked.connect(self._on_win_slider_click)
+        self.slider.installEventFilter(self)
+        self._win_markers = {
+            "start": WinMarker(True, self.slider),
+            "end": WinMarker(False, self.slider),
+        }
+        for _side, _m in self._win_markers.items():
+            _m.clicked.connect(lambda s=_side: self._win_select(s))
+            _m.drag_moved.connect(lambda x, s=_side: self._win_drag(s, x))
+            _m.hide()
+        self._win_sel = False          # window-select mode active?
+        self._win_sel_side = None      # "start" | "end" (arrow keys move it)
+        self._win_start_ms = 0
+        self._win_end_ms = 0
+
         self.btn_back60 = ctl_btn(ic.rewind60(), "Rewind 60 seconds")
         self.btn_back10 = ctl_btn(ic.rewind10(), "Rewind 10 seconds")
         self.btn_play = ctl_btn(ic.play(), "Play / Pause (Space)")
@@ -739,7 +859,17 @@ class PlayerView(QtWidgets.QWidget):
         # (the file is already fully seekable — there is nothing to
         # timeshift; recording a stream re-encodes, a download is verbatim)
         self.btn_dl = ctl_btn(ic.download(),
-                              "Download this video to the recordings folder")
+                              "Download this video to the downloads folder")
+        # catch-up programs get the WINDOW download instead of REC/DL: the
+        # first press drops two gold < > markers on the time bar (drag /
+        # arrow-key them, click the bar to place), the second press
+        # downloads exactly that stretch of the recording
+        self.btn_win = ctl_btn(ic.download_window(),
+                               "Download a time window of this program",
+                               checkable=True)
+        self.btn_win.setStyleSheet(
+            "QToolButton:checked { background: rgba(245,197,24,52);"
+            " border: 1px solid #f5c518; border-radius: 4px; }")
         self.btn_rec = ctl_btn(ic.rec(False),
                                "Record this channel to a file "
                                "(Settings > Recording folder)", checkable=True)
@@ -776,7 +906,7 @@ class PlayerView(QtWidgets.QWidget):
         rl.setSpacing(6)
         for w in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
-                  self.btn_dl, self.btn_rec, self.sep2,
+                  self.btn_dl, self.btn_win, self.btn_rec, self.sep2,
                   self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
                   self.sep3, self.btn_mute, self.vol_slider):
             rl.addWidget(w)
@@ -820,6 +950,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_speed.clicked.connect(self._speed_menu)
         self.btn_mute.toggled.connect(self._on_mute)
         self.btn_dl.clicked.connect(self._start_download)
+        self.btn_win.clicked.connect(self._on_win_btn)
         self.btn_rec.toggled.connect(self._on_rec_toggled)
         self.vol_slider.valueChanged.connect(self._on_volume)
         # sliderMoved too: a plain CLICK on the groove sets the position
@@ -983,10 +1114,38 @@ class PlayerView(QtWidgets.QWidget):
 
     # ---- content kinds ----
     def _is_vod(self) -> bool:
-        """A movie or series episode: the whole file already exists, so it
-        is seekable/scrubbable without any DVR machinery."""
+        """A movie, series episode or catch-up program: the whole recording
+        already exists server-side, so it is seekable/scrubbable without
+        any DVR machinery."""
         return bool(self.current
-                    and self.current.get("kind") in ("vod", "series"))
+                    and self.current.get("kind") in ("vod", "series",
+                                                     "catchup"))
+
+    def _is_catchup(self) -> bool:
+        """A provider catch-up (archive) program — window-downloadable."""
+        return bool(self.current and self.current.get("kind") == "catchup")
+
+    def _catchup_dur_ms(self) -> int:
+        """Known recording length (EPG start -> stop).  VLC cannot compute
+        a duration for these raw TS streams, so the scrubber is seeded
+        from the program window instead of get_length()."""
+        cur = self.current or {}
+        try:
+            return max(0, int(cur.get("utc_end") or 0)
+                       - int(cur.get("utc_start") or 0)) * 1000
+        except (TypeError, ValueError):
+            return 0
+
+    def _catchup_seek_to(self, target_ms: float):
+        """Catch-up seek on the byte-fraction axis: time-based set_time
+        lands imprecisely on indexless TS, but the relay is fully
+        range-seekable and VLC maps fractions to exact byte ranges."""
+        dur = self._catchup_dur_ms()
+        if dur <= 0:
+            return
+        frac = max(0.0, min(0.999, float(target_ms) / dur))
+        self.vlc.set_position(frac)
+        self._vid_s = min(dur / 1000.0, max(0.0, float(target_ms) / 1000.0))
 
     def _is_dvrable(self) -> bool:
         """DVR/timeshift only makes sense for a live stream."""
@@ -1224,6 +1383,9 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_rec.setChecked(False)
         self.btn_rec.setIcon(ic.rec(False))
         self.btn_rec.blockSignals(False)
+        # a half-finished download-window selection never carries into the
+        # next program
+        self._win_cancel(silent=True)
         self._mode = "live"
         self._chase_paused = False
         self._dvr_t0 = None
@@ -1774,6 +1936,10 @@ class PlayerView(QtWidgets.QWidget):
                 else self._vid_s
             self._chase_seek(base + ms / 1000.0)
             return
+        if self._is_catchup():
+            # indexless TS: seek on the byte-fraction axis
+            self._catchup_seek_to(self._vid_s * 1000.0 + ms)
+            return
         # Live / VOD: normal seek (works for VOD; live streams ignore it).
         self.vlc.seek_ms(ms)
 
@@ -1784,6 +1950,8 @@ class PlayerView(QtWidgets.QWidget):
             self._set_rate(1.0)
             self._sync_transport("jump_begin", 0.0)
             self._chase_seek(0.0, resume=True)
+        elif self._is_catchup():
+            self._catchup_seek_to(0.0)
         elif self.vlc.get_length() > 0:
             self.vlc.set_time(0)
 
@@ -2023,6 +2191,9 @@ class PlayerView(QtWidgets.QWidget):
                 # content axis before clamping
                 self._chase_seek(
                     self._cap_content_for_raw(self.slider.value() / 1000.0))
+            elif self._is_catchup():
+                # indexless TS: the byte-fraction axis is the reliable one
+                self._catchup_seek_to(self.slider.value())
             else:
                 self.vlc.set_time(self.slider.value())
                 # Re-base the tracked position: the tick's snap guard
@@ -2461,21 +2632,27 @@ class PlayerView(QtWidgets.QWidget):
             self.btn_rec.blockSignals(False)
 
     # ---- VOD download (replaces the DVR button for movies / series) ----
+    def _dl_folder(self):
+        """Where downloads land (Settings > Download folder).  Asks once
+        and remembers when unset."""
+        folder = self.config.download_folder
+        if not folder or not os.path.isdir(folder):
+            folder = QtWidgets.QFileDialog.getExistingDirectory(
+                self, "Choose where downloads are saved")
+            if folder:
+                self.config.download_folder = folder
+                self.config.save()
+        return folder or ""
+
     def _start_download(self):
-        """Save the original movie/episode file to the recordings folder.
+        """Save the original movie/episode file to the downloads folder.
         Unlike REC (which re-records the decode), this copies the provider's
         bytes verbatim in a background thread."""
         if self._downloading or not self._is_vod():
             return
         if not (self.current and self.current.get("url")):
             return
-        folder = self.config.record_folder
-        if not folder or not os.path.isdir(folder):
-            folder = QtWidgets.QFileDialog.getExistingDirectory(
-                self, "Choose where downloads are saved")
-            if folder:
-                self.config.record_folder = folder
-                self.config.save()
+        folder = self._dl_folder()
         if not folder:
             return
         url = self.current["url"]
@@ -2510,6 +2687,7 @@ class PlayerView(QtWidgets.QWidget):
     def _on_dl_finished(self, ok, msg):
         self._downloading = False
         self.btn_dl.setEnabled(self._is_vod())
+        self.btn_win.setEnabled(self._is_catchup())
         if ok:
             self._set_dvr_status(f"Downloaded: {os.path.basename(msg)}")
         else:
@@ -2522,8 +2700,238 @@ class PlayerView(QtWidgets.QWidget):
 
     def _hide_dl_pill(self):
         if (not self._downloading and self._dvr_status.isVisible()
-                and self._dvr_status.text().startswith("Download")):
+                and self._dvr_status.text().startswith(
+                    ("Download", "Enable", "Stream length"))):
             self._set_dvr_status(None)
+
+    # ---- catch-up download window (gold < > markers on the scrubber) ----
+    def _on_win_btn(self):
+        """The window button: FIRST press drops the two gold < > markers on
+        the time bar, SECOND press confirms and downloads the selected
+        stretch (Esc cancels)."""
+        if self._closing:
+            return
+        if self._win_sel:
+            self._win_confirm()
+        elif self._is_catchup():
+            self._win_engage()
+
+    def _win_engage(self):
+        if not self.config.control_buttons.get("timebar", True):
+            # the time bar setting is off — there is nothing to mark
+            self._set_dvr_status(
+                "Enable the time bar (Settings \u25b8 Playback controls) "
+                "to pick a download window")
+            QtCore.QTimer.singleShot(4000, self._hide_dl_pill)
+            return
+        self._set_scrub_visible(True)
+        if self.slider.maximum() <= 0:
+            self._set_dvr_status("Stream length unknown yet \u2014 try again "
+                                 "in a moment")
+            QtCore.QTimer.singleShot(4000, self._hide_dl_pill)
+            return
+        self._win_sel = True
+        self.btn_win.setChecked(True)
+        self.btn_win.setToolTip("Confirm download window (Esc cancels)")
+        # < lands at the current position, > at the end of the recording:
+        # drag/nudge < back to 0 for the whole program
+        end = self.slider.maximum()
+        start = int(max(0.0, min(self._vid_s * 1000.0, end - _WIN_GAP_MS)))
+        self._win_start_ms = start
+        self._win_end_ms = end
+        self.slider._win_mode = True
+        for m in self._win_markers.values():
+            m.show()
+        self._win_reposition()
+        self._win_select("start")
+        self._wake()
+
+    def _win_cancel(self, silent: bool = False):
+        """Leave window-select mode (cancel / channel change / teardown)."""
+        if not self._win_sel:
+            return
+        self._win_sel = False
+        self._win_sel_side = None
+        self.slider._win_mode = False
+        for m in self._win_markers.values():
+            m.selected = False
+            m.update()
+            m.hide()
+        self.btn_win.blockSignals(True)
+        self.btn_win.setChecked(False)
+        self.btn_win.blockSignals(False)
+        self.btn_win.setToolTip("Download a time window of this program")
+        if not silent:
+            self._set_dvr_status(None)
+            self._wake()
+
+    def _win_cancel_if_active(self) -> bool:
+        """Esc: eat the key only when a window selection was live."""
+        if self._win_sel:
+            self._win_cancel()
+            return True
+        return False
+
+    def _win_confirm(self):
+        a, b = int(self._win_start_ms), int(self._win_end_ms)
+        self._win_cancel(silent=True)
+        if b - a < _WIN_GAP_MS:
+            return
+        self._start_window_download(a, b)
+
+    def _win_select(self, side):
+        """One marker selected at a time — the arrow keys nudge that one."""
+        if not self._win_sel:
+            return
+        self._win_sel_side = side
+        for s, m in self._win_markers.items():
+            m.selected = (s == side)
+            m.update()
+        self._win_update_pill()
+        self._wake()
+
+    def _win_nudge(self, ms):
+        if not self._win_sel:
+            return
+        if self._win_sel_side == "end":
+            self._win_end_ms = int(max(self._win_start_ms + _WIN_GAP_MS,
+                                       min(self.slider.maximum(),
+                                           self._win_end_ms + ms)))
+        else:
+            self._win_start_ms = int(max(0, min(
+                self._win_end_ms - _WIN_GAP_MS, self._win_start_ms + ms)))
+        self._win_reposition()
+        self._win_update_pill()
+        self._wake()
+
+    def _win_drag(self, side, x):
+        """Marker drag: x is slider-local pixels (WinMarker reports it)."""
+        if not self._win_sel:
+            return
+        self._win_sel_side = side
+        val = self._value_for_x(x)
+        if side == "end":
+            self._win_end_ms = int(max(self._win_start_ms + _WIN_GAP_MS,
+                                       min(self.slider.maximum(), val)))
+        else:
+            self._win_start_ms = int(max(0, min(
+                self._win_end_ms - _WIN_GAP_MS, val)))
+        for s, m in self._win_markers.items():
+            m.selected = (s == side)
+        self._win_reposition()
+        self._win_update_pill()
+
+    def _on_win_slider_click(self, val):
+        """Click on the time bar while selecting: the NEAREST marker jumps
+        there and becomes the selected one."""
+        if not self._win_sel:
+            return
+        if abs(val - self._win_start_ms) <= abs(val - self._win_end_ms):
+            self._win_start_ms = int(max(
+                0, min(self._win_end_ms - _WIN_GAP_MS, val)))
+            self._win_select("start")
+        else:
+            self._win_end_ms = int(max(
+                self._win_start_ms + _WIN_GAP_MS,
+                min(self.slider.maximum(), val)))
+            self._win_select("end")
+        self._win_reposition()
+
+    def _win_update_pill(self):
+        a, b = self._win_start_ms, self._win_end_ms
+        glyph = "<" if self._win_sel_side == "start" else ">"
+        self._set_dvr_status(
+            f"Download window {glyph}  {_fmt(a)} \u2013 {_fmt(b)} "
+            f"({_fmt(b - a)})  \u2014  drag or click the gold markers, "
+            f"\u2190/\u2192 nudge the selected one; press the gold window "
+            f"button again to download, Esc cancels")
+
+    def _win_reposition(self):
+        if not self._win_sel:
+            return
+        h = max(self.slider.height(), 20)
+        for side, m in self._win_markers.items():
+            v = self._win_start_ms if side == "start" else self._win_end_ms
+            x = int(round(self._x_for_value(v)))
+            m.setGeometry(x - m.width() // 2, 0, m.width(), h)
+            m.raise_()
+
+    # pixel <-> ms mapping, mirroring JumpSlider's own click math
+    def _slider_metrics(self):
+        st = self.slider.style()
+        handle = st.pixelMetric(QtWidgets.QStyle.PM_SliderLength,
+                                None, self.slider)
+        return handle, max(1, self.slider.width() - handle)
+
+    def _x_for_value(self, v) -> float:
+        lo = self.slider.minimum()
+        hi = max(1, self.slider.maximum())
+        handle, span = self._slider_metrics()
+        frac = min(1.0, max(0.0, (v - lo) / float(hi - lo)))
+        return handle // 2 + frac * span
+
+    def _value_for_x(self, x) -> int:
+        lo = self.slider.minimum()
+        hi = max(1, self.slider.maximum())
+        handle, span = self._slider_metrics()
+        frac = min(1.0, max(0.0, (x - handle // 2) / float(span)))
+        return int(lo + round((hi - lo) * frac))
+
+    def seek_or_nudge(self, sec, nudge_s=None):
+        """Arrow keys: with the download-window markers active they nudge
+        the selected gold marker (1 s steps by default, coarser via
+        Shift/Ctrl); otherwise they seek playback by ``sec`` seconds."""
+        if self._win_sel:
+            step = nudge_s if nudge_s is not None else max(1, min(10, abs(sec)))
+            self._win_nudge(int(step * 1000) * (1 if sec >= 0 else -1))
+        else:
+            self._seek_ms(int(sec * 1000))
+
+    def _start_window_download(self, a_ms: int, b_ms: int):
+        """Download the selected [a, b) window of the catch-up recording.
+        The provider's timeshift endpoint honors arbitrary start times and
+        durations, so the window is simply a SECOND timeshift URL —
+        verbatim bytes, no re-encode, playback untouched."""
+        cur = self.current or {}
+        if self._downloading:
+            return
+        if not (self.client and cur.get("stream_id") is not None
+                and cur.get("utc_start") is not None):
+            self._set_dvr_status("Window download unavailable for this "
+                                 "stream")
+            QtCore.QTimer.singleShot(4000, self._hide_dl_pill)
+            return
+        folder = self._dl_folder()
+        if not folder:
+            return
+        utc_a = int(cur["utc_start"]) + a_ms // 1000
+        dur_min = max(1, math.ceil((b_ms - a_ms) / 60000.0))
+        url = self.client.timeshift_url(cur["stream_id"], utc_a, dur_min)
+        t0 = datetime.fromtimestamp(utc_a)
+        t1 = datetime.fromtimestamp(utc_a + (b_ms - a_ms) // 1000)
+        safe = re.sub(r"[^\w\-.]+", "_",
+                      (cur.get("title") or "catchup")).strip("._")[:60]
+        safe = safe or "catchup"
+        path = os.path.join(
+            folder, f"{safe}_{t0.strftime('%H%M')}-{t1.strftime('%H%M')}.ts")
+        n = 1
+        while os.path.exists(path):        # never clobber an earlier download
+            path = os.path.join(
+                folder,
+                f"{safe}_{t0.strftime('%H%M')}-{t1.strftime('%H%M')} ({n}).ts")
+            n += 1
+        self._downloading = True
+        self.btn_dl.setEnabled(False)
+        self.btn_win.setEnabled(False)
+        self._set_dvr_status("Downloading window\u2026")
+        self._dl = FileDownloader(self)
+        self._dl.progress.connect(self._on_dl_progress)
+        self._dl.finished.connect(self._on_dl_finished)
+        self._dl.start(url, path)
+        try:
+            log.info("window download start: %s -> %s", url, path)
+        except Exception:
+            pass
 
     # ---- controls auto-hide (always while playing; immersive too) ----
     @property
@@ -2549,8 +2957,13 @@ class PlayerView(QtWidgets.QWidget):
 
     def eventFilter(self, obj, event):
         et = event.type()
-        if et in (QtCore.QEvent.MouseMove, QtCore.QEvent.HoverMove,
-                  QtCore.QEvent.Wheel):
+        if obj is self.slider and et == QtCore.QEvent.Resize \
+                and self._win_sel:
+            # the bar resized (window resize / compact fit): the gold
+            # markers follow their millisecond positions
+            self._win_reposition()
+        elif et in (QtCore.QEvent.MouseMove, QtCore.QEvent.HoverMove,
+                    QtCore.QEvent.Wheel):
             if isinstance(obj, QtWidgets.QWidget) and (
                     self.isAncestorOf(obj) or obj is self.overlay):
                 self._wake()
@@ -2688,6 +3101,11 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not force and (self._seeking or self._popup_open
                           or self._cursor_on_controls()):
+            self.hide_timer.start()
+            return
+        if self._win_sel:
+            # mid download-window selection: the markers + pill must stay
+            # on screen — hiding the bar would strand the interaction
             self.hide_timer.start()
             return
         self.ctl.hide()
@@ -2927,12 +3345,18 @@ class PlayerView(QtWidgets.QWidget):
         self._tick_t = now
         length = self.vlc.get_length()
         raw = self.vlc.get_time()
+        if length <= 0 and self._is_catchup():
+            # VLC cannot size these indexless TS streams; the program
+            # window IS the length (the scrubber + markers rely on it)
+            length = self._catchup_dur_ms()
         vod = length > 0
         if vod != self._scrub_on:
             self._scrub_on = vod
             for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
                       self.btn_begin):
                 b.setEnabled(vod)
+            self.btn_win.setEnabled(
+                vod and self._is_catchup() and not self._downloading)
             self._set_scrub_visible(vod)
         # LIVE works in plain live mode (jump back to the edge and resume
         # after a timeshift pause — or reconnect a dead stream) and skips
@@ -2967,6 +3391,9 @@ class PlayerView(QtWidgets.QWidget):
             self.slider.blockSignals(True)
             self.slider.setRange(0, maximum)
             self.slider.blockSignals(False)
+            # the marker pixel<->ms mapping changed with the range
+            if self._win_sel:
+                self._win_reposition()
         self.slider.blockSignals(True)
         self.slider.setValue(max(0, value))
         self.slider.blockSignals(False)
@@ -3023,6 +3450,7 @@ class PlayerView(QtWidgets.QWidget):
             b.setEnabled(chase or vod)
         self.btn_live.setEnabled(chase or vod or bool(self.current))
         self.btn_dl.setEnabled(vod and not self._downloading)
+        self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
         self._scrub_on = chase
         self._set_scrub_visible(chase)
         if not chase and not vod:
@@ -3041,6 +3469,7 @@ class PlayerView(QtWidgets.QWidget):
         vis = self.config.control_buttons
         compact = self._compact_hidden
         vod = self._is_vod()
+        catchup = self._is_catchup()
         widgets = {
             "back60": self.btn_back60, "back10": self.btn_back10,
             "play": self.btn_play, "fwd10": self.btn_fwd10,
@@ -3061,10 +3490,13 @@ class PlayerView(QtWidgets.QWidget):
                 # whenever playback runs through the caption relay (the
                 # account allows one) and breaks the overlay's cue feed.
                 # Download covers the same want verbatim, in the background,
-                # without touching playback. Evaluated end-to-end and
-                # deliberately left as the swap.
+                # without touching playback. Catch-up programs get the
+                # WINDOW download button instead (pick a start/end stretch
+                # of the recording). Evaluated end-to-end and deliberately
+                # left as the swap.
                 w.setVisible(on and not vod)
-                self.btn_dl.setVisible(on and vod)
+                self.btn_dl.setVisible(on and vod and not catchup)
+                self.btn_win.setVisible(on and catchup)
             else:
                 w.setVisible(on)
 
@@ -3967,7 +4399,7 @@ class PlayerView(QtWidgets.QWidget):
             return          # nothing playing: next playback picks them up
         kind = cur.get("kind", "live")
         start_at = 0.0
-        if kind in ("vod", "series"):
+        if kind in ("vod", "series", "catchup"):
             try:
                 t = self.vlc.get_time() / 1000.0
                 if t > 2.0:
@@ -4278,21 +4710,27 @@ class PlayerView(QtWidgets.QWidget):
         self._on_media_for_profanity((self.current or {}).get("kind"))
 
     def _effective_url(self, url: str, kind: str) -> str:
-        """Playback URL, routed through the local splitter for VOD when
-        captions are wanted (the overlay's text track and/or the profanity
-        filter) — single provider connection; the splitter peels the
-        subtitle text and feeds VLC byte-identical data through localhost.
-        Falls back to the original URL on any hesitation — playback must
-        never depend on it.
+        """Playback URL.  Catch-up goes through the local RANGE relay (the
+        provider's timeshift responses carry a malformed Accept-Ranges
+        header, which leaves VLC's stream non-seekable — no scrub bar, no
+        seeks; the relay re-serves the bytes with correct range headers).
+        VOD with captions wanted routes through the local splitter relay
+        (single provider connection; the splitter peels the subtitle text
+        and feeds VLC byte-identical data through localhost).  Both fall
+        back to the original URL on any hesitation — playback must never
+        depend on them.
 
         ``self._relay_start_offset`` (set by play_media for resumes and by
         _restart_through_relay for mid-movie engages) marks a RESUME
         session: the relay prefetches only the tail and VLC's own opening
         walk + seek drive the provider stream, so subtitles surface right
         at the switch position."""
-        want_caps = self._cap_want and not self._cap_fail
         offset = self._relay_start_offset
         self._relay_start_offset = 0
+        if kind == "catchup" and url and url.startswith("http") \
+                and not self._closing:
+            return self._start_catchup_relay(url) or url
+        want_caps = self._cap_want and not self._cap_fail
         if kind not in ("vod", "series") or self._closing \
                 or not (want_caps or self.config.profanity.get("enabled")) \
                 or not vod_splitter.VOD_SPLITTER_READY:
@@ -4333,6 +4771,34 @@ class PlayerView(QtWidgets.QWidget):
         # mute is ever applied
         self._filter_timer.start()
         return local
+
+    # ---- catch-up relay (localhost range proxy: scrub-ability) ----
+    def _start_catchup_relay(self, url: str) -> str:
+        """Serve the timeshift stream locally with correct range headers;
+        '' on failure (caller plays the provider URL directly)."""
+        try:
+            relay = CatchupRelay()
+            local = relay.start(url, USER_AGENT)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("catchup relay: failed (%r) — direct playback",
+                            exc)
+            except Exception:
+                pass
+            return ""
+        if not local:
+            return ""
+        self._catchup_relay = relay
+        return local
+
+    def _stop_catchup_relay(self):
+        relay = self._catchup_relay
+        self._catchup_relay = None
+        if relay is not None:
+            try:
+                relay.stop()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _cap_relay_live(self) -> bool:
         """Stale-delivery guard for the VOD relay's queued cue/failed
@@ -4712,6 +5178,7 @@ class PlayerView(QtWidgets.QWidget):
         on a text track) they must survive: the relay IS the playback URL
         at that point, and the CCSource feeds the overlay, not just the
         filter. play_media/_set_cap_on(False) releases the claim first."""
+        self._stop_catchup_relay()
         if self._vod_relay is not None and not self._cap_on:
             try:
                 self._vod_relay.cue.disconnect()
@@ -4854,6 +5321,7 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
         # (d) mode/UI reset.
+        self._win_cancel(silent=True)
         self._mode = "live"
         self._chase_paused = False
         self._dvr_t0 = None
@@ -4893,19 +5361,26 @@ class PlayerView(QtWidgets.QWidget):
 
     def keyPressEvent(self, event):
         key = event.key()
+        mods = event.modifiers()
         if key == QtCore.Qt.Key_Escape \
                 and self._ctl_panel.isVisible():
             self._ctl_panel.close_panel()
+        elif key == QtCore.Qt.Key_Escape and self._win_sel:
+            self._win_cancel()
         elif key == QtCore.Qt.Key_Space:
             self._toggle_pause()
-        elif key == QtCore.Qt.Key_Left:
-            self._seek_ms(-10000)
-        elif key == QtCore.Qt.Key_Right:
-            self._seek_ms(10000)
-        elif key == QtCore.Qt.Key_Down:
-            self._seek_ms(-60000)
-        elif key == QtCore.Qt.Key_Up:
-            self._seek_ms(60000)
+        elif key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right,
+                     QtCore.Qt.Key_Up, QtCore.Qt.Key_Down):
+            sign = -1 if key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Down) else 1
+            if self._win_sel:
+                # marker nudging: plain 1 s, Shift 10 s, Ctrl 60 s
+                nudge = 6000 if mods & QtCore.Qt.ControlModifier \
+                    else 1000 if not mods & QtCore.Qt.ShiftModifier else 10000
+                self._win_nudge(sign * nudge)
+            elif key in (QtCore.Qt.Key_Left, QtCore.Qt.Key_Right):
+                self._seek_ms(sign * 10000)
+            else:
+                self._seek_ms(sign * 60000)
         elif key == QtCore.Qt.Key_M:
             self.btn_mute.toggle()
         elif key == QtCore.Qt.Key_C:

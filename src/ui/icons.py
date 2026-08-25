@@ -14,6 +14,7 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 WHITE = QtGui.QColor(255, 255, 255, 255)
 RED = QtGui.QColor(255, 69, 58, 255)
 BLUE = QtGui.QColor(10, 132, 255, 255)
+GOLD = QtGui.QColor(245, 197, 24, 255)   # catch-up window markers / button
 
 _L = 24          # logical canvas size
 _S = 8           # supersampling scale for the master render
@@ -328,6 +329,22 @@ def download():
         _polyline(p, c, [(7.9, 9.5), (12.0, 13.6), (16.1, 9.5)])
         _polyline(p, c, [(4.7, 16.6), (4.7, 19.4), (19.3, 19.4), (19.3, 16.6)])
     return _icon("download", draw)
+
+
+def download_window():
+    """Catch-up window download (gold): a timeline segment between two
+    in-point markers with the download arrow below it — mirrors the two
+    gold < > markers the button drops onto the scrubber."""
+    def draw(p, c):
+        gold = GOLD
+        # the timeline with the selected segment highlighted
+        _polyline(p, gold, [(3.0, 5.2), (21.0, 5.2)], 2.0)
+        _polyline(p, gold, [(6.6, 2.8), (6.6, 7.6), (17.4, 7.6), (17.4, 2.8)], 2.0)
+        # the download arrow beneath
+        _polyline(p, gold, [(12.0, 10.6), (12.0, 16.6)])
+        _polyline(p, gold, [(8.9, 13.8), (12.0, 16.9), (15.1, 13.8)])
+        _polyline(p, gold, [(6.0, 19.6), (6.0, 21.4), (18.0, 21.4), (18.0, 19.6)], 2.0)
+    return _icon("download-window", draw)
 
 
 def check():

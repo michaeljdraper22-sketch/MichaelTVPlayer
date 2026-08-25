@@ -1,0 +1,37 @@
+[1] archive channels
+  ok   archive-capable channels found (1014 channels)
+[2] epg table + headless libVLC playback of a recorded program
+    (direct first, then through the local range relay)
+    probing: IN: UTSAV PLUS ᴴᴰ ◉ sid=1015347 archive=7d program='Yeh Rishta Kya Kehlata Hai'
+      direct: advanced=True frac_seek=True
+      relay:  advanced=True frac_seek=True provider_opens=3
+  ok   past programs available (title decode works) (IN: UTSAV PLUS ᴴᴰ ◉ / 'Yeh Rishta Kya Kehlata Hai')
+  ok   playback advances through the relay
+  ok   byte-fraction seek lands mid-program through the relay (the app's scrub axis)
+[3] window download URL (mid-program start + short duration)
+  ok   window request serves video/mp2t
+  ok   window is ~1 minute of bytes (not the whole program) (17 MB)
+  ok   MPEG-TS 188-byte sync grid found in the payload (198 sync offsets)
+  ok   FileDownloader completes on a window URL (17 MB)
+
+8 passed, 0 failed
+[000001e6d04337f0] main decoder error: buffer deadlock prevented
+[000001e6d04441d0] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 13, expected 15) for PID 0
+[000001e6d04441d0] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 13, expected 15) for PID 4096
+[000001e6d04441d0] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 5, expected 10) for PID 17
+[000001e6d04337f0] main decoder error: buffer deadlock prevented
+[000001e6d043e180] main decoder error: buffer deadlock prevented
+[000001e6d04337f0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[000001e6d04337f0] avcodec decoder error: hardware acceleration picture allocation failed
+[hevc @ 000001e6d0635640] get_buffer() failed
+[hevc @ 000001e6d0635640] thread_get_buffer() failed
+[000001e6d04439f0] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 5, expected 10) for PID 17
+[000001e6d043e180] main decoder error: buffer deadlock prevented
+[hevc @ 000001e6d0635ac0] Could not find ref with POC 28
+[000001e6d04337f0] avcodec decoder error: avcodec_send_packet critical error
+[000001e6d043e180] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[000001e6d043e180] avcodec decoder error: hardware acceleration picture allocation failed
+[hevc @ 000001e6de59e440] get_buffer() failed
+[hevc @ 000001e6de59e440] thread_get_buffer() failed
+[hevc @ 000001e6de59e8c0] Could not find ref with POC 28
+[000001e6d043e180] avcodec decoder error: avcodec_send_packet critical error

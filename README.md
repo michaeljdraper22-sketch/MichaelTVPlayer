@@ -29,6 +29,17 @@ through a single VLC connection.
 - **Dark mode by default** (theme applied on every launch) and a **black
   title bar** on Windows 10/11
 - **Live TV, Movies (VOD) and Series** browsing with categories + live search
+- **Catch-Up tab** — the provider's archived broadcasts: channels with
+  `tv_archive` enabled, grouped by category, showing the archive depth
+  (`(3d)` etc.). Activating a channel opens a day-grouped program picker
+  (Today / Yesterday / weekday, newest first, straight from the EPG);
+  double-click (or right-click ▸ Play) watches the recorded broadcast.
+  Playback runs through a local range-relay so the scrubber can seek
+  anywhere in the program (the provider's own stream headers are not
+  range-seekable), and the **gold ⧇ button** drops two `< >` markers on
+  the scrubber to select a download window of the program — drag or click
+  them, nudge with ←/→ (Shift = 10 s), then ⬇ saves exactly that span.
+  **Esc** cancels a marker selection.
 - **Now / Next EPG** (TV guide) for the current live channel
 - **Real VLC playback** (libvlc) embedded in the window
 - **Single stream connection** — playback, DVR and recording all

@@ -11,10 +11,6 @@
     (vendored version 0.96)
   ok   modern build (>= 0.96, not the ancient 0.88)
   ok   modern flags accepted (no 'not understood' error)
-    (first SRT output after 2097152 bytes fed; 97 bytes on stdout; stdin-open alive=True)
-  ok   bundled CCX streams SRT before EOF (growing stdin)
-  ok   zero-install engage accepted (no 0.88-style fail-fast)
-    (delivered 5 cue(s), 0 failure signal(s) [])
-  ok   live cues delivered while the buffer grows
+  FAIL local test recording present for streaming checks
 
-all 15 checks passed
+FAILED 1: ['local test recording present for streaming checks']

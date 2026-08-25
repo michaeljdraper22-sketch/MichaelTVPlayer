@@ -3,49 +3,60 @@
   ok   chase engages (took 0.1s)
   ok   chase playback running
 [3] buffer grows
-  ok   frontier advances (1.5s -> 8.4s)
+  ok   frontier advances (4.2s -> 8.3s)
 [4] rewind -30s (after the buffer has room)
   ok   buffer built up for rewinding
-  ok   playhead rewound (48.1s -> 20.3s, expected ~18.1s)
+  ok   playhead rewound (43.3s -> 16.0s, expected ~13.3s)
 [5] jump to LIVE
-  ok   playhead near frontier (84.7s vs 49.9s)
+  ok   playhead near frontier (75.0s vs 47.3s)
 [6] fast-forward +10s (from behind the live edge)
-  ok   playhead moved forward (54.3s -> 64.5s)
+  ok   playhead moved forward (44.5s -> 54.5s)
   ok   and never lands past the TRUE live edge
 [6b] jump to BEGINNING
   ok   playhead back near 0 (2.2s)
-  ok   and LIVE returns to the edge (91.1s vs 59.6s)
+  ok   and LIVE returns to the edge (84.3s vs 58.3s)
 [7] still playing after all seeks
   ok   playback alive
 
 12 passed, 0 failed
-[0000023a73523cf0] mpeg4audio decoder: AAC channels: 2 samplerate: 48000
-[0000023a73524410] mpeg4audio packetizer: AAC channels: 2 samplerate: 48000
-[0000023a73523240] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 8) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 8) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 8) for PID 17
-[0000023a73523240] main decoder error: Timestamp conversion failed (delay 1000000, buffering 100000, bound 9000000)
-[0000023a73523240] main decoder error: Could not convert timestamp 182691144000 for FFmpeg
-[0000023a73523240] main decoder error: buffer deadlock prevented
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 13) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 13) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 13) for PID 17
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 14) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 14) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 14) for PID 17
-[0000023a73523240] main decoder error: Timestamp conversion failed (delay 1000000, buffering 91984, bound 9000000)
-[0000023a73523240] main decoder error: Could not convert timestamp 182698818345 for FFmpeg
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 6) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 6) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 6) for PID 17
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 9) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 9) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 9) for PID 17
-[0000023a73523240] main decoder error: Timestamp conversion failed (delay 1000000, buffering 39538, bound 9000000)
-[0000023a73523240] main decoder error: Could not convert timestamp 182734504234 for FFmpeg
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 10, expected 2) for PID 0
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 10, expected 2) for PID 32
-[0000023a73500950] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 10, expected 2) for PID 17
-[0000023a73523240] main decoder error: buffer deadlock prevented
-[0000023a735cfe70] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4
+[00000269a890b560] mpeg4audio decoder: AAC channels: 2 samplerate: 24000
+[00000269aa4b2ac0] mpeg4audio packetizer: AAC channels: 2 samplerate: 24000
+[00000269a890b8f0] avcodec decoder: Using D3D11VA (NVIDIA GeForce RTX 3070, vendor 10de(NVIDIA), device 2484, revision a1) for hardware decoding
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 2, expected 15) for PID 0
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 2, expected 15) for PID 32
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 2, expected 15) for PID 17
+[00000269a890b8f0] main decoder error: Timestamp conversion failed (delay 1000000, buffering 100000, bound 9000000)
+[00000269a890b8f0] main decoder error: Could not convert timestamp 91551350000 for FFmpeg
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 6) for PID 0
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 6) for PID 32
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 9, expected 6) for PID 17
+[00000269a890b8f0] main decoder error: buffer deadlock prevented
+[00000269a890b8f0] avcodec decoder error: hardware acceleration picture allocation failed
+[h264 @ 00000269a8af4480] get_buffer() failed
+[h264 @ 00000269a8af4480] thread_get_buffer() failed
+[h264 @ 00000269a8af4480] decode_slice_header error
+[h264 @ 00000269a8af4480] no frame!
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 13) for PID 0
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 13) for PID 32
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 3, expected 13) for PID 17
+[00000269a890b8f0] main decoder error: Timestamp conversion failed (delay 1000000, buffering 100000, bound 9000000)
+[00000269a890b8f0] main decoder error: Could not convert timestamp 91558972678 for FFmpeg
+[00000269a890b8f0] main decoder error: buffer deadlock prevented
+[00000269a890b8f0] avcodec decoder error: hardware acceleration picture allocation failed
+[h264 @ 00000269a8a81b00] get_buffer() failed
+[h264 @ 00000269a8a81b00] thread_get_buffer() failed
+[h264 @ 00000269a8a81b00] decode_slice_header error
+[h264 @ 00000269a8a81b00] no frame!
+[00000269a890b8f0] main decoder error: buffer deadlock prevented
+[00000269a890b8f0] avcodec decoder error: hardware acceleration picture allocation failed
+[h264 @ 00000269a8af4480] get_buffer() failed
+[h264 @ 00000269a8af4480] thread_get_buffer() failed
+[h264 @ 00000269a8af4480] decode_slice_header error
+[h264 @ 00000269a8af4480] no frame!
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 7) for PID 0
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 7) for PID 32
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 0, expected 7) for PID 17
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 2) for PID 0
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 2) for PID 32
+[00000269a8995220] ts demux error: libdvbpsi error (PSI decoder): TS discontinuity (received 7, expected 2) for PID 17
+[00000269a8af28c0] direct3d11 vout display error: SetThumbNailClip failed: 0x800706f4

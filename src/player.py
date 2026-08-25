@@ -533,6 +533,11 @@ class VLCPlayer:
     def set_time(self, ms: int) -> None:
         self.player.set_time(int(ms))
 
+    def set_position(self, frac: float) -> None:
+        """Byte-fraction seek — the reliable axis for raw MPEG-TS inputs
+        (no duration index, so time-based set_time lands imprecisely)."""
+        self.player.set_position(max(0.0, min(1.0, float(frac))))
+
     def jump_to_live(self) -> None:
         """Seek to the live edge of the timeshift buffer."""
         length = self.get_length()

@@ -1,0 +1,83 @@
+[1] match levels — the user's exact examples
+  ok   exact
+  ok   partial
+  ok   whole
+  ok   case-insensitive
+  ok   exact skips compounds
+  ok   whole catches compound
+  ok   punctuation counts as a boundary
+[2] SRT text cleaning
+  ok   tags/braces stripped
+[3] incremental SRT parser (chunks split mid-line)
+  ok   two cues parsed
+  ok   cue 1 time + text
+  ok   cue 2 time + text
+[4] windows from cues (proportional word timing)
+  ok   exact window inside the cue
+  ok   partial window shorter
+  ok   clean cue produces nothing
+  ok   overlaps merge
+[5] engine: pads, sync and edge behaviour
+  ok   no mute before pad-before
+  ok   pad-before opens the mute early
+  ok   pad-after still muted (inclusive edge)
+  ok   unmuted after pad
+  ok   sync offset shifts the window
+  ok   sync offset respected before
+  ok   disabled engine never mutes
+  ok   clear() unmutes the filter
+[5b] caption lead: windows shift EARLIER by lead_s
+  ok   window moved earlier by the lead
+  ok   mutes at the shifted (earlier) position
+  ok   unmuted after the shifted window
+[5c] whole-cue mode: mute the whole line while the word shows
+  ok   default (mode off) keeps word-granularity windows
+  ok   whole_cue covers the entire cue
+  ok   whole_cue ignores clean cues
+  ok   engine whole-cue window = the full cue
+  ok   muted right at cue start (the word itself is far later)
+  ok   still muted near the cue end
+  ok   unmuted once the cue leaves the screen
+[6] VLCPlayer: filter mute layers under the user's mute
+  ok   filter mute set without user mute
+  ok   user mute re-apply keeps filter mute
+  ok   filter release restores audible (user unmuted)
+  ok   user mute survives filter on/off
+[7] view integration: live engages DVR + caption reader
+  ok   view propagates the whole-cue mode to the engine
+  ok   VOD does not engage the live filter
+  ok   VOD mute windows open lead-early (stage-3 trim)
+  ok   VOD routes through the splitter when the filter is on
+  ok   VOD engagement starts the evaluation timer
+  ok   teardown stops the VOD evaluation timer
+  ok   live alone does not start the reader (chase entry does)
+  ok   live NEVER rewrites the delay setting
+  ok   caption reader started on the buffer
+  ok   live caption engagement starts the evaluation timer
+  ok   young buffer joins from byte 0 (no skip)
+  ok   live cue anchored onto the app clock (arrival)
+  ok   anchored caption cue became a window
+  ok   chase tick muted inside the anchored word
+  ok   chase tick unmuted outside
+  ok   disabling tears down the reader
+  ok   evaluation timer stops with the reader
+  ok   short delay skips the reader (no late mutes)
+  ok   short delay notice shown, setting untouched
+[8] settings dialog
+  ok   starts with the default word list
+  ok   toggle saves enabled
+  ok   saved toggle + timing
+  ok   custom word saved once
+  ok   on_saved callback ran (both dialogs)
+  ok   restore defaults works
+[8b] whole-line checkbox + reset ALL settings
+  ok   whole-line checkbox defaults OFF (opt-in)
+  ok   whole-line preference persists
+  ok   config getter carries the key from defaults
+  ok   reset-all restores the enable state
+  ok   reset-all restores the timing spinners
+  ok   reset-all restores the whole-line checkbox
+  ok   reset-all restores the word table
+  ok   reset-all persists the factory set on save
+
+all 70 checks passed

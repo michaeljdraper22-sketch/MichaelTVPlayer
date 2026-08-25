@@ -1,8 +1,15 @@
 """Channel/movie/series browsers, favorites and custom-channel lists."""
 
+import html
+import math
+import time
+import urllib.parse
+from datetime import datetime
+
 from PyQt5 import QtCore, QtWidgets
 
 from ..filters import extract_country
+from ..xtream import decode_epg_text
 from .worker import AsyncRunner
 
 
@@ -525,6 +532,285 @@ class SeriesEpisodesDialog(QtWidgets.QDialog):
         act_play = menu.addAction("Play")
         is_fav = self.config.is_favorite(playable["fav_key"])
         act_fav = menu.addAction("Remove from Favorites" if is_fav else "Add to Favorites")
+        chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
+        if chosen == act_play:
+            self.config.add_recent(playable)
+            self.media_activated.emit(playable)
+            self.accept()
+        elif chosen == act_fav:
+            self.config.toggle_favorite(playable)
+            self.favorite_changed.emit()
+
+
+def _epg_text(s: str) -> str:
+    """Base64 + URL/HTML encoded EPG text -> readable string."""
+    text = decode_epg_text(s or "")
+    try:
+        text = urllib.parse.unquote(text)
+    except Exception:  # noqa: BLE001
+        pass
+    return html.unescape(text)
+
+
+class CatchupBrowser(BaseBrowser):
+    """Catch-Up tab: live channels whose provider archive is enabled
+    (tv_archive == 1).  Activating a channel opens the archive picker
+    (CatchupPickerDialog) listing its past programs; picking one plays the
+    provider's recorded broadcast via the timeshift URL."""
+
+    # NO country filter (country_prefix None): the archive list is small
+    # (~1k channels) and the archive-capable channels cluster in country
+    # groups the Live filter may have deselected — sharing it rendered
+    # this tab empty on a filtered config (measured: 1014 archive
+    # channels, 0 visible with a 4K/8K/US Live filter).
+    country_prefix = None
+
+    def fetch_categories(self):
+        return self.client.live_categories()
+
+    def fetch_items(self, cat_id):
+        # only archive-capable channels have anything to catch up on
+        return [c for c in (self.client.live_streams(cat_id) or [])
+                if str(c.get("tv_archive")) == "1"]
+
+    def item_display(self, it):
+        dur = it.get("tv_archive_duration")
+        base = it.get("name", "")
+        if dur:
+            return f"{base}  ({dur}d)"
+        return base
+
+    def fav_key_of(self, it):
+        sid = it.get("stream_id")
+        return f"catchup:{sid}" if sid is not None else None
+
+    def make_playable(self, it):
+        return {
+            "kind": "catchup_channel",
+            "title": it.get("name", ""),
+            "stream_id": it.get("stream_id"),
+            "archive_days": it.get("tv_archive_duration"),
+            "fav_key": self.fav_key_of(it),
+            "icon": it.get("stream_icon", ""),
+        }
+
+    def _activate(self, wi):
+        if wi:
+            self._open_picker(wi.data(QtCore.Qt.UserRole))
+
+    def _open_picker(self, channel):
+        if not channel:
+            return
+        # favorited channels arrive as catchup_channel playables without the
+        # raw provider fields — carry what we need through
+        chan = dict(channel or {})
+        chan.setdefault("name", chan.get("title", ""))
+        chan.setdefault("stream_id", chan.get("stream_id"))
+        dlg = CatchupPickerDialog(self.client, self.config, chan, self)
+        dlg.media_activated.connect(self.media_activated)
+        dlg.favorite_changed.connect(self.favorite_changed)
+        dlg.exec_()
+
+    def _context_menu(self, pos):
+        wi = self.list.itemAt(pos)
+        if not wi:
+            return
+        data = wi.data(QtCore.Qt.UserRole)
+        if self._playable_mode:
+            playable = data
+            menu = QtWidgets.QMenu(self)
+            act_play = menu.addAction("Play")
+            act_rm = None
+            if playable.get("fav_key") and self.config.is_favorite(playable["fav_key"]):
+                act_rm = menu.addAction("Remove from Favorites")
+            chosen = menu.exec_(self.list.viewport().mapToGlobal(pos))
+            if chosen == act_play:
+                self.media_activated.emit(playable)
+            elif chosen == act_rm:
+                self.config.toggle_favorite(playable)
+                self.favorite_changed.emit()
+        else:
+            playable = self.make_playable(data)
+            menu = QtWidgets.QMenu(self)
+            act_open = menu.addAction("Browse catch-up programs")
+            act_fav = None
+            if playable.get("fav_key"):
+                is_fav = self.config.is_favorite(playable["fav_key"])
+                act_fav = menu.addAction(
+                    "Remove from Favorites" if is_fav else "Add to Favorites")
+            chosen = menu.exec_(self.list.viewport().mapToGlobal(pos))
+            if chosen == act_open:
+                self._open_picker(data)
+            elif chosen == act_fav:
+                self.config.toggle_favorite(playable)
+                self.favorite_changed.emit()
+                self._apply_filter(self.search.text())
+
+
+class CatchupPickerDialog(QtWidgets.QDialog):
+    """Archive program picker for one catch-up channel: the provider's EPG
+    data table filtered to programs that already started (the recorded
+    window), grouped by local day, newest first.  Double-click (or the
+    context menu) plays the program from its beginning."""
+
+    media_activated = QtCore.pyqtSignal(dict)
+    favorite_changed = QtCore.pyqtSignal()
+
+    def __init__(self, client, config, channel, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.config = config
+        self.channel = dict(channel or {})
+        self.channel.setdefault("name", self.channel.get("title", "Channel"))
+        self.setWindowTitle(f"Catch-Up — {self.channel.get('name', 'Channel')}")
+        self.resize(720, 640)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        title = QtWidgets.QLabel(self.channel.get("name", ""))
+        title.setStyleSheet("font-weight:bold; font-size:14px;")
+        days = self.channel.get("archive_days") or self.channel.get("tv_archive_duration")
+        sub = QtWidgets.QLabel(
+            f"Recorded programs ({days} day archive)" if days
+            else "Recorded programs")
+        sub.setStyleSheet("color:#9aa0a6;")
+        layout.addWidget(title)
+        layout.addWidget(sub)
+
+        self.tree = QtWidgets.QTreeWidget()
+        self.tree.setHeaderLabels(["Time", "Program", "Length"])
+        self.tree.itemActivated.connect(self._on_double)
+        self.tree.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._context)
+        layout.addWidget(self.tree, 1)
+
+        self.status = QtWidgets.QLabel("Loading programs…")
+        self.status.setStyleSheet("color:#666;")
+        layout.addWidget(self.status)
+
+        self.runner = AsyncRunner()
+        self.runner.finished.connect(self._on_loaded)
+        self.runner.run(self.client.epg_table, self.channel.get("stream_id"))
+
+    # ---- helpers ----
+    @staticmethod
+    def _ts(v):
+        try:
+            n = int(str(v).strip())
+            return n if n > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _on_loaded(self, result):
+        ok, val = result
+        if ok != "ok":
+            self.status.setText(f"Error: {val}")
+            return
+        now = time.time()
+        days = self._ts(self.channel.get("archive_days")
+                        or self.channel.get("tv_archive_duration")) or 3
+        # programs that already started, within the archive window
+        rows = []
+        for e in val or []:
+            st = self._ts(e.start_timestamp)
+            sp = self._ts(e.stop_timestamp)
+            if st is None:
+                continue
+            if sp is None:
+                sp = st + 1800
+            if st >= now or st < now - (days * 86400 + 7200):
+                continue
+            rows.append((st, sp, e))
+        rows.sort(key=lambda r: r[0], reverse=True)
+
+        self.tree.clear()
+        groups = {}
+        order = []
+        for st, sp, e in rows:
+            day = datetime.fromtimestamp(st).date()
+            if day not in groups:
+                groups[day] = []
+                order.append(day)
+            groups[day].append((st, sp, e))
+        total = 0
+        for day in order:
+            delta = (datetime.now().date() - day).days
+            if delta == 0:
+                label = "Today"
+            elif delta == 1:
+                label = "Yesterday"
+            else:
+                label = day.strftime("%A, %b %d")
+            root = QtWidgets.QTreeWidgetItem([label, "", ""])
+            f = root.font(0)
+            f.setBold(True)
+            root.setFont(0, f)
+            self.tree.addTopLevelItem(root)
+            for st, sp, e in groups[day]:
+                t0 = datetime.fromtimestamp(st)
+                t1 = datetime.fromtimestamp(sp)
+                dur = max(1, int(round((sp - st) / 60.0)))
+                in_progress = sp > now
+                disp = _epg_text(e.title) or "Program"
+                col0 = t0.strftime("%H:%M") + "\u2013" + t1.strftime("%H:%M")
+                col2 = (f"{dur // 60}:{dur % 60:02d}"
+                        + ("  (in progress)" if in_progress else ""))
+                node = QtWidgets.QTreeWidgetItem([col0, disp, col2])
+                node.setData(0, QtCore.Qt.UserRole, {
+                    "stream_id": self.channel.get("stream_id"),
+                    "channel": self.channel.get("name", ""),
+                    "icon": self.channel.get("stream_icon",
+                                             self.channel.get("icon", "")),
+                    "title": disp,
+                    "start": st,
+                    "stop": sp,
+                    "description": _epg_text(e.description),
+                })
+                root.addChild(node)
+                total += 1
+            root.setExpanded(day == order[0])
+        if not total:
+            self.status.setText("No recorded programs available.")
+            return
+        self.status.setText(f"{total} program(s)")
+
+    def _make_playable(self, prog):
+        dur_min = max(1, math.ceil((prog["stop"] - prog["start"]) / 60.0))
+        return {
+            "kind": "catchup",
+            "title": f"{prog['channel']} \u2014 {prog['title']}",
+            "url": self.client.timeshift_url(
+                prog["stream_id"], prog["start"], dur_min),
+            "stream_id": prog["stream_id"],
+            "utc_start": prog["start"],
+            "utc_end": prog["stop"],
+            "channel": prog["channel"],
+            "program": prog["title"],
+            "fav_key": f"catchup:{prog['stream_id']}:{prog['start']}",
+            "icon": prog.get("icon", ""),
+        }
+
+    def _on_double(self, item, _col):
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data:
+            return
+        playable = self._make_playable(data)
+        self.config.add_recent(playable)
+        self.media_activated.emit(playable)
+        self.accept()
+
+    def _context(self, pos):
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+        data = item.data(0, QtCore.Qt.UserRole)
+        if not data:
+            return
+        playable = self._make_playable(data)
+        menu = QtWidgets.QMenu(self)
+        act_play = menu.addAction("Play")
+        is_fav = self.config.is_favorite(playable["fav_key"])
+        act_fav = menu.addAction("Remove from Favorites" if is_fav
+                                 else "Add to Favorites")
         chosen = menu.exec_(self.tree.viewport().mapToGlobal(pos))
         if chosen == act_play:
             self.config.add_recent(playable)
