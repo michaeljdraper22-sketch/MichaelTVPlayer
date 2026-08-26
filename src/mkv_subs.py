@@ -47,6 +47,9 @@ _CTX_ROOT, _CTX_SEG, _CTX_CLUSTER, _CTX_TRACKS, _CTX_TRACK, _CTX_BLOCKGROUP = ra
 _UNKNOWN = -1
 
 _FALLBACK_CUE_S = 3.0      # SimpleBlocks carry no duration — assume this
+_MAX_BLOCK_BYTES = 16 << 20   # misalignment guard: real blocks (even 4K
+#                           # keyframes) are ≤ ~2 MB; anything bigger is
+#                           # garbage decoded off a mid-stream anchor
 
 # ---- text flattening (subrip markup + ASS/SSA payloads -> plain text) ----
 _DRAW_RE = re.compile(r"\{\\p[0-9]+\}.*?(?:\{\\p0\}|$)", re.S)
@@ -297,6 +300,18 @@ class MkvSubParser:
                 del self.buf[:header]
                 continue
             if eid == _CLUSTER and ctx in (_CTX_SEG, _CTX_CLUSTER):
+                # A real Cluster opens with the mandatory-first Timecode
+                # child; the 4 magic bytes alone occur inside 4K block
+                # payloads, and latching a false one derails the parse
+                # one element later. Verify the header (None = the
+                # child id sits past the chunk edge: wait for it).
+                head = self._cluster_head_ok(self.buf, 0)
+                if head is None:
+                    break               # header at the chunk edge: wait
+                if head is False:
+                    if not self._resync():
+                        break
+                    continue
                 # descend (or sibling cluster): reset the clock
                 if ctx == _CTX_SEG:
                     self._stack.append(_CTX_CLUSTER)
@@ -333,12 +348,24 @@ class MkvSubParser:
                 del self.buf[:header + size]
                 continue
             if ctx == _CTX_CLUSTER and eid in (_SIMPLE_BLOCK, _BLOCK):
+                if size > _MAX_BLOCK_BYTES:
+                    # garbage posing as a block: no real block is this
+                    # big (4K keyframes top out ~2 MB; 16 MB is 8x
+                    # margin). Buffering a bogus 100+ MB "block" stalled
+                    # the mid-stream join for minutes — resync instead.
+                    if not self._resync():
+                        break
+                    continue
                 made = self._parse_block(header, size)
                 if made is None:
                     break                       # incomplete: wait
                 out += made
                 continue
             if ctx == _CTX_CLUSTER and eid == _BLOCK_GROUP:
+                if size > _MAX_BLOCK_BYTES:
+                    if not self._resync():
+                        break
+                    continue
                 if avail < size:
                     break
                 blob = bytes(self.buf[header:header + size])
@@ -349,6 +376,17 @@ class MkvSubParser:
             # ---- generic skip ----
             if avail < size:
                 if size > (1 << 20):
+                    if ctx == _CTX_CLUSTER:
+                        # No legit cluster child is an UNKNOWN >1 MB
+                        # element (the big ones — SimpleBlock/BlockGroup
+                        # — are handled above): mid-stream garbage that
+                        # decodes to a huge size must never arm a blind
+                        # stream-skip, or it swallows whole clusters
+                        # without ever resyncing (the mid-session tap
+                        # restart on a 4K rip died exactly there).
+                        if not self._resync():
+                            break       # nothing verifiable: wait
+                        continue
                     # stream-skip without buffering the payload
                     self._skip = size - max(0, avail)
                     del self.buf[:]
@@ -356,27 +394,65 @@ class MkvSubParser:
             del self.buf[:header + size]
         return out
 
+    @staticmethod
+    def _cluster_head_ok(buf, i):
+        """True/False: does a Cluster magic at buf[i] open like a REAL
+        cluster header — sane size vint, first child the mandatory-first
+        Timecode, directly (mkvmerge) or behind an EBML CRC-32 (ffmpeg
+        writes the 4-byte cluster checksum first). None: the deciding
+        bytes are not buffered yet. The 4 magic bytes alone occur inside
+        4K video payloads; latching a false one derails the parse one
+        element later."""
+        size, slen = _vint_size(buf, i + 4, keep_marker=False)
+        if size is None:
+            return None
+        if not (8 <= size <= (1 << 30)):
+            return False
+        p = i + 4 + slen
+        if p >= len(buf):
+            return None
+        if buf[p] == _TIMECODE:
+            return True
+        if buf[p] == 0xBF:            # EBML CRC-32 leads the children
+            sz2, sl2 = _vint_size(buf, p + 1, keep_marker=False)
+            if sz2 is None:
+                return None
+            if sz2 != 4:
+                return False
+            q = p + 1 + sl2 + sz2      # past the 4-byte checksum
+            if q >= len(buf):
+                return None
+            return buf[q] == _TIMECODE
+        return False
+
     def _resync(self) -> bool:
-        """Self-heal after garbage: jump to the next Cluster header.
-        Returns False when no progress is possible — nothing left to
-        discard, the parse must WAIT for more data. Without that, an
-        all-zero or magic-less stretch shrank the buffer to 4 bytes and
-        _parse spun on it forever (a core at 100% and the tap's cues
-        dead for the rest of the session)."""
-        i = self.buf.find(bytes([0x1F, 0x43, 0xB6, 0x75]), 1)
-        if i < 0:
-            # keep the tail: the magic can straddle the chunk edge
-            keep = min(4, len(self.buf))
-            del self.buf[:len(self.buf) - keep]
-            if keep <= 4:
+        """Self-heal after garbage: jump to the next VERIFIED Cluster
+        header. Returns False when no progress is possible — nothing
+        verifiable in buffer, the parse must WAIT for more data (an
+        undecidable candidate runs into the buffer edge; so do all
+        later ones). Without the wait, a magic-less stretch shrank the
+        buffer and _parse spun on it forever (a core at 100% and the
+        tap's cues dead for the rest of the session)."""
+        magic = b"\x1f\x43\xb6\x75"
+        i = self.buf.find(magic, 0)
+        while i >= 0:
+            ok = self._cluster_head_ok(self.buf, i)
+            if ok is True:
+                del self.buf[:i]
                 if self._stack[-1] != _CTX_CLUSTER:
                     self._stack.append(_CTX_CLUSTER)
-                return False
-        else:
-            del self.buf[:i]
+                return True
+            if ok is None:
+                break                 # need the bytes that follow
+            i = self.buf.find(magic, i + 1)
+        # nothing verified yet: keep enough tail for a header (magic +
+        # size vint + optional CRC-32 + the Timecode id) to straddle
+        # the chunk edge and be re-examined once more data lands
+        keep = min(24, len(self.buf))
+        del self.buf[:len(self.buf) - keep]
         if self._stack[-1] != _CTX_CLUSTER:
             self._stack.append(_CTX_CLUSTER)
-        return True
+        return False
 
     def _parse_children(self, ctx, blob):
         """Walk a fully-buffered container (Tracks) for track metadata."""

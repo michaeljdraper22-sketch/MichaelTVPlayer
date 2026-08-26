@@ -135,6 +135,13 @@ def main():
     view.vlc.set_spu_delay = fake.set_spu_delay
     view._refresh_spu_button()
     view._ctl_panel.close_panel()
+    # a click with subtitles OFF auto-STARTS the recommended English
+    # track now (no menu): turn something on first, then the click
+    # opens the track/style card the settings entry lives in
+    view._spu_want = -1
+    view._subs_menu()
+    check("click with subs off auto-starts English (no menu)",
+          view._spu_want == 1 and not view._ctl_panel.rows())
     view._subs_menu()
     labels = [r.get("main") for r in view._ctl_panel.rows()
               if not r.get("sep")]

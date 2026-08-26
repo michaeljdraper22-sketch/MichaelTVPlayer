@@ -4446,7 +4446,49 @@ class PlayerView(QtWidgets.QWidget):
         self._select_spu(nxt, names.get(nxt, ""))
         self._flash_spu(nxt, names.get(nxt, ""))
 
+    def _recommended_spu(self, tracks):
+        """(id, name) of the track one-click captions should start: the
+        first English-named track, else the first unlabeled one (no
+        language evidence = assumed English, the same ladder the relay
+        parser uses). None when every track is labeled non-English —
+        auto-showing a foreign track is exactly the default the
+        English-default policy forbids, so the button opens the menu
+        and lets the user pick deliberately."""
+        tracks = self._english_first(list(tracks))
+        tid, name = tracks[0]
+        if self._is_english_name(name) \
+                or not track_language_evidence("", name):
+            return tid, name
+        for tid, name in tracks[1:]:
+            if self._is_english_name(name) \
+                    or not track_language_evidence("", name):
+                return tid, name
+        return None
+
     def _subs_menu(self):
+        """CC button: with subtitles OFF, one click STARTS the recommended
+        English captions (the same English-first pick the C key makes) —
+        no menu, no fuss; the track/style menu is what the button opens
+        once something is already on (and what a stream without an
+        auto-startable track falls back to)."""
+        if not self._closing and self._spu_want == -1 and not self._cap_on:
+            try:
+                tracks = self.vlc.spu_tracks()
+            except Exception:  # noqa: BLE001
+                tracks = []
+            pick = self._recommended_spu(tracks) if tracks else None
+            if pick is not None:
+                self._select_spu(pick[0], pick[1])
+                self._flash_spu(pick[0], pick[1])
+                return
+            if not tracks and self._is_dvrable() and not self._cap_fail:
+                # live channel whose captions never surface as VLC
+                # tracks (the CC pipeline needs no track id): engaging
+                # the overlay directly still gives one-click captions
+                # (a missing CCExtractor disengages with a note inside)
+                self._spu_name = "English CC"
+                self._engage_caption_overlay()
+                return
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001

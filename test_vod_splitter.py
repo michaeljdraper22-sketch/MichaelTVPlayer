@@ -477,6 +477,86 @@ def main():
           any("hell" in c[2] or "dogs" in c[2] or "snow" in c[2]
               for c in more))
 
+    print("[3b-p] mid-stream anchor poison: resync, never blind-skip")
+    # A tap restart (CC-menu pick mid-playback), a cache rebase (seek)
+    # and a resume backfill all anchor the parser at an ARBITRARY byte
+    # inside a cluster. Block-payload garbage decodes as (eid, size)
+    # pairs, and a garbage size in the 1 MB..1 GB window used to arm a
+    # blind stream-skip that swallowed every following REAL cluster
+    # without ever resyncing — on a 4K episode (1.5 MB clusters) the
+    # pick showed subtitles for the backfilled second, then everything
+    # (overlay cues AND the profanity filter, which reads the same tap)
+    # went dead for the rest of the session. Measured on the real file:
+    # 0 cues out of the post-anchor region before the fix, 11 after.
+    def seeded_midstream():
+        q = MkvSubParser(prefer_language="eng", mid_stream=True)
+        q._track_meta = {n: dict(m) for n, m in phead._track_meta.items()}
+        q._select_track()
+        q._saw_tracks = True
+        q._selected = phead._selected
+        return q
+
+    def has_cues(made):
+        return any("hell" in c[2] or "dogs" in c[2] or "snow" in c[2]
+                   for c in made)
+
+    # (a) unknown 2-byte element id with a garbage 251 MB size
+    # (0x4EFE = 2-byte vint id, 0x0F000001 = 4-byte vint size — NOT the
+    # all-ones value, so the old all-ones guard doesn't catch it; the
+    # old parser armed a 251 MB blind skip here and emitted 0 cues)
+    pa = seeded_midstream()
+    made_a = pa.feed(b"\x4e\xfe\x1f\x00\x00\x01" + b"\xaa" * 64
+                     + sample[cluster_off:])
+    check("unknown-eid giant size no longer stream-skips clusters",
+          has_cues(made_a) and pa._skip == 0)
+    # (b) garbage posing as a SimpleBlock with a giant (>16 MB) size
+    pb = seeded_midstream()
+    made_b = pb.feed(b"\xa3\x11\x00\x01\x00" + b"\xbb" * 64
+                     + sample[cluster_off:])
+    check("bogus giant block no longer buffers/swallows the stream",
+          has_cues(made_b) and pb._skip == 0)
+    # (c) FALSE cluster magic: sane size but the children don't open
+    # with Timecode (or CRC-32 + Timecode) — must be rejected, not
+    # latched (the 4 magic bytes occur inside 4K video payloads)
+    pc = seeded_midstream()
+    false_hdr = (b"\x1f\x43\xb6\x75\x40\x40\x00"     # size 0x4000
+                 + b"\x99\x11\x22\x33" + b"\xcc" * 64)
+    made_c = pc.feed(false_hdr + sample[cluster_off:])
+    check("false cluster header rejected, real one latched",
+          has_cues(made_c))
+    # (d) a real cluster header STRADDLING the feed edge still latches
+    # once the deciding bytes arrive (the None/undecidable path)
+    pd = seeded_midstream()
+    made_d = pd.feed(sample[cluster_off:cluster_off + 6])
+    check("half-buffered cluster header waits (no cues yet)",
+          not made_d)
+    made_d += pd.feed(sample[cluster_off + 6:])
+    check("header completes across feeds and yields the cues",
+          has_cues(made_d))
+    # (e) ffmpeg-style clusters open with an EBML CRC-32 before the
+    # Timecode — verification must accept that shape (the fixtures
+    # themselves are CRC'd; this pins the intent)
+    check("cluster head ok on the CRC-32 shape",
+          MkvSubParser._cluster_head_ok(sample, cluster_off) is True)
+    false_at = sample.find(b"\x1f\x43\xb6\x75\x40\x40\x00")
+    check("synthetic false header marked not-ok",
+          MkvSubParser._cluster_head_ok(
+              false_hdr + sample[cluster_off:], 0) is False)
+    # (f) the cues a poisoned mid-stream restart RECOVERS still reach
+    # the profanity filter: same tap, so before the fix the filter went
+    # dead alongside the overlay ("profanity filter isn't doing
+    # anything to this show") — mute windows must exist again
+    from src.profanity import ProfanityEngine
+    eng = ProfanityEngine(player=None)
+    eng.enabled = True
+    eng.words = [("hell", "exact")]
+    for s, e, txt in made_a:
+        eng.add_cue(s, e, txt, lead_s=0.0)
+    mid = next(s + (e - s) / 2 for s, e, t in made_a if "hell" in t)
+    eng.evaluate(mid)
+    check("recovered cues produce profanity mute windows",
+          bool(eng.windows) and eng.muted is True)
+
     print("[3c] e2e: ASS-only MKV flattens to text cues through the relay")
     ASS = os.path.abspath("build/split_test_ass.mkv").replace("\\", "/")
     subprocess.run(

@@ -155,6 +155,67 @@ def main():
     view._tick()
     check("tick re-asserted Off", fake.active == -1)
 
+    print("[10b] CC button click with subs OFF auto-starts English")
+    # One click on btn_cc must START the recommended English captions
+    # without opening any menu (the menu is what the button opens once
+    # something is on): "just by clicking the cc button, I want
+    # subtitles to just start without any fuss".
+    fake.tracks = [(1, "Track 1 - [Arabic]"), (2, "SDH - [English]"),
+                   (3, "Track 8 - [English]"), (4, "Deutsch")]
+    fake.active = -1
+    view._spu_want = -1
+    view._spu_name = ""
+    view._cap_on = False
+    view._cap_fail = False
+    view._ctl_panel.close_panel()
+    view._subs_menu()
+    check("click auto-starts the FIRST English track (SDH)",
+          view._spu_want == 2 and fake.active == 2)
+    check("no menu opened", not view._ctl_panel.isVisible())
+    view._subs_menu()
+    check("second click (subs on) opens the track menu",
+          len(view._ctl_panel.rows()) >= 5)
+    view._ctl_panel.close_panel()
+
+    print("[10b2] no English track: click opens the menu, never a "
+          "foreign auto-pick")
+    fake.tracks = [(1, "Track 1 - [Arabic]"), (2, "Track 2 - [Danish]")]
+    fake.active = -1
+    view._spu_want = -1
+    view._spu_name = ""
+    view._cap_on = False
+    view._subs_menu()
+    check("all labeled non-English -> menu, subtitles stay off",
+          view._spu_want == -1 and view._ctl_panel.rows())
+    view._ctl_panel.close_panel()
+    fake.tracks = [(1, "Track 1 - [Arabic]"), (2, "Track 2")]
+    view._subs_menu()
+    check("unlabeled track is the assumed-English auto-pick",
+          view._spu_want == 2 and not view._ctl_panel.isVisible())
+    view._ctl_panel.close_panel()
+
+    print("[10c] click with no tracks: menu on VOD, direct CC on live")
+    fake.tracks = []
+    view._spu_want = -1
+    view._cap_on = False
+    view.current = {"kind": "series"}
+    view._subs_menu()
+    check("no tracks + VOD -> the menu (Off + settings)",
+          view._spu_want == -1 and view._ctl_panel.rows())
+    view._ctl_panel.close_panel()
+    view.current = {"kind": "live"}
+    view._is_dvrable = lambda: True
+    view._cap_want = False
+    view._subs_menu()
+    check("no tracks + live -> trackless CC overlay engaged",
+          view._cap_want is True and view._cap_on is True)
+    check("live CC state shows on the button",
+          "English CC" in view.btn_cc.toolTip())
+    del view._is_dvrable
+    view._disengage_caption_overlay()
+    view._cap_want = False
+    view.current = None
+
     print("[11] teardown safety")
     view._closing = True
     view._enforce_spu()      # must not touch anything
