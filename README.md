@@ -322,3 +322,25 @@ Channels ▸ **Add custom channel…** lets you add any stream URL
 - **Reporting a bug / freeze** — attach the log file
   `%APPDATA%\MichaelTVPlayer\player.log` (recreated on every launch; it holds
   the last events before the problem).
+
+## Updating & uninstalling
+- **Settings ▸ Check for updates…** — manual only (the app never prompts
+  or nags). It compares your version against the latest
+  [GitHub release](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases);
+  if a newer one exists you choose Yes/No to update. The update keeps
+  everything personal — settings, favorites, recents and your Xtream
+  login (`%APPDATA%\MichaelTVPlayer`) are never touched — while the
+  install folder is fully mirrored, so files dropped from newer builds
+  don't linger. The app restarts itself when the swap is done.
+- **UninstallMichaelTV.exe** ships next to the app. It asks first, removes
+  shortcuts and the app, and separately asks whether to also delete your
+  personal data (default: keep it, so a reinstall picks up where you left
+  off).
+
+### Cutting a release (maintainer)
+1. Bump `APP_VERSION` in `src/config.py`, commit.
+2. Run `build.bat` — it produces `dist/MichaelTV.exe`,
+   `dist/UninstallMichaelTV.exe` and the release zip
+   `dist/MichaelTV-<version>.zip` (exe + uninstaller + `vlc\` runtime).
+3. Tag the commit `v<version>` and upload the zip as a release asset —
+   the in-app updater downloads exactly that asset.

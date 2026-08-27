@@ -509,6 +509,12 @@ class SeriesEpisodesDialog(QtWidgets.QDialog):
             "url": self.client.series_url(ep["id"], ep.get("container_extension", "mp4")),
             "fav_key": f"episode:{ep['id']}",
             "icon": (ep.get("info") or {}).get("movie_image", ""),
+            # identity for "play next episode": the next fetch re-reads
+            # series_info and walks the ordered season/episode list
+            "series_id": self.series.get("series_id"),
+            "series_name": ep.get("series_name", ""),
+            "season": ep.get("season"),
+            "episode": ep.get("episode"),
         }
 
     def _on_double(self, item, _col):

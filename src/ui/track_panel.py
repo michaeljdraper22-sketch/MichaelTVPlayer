@@ -22,7 +22,9 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from . import icons as ic
 
+import ctypes.wintypes
 import logging
+import sys
 
 log = logging.getLogger("mtp")
 
@@ -73,25 +75,59 @@ class _OutsideCloser(QtCore.QObject):
         super().__init__(parent)
         self._panel = panel
 
+    def maybe_close_at(self, global_pos) -> None:
+        """Close the panel when ``global_pos`` (a QPoint) is outside both
+        the card and the anchor button.  Shared by the Qt press filter and
+        the native Windows watcher below."""
+        p = self._panel
+        if not p.isVisible():
+            return
+        rect = QtCore.QRect(p.mapToGlobal(QtCore.QPoint(0, 0)), p.size())
+        if rect.contains(global_pos):
+            return
+        anchor = getattr(p, "_anchor", None)
+        if anchor is not None and anchor.isVisible():
+            arect = QtCore.QRect(anchor.mapToGlobal(QtCore.QPoint(0, 0)),
+                                 anchor.size())
+            if arect.contains(global_pos):
+                return          # the toggle button's press
+        _log("ctl panel: closed by outside press")
+        p.close_panel("outside press")
+
     def eventFilter(self, _obj, ev):
         if ev.type() == QtCore.QEvent.MouseButtonPress:
-            p = self._panel
-            if p.isVisible():
-                gp = ev.globalPos()
-                rect = QtCore.QRect(p.mapToGlobal(QtCore.QPoint(0, 0)),
-                                    p.size())
-                if rect.contains(gp):
-                    return False
-                anchor = getattr(p, "_anchor", None)
-                if anchor is not None and anchor.isVisible():
-                    arect = QtCore.QRect(
-                        anchor.mapToGlobal(QtCore.QPoint(0, 0)),
-                        anchor.size())
-                    if arect.contains(gp):
-                        return False    # the toggle button's press
-                _log("ctl panel: closed by outside press")
-                p.close_panel("outside press")
+            self.maybe_close_at(ev.globalPos())
         return False
+
+
+if sys.platform == "win32":
+    class _NativePressCloser(QtCore.QAbstractNativeEventFilter):
+        """Windows backstop for _OutsideCloser: presses on windows Qt does
+        not own never become QEvents — most importantly libvlc's own video
+        child HWND, which covers the whole video area during playback.
+        Clicking the video (the most obvious "outside") therefore has to be
+        caught at the native message level or the card stays open."""
+
+        WM_LBUTTONDOWN = 0x0201
+
+        def __init__(self, closer):
+            super().__init__()
+            self._closer = closer
+
+        def nativeEventFilter(self, eventType, message):
+            try:
+                if bytes(eventType) == b"windows_generic_MSG":
+                    msg = ctypes.wintypes.MSG.from_address(int(message))
+                    if msg.message == self.WM_LBUTTONDOWN:
+                        self._closer.maybe_close_at(
+                            QtCore.QPoint(msg.pt.x, msg.pt.y))
+            except Exception:  # noqa: BLE001
+                pass
+            # PyQt5 requires (boolhandled, result) — a bare False here
+            # raises inside the message pump and takes the app down
+            return False, 0
+else:
+    _NativePressCloser = None
 
 
 class _Row(QtWidgets.QWidget):
@@ -187,6 +223,8 @@ class TrackPanel(QtWidgets.QWidget):
         v.addSpacing(4)
         v.addWidget(self._scroll, 1)
         self._closer = _OutsideCloser(self, self)
+        self._native_closer = (_NativePressCloser(self._closer)
+                               if _NativePressCloser is not None else None)
         self.hide()
 
     # ---- data ----
@@ -267,7 +305,12 @@ class TrackPanel(QtWidgets.QWidget):
         self.move(x, y)
         self.show()
         self.raise_()
-        QtWidgets.QApplication.instance().installEventFilter(self._closer)
+        app = QtWidgets.QApplication.instance()
+        app.installEventFilter(self._closer)
+        if self._native_closer is not None:
+            # clicks on the (non-Qt) libvlc video HWND never reach the app
+            # filter above — watch them at the native message level too
+            app.installNativeEventFilter(self._native_closer)
 
     def close_panel(self, reason: str = "hide"):
         """Hide the card. ``reason`` is only for the log line — the close
@@ -275,15 +318,45 @@ class TrackPanel(QtWidgets.QWidget):
         if not self.isVisible():
             return
         self.hide()
-        QtWidgets.QApplication.instance().removeEventFilter(self._closer)
+        app = QtWidgets.QApplication.instance()
+        app.removeEventFilter(self._closer)
+        if self._native_closer is not None:
+            try:
+                app.removeNativeEventFilter(self._native_closer)
+            except Exception:  # noqa: BLE001
+                pass
         _log("ctl panel: closed (%s)", reason)
         self.closed.emit()
 
     def hideEvent(self, event):
-        # every hide path (including the host window hiding) uninstalls
-        # the click-outside watcher
+        # every hide path (including the host window hiding) uninstalls the
+        # click-outside watchers
+        app = QtWidgets.QApplication.instance()
         try:
-            QtWidgets.QApplication.instance().removeEventFilter(self._closer)
+            app.removeEventFilter(self._closer)
         except Exception:  # noqa: BLE001
             pass
+        if self._native_closer is not None:
+            try:
+                app.removeNativeEventFilter(self._native_closer)
+            except Exception:  # noqa: BLE001
+                pass
         super().hideEvent(event)
+
+    def showEvent(self, event):
+        # Mirror of hideEvent: hiding the card (or its whole host overlay —
+        # the overlay window is suppressed on focus changes, e.g. the video
+        # HWND grabbing focus) uninstalls the watchers; when the card
+        # becomes visible AGAIN they must come back, or the open card can
+        # never be closed by clicking outside (the "stuck menu" bug).
+        # installEventFilter dedupes, so re-installing is safe.
+        super().showEvent(event)
+        if self._anchor is None:
+            return          # pre-popup show while the panel is constructed
+        try:
+            app = QtWidgets.QApplication.instance()
+            app.installEventFilter(self._closer)
+            if self._native_closer is not None:
+                app.installNativeEventFilter(self._native_closer)
+        except Exception:  # noqa: BLE001
+            pass

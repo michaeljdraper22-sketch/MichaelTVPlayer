@@ -1,10 +1,12 @@
 """Main application window: content tabs + player + menus."""
 
 import logging
+import os
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from ..config import Config
+from .. import updater
+from ..config import APP_VERSION, Config
 from ..xtream import XtreamClient
 from . import icons as ic
 from .browsers import (
@@ -151,6 +153,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.player_view.request_fullscreen.connect(self.toggle_fullscreen)
         self.player_view.request_toggle_panel.connect(self.toggle_zen)
         self.player_view.request_toggle_channels.connect(self.toggle_channels)
+        self.player_view.request_next_channel.connect(self.play_next_channel)
 
         self.splitter.addWidget(self.tabs)
         self.splitter.addWidget(self.player_view)
@@ -214,6 +217,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._acc_runner.finished.connect(self._on_account)
         self._acc_runner.run(self.client.authenticate)
 
+        self._upd_runner = AsyncRunner()
+        self._upd_runner.finished.connect(self._on_update_checked)
+
         self.fav_tab.refresh()
         self._restore_state()
 
@@ -264,6 +270,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.player_view._cycle_spu)
         QtWidgets.QShortcut(QtGui.QKeySequence("A"), self,
                             activated=self.player_view._cycle_audio)
+        QtWidgets.QShortcut(QtGui.QKeySequence("N"), self,
+                            activated=self.player_view._play_next_clicked)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
@@ -312,8 +320,11 @@ class MainWindow(QtWidgets.QMainWindow):
         act_pause.triggered.connect(self.player_view.toggle_pause)
         act_stop = QtWidgets.QAction("Stop", self)
         act_stop.triggered.connect(self.player_view.stop)
+        act_next = QtWidgets.QAction("Play next (N)", self)
+        act_next.triggered.connect(self.player_view._play_next_clicked)
         play_menu.addAction(act_pause)
         play_menu.addAction(act_live)
+        play_menu.addAction(act_next)
         play_menu.addAction(act_stop)
 
         settings_menu = menu_bar.addMenu("&Settings")
@@ -339,6 +350,10 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu.addAction(act_dvr_window)
         settings_menu.addAction(act_delay)
         settings_menu.addAction(act_cache)
+        settings_menu.addSeparator()
+        act_update = QtWidgets.QAction("Check for updates\u2026", self)
+        act_update.triggered.connect(self.check_for_updates)
+        settings_menu.addAction(act_update)
 
         help_menu = menu_bar.addMenu("&Help")
         act_help = QtWidgets.QAction("About / Shortcuts", self)
@@ -358,6 +373,139 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.add_recent(playable)
         self.config.data["last_channel"] = playable
         self.config.save()
+
+    def play_next_channel(self):
+        """Live TV "Play next": advance to the next channel in the Live
+        tab's current (filtered) list, wrapping back to the top at the end.
+        The current channel must be in that list — a custom-URL stream has
+        no neighbours to step through."""
+        cur = self.player_view.current or {}
+        sid = cur.get("stream_id") if cur.get("kind") == "live" else None
+        items = self.live_tab.all_items
+        if sid is None or not items:
+            self.statusBar().showMessage(
+                "No channel list to advance from", 3000)
+            return
+        idx = next((i for i, it in enumerate(items)
+                    if it.get("stream_id") == sid), None)
+        if idx is None:
+            self.statusBar().showMessage(
+                "Current channel is not in the Live list", 3000)
+            return
+        nxt = items[(idx + 1) % len(items)]
+        playable = self.live_tab.make_playable(nxt)
+        self.play(playable)
+        self._select_playing(playable)
+
+    def _select_playing(self, playable: dict):
+        """Move the blue selected row of the matching browser tab to whatever
+        just started playing (Play next / autoplay next) — otherwise the old
+        row keeps the highlight while a different channel/episode plays."""
+        kind = playable.get("kind")
+        tab = {"live": self.live_tab, "vod": self.vod_tab,
+               "series": self.series_tab}.get(kind)
+        if tab is None:
+            return
+        sid = playable.get("stream_id")
+        fkey = playable.get("fav_key")
+        title = playable.get("title")
+        for i in range(tab.list.count()):
+            data = tab.list.item(i).data(QtCore.Qt.UserRole) or {}
+            if sid is not None:
+                if data.get("stream_id") == sid:
+                    tab.list.setCurrentRow(i)
+                    return
+            elif fkey and data.get("fav_key") == fkey:
+                tab.list.setCurrentRow(i)
+                return
+            elif data.get("title") == title:
+                tab.list.setCurrentRow(i)
+                return
+
+    # ---- manual update (Settings ▸ Check for updates…; never auto) ----
+    def check_for_updates(self):
+        """User-initiated ONLY: quietly query the latest GitHub release.
+        Never prompts, never nags — nothing happens unless the user is
+        here, clicking this button."""
+        try:
+            self._upd_runner.run(updater.fetch_latest)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "MichaelTV — Update",
+                f"Could not start the update check: {exc}")
+
+    def _on_update_checked(self, result):
+        ok, val = result
+        if ok != "ok":
+            QtWidgets.QMessageBox.information(
+                self, "MichaelTV — Update",
+                f"Could not check for updates:\n{val}")
+            return
+        ver, notes, asset_url = val
+        if not updater.is_newer(ver):
+            QtWidgets.QMessageBox.information(
+                self, "MichaelTV — Update",
+                f"You are up to date (version {APP_VERSION}).")
+            return
+        note_txt = (notes or "").strip()
+        if len(note_txt) > 800:
+            note_txt = note_txt[:800] + "\n…"
+        body = (f"A new version ({ver}) is available — you have "
+                f"{APP_VERSION}.\n\n{note_txt}\n\n"
+                "Update now? Your settings, favorites and Xtream login are "
+                "kept; the app restarts itself when the update is ready.")
+        btn = QtWidgets.QMessageBox.question(
+            self, "MichaelTV — Update available", body)
+        if btn != QtWidgets.QMessageBox.Yes:
+            return
+        self._download_update(asset_url, ver)
+
+    def _download_update(self, asset_url, ver):
+        prog = QtWidgets.QProgressDialog(
+            f"Downloading MichaelTV {ver}\u2026", None, 0, 0, self)
+        prog.setWindowTitle("MichaelTV — Update")
+        prog.setWindowModality(QtCore.Qt.WindowModal)
+        prog.setMinimumDuration(0)
+        prog.show()
+        QtWidgets.QApplication.processEvents()
+
+        import tempfile
+
+        def work():
+            dest = os.path.join(tempfile.gettempdir(),
+                                f"MichaelTV-{ver}.zip")
+            return (ver, updater.download(asset_url, dest))
+
+        self._upd_dl_runner = AsyncRunner()
+        self._upd_dl_runner.finished.connect(
+            lambda res: self._on_update_downloaded(res, prog))
+        self._upd_dl_runner.run(work)
+
+    def _on_update_downloaded(self, result, prog):
+        prog.close()
+        ok, val = result
+        if ok != "ok":
+            QtWidgets.QMessageBox.warning(
+                self, "MichaelTV — Update",
+                f"The download failed:\n{val}")
+            return
+        try:
+            ver, zip_path = val
+            helper, _staging = updater.stage_update(zip_path)
+        except Exception as exc:  # noqa: BLE001
+            QtWidgets.QMessageBox.warning(
+                self, "MichaelTV — Update",
+                f"The update could not be prepared:\n{exc}")
+            return
+        QtWidgets.QMessageBox.information(
+            self, "MichaelTV — Update",
+            "Update ready — MichaelTV will now restart with the new "
+            "version.")
+        updater.launch_helper(helper)
+        # state is persisted by closeEvent; hard exit right after so the
+        # swap helper's PID wait ends quickly
+        self.close()
+        QtCore.QTimer.singleShot(800, lambda: os._exit(0))
 
     def open_account(self):
         if LoginDialog.configure(self.config, self).exec_() == QtWidgets.QDialog.Accepted:
@@ -469,6 +617,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ("cc", "Subtitles"),
             ("audio", "Audio tracks"),
             ("scale", "Video scaling"), ("speed", "Playback speed"),
+            ("autoplay", "Autoplay next episode"),
+            ("playnext", "Play next"),
             ("mute", "Mute"), ("volume", "Volume slider"),
             ("timebar", "Time bar (live rewind)"),
         ]

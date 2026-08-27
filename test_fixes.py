@@ -38,8 +38,13 @@ def main():
     qss = pv_mod._OVERLAY_QSS
     qss_nc = __import__("re").sub(r"/\*.*?\*/", "", qss, flags=__import__("re").S)
     check("no rgba(0,0,0,1) plates left in QSS", "rgba(0,0,0,1)" not in qss_nc)
-    check("buttons paint nothing at rest",
-          "#ctlOverlay QToolButton { background: transparent;" in qss)
+    check("buttons carry invisible alpha-2 gray hit plates",
+          "#ctlOverlay QToolButton { background-color: rgba(63,63,63,2);"
+          in qss)
+    check("corner buttons carry alpha-2 gray hit plates too",
+          "#ovButton { background-color: rgba(63,63,63,2);" in qss)
+    check("no visible white plates left (tiles on dark video)",
+          "rgba(255,255,255,3)" not in qss_nc)
     check("#ovStatus pill style present", "#ovStatus" in qss)
     try:
         app.setStyleSheet(app.styleSheet())  # must not raise
@@ -207,6 +212,7 @@ def main():
           saw("play_at", 195.0) and not view._chase_paused)
     view._chase_paused = False
     real.state = "playing"
+    view.current = {"kind": "live", "title": "t", "url": "u"}  # media loaded
     view._toggle_pause()
     check("pause while playing -> vlc.pause + flag",
           view._chase_paused and saw("pause"))
@@ -214,6 +220,12 @@ def main():
     view._toggle_pause()
     check("resume while healthy -> vlc.resume",
           not view._chase_paused and saw("resume"))
+    # no media loaded: play/pause does nothing (pre-stream Space key)
+    view.current = None
+    del calls[:]
+    view._toggle_pause()
+    check("pre-stream toggle_pause is a no-op",
+          not calls and not view._chase_paused)
     view.vlc = real_vlc
     view.dvr = None
     view._mode = "live"
@@ -226,8 +238,9 @@ def main():
     rsrc = inspect.getsource(pv_mod.PlayerView._reopen_chase)
     check("watchdog reopen keeps the tracked position (no jump to live)",
           "_safe_seek_target(at)" in rsrc
-          and "_cap_clock_s if self._cap_clock_s > 0.0 else self._vid_s"
-          in rsrc)
+          and "max(self._cap_clock_s, self._vid_s)" in rsrc)
+    check("watchdog reopen has a same-anchor loop breaker",
+          "_reopen_repeats" in rsrc)
     check("speeds capped at 4x (audio mute limit)",
           max(pv_mod._SPEEDS) <= 4.0)
     check("jump-to-beginning button exists + wired",

@@ -6,6 +6,9 @@ import uuid
 from pathlib import Path
 
 APP_NAME = "MichaelTVPlayer"
+# App version — bumped per release; the Settings ▸ Check for updates action
+# compares it against the latest GitHub release tag (see src/updater.py).
+APP_VERSION = "1.1.0"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -82,7 +85,9 @@ DEFAULTS = {
         "begin": True, "live": True, "rec": True,
         "cc": True, "audio": True, "scale": True, "speed": True,
         "mute": True, "volume": True, "timebar": True,
+        "autoplay": True, "playnext": True,
     },
+    "autoplay_next": True,          # the autoplay toggle's state (series/catch-up)
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
     "subtitle_appearance": dict(SUBTITLE_DEFAULTS),
     "profanity": dict(PROFANITY_DEFAULTS),
@@ -91,6 +96,7 @@ DEFAULTS = {
 BUTTON_KEYS = (
     "back60", "back10", "play", "fwd10", "begin", "live", "rec",
     "cc", "audio", "scale", "speed", "mute", "volume", "timebar",
+    "autoplay", "playnext",
 )
 
 
@@ -364,6 +370,15 @@ class Config:
             if key in (value or {}):
                 clean[key] = bool(value[key])
         self.data["control_buttons"] = clean
+
+    @property
+    def autoplay_next(self) -> bool:
+        return bool(self.data.get("autoplay_next", True))
+
+    @autoplay_next.setter
+    def autoplay_next(self, value: bool) -> None:
+        self.data["autoplay_next"] = bool(value)
+        self.save()
 
     @property
     def scale_mode(self) -> str:

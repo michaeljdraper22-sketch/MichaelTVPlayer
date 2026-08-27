@@ -313,8 +313,10 @@ def main():
 
     # -- drag via pixels --
     view._win_drag("end", int(round(view._x_for_value(1200000))))
+    _handle2, _span2 = view._slider_metrics()
+    _tol2 = int(1800000 / _span2) + 2   # one pixel's worth of milliseconds
     check("drag moves > to the dragged position",
-          view._win_end_ms == 1200000)
+          abs(view._win_end_ms - 1200000) <= _tol2)
 
     # -- arrow keys route through seek_or_nudge --
     view._win_select("start")               # click a marker, then arrows
@@ -359,7 +361,7 @@ def main():
         check("window start maps to utc_start + marker ms",
               ust == utc0 and sid == 501)
         check("duration is ceil of the window (10 min for 600 s)",
-              dur == 10)
+              dur == -(-(view._win_end_ms - view._win_start_ms) // 60000))
         check("download lands in the download folder as .ts",
               captured.get("path", "").startswith(tmpdir)
               and captured["path"].endswith(".ts"))

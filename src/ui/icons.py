@@ -362,6 +362,44 @@ def download_window(color=None, keep_disabled=False):
     return _icon(key, draw, keep_disabled=keep_disabled)
 
 
+# ---- autoplay next / play next ----
+# Both buttons use the user's own original glyph design: an OUTLINED play
+# triangle with a two-crest squiggle running under its lower edge. The
+# triangle is drawn ~10% larger than the sketch and the squiggle is one
+# segment shorter (it ends at the second crest instead of hooking back
+# down), so the whole glyph sits cleanly inside the 24px button box.
+def _next_glyph(p, c):
+    # outlined triangle (no fill), apex pointing right
+    _pen(p, c, 2.2)
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.drawPolygon(QtGui.QPolygonF(
+        [_F(5.4, 4.9), _F(5.4, 19.5), _F(18.2, 12.2)]))
+    # the squiggle: starts just below the triangle's lower edge, rises to
+    # crest 1, dips to the trough, rises to crest 2 — and ENDS there
+    _polyline(p, c, [(12.6, 17.6), (15.3, 12.2), (18.0, 17.2), (20.7, 11.8)],
+              2.2)
+
+
+def autoplay(on):
+    """Autoplay-next toggle: the user's triangle+wave glyph; OFF strikes an
+    X through it, the mute-button convention for 'disabled'."""
+    def draw(p, c):
+        _next_glyph(p, c)
+        if not on:
+            _pen(p, c, 2.0)
+            p.drawLine(_F(4.6, 6.2), _F(19.4, 18.4))
+            p.drawLine(_F(19.4, 6.2), _F(4.6, 18.4))
+    return _icon("autoplay2" + ("on" if on else "off"), draw)
+
+
+def play_next():
+    """Play next (next episode / next channel): the user's original
+    triangle + wave design."""
+    def draw(p, c):
+        _next_glyph(p, c)
+    return _icon("play_next2", draw)
+
+
 def check():
     """Checkmark — the selected row marker in the track picker panel."""
     def draw(p, c):

@@ -285,26 +285,37 @@ _OVERLAY_QSS = """
    PlayerView.__init__): the video surface is native and libvlc draws
    through its own child HWND, so sibling widgets could never reliably
    rise above the video.  Controls paint NOTHING at rest — no background
-   plates at all — so the white glyphs float directly on the video.  (The
-   old rgba(0,0,0,1) "hit plates" rendered as solid black boxes on some
-   Windows setups.)  Buttons stay clickable: Qt routes mouse hits by child
-   geometry, not by painted pixels. */
-#ovButton { background: transparent; border: none; border-radius: 5px;
-            color: #ffffff; font-size: 13px; }
+/* NOTE on hit plates: the overlay is a per-pixel-alpha window and WINDOWS
+   ROUTES CLICKS BY PIXEL ALPHA — a fully transparent pixel passes the
+   click through to the video below, even inside a button's rect.  Without
+   a plate only the glyph's own strokes were clickable (measured: the
+   scale button's whole 42 px hit-tested as VideoSurface).  The plate must
+   ALSO be invisible: the earlier white rgba(255,255,255,3) plates showed
+   as (3,3,3) gray tiles on dark video.  rgba(63,63,63,2) is the fix:
+   premultiplied it stores (0,0,0,2) — zero contribution over black, at
+   most a 2-step dip on pure white — while the nonzero alpha keeps every
+   pixel clickable (verified with WindowFromPoint: the overlay is hit at
+   stored alpha 1-3, transparent pixels fall through).  QSS parsing traps
+   rule out the neighbors: alpha 1 parses as FLOAT 1.0 = fully opaque,
+   and sub-1% percentages misparse — keep an integer >= 2.  Keep the
+   plate a COLOR, not pure black: alpha-1 black plates once rendered as
+   solid boxes on some setups. */
+#ovButton { background-color: rgba(63,63,63,2); border: none;
+            border-radius: 5px; color: #ffffff; font-size: 13px; }
 #ovButton:hover { background-color: rgba(255,255,255,45); }
 #ovButton:pressed { background-color: rgba(255,255,255,95); }
 
 /* ---- on-video playback controls (float over the video, no box) ---- */
 #ctlOverlay { background: transparent; }
 #ctlOverlay QWidget { background: transparent; }
-#ctlOverlay QToolButton { background: transparent; border: none;
-                          border-radius: 6px; }
+#ctlOverlay QToolButton { background-color: rgba(63,63,63,2);
+                          border: none; border-radius: 6px; }
 #ctlOverlay QToolButton:hover { background-color: rgba(255,255,255,45); }
 #ctlOverlay QToolButton:pressed { background-color: rgba(255,255,255,95); }
 #ctlSep { color: rgba(255,255,255,70); background: transparent; }
 #ctlTimeLabel { color: #ffffff; background: transparent; font-size: 12px;
                 font-weight: 600; }
-#ctlOverlay QSlider { background: transparent; }
+#ctlOverlay QSlider { background-color: rgba(63,63,63,2); }
 
 /* DVR start-up progress pill (buffer filling before chase playback) */
 #ovStatus { background-color: rgba(0,0,0,165); color: #ffffff;
@@ -523,12 +534,23 @@ class PlayerView(QtWidgets.QWidget):
     request_fullscreen = QtCore.pyqtSignal()
     request_toggle_panel = QtCore.pyqtSignal()
     request_toggle_channels = QtCore.pyqtSignal()
+    # live TV "Play next": PlayerView has no channel list — MainWindow
+    # resolves the next channel in the Live tab's current list
+    request_next_channel = QtCore.pyqtSignal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config = config
         self.client = None
         self.current = None
+        # Paint the themed background on EVERY expose.  Without this the
+        # widget paints nothing of its own (no styled background, no
+        # autofill), so strips newly exposed by a splitter drag — where the
+        # channel panel / handle used to sit — kept the stale backing-store
+        # pixels forever: the "ghost list" trails over the video.  (The
+        # opaque black VideoSurface child covers this everywhere except
+        # the exact expose strips.)
+        self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
         self._seeking = False
         self._fullscreen = False
         self._zen = False
@@ -581,9 +603,13 @@ class PlayerView(QtWidgets.QWidget):
         self._compact_level = -1      # control-row compaction step (see _fit_ctl)
         self._compact_hidden = set()  # buttons hidden by compaction
         self._in_fit_ctl = False      # _fit_ctl re-entrancy guard
+        self._resize_burst_t0 = None  # wall time a resize burst started
         self._was_playing = False     # for the audio re-apply on transitions
         self._scrub_on = False        # scrubber row currently shown (VOD/chase)
         self._popup_open = False      # a ctl popup menu is open (don't hide)
+        self._info_sticky = False     # now-playing banner tied to the
+        #                             # control show/hide cycle (see
+        #                             # show_info / _wake / _sleep)
         self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
         self._spu_name = ""           # its name — re-matched after media opens
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
@@ -687,6 +713,12 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_timer.timeout.connect(self._caption_tick)
         self.runner = AsyncRunner()
         self.runner.finished.connect(self._on_epg)
+        # next-episode / next-program lookups (Play next button + the
+        # autoplay-on-end path) — its own runner so a slow series_info
+        # fetch can never clobber the EPG display
+        self._next_runner = AsyncRunner()
+        self._next_runner.finished.connect(self._on_next_fetched)
+        self._eof_next_done = False   # one autoplay shot per media
         self.vlc = VLCPlayer(
             timeshift=config.timeshift, volume=config.volume,
             network_caching=config.network_caching,
@@ -896,6 +928,23 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_scale.setFixedSize(42, 30)
         self.btn_speed = ctl_btn(ic.speed(), "Playback speed "
                                               "(live rewind, movies & series)")
+        # autoplay-next toggle (series episodes / catch-up programs): ON by
+        # default — the natural end of an episode rolls straight into the
+        # next one, and a season finale into the next season's first
+        # episode. OFF strikes an X through the glyph, mute-button style.
+        self.btn_auto = ctl_btn(ic.autoplay(self.config.autoplay_next),
+                                "Autoplay next episode", checkable=True)
+        self.btn_auto.setChecked(self.config.autoplay_next)
+        # subtle white ring while ON (1px border in BOTH states so the
+        # button's size hint — and the whole control row's pixel layout —
+        # never changes when the state flips)
+        self.btn_auto.setStyleSheet(
+            "QToolButton { background: transparent;"
+            " border: 1px solid transparent; border-radius: 4px; }"
+            "QToolButton:checked { border: 1px solid rgba(255,255,255,90); }")
+        # play next: next episode for series, the next recorded program for
+        # catch-up, the next channel for live TV (movies get neither)
+        self.btn_next = ctl_btn(ic.play_next(), "Play next (N)")
         self.sep3 = ctl_sep()
         self.btn_mute = ctl_btn(ic.volume(True), "Mute (M)", checkable=True)
         # JumpSlider = click anywhere on the bar to set the volume directly
@@ -916,14 +965,21 @@ class PlayerView(QtWidgets.QWidget):
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
                   self.btn_dl, self.btn_win, self.btn_rec, self.sep2,
                   self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
-                  self.sep3, self.btn_mute, self.vol_slider):
+                  self.btn_auto, self.btn_next, self.sep3,
+                  self.btn_mute, self.vol_slider):
             rl.addWidget(w)
         ctl_lay.addWidget(row)
-        # rewinds / jump buttons / speed work in DVR (chase) mode and for
-        # movies / series episodes (the whole file is already available)
-        for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                  self.btn_begin, self.btn_live, self.btn_speed,
-                  self.btn_cc):
+        # Pre-stream (nothing playing yet): the transport buttons, play and
+        # the audio picker can do nothing, and REC has no stream to record,
+        # so they start grayed out. CC, scaling AND SPEED stay LIVE: all
+        # three pick defaults the next stream starts with (sticky English
+        # captions / remembered scale mode / the speed choice now applies
+        # to whatever starts playing — see _set_rate).
+        # _update_control_state() re-enables per mode once media plays.
+        for b in (self.btn_back60, self.btn_back10, self.btn_play,
+                  self.btn_fwd10, self.btn_begin, self.btn_live,
+                  self.btn_rec, self.btn_audio,
+                  self.btn_next):
             b.setEnabled(False)
 
         # DVR start-up pill ("DVR 12s / 20s buffered…"), centered on the
@@ -956,6 +1012,8 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_audio.clicked.connect(self._audio_menu)
         self.btn_scale.clicked.connect(self._scale_menu)
         self.btn_speed.clicked.connect(self._speed_menu)
+        self.btn_auto.toggled.connect(self._on_autoplay_toggled)
+        self.btn_next.clicked.connect(self._play_next_clicked)
         self.btn_mute.toggled.connect(self._on_mute)
         self.btn_dl.clicked.connect(self._start_download)
         self.btn_win.clicked.connect(self._on_win_btn)
@@ -988,6 +1046,12 @@ class PlayerView(QtWidgets.QWidget):
         self._scale_timer.setSingleShot(True)
         self._scale_timer.setInterval(120)
         self._scale_timer.timeout.connect(self._apply_scale)
+        # Splitter/window resize settle: rebuild the native video window's
+        # content once dragging stops (see _recompose_video_surface).
+        self._ghost_fix_timer = QtCore.QTimer(self)
+        self._ghost_fix_timer.setSingleShot(True)
+        self._ghost_fix_timer.setInterval(180)
+        self._ghost_fix_timer.timeout.connect(self._recompose_video_surface)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(400)
         self.timer.timeout.connect(self._tick)
@@ -1015,11 +1079,56 @@ class PlayerView(QtWidgets.QWidget):
         self._apply_button_visibility()
 
     def resizeEvent(self, event):
+        now = now_s()
+        if self._ghost_fix_timer.isActive() and self._resize_burst_t0 \
+                and now - self._resize_burst_t0 > 0.15:
+            # long continuous drag: clear the accumulating ghost tiles
+            # inline (nothing is playing on a black surface — invisible);
+            # safe: no layout surgery, just a hide/repaint/show cycle
+            self._recompose_video_surface()
+            self._resize_burst_t0 = now
+        else:
+            if not self._ghost_fix_timer.isActive():
+                self._resize_burst_t0 = now
         super().resizeEvent(event)
         self._layout_overlays()
         # Video aspect/crop is re-applied debounced (see _scale_timer):
         # never block the GUI thread with libvlc calls mid-drag.
         self._scale_timer.start()
+        # Native video window ghost cure, also debounced (see
+        # _recompose_video_surface): runs once the drag settles.
+        self._ghost_fix_timer.start()
+
+    def _recompose_video_surface(self):
+        """Clear the tiled "ghost" echoes a splitter drag leaves on the video.
+
+        The video surface is a NATIVE child window; Windows fills strips a
+        resize exposes with nothing (NULL class brush), so the DWM keeps
+        compositing whatever was on screen there before — tiled echoes of
+        the channel list / splitter handle over the black video area.  With
+        nothing playing no repaint ever covers them.  Hide the surface,
+        force a synchronous repaint of the window (which also erases every
+        stale backing-store pixel underneath the hidden surface), then show
+        it again with clean content.  While a stream plays, the video
+        frames repaint the whole area every few milliseconds — nothing to
+        do.  Runs debounced after a resize burst settles, and inline every
+        ~0.35 s during a long drag.
+        """
+        if self._closing:
+            return
+        try:
+            playing = False
+            try:
+                playing = bool(self.vlc.is_playing())
+            except Exception:  # noqa: BLE001
+                pass
+            if playing:
+                return
+            self.surface.hide()
+            self.window().repaint()
+            self.surface.show()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _layout_overlays(self):
         g = self.surface.geometry()
@@ -1349,21 +1458,46 @@ class PlayerView(QtWidgets.QWidget):
             pass
         self.play_media(pending)
 
-    def show_info(self, title: str, epg: str = ""):
+    def show_info(self, title: str, epg: str = "", sticky: bool = False):
+        """Show the now-playing banner.
+
+        ``sticky=True`` (media start/switch): the banner stays for as long
+        as the playback controls are on screen and hides with them; after
+        that it only comes back when the user moves the cursor to the very
+        top of the video (see _wake) and leaves again when the controls
+        sleep. ``sticky=False`` (transient messages, EPG refresh) keeps the
+        old 4.5 s auto-hide — and while a sticky banner is up it only
+        refreshes the text instead of restarting a timer."""
         if epg:
             self._last_epg = epg
         elif title and not epg and self._last_epg:
             epg = self._last_epg
+        if sticky:
+            self._info_sticky = True
+        elif self._info_sticky:
+            self.info_overlay.set_info(title, epg)   # refresh text only
+            return
         self.info_overlay.set_info(title, epg)
         self.info_overlay.show()
         if (not self._immersive and not self.overlay.isVisible()
                 and not self._overlay_suppressed):
             self.overlay.show()   # the info banner lives in the overlay window
         self._layout_overlays()
-        self.info_timer.start()
+        if not sticky:
+            self.info_timer.start()
+
+    def _resurface_info(self):
+        """Bring the now-playing banner back for another control-cycle
+        (cursor dragged to the very top of the video while the controls
+        are awake)."""
+        if not self.current:
+            return
+        title = self.current.get("title", "")
+        self.show_info(title, self._last_epg, sticky=True)
 
     def hide_info(self):
         self.info_overlay.hide()
+        self._info_sticky = False
 
     def play_media(self, playable: dict, start_at: float = 0.0):
         if not self._attach_done and not self._closing:
@@ -1402,7 +1536,7 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         self._last_epg = ""
-        self.show_info(title)
+        self.show_info(title, sticky=True)
         # Per-channel reset: DVR / Record never carry over to the next channel.
         # Default is the plain live stream (single connection).
         # Handoff order (ONE provider stream max, Windows-safe temp cleanup):
@@ -1470,6 +1604,9 @@ class PlayerView(QtWidgets.QWidget):
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0
+        self._reopen_last_at = -1e9
+        self._reopen_last_t = 0.0
+        self._reopen_repeats = 0
         self._cu_raw_wall = 0.0
         self._cu_raw_moved = False
         self._chase_started = False
@@ -1486,6 +1623,7 @@ class PlayerView(QtWidgets.QWidget):
         self._dvr_status.hide()
         self._scrub_on = False
         self._vid_s = 0.0
+        self._eof_next_done = False   # re-arm autoplay-next for this media
         self._last_raw = None
         self._raw_change_wall = 0.0
         self._video_wh = (0, 0)   # next media's size is unknown until the
@@ -1501,7 +1639,9 @@ class PlayerView(QtWidgets.QWidget):
         self._audio_want = None
         self._audio_name = ""
         self._audio_auto_tid = None
-        self._set_rate(1.0)
+        # Playback speed is STICKY: a pick made before (or during) a stream
+        # applies to whatever starts next — never reset to 1x on switch.
+        # _poke_rate re-applies it once the fresh player has its media.
         self._update_control_state()
         self._apply_scale()
         url = playable.get("url", "")
@@ -1521,6 +1661,7 @@ class PlayerView(QtWidgets.QWidget):
             self.vlc.play(self._effective_url(url, kind),
                           timeshift=False, start_seconds=start_at)
         self._poke_audio()
+        self._poke_rate()
         self._wake()
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
         # tick) re-selects a track with the same NAME once the new media's
@@ -1543,8 +1684,193 @@ class PlayerView(QtWidgets.QWidget):
         title = self.current.get("title", "") if self.current else ""
         self.show_info(title, text)
 
+    # ---- play next / autoplay next ----
+    def _on_autoplay_toggled(self, on):
+        self.config.autoplay_next = bool(on)
+        self.btn_auto.setIcon(ic.autoplay(on))
+        self.btn_auto.setToolTip("Autoplay next episode — ON"
+                                 if on else "Autoplay next episode — OFF")
+
+    def _play_next_clicked(self):
+        cur = self.current
+        if self._closing or not cur:
+            return
+        if cur.get("kind") == "live":
+            self.request_next_channel.emit()
+            return
+        if cur.get("kind") not in ("series", "catchup") or not self.client:
+            return
+        if cur.get("kind") == "series" and cur.get("series_id") is None:
+            self.show_info("No episode list for this item")
+            return
+        self.show_info("Finding next\u2026")
+        base = cur.get("fav_key")
+        self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+
+    @staticmethod
+    def _nn(v):
+        """Tolerant int() for provider episode/season numbers."""
+        try:
+            return int(str(v).strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _fetch_next(self, cur):
+        """Worker-thread lookup: the playable AFTER ``cur``, or None.
+        Series walks the full ordered season list (season finale -> the
+        next season's first episode); catch-up takes the earliest recorded
+        program that starts after the current one."""
+        if cur.get("kind") == "series":
+            return self._fetch_series_next(cur)
+        if cur.get("kind") == "catchup":
+            return self._fetch_catchup_next(cur)
+        return None
+
+    def _fetch_series_next(self, cur):
+        info = self.client.series_info(cur["series_id"]) or {}
+        eps = []
+        ep_map = info.get("episodes")
+        if isinstance(ep_map, dict) and ep_map:
+            # modern shape: {"episodes": {"1": [...], "2": [...]}}
+            for key, lst in ep_map.items():
+                for e in sorted(lst or [],
+                                key=lambda e: self._nn(e.get("episode_num"))):
+                    eps.append((self._nn(key),
+                                self._nn(e.get("episode_num")), e))
+        else:
+            for sm in info.get("seasons") or []:
+                for e in sm.get("episode") or []:
+                    eps.append((self._nn(sm.get("season_number")),
+                                self._nn(e.get("episode_num")), e))
+        eps.sort(key=lambda t: (t[0], t[1]))
+        season = self._nn(cur.get("season"))
+        episode = self._nn(cur.get("episode"))
+        idx = next((i for i, (s, n, _e) in enumerate(eps)
+                    if s == season and n == episode), None)
+        if idx is None or idx + 1 >= len(eps):
+            return None
+        s, n, e = eps[idx + 1]
+        name = cur.get("series_name") or ""
+        title = e.get("title") or f"Episode {n}"
+        return {
+            "kind": "series",
+            "title": f"{name} - S{s}E{n} {title}".strip(),
+            "url": self.client.series_url(e.get("id"),
+                                          e.get("container_extension", "mp4")),
+            "fav_key": f"episode:{e.get('id')}",
+            "icon": (e.get("info") or {}).get("movie_image", ""),
+            "series_id": cur.get("series_id"),
+            "series_name": name,
+            "season": s,
+            "episode": n,
+        }
+
+    def _fetch_catchup_next(self, cur):
+        started_after = int(cur.get("utc_start") or 0)
+        if not started_after or cur.get("stream_id") is None:
+            return None
+        now = time.time()
+        best = None
+        for e in self.client.epg_table(cur["stream_id"]) or []:
+            try:
+                st = int(str(e.start_timestamp).strip())
+                sp = int(str(e.stop_timestamp).strip())
+            except (TypeError, ValueError):
+                continue
+            # only programs that already started (they exist in the
+            # archive) and begin after the current one
+            if st <= started_after or st > now:
+                continue
+            if best is None or st < best[0]:
+                best = (st, sp, e)
+        if best is None:
+            return None
+        st, sp, e = best
+        if sp <= st:
+            sp = st + 1800
+        title = _decode(e.title) or "Program"
+        dur_min = max(1, math.ceil((sp - st) / 60.0))
+        return {
+            "kind": "catchup",
+            "title": f"{cur.get('channel', '')} \u2014 {title}",
+            "url": self.client.timeshift_url(cur["stream_id"], st, dur_min),
+            "stream_id": cur["stream_id"],
+            "utc_start": st,
+            "utc_end": sp,
+            "channel": cur.get("channel", ""),
+            "program": title,
+            "fav_key": f"catchup:{cur['stream_id']}:{st}",
+            "icon": cur.get("icon", ""),
+        }
+
+    def _on_next_fetched(self, result):
+        ok, val = result
+        if self._closing or ok != "ok":
+            if not self._closing:
+                try:
+                    log.warning("next-episode lookup failed: %s", val)
+                except Exception:
+                    pass
+                self.show_info("Could not look up the next item")
+            return
+        base, nxt = val
+        cur = self.current or {}
+        if cur.get("fav_key") != base:
+            return          # the user moved on while the lookup ran
+        if not nxt:
+            self.show_info("No more episodes in this series"
+                           if cur.get("kind") == "series"
+                           else "No later programs in the archive")
+            return
+        self._start_next(nxt)
+
+    def _start_next(self, nxt):
+        """Switch playback to the next item through the same bookkeeping
+        MainWindow.play() does (recents + last_channel)."""
+        self.config.add_recent(nxt)
+        self.config.data["last_channel"] = nxt
+        self.config.save()
+        self.play_media(nxt)
+        # move the browser tab's blue selection to the new episode/program
+        try:
+            win = self.window()
+            if hasattr(win, "_select_playing"):
+                win._select_playing(nxt)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _maybe_autoplay_next(self, playing, length_ms, raw_ms):
+        """Natural end of a series episode / catch-up program: roll into
+        the next item when the autoplay toggle is on."""
+        if self._eof_next_done or self._closing:
+            return
+        cur = self.current or {}
+        if cur.get("kind") not in ("series", "catchup"):
+            return
+        if not self.btn_auto.isChecked() or length_ms <= 0:
+            return
+        if self._seeking or self._live_paused or self._win_sel \
+                or self._downloading:
+            return
+        ended = False
+        try:
+            ended = self.vlc.state_name() == "ended"
+        except Exception:  # noqa: BLE001
+            pass
+        if not ended:
+            # indexless catch-up TS may never report "ended" — the clock
+            # sitting at the end with playback stopped is the same signal
+            if playing or raw_ms <= 0 or raw_ms < length_ms - 1500:
+                return
+        self._eof_next_done = True
+        self.show_info("Up next\u2026")
+        base = cur.get("fav_key")
+        self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+
     # ---- controls ----
     def _toggle_pause(self):
+        if not self.current:
+            return          # nothing loaded (pre-stream Space key)
         if self._mode == "chase":
             # Watching the buffer: a plain file pause — the recorder keeps
             # filling the file, so this is a flawless pause of live TV.
@@ -2180,7 +2506,7 @@ class PlayerView(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(700, self._poke_rate_late)
 
     def _poke_rate_late(self):
-        if self._closing or self._mode != "chase":
+        if self._closing or (self._mode != "chase" and not self._is_vod()):
             return
         try:
             self.vlc.set_rate(self._rate)
@@ -2587,7 +2913,7 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_started = False   # armed on the first playing tick
         self._chase_fail_count = 0    # chase runs: retry budget re-armed
         self._stall_ticks = 0
-        self._set_rate(1.0)
+        self._set_rate(self._rate)    # sticky speed applies to this stream too
         self._update_control_state()
         # profanity filter / caption overlay: begin reading captions from
         # the buffer now (ONE CCSource serves both)
@@ -2620,11 +2946,37 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not (self._mode == "chase" and self.dvr and self.dvr.buffer_file()):
             return
-        # revive where the viewer actually WAS: the caption clock is the
-        # display truth (it holds through VLC freezes via its stall
-        # detection), while _vid_s can lag behind (its snap guard rejects
-        # big raw jumps)
-        at = self._cap_clock_s if self._cap_clock_s > 0.0 else self._vid_s
+        # revive where the viewer actually WAS. The caption clock is the
+        # display truth when it is LIVE (it holds through VLC freezes via
+        # its stall detection), but a caption pipeline that died with the
+        # old channel leaves it FROZEN at a stale position — reopening
+        # there every cooldown was the "short permanent loop" after a
+        # play-next channel switch (same few seconds repeating until the
+        # user changed channels). Take the FURTHEST of the two clocks:
+        # _vid_s always advanced while frames played, and a stale caption
+        # clock can then never drag playback backwards.
+        at = max(self._cap_clock_s, self._vid_s)
+        # Loop-breaker: repeated rescues at (nearly) the same anchor mean
+        # the player wedges the instant it lands there — after 3 in a row,
+        # jump to fresh data near the live edge instead of reopening at
+        # the same spot forever.
+        noww = now_s()
+        if at <= getattr(self, "_reopen_last_at", -1e9) + 2.0 \
+                and noww - getattr(self, "_reopen_last_t", 0.0) < 60.0:
+            self._reopen_repeats = getattr(self, "_reopen_repeats", 0) + 1
+        else:
+            self._reopen_repeats = 0
+        self._reopen_last_at = at
+        self._reopen_last_t = noww
+        if self._reopen_repeats >= 3:
+            self._reopen_repeats = 0
+            at = self._safe_seek_target(self._frontier_s()
+                                        - self.config.chase_delay)
+            try:
+                log.warning("chase reopen: same-anchor loop broken — "
+                            "jumping near live edge (%.1fs)", at)
+            except Exception:
+                pass
         target = self._safe_seek_target(at)
         try:
             log.warning("chase reopen: play_at %.1fs (frontier=%.1fs "
@@ -3175,6 +3527,21 @@ class PlayerView(QtWidgets.QWidget):
             self._btn_showpanel.raise_()
         if shown:
             self._layout_overlays()
+            # fresh-from-hidden: flush any stale backing-store pixels the
+            # vout swap of a stream switch left behind (ghost buttons)
+            self.overlay.repaint()
+        # now-playing banner: after its first control-cycle it only comes
+        # back when the cursor is dragged to the VERY TOP of the video
+        try:
+            pos = QtGui.QCursor.pos()
+            local = self.surface.mapFromGlobal(pos)
+            top_band = max(28, self.surface.height() // 12)
+            if (self.current and 0 <= local.x() < self.surface.width()
+                    and 0 <= local.y() <= top_band
+                    and not self.info_overlay.isVisible()):
+                self._resurface_info()
+        except Exception:  # noqa: BLE001
+            pass
         self.hide_timer.start()
 
     def _sleep(self, force=False):
@@ -3198,6 +3565,10 @@ class PlayerView(QtWidgets.QWidget):
             return
         self.ctl.hide()
         self._btn_showpanel.hide()
+        # the sticky now-playing banner leaves with the controls
+        if self._info_sticky:
+            self.info_overlay.hide()
+            self._info_sticky = False
         if self._immersive:
             self._btn_panel.hide()
             self._btn_ovfs.hide()
@@ -3252,9 +3623,14 @@ class PlayerView(QtWidgets.QWidget):
             # stream switch: VLC destroys and recreates its native window
             # under the translucent overlay, and Windows can leave the old
             # pixels of the layered window behind (ghosted buttons, duplicated
-            # slider handles). A synchronous full repaint clears the trails.
-            if self.overlay.isVisible():
-                self.overlay.repaint()
+            # slider handles — e.g. a doubled play-next glyph right after a
+            # play-next channel switch, or leftover control plates after a
+            # series-episode -> movie transition). Repaint UNCONDITIONALLY:
+            # when the overlay is hidden at that instant (controls asleep
+            # mid-switch) the stale pixels simply live in its backing store
+            # until the next _wake() paints them over the video — the
+            # isVisible() guard was exactly how those ghosts survived.
+            self.overlay.repaint()
 
     def _tick(self):
         # Teardown guard: once stop() has run, no timer may touch VLC —
@@ -3470,6 +3846,7 @@ class PlayerView(QtWidgets.QWidget):
             if self._is_catchup():
                 self._catchup_watchdog(now, playing, raw_s,
                                        length / 1000.0, raw_moved)
+            self._maybe_autoplay_next(playing, length, raw)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None
             self._vid_s = 0.0
@@ -3538,15 +3915,27 @@ class PlayerView(QtWidgets.QWidget):
         A Download button replaces Record for movies / series."""
         chase = self._mode == "chase"
         vod = self._is_vod()
+        # Pre-stream (no media yet) the transport group stays enabled: the
+        # speed pick is sticky and applies to whatever stream starts next.
+        live_prestream = self.current is None
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
                   self.btn_begin, self.btn_speed):
-            b.setEnabled(chase or vod)
+            b.setEnabled(chase or vod or live_prestream)
         self.btn_live.setEnabled(chase or vod or bool(self.current))
+        # play/pause + audio need SOMETHING loaded; REC needs the DVR
+        # recorder of a live chase stream (VOD/catch-up swap the slot to
+        # Download/Window) — never disable it mid-recording
+        self.btn_play.setEnabled(bool(self.current))
+        self.btn_audio.setEnabled(bool(self.current))
+        kind = (self.current or {}).get("kind")
+        self.btn_auto.setEnabled(kind in ("series", "catchup"))
+        self.btn_next.setEnabled(kind in ("live", "series", "catchup"))
+        self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled(vod and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
         self._scrub_on = chase
         self._set_scrub_visible(chase)
-        if not chase and not vod:
+        if self.current is not None and not chase and not vod:
             self._set_rate(1.0)
         self._apply_button_visibility()
         self._apply_scale()
@@ -3572,7 +3961,9 @@ class PlayerView(QtWidgets.QWidget):
             "scale": self.btn_scale,
             "speed": self.btn_speed, "mute": self.btn_mute,
             "volume": self.vol_slider,
+            "autoplay": self.btn_auto, "playnext": self.btn_next,
         }
+        kind = (self.current or {}).get("kind")
         for key, w in widgets.items():
             on = bool(vis.get(key, True)) and key not in compact
             if key == "rec":
@@ -3590,6 +3981,14 @@ class PlayerView(QtWidgets.QWidget):
                 w.setVisible(on and not vod)
                 self.btn_dl.setVisible(on and vod and not catchup)
                 self.btn_win.setVisible(on and catchup)
+            elif key == "autoplay":
+                # series episodes + catch-up programs only (never movies,
+                # never live TV — there is no "next" to roll into)
+                w.setVisible(on and kind in ("series", "catchup"))
+            elif key == "playnext":
+                # "play next channel" on live TV, "play next episode" on
+                # series / catch-up; hidden for movies and pre-stream
+                w.setVisible(on and kind in ("live", "series", "catchup"))
             else:
                 w.setVisible(on)
 
@@ -3612,6 +4011,12 @@ class PlayerView(QtWidgets.QWidget):
                              and any_of("mute", "volume"))
         self._set_scrub_visible(self._scrub_on)
         self._layout_overlays()
+        # button show/hide mid-stream-switch (series -> movie swaps the
+        # rec slot etc.) re-composes the layered overlay window; a
+        # synchronous repaint keeps no stale glyph pixels behind. Skipped
+        # during _fit_ctl's compaction ladder (it re-runs this per level).
+        if self.overlay.isVisible() and not self._in_fit_ctl:
+            self.overlay.repaint()
 
     # ---- control-bar popup cards (speed / scale / audio / subtitles) ----
     def _open_ctl_panel(self, btn, header, rows, on_pick, refresh=None):
@@ -3709,8 +4114,11 @@ class PlayerView(QtWidgets.QWidget):
 
     def _set_rate(self, rate):
         rate = max(0.125, min(5.0, float(rate)))
-        if self._mode != "chase" and not self._is_vod():
-            rate = 1.0   # speed control needs DVR or a seekable file
+        if self.current is not None and self._mode != "chase" \
+                and not self._is_vod():
+            rate = 1.0   # plain-live fallback has no speed control; a
+            #              PRE-stream pick (current is None) is kept and
+            #              applied when the next stream starts
         self._sync_transport("rate", None, extra="rate=%g" % rate)
         self._rate = rate
         try:
@@ -5563,5 +5971,7 @@ class PlayerView(QtWidgets.QWidget):
             self._cycle_spu()
         elif key == QtCore.Qt.Key_A:
             self._cycle_audio()
+        elif key == QtCore.Qt.Key_N:
+            self._play_next_clicked()
         else:
             super().keyPressEvent(event)
