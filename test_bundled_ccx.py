@@ -31,8 +31,17 @@ from src.live_cc import (bundled_ccextractor, ccx_args,  # noqa: E402
                          find_ccextractor)
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-RECORDING = os.path.join(ROOT, "TV Recordings",
-                         "US_NFL_NETWORK_HD_20260820_171631.ts")
+def _find_recording():
+    """Any NFL Network HD capture works as the captioned fixture (a real
+    60 s recording — see the capture note in README/tests)."""
+    import glob as _glob
+    hits = sorted(_glob.glob(os.path.join(
+        ROOT, "TV Recordings", "US_NFL_NETWORK_HD_*.ts")))
+    return hits[-1] if hits else os.path.join(
+        ROOT, "TV Recordings", "US_NFL_NETWORK_HD_missing.ts")
+
+
+RECORDING = _find_recording()
 # The vendored runtime subset (WP4b): exe + static import closure.
 VENDOR_DLLS = [
     "libgpac.dll", "avcodec-60.dll", "avformat-60.dll", "avfilter-9.dll",

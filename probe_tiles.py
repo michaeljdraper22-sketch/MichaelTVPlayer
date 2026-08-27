@@ -69,16 +69,19 @@ def main():
             b.objectName() or b.toolTip()[:12], dark))
         worst = max(worst, sum(dark[0][0]) if dark else 0)
 
-    # reference: pure video area away from controls
+    # reference: the video area away from controls — the plate is invisible
+    # when its composited pixels match THIS background (the old verdict
+    # assumed a pure-black video, but the themed surface paints #1e1e1e)
     gp = pv.surface.mapToGlobal(QtCore.QPoint(10, 10))
     pm = app.primaryScreen().grabWindow(0, gp.x(), gp.y(), 40, 40)
     img = pm.toImage().convertToFormat(QtGui.QImage.Format_RGB888)
     c = img.pixel(20, 20)
-    print("  video background reference:", (c & 0xff, (c >> 8) & 0xff,
-                                            (c >> 16) & 0xff))
+    bg = (c & 0xff, (c >> 8) & 0xff, (c >> 16) & 0xff)
+    print("  video background reference:", bg)
     print()
+    bg_sum = sum(bg)
     print("VERDICT:", "INVISIBLE (plates match background)"
-          if worst <= 3 else "STILL VISIBLE")
+          if worst <= bg_sum + 9 else "STILL VISIBLE")
     return 0
 
 

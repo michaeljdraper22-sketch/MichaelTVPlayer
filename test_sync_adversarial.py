@@ -83,9 +83,17 @@ from src.ui.player_view import (PlayerView,  # noqa: E402
                                 _CHASE_SAFETY_S)
 from src.ui.caption_overlay import visible_lines  # noqa: E402
 
-RECORDING = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "TV Recordings",
-                         "US_NFL_NETWORK_HD_20260820_171631.ts")
+def _find_recording():
+    import glob as _glob
+    hits = sorted(_glob.glob(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "TV Recordings", "US_NFL_NETWORK_HD_*.ts")))
+    return hits[-1] if hits else os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "TV Recordings",
+        "US_NFL_NETWORK_HD_missing.ts")
+
+
+RECORDING = _find_recording()
 QUICK = "--quick" in sys.argv
 DUR = 0.35 if QUICK else 1.0        # scenario duration factor
 _only = [a[len("--only:"):] for a in sys.argv if a.startswith("--only:")]
