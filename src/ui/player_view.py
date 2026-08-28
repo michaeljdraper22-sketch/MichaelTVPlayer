@@ -2169,8 +2169,19 @@ class PlayerView(QtWidgets.QWidget):
         frontier under-credits the cold burst by 20-35 s of content that
         the buffer really holds; frontier+60 caps pathological edge
         over-estimates (a seek past EOF would stall-loop the watchdog)."""
-        limit = min(self._cap_edge_s(), self._frontier_s() + 60.0) \
-            - _CHASE_SAFETY_S
+        edge = self._cap_edge_s()
+        frontier = self._frontier_s()
+        # Stale-axis guard: the edge is dead-reckoned off the caption
+        # clock. If that clock has not run for seconds (the caption /
+        # filter machinery down), a FROZEN edge must not veto data the
+        # frontier has already confirmed on disk — it used to clamp every
+        # rescue reopen and loop-breaker escape back to the buffer start,
+        # which is what made the wedge repeat the same few seconds
+        # forever. The frontier only ever confirms bytes that exist, so
+        # it is the safe floor while the edge is stale.
+        if edge < frontier and now_s() - self._cap_wall > 5.0:
+            edge = frontier
+        limit = min(edge, frontier + 60.0) - _CHASE_SAFETY_S
         return max(0.0, min(max(0.0, target), limit))
 
     # ---- stage-2 single-axis caption timing helpers ----
@@ -2337,9 +2348,12 @@ class PlayerView(QtWidgets.QWidget):
     def _seek_ms(self, ms):
         if self._mode == "chase" and self.dvr:
             # Skip relative to what's DISPLAYED (the content-axis clock),
-            # not to _vid_s — after PTS renumbering those disagree.
-            base = self._cap_clock_s if self._cap_clock_s > 0.0 \
-                else self._vid_s
+            # not to _vid_s — after PTS renumbering those disagree. The
+            # max() guards against a clock that is somehow stale: it must
+            # never drag a rewind target BEHIND the tracked position (the
+            # frozen-clock bug sent Rewind 60 straight to the beginning).
+            base = max(self._cap_clock_s, self._vid_s) \
+                if self._cap_clock_s > 0.0 else self._vid_s
             self._chase_seek(base + ms / 1000.0)
             return
         if self._is_catchup():
@@ -2396,6 +2410,16 @@ class PlayerView(QtWidgets.QWidget):
         else:
             target = self._safe_seek_target(target_s)
         vlc_t = 0.0 if target <= 0.0 else self._cap_vlc_time_for(target)
+        try:
+            log.info("chase seek: target=%.1fs safe=%.1fs vlc=%.1fs "
+                     "frontier=%.1fs edge=%.1fs div=%s%s",
+                     target_s, target, vlc_t, self._frontier_s(),
+                     self._cap_edge_s(),
+                     "-" if not self._cap_div_ok
+                     else "%.1f" % self._cap_div_s,
+                     " jump_live" if jump_live else "")
+        except Exception:
+            pass
         self._sync_transport("chase_seek" if not jump_live else "jump_edge",
                              target_s,
                              extra="safe=%.2f vlc=%.2f resume=%s"
@@ -3717,6 +3741,19 @@ class PlayerView(QtWidgets.QWidget):
                     > _CC_TRICKLE_WIN_S:
                 del self._raw_win[0]
             self._trickle_hold = self._trickle_test(now, playing)
+            # Advance the content-axis clock HERE, unconditionally: it is
+            # not just caption timing anymore — _seek_ms's rewind base,
+            # _jump_live's edge and _safe_seek_target's clamp all lean on
+            # it. It used to run only from _caption_tick/_filter_tick, so
+            # with captions off (and the profanity filter windowless) the
+            # clock stayed frozen at its last transport seed: a Rewind 60
+            # computed base=seed-60 → clamped to 0 → "jumps to the
+            # beginning", and every rescue reopen was clamped back there
+            # by the frozen edge → the short loop (2026-08-27 report).
+            # The integrator is dt-keyed on _cap_wall, so an extra cadence
+            # alongside the 100 ms caption/filter ticks double-counts
+            # nothing.
+            self._caption_clock_s()
             current = self._vid_s
             # ---- stuck-player rescue (merged watchdogs) ----
             # VLC at the ragged edge of the growing buffer file can end up

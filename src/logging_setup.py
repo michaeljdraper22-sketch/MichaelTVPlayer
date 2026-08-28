@@ -22,6 +22,7 @@ import sys
 _LOG_DIR = os.path.join(
     os.environ.get("APPDATA") or os.path.expanduser("~"), "MichaelTVPlayer"
 )
+LOG_DIR = _LOG_DIR   # public: src.diagnostics reads the log tail from here
 LOG_PATH = os.path.join(_LOG_DIR, "player.log")
 SYNC_LOG_PATH = os.path.join(_LOG_DIR, "sync_debug.log")
 DUMP_PATH = os.path.join(_LOG_DIR, "crash.dump")

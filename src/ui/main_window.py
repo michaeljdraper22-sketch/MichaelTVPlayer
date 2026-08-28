@@ -5,6 +5,7 @@ import os
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
+from .. import diagnostics as diag
 from .. import updater
 from ..config import APP_VERSION, Config
 from ..xtream import XtreamClient
@@ -351,6 +352,9 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu.addAction(act_delay)
         settings_menu.addAction(act_cache)
         settings_menu.addSeparator()
+        act_diag = QtWidgets.QAction("Help improve MichaelTV\u2026", self)
+        act_diag.triggered.connect(self.edit_telemetry)
+        settings_menu.addAction(act_diag)
         act_update = QtWidgets.QAction("Check for updates\u2026", self)
         act_update.triggered.connect(self.check_for_updates)
         settings_menu.addAction(act_update)
@@ -684,6 +688,93 @@ class MainWindow(QtWidgets.QMainWindow):
         from .profanity_dialog import ProfanityDialog
         ProfanityDialog(self.config, self.player_view.apply_profanity_settings,
                         parent=self).exec_()
+
+    def edit_telemetry(self):
+        """Settings ▸ Help improve MichaelTV… — opt-in diagnostics uploads.
+
+        A silent on/off switch: when on, the app posts a redacted report
+        (system info + the player.log tail) to GitHub whenever it hits an
+        error or a playback-rescue storm, at most every 4 hours plus one
+        startup heartbeat a day. Off by default, nothing is ever sent.
+        """
+        import threading
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Help improve MichaelTV")
+        dlg.resize(560, 340)
+        lay = QtWidgets.QVBoxLayout(dlg)
+        cb = QtWidgets.QCheckBox(
+            "Send diagnostics to help solve errors and bugs")
+        cb.setChecked(self.config.telemetry_enabled)
+        lay.addWidget(cb)
+        info = QtWidgets.QLabel(
+            "<b>When on, MichaelTV silently sends a report when it hits "
+            "trouble</b> (a crash/error, or repeated playback rescues), "
+            "plus one summary per day at startup — never more than one "
+            "report every 4 hours.\n\n"
+            "A report contains:\n"
+            "\u2022 general computer info (Windows build, CPU, RAM, "
+            "screens, VLC version)\n"
+            "\u2022 a few playback settings (network cache, live delay)\n"
+            "\u2022 the tail of the app's player.log\n\n"
+            "Account details are never read. Credentials that appear in "
+            "log lines (stream username/password, Windows profile paths) "
+            "are automatically replaced with REDACTED. Reports are posted "
+            "as issues on the project's GitHub repo and need the token "
+            "below (a fine-grained GitHub token with Issues: Read and "
+            "write on just that repo).")
+        info.setWordWrap(True)
+        lay.addWidget(info, 1)
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("GitHub token:"))
+        ed_token = QtWidgets.QLineEdit()
+        ed_token.setPlaceholderText(
+            "paste a fine-grained PAT (Issues: Read and write)")
+        ed_token.setText(self.config.telemetry_token)
+        row.addWidget(ed_token, 1)
+        lay.addLayout(row)
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_view = QtWidgets.QPushButton("View sent reports")
+        btn_test = QtWidgets.QPushButton("Send a test report now")
+        lbl_status = QtWidgets.QLabel("")
+        btn_view.clicked.connect(diag.open_repo_issues)
+        btn_row.addWidget(btn_view)
+        btn_row.addWidget(btn_test)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+        lay.addWidget(lbl_status)
+
+        def _send_test():
+            btn_test.setEnabled(False)
+            lbl_status.setText("Sending\u2026 (up to ~30 s)")
+            holder = {"text": ""}
+
+            def work():
+                holder["text"] = diag.upload_now_blocking(
+                    self.config, "manual test report")
+
+            t = threading.Thread(target=work, daemon=True)
+
+            def poll():
+                if t.is_alive():
+                    QtCore.QTimer.singleShot(400, poll)
+                    return
+                lbl_status.setText(holder["text"])
+                btn_test.setEnabled(True)
+
+            t.start()
+            QtCore.QTimer.singleShot(400, poll)
+
+        btn_test.clicked.connect(_send_test)
+        bb = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        lay.addWidget(bb)
+        if dlg.exec_() == QtWidgets.QDialog.Accepted:
+            self.config.telemetry_enabled = cb.isChecked()
+            self.config.telemetry_token = ed_token.text()
+            self.config.save()
 
     # ---- black title bar (Windows 10 dark / Windows 11 caption color) ----
     def showEvent(self, event):

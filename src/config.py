@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -91,6 +91,13 @@ DEFAULTS = {
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
     "subtitle_appearance": dict(SUBTITLE_DEFAULTS),
     "profanity": dict(PROFANITY_DEFAULTS),
+    # Opt-in diagnostics ("Help improve MichaelTV", Settings menu). Off
+    # until the user turns it on; see src/diagnostics.py for what is sent.
+    "telemetry_enabled": False,
+    "telemetry_token": "",         # fine-grained GitHub PAT (issues:write)
+    "telemetry_id": "",            # random install id, set on first send
+    "telemetry_last_sent": 0.0,    # epoch of the last uploaded report
+    "telemetry_repo": "",          # "" = diagnostics.REPO
 }
 
 BUTTON_KEYS = (
@@ -482,3 +489,45 @@ class Config:
     @chase_delay.setter
     def chase_delay(self, value: int) -> None:
         self.data["chase_delay"] = max(5, min(120, int(value)))
+
+    # ---- opt-in diagnostics (Settings ▸ "Help improve MichaelTV…") ----
+
+    @property
+    def telemetry_enabled(self) -> bool:
+        return bool(self.data.get("telemetry_enabled", False))
+
+    @telemetry_enabled.setter
+    def telemetry_enabled(self, value: bool) -> None:
+        self.data["telemetry_enabled"] = bool(value)
+
+    @property
+    def telemetry_token(self) -> str:
+        return self.data.get("telemetry_token", "") or ""
+
+    @telemetry_token.setter
+    def telemetry_token(self, value: str) -> None:
+        self.data["telemetry_token"] = (value or "").strip()
+
+    @property
+    def telemetry_id(self) -> str:
+        """Random install id — generated once, then sticky (correlates
+        reports from the same machine without sending anything personal)."""
+        tid = self.data.get("telemetry_id", "") or ""
+        if not tid:
+            tid = uuid.uuid4().hex[:12]
+            self.data["telemetry_id"] = tid
+        return tid
+
+    @property
+    def telemetry_last_sent(self) -> float:
+        try:
+            return float(self.data.get("telemetry_last_sent", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    @telemetry_last_sent.setter
+    def telemetry_last_sent(self, value: float) -> None:
+        try:
+            self.data["telemetry_last_sent"] = float(value)
+        except (TypeError, ValueError):
+            pass

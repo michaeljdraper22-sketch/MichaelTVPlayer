@@ -168,6 +168,20 @@ def main() -> int:
     apply_theme(app)
 
     config = Config.load()
+    try:
+        from src import diagnostics
+        diagnostics.capture_screen_info()   # main thread only (no Qt off it)
+    except Exception:
+        pass
+    # Opt-in diagnostics ("Help improve MichaelTV", Settings menu): the
+    # error/warning trigger + the daily startup heartbeat. Both no-op
+    # while the setting is off; both swallow their own errors.
+    try:
+        from src import diagnostics
+        diagnostics.startup_heartbeat(config)
+        diagnostics.install_trigger(config)
+    except Exception:
+        pass
     if not config.has_account():
         if LoginDialog.configure(config).exec_() != QtWidgets.QDialog.Accepted:
             return 0
