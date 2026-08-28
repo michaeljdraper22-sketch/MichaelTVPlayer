@@ -140,6 +140,11 @@ def main() -> int:
     _setup_windows_identity()
     _setup_bundled_vlc()
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    # Without this, QIcon treats a DPR-tagged pixmap as its raw device size
+    # and smooth-rescales it on every paint (down to logical, back up to
+    # device) — that double resample was why the control-bar glyphs read
+    # soft/blurry on any Windows display-scaling above 100%.
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("MichaelTV")

@@ -1,10 +1,11 @@
 """Crisp, minimal white line icons (Stremio-style) for the player UI.
 
-Each glyph is drawn once into an 8x supersampled master and then downscaled
-with smooth transformation to the EXACT device pixels the screen will ask
-for (24 logical px x the screen DPR). QIcon then serves a pixel-perfect
-match instead of rescaling a master on every paint — that per-paint
-rescale was the last source of grain/softness.
+Every glyph is pure vector code (QPainter paths at any scale). Each icon is
+painted ONCE, antialiased directly at the exact device pixels the screen
+will ask for (24 logical px x the screen DPR) and handed to QIcon with its
+DPR tag; the app sets AA_UseHighDpiPixmaps so Qt serves that pixmap
+1:1 instead of rescaling it on every paint. No intermediate raster is ever
+resampled — that was the source of the old grain/softness.
 """
 
 from math import cos, radians, sin
@@ -17,7 +18,6 @@ BLUE = QtGui.QColor(10, 132, 255, 255)
 GOLD = QtGui.QColor(245, 197, 24, 255)   # catch-up window markers / button
 
 _L = 24          # logical canvas size
-_S = 8           # supersampling scale for the master render
 _cache = {}
 
 
@@ -41,22 +41,20 @@ def _icon(key, draw, keep_disabled=False):
     """Render one glyph. ``keep_disabled`` pins the SAME pixmap into the
     icon's Disabled mode (state-indicator glyphs — e.g. the window-download
     button while a download runs — must not gray out; they carry meaning)."""
-    icon = _cache.get(key)
-    if icon is not None:
-        return icon
-    master = QtGui.QPixmap(_L * _S, _L * _S)
-    master.fill(QtCore.Qt.transparent)
-    p = QtGui.QPainter(master)
-    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
-    p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
-    p.scale(_S, _S)
-    draw(p, WHITE)
-    p.end()
-    # Downscale once, smoothly, to the exact device pixels the buttons use.
     dpr = _screen_dpr()
     side = max(8, int(round(_L * dpr)))
-    pm = master.scaled(side, side, QtCore.Qt.KeepAspectRatio,
-                       QtCore.Qt.SmoothTransformation)
+    cache_key = (key, side)
+    icon = _cache.get(cache_key)
+    if icon is not None:
+        return icon
+    pm = QtGui.QPixmap(side, side)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    p.setRenderHint(QtGui.QPainter.TextAntialiasing, True)
+    p.scale(side / _L, side / _L)
+    draw(p, WHITE)
+    p.end()
     pm.setDevicePixelRatio(dpr)
     if keep_disabled:
         icon = QtGui.QIcon()
@@ -64,7 +62,7 @@ def _icon(key, draw, keep_disabled=False):
         icon.addPixmap(pm, QtGui.QIcon.Disabled, QtGui.QIcon.Off)
     else:
         icon = QtGui.QIcon(pm)
-    _cache[key] = icon
+    _cache[cache_key] = icon
     return icon
 
 
@@ -363,54 +361,55 @@ def download_window(color=None, keep_disabled=False):
 
 
 # ---- autoplay next / play next ----
-# Both glyphs follow the user's mockups: a rounded-rectangle outline
-# framing the design, line-art only (hollow strokes, no fills).
+# Both glyphs are direct translations of the user's mockups (Screenshot
+# 2026-08-28 105013 for autoplay, 121619 for play next).
 def _glyph_frame(p, c):
-    """The rounded-rect frame both buttons share."""
+    """The rounded-rect chip frame the autoplay button wears."""
     _pen(p, c, 1.8)
     p.setBrush(QtCore.Qt.NoBrush)
     p.drawRoundedRect(QtCore.QRectF(3.2, 4.4, 17.6, 15.2), 3.0, 3.0)
 
 
-def _hollow_triangle(p, c, x0, y0, y1, apex_x, w=1.8):
-    """An outlined right-pointing triangle occupying [x0, apex_x]."""
-    _pen(p, c, w)
-    p.setBrush(QtCore.Qt.NoBrush)
-    p.drawPolygon(QtGui.QPolygonF(
-        [_F(x0, y0), _F(x0, y1), _F(apex_x, (y0 + y1) / 2.0)]))
-
-
 def autoplay(on):
-    """Autoplay-next toggle, per the user's sketch: inside the rounded
-    frame, an outlined play triangle whose stroke continues as a
-    serpentine loop — play feeding into the next thing. OFF strikes an X
-    over it, the mute-button convention for 'disabled'."""
+    """Autoplay-next toggle, per the user's mockup: inside the rounded chip,
+    a SOLID play triangle whose run curves into two tall overlapping loops
+    (an upright infinity sign) — one play rolling endlessly into the next.
+    OFF strikes an X over it, the mute-button convention for 'disabled'."""
     def draw(p, c):
         _glyph_frame(p, c)
-        _hollow_triangle(p, c, 5.6, 8.4, 15.6, 10.6)
-        # the serpentine: leaves the triangle's apex, one S-swing down
-        # and up, ending in a small vertical tick (the "into the next"
-        # hook)
-        _polyline(p, c, [(10.8, 12.0), (12.4, 14.6), (14.4, 9.4),
-                         (16.2, 13.2)], 1.8)
-        _polyline(p, c, [(17.8, 10.2), (17.8, 14.6)], 1.8)
+        # the solid play triangle (left third of the chip)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(5.4, 9.2), _F(5.4, 14.8), _F(10.2, 12.0)]))
+        # the double loop: two tall ellipses sharing their middle stroke
+        _pen(p, c, 1.7)
+        p.setBrush(QtCore.Qt.NoBrush)
+        p.drawEllipse(QtCore.QRectF(10.1, 6.2, 5.0, 11.6))
+        p.drawEllipse(QtCore.QRectF(13.6, 6.2, 5.0, 11.6))
+        # the swoosh: sweeps out from under the triangle into the first
+        # loop's bottom — the "feeds into the next" stroke of the sketch
+        path = QtGui.QPainterPath(_F(6.6, 15.7))
+        path.quadTo(_F(9.6, 18.6), _F(12.6, 17.7))
+        p.drawPath(path)
         if not on:
             _pen(p, c, 2.0)
             p.drawLine(_F(4.6, 6.2), _F(19.4, 18.4))
             p.drawLine(_F(19.4, 6.2), _F(4.6, 18.4))
-    return _icon("autoplay3" + ("on" if on else "off"), draw)
+    return _icon("autoplay4" + ("on" if on else "off"), draw)
 
 
 def play_next():
-    """Play next (next episode / next channel), per the user's sketch:
-    inside the rounded frame, two outlined right-pointing triangles with
-    a vertical bar between them — a skip-forward glyph."""
+    """Play next (next episode / next channel), per the user's mockup: a
+    chunky SOLID right-pointing triangle with a SOLID rounded-cap bar on
+    its heel — the skip-forward glyph, no frame."""
     def draw(p, c):
-        _glyph_frame(p, c)
-        _hollow_triangle(p, c, 5.9, 8.6, 15.4, 10.1)
-        _polyline(p, c, [(12.1, 8.4), (12.1, 15.6)], 1.8)
-        _hollow_triangle(p, c, 13.9, 8.6, 15.4, 18.1)
-    return _icon("play_next3", draw)
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(1.8, 5.4), _F(1.8, 18.6), _F(17.8, 12.0)]))
+        p.drawRoundedRect(QtCore.QRectF(19.4, 5.4, 2.6, 13.2), 1.3, 1.3)
+    return _icon("play_next4", draw)
 
 
 def check():

@@ -932,7 +932,9 @@ class PlayerView(QtWidgets.QWidget):
         # autoplay-next toggle (series episodes / catch-up programs): ON by
         # default — the natural end of an episode rolls straight into the
         # next one, and a season finale into the next season's first
-        # episode. OFF strikes an X through the glyph, mute-button style.
+        # episode. Live from app open (sticky preference, like CC/scale/
+        # speed — it only flips the setting until a stream plays). OFF
+        # strikes an X through the glyph, mute-button style.
         self.btn_auto = ctl_btn(ic.autoplay(self.config.autoplay_next),
                                 "Autoplay next episode", checkable=True)
         self.btn_auto.setChecked(self.config.autoplay_next)
@@ -3966,7 +3968,10 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_play.setEnabled(bool(self.current))
         self.btn_audio.setEnabled(bool(self.current))
         kind = (self.current or {}).get("kind")
-        self.btn_auto.setEnabled(kind in ("series", "catchup"))
+        # autoplay is a sticky preference, not a stream action: selectable
+        # (and hoverable) from app open, before anything plays — flipping
+        # it pre-stream just sets what the next series/catch-up will do.
+        self.btn_auto.setEnabled(True)
         self.btn_next.setEnabled(kind in ("live", "series", "catchup"))
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled(vod and not self._downloading)
