@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 from .config import APP_VERSION
@@ -63,6 +64,7 @@ _BODY_CAP = 60_000             # GitHub issue body hard limit is 65536
 _STARTED_AT = time.time()
 _SCREEN_INFO = ""              # captured on the Qt main thread (see below)
 _busy = threading.Lock()       # one upload at a time
+_last_error = ""               # why the most recent upload failed (dialog)
 
 
 # ---- credential scrubbing (the log tail goes to a public repo) ----
@@ -234,20 +236,44 @@ def build_report(config, reason: str) -> tuple:
 def _post_issue(token: str, repo: str, title: str, body: str) -> None:
     if len(body) > _BODY_CAP:
         body = body[:_BODY_CAP] + "\n…(truncated)"
-    url = "https://api.github.com/repos/%s/issues" % repo
-    payload = json.dumps({"title": title, "body": body,
-                          "labels": ["diagnostics"]}).encode("utf-8")
-    req = urllib.request.Request(
-        url, data=payload, method="POST",
-        headers={
-            "Authorization": "Bearer " + token,
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "MichaelTVPlayer-diagnostics",
-            "Content-Type": "application/json",
-        })
-    with urllib.request.urlopen(req, timeout=30) as r:
-        if r.status not in (200, 201):
-            raise RuntimeError("GitHub returned HTTP %d" % r.status)
+
+    def _post(payload):
+        url = "https://api.github.com/repos/%s/issues" % repo
+        req = urllib.request.Request(
+            url, data=json.dumps(payload).encode("utf-8"), method="POST",
+            headers={
+                "Authorization": "Bearer " + token,
+                "Accept": "application/vnd.github+json",
+                "User-Agent": "MichaelTVPlayer-diagnostics",
+                "Content-Type": "application/json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            })
+        with urllib.request.urlopen(req, timeout=30) as r:
+            if r.status not in (200, 201):
+                raise RuntimeError("GitHub returned HTTP %d" % r.status)
+
+    payload = {"title": title, "body": body, "labels": ["diagnostics"]}
+    try:
+        _post(payload)
+        return
+    except urllib.error.HTTPError as exc:
+        # GitHub's response body names the real problem (bad credentials,
+        # missing permission, wrong repo) — surface it, never swallow it.
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            pass
+        # Attaching a label the repo doesn't have yet can trip token
+        # permissions — the report matters more than its tag, so retry
+        # once without labels.
+        if exc.code in (403, 422):
+            log.info("diagnostics: retrying without labels "
+                     "(HTTP %d %s)", exc.code, detail)
+            _post({"title": title, "body": body})
+            return
+        raise RuntimeError("GitHub HTTP %d %s — %s"
+                           % (exc.code, exc.reason, detail)) from exc
 
 
 def maybe_upload(config, reason: str, force: bool = False) -> bool:
@@ -273,6 +299,8 @@ def maybe_upload(config, reason: str, force: bool = False) -> bool:
         log.info("diagnostics: report sent (%s)", reason)
         return True
     except Exception as exc:  # noqa: BLE001
+        global _last_error
+        _last_error = str(exc)[:300]
         try:
             log.warning("diagnostics: upload failed: %r", exc)
         except Exception:
@@ -305,8 +333,11 @@ def upload_now_blocking(config, reason: str) -> str:
         if not ((config.telemetry_token or "").strip() or _GH_TOKEN):
             return "No token set — paste a GitHub token first."
         ok = maybe_upload(config, reason, force=True)
-        return "Report sent — check the repo's Issues." if ok \
-            else "Upload failed (see player.log, logger mtp.diagnostics)."
+        if ok:
+            return "Report sent — check the repo's Issues."
+        return "Upload failed: %s" % (_last_error or
+                                      "unknown (see player.log, "
+                                      "logger mtp.diagnostics)")
     except Exception as exc:  # noqa: BLE001
         return "Upload failed: %r" % exc
 
