@@ -533,10 +533,16 @@ class MainWindow(QtWidgets.QMainWindow):
             "Update ready — MichaelTV will now restart with the new "
             "version.")
         updater.launch_helper(helper)
-        # state is persisted by closeEvent; hard exit right after so the
-        # swap helper's PID wait ends quickly
+        # Hard exit on a TIMER THREAD, started BEFORE close(): the Qt
+        # singleShot used here could never fire while closeEvent's VLC
+        # teardown blocked the event loop, leaving a zombie app for the
+        # swap helper to wait on. A daemon timer thread fires regardless.
+        import threading
+        t = threading.Timer(1.5, lambda: os._exit(0))
+        t.daemon = True
+        t.start()
+        # state is persisted by closeEvent
         self.close()
-        QtCore.QTimer.singleShot(800, lambda: os._exit(0))
 
     def open_account(self):
         if LoginDialog.configure(self.config, self).exec_() == QtWidgets.QDialog.Accepted:

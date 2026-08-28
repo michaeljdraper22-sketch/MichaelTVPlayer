@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import urllib.request
 import zipfile
 
@@ -92,7 +93,19 @@ def download(asset_url, dest, progress=None, chunk=1 << 16):
 
 def stage_update(zip_path):
     """Extract the payload and write the swap helper. Returns
-    (helper_bat, staging_dir) or raises."""
+    (helper_bat, staging_dir) or raises.
+
+    The helper contains NO PIPES and NO ``timeout``: inside a DETACHED
+    cmd (how launch_helper spawns it) a ``tasklist | find`` pipeline
+    NEVER RETURNS and ``timeout`` fails outright (rc 125) — the original
+    wait loop hung forever on both, which is what bricked the first-ever
+    in-app update (v1.4 → v1.4.1): the download "completed", the app
+    exited, and the helper sat in its loop so the old exe stayed put and
+    nothing restarted. Delays now use ``ping`` (console-free), and the
+    app's exit is guaranteed by the caller's threading.Timer hard-exit;
+    the unconditional ``taskkill`` only matters if even that failed.
+    Every step appends to %TEMP%\\MichaelTV-swap.log for diagnosability.
+    """
     staging = os.path.join(
         tempfile.gettempdir(), f"MichaelTV-update-{os.getpid()}")
     if os.path.isdir(staging):
@@ -118,16 +131,28 @@ def stage_update(zip_path):
                            "(no MichaelTV.exe beside the running app)")
     helper = os.path.join(staging, "_swap.bat")
     pid = os.getpid()
+    logf = os.path.join(tempfile.gettempdir(), "MichaelTV-swap.log")
+    rc = ("/MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /NP >nul")
     with open(helper, "w") as f:
         f.write(
             "@echo off\r\n"
-            ":waitloop\r\n"
-            f"tasklist /FI \"PID eq {pid}\" 2>nul | find /I \"{pid}\" >nul"
-            " && (timeout /t 1 /nobreak >nul & goto waitloop)\r\n"
-            f"robocopy \"{payload}\" \"{install_dir}\" /MIR /R:2 /W:2"
-            " /NFL /NDL /NJH /NJS /NP >nul\r\n"
+            f"echo [{time.strftime('%Y-%m-%d %H:%M:%S')}] swap start"
+            f" pid={pid} >> \"{logf}\"\r\n"
+            # ~4 s for the app's hard-exit timer (+ teardown stragglers)
+            "ping -n 5 127.0.0.1 >nul\r\n"
+            # if the app still wedged mid-shutdown, take it down; rc 128
+            # (no such process) is the normal, already-exited case
+            f"taskkill /F /PID {pid} >nul 2>&1\r\n"
+            f"echo [..] copying payload >> \"{logf}\"\r\n"
+            f"robocopy \"{payload}\" \"{install_dir}\" {rc}\r\n"
+            # one retry a beat later: AV suites can briefly hold the
+            # fresh exe after writing it
+            "ping -n 4 127.0.0.1 >nul\r\n"
+            f"robocopy \"{payload}\" \"{install_dir}\" {rc}\r\n"
+            f"echo [..] starting new version >> \"{logf}\"\r\n"
             f"start \"\" \"{install_dir}\\MichaelTV.exe\"\r\n"
             f"rd /s /q \"{staging}\"\r\n"
+            f"echo [..] swap done >> \"{logf}\"\r\n"
         )
     return helper, staging
 
