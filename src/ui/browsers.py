@@ -13,6 +13,22 @@ from ..xtream import decode_epg_text
 from .worker import AsyncRunner
 
 
+def episode_title(name, season, episode, ep_title):
+    """Compose a series-episode display title. Providers often name the
+    episode with the series name (and even the SxEy code) already baked
+    in — "4K-NF - Ransom Canyon (2025) (US) - S1E4" — so blindly
+    prefixing "{series} - S1E4 " printed the whole thing twice. If the
+    episode title already carries the series name, use it as-is."""
+    ep_title = (ep_title or "").strip() or f"Episode {episode}"
+    name = (name or "").strip()
+    if not name or name.lower() in ep_title.lower():
+        return ep_title
+    compact = ep_title.lower().replace(" ", "")
+    if f"s{season}e{episode}".lower() in compact:
+        return f"{name} - {ep_title}"
+    return f"{name} - S{season}E{episode} {ep_title}"
+
+
 class BaseBrowser(QtWidgets.QWidget):
     """Base class for the Live / Movies / Series content tabs.
 
@@ -504,8 +520,8 @@ class SeriesEpisodesDialog(QtWidgets.QDialog):
     def _make_playable(self, ep):
         return {
             "kind": "series",
-            "title": (f"{ep['series_name']} - S{ep['season']}E{ep['episode']} "
-                      f"{ep['title']}").strip(),
+            "title": episode_title(ep["series_name"], ep["season"],
+                                   ep["episode"], ep["title"]),
             "url": self.client.series_url(ep["id"], ep.get("container_extension", "mp4")),
             "fav_key": f"episode:{ep['id']}",
             "icon": (ep.get("info") or {}).get("movie_image", ""),

@@ -24,6 +24,7 @@ from .. import vod_splitter
 from ..vod_splitter import VodRelay
 from ..mkv_subs import (is_text_codec, is_language_name, lang_matches,
                         lang_token, track_language_evidence)
+from . import browsers
 from . import icons as ic
 from .caption_overlay import (CaptionOverlay, CueStore, displayed_video_rect)
 from .track_panel import TrackPanel
@@ -1751,10 +1752,10 @@ class PlayerView(QtWidgets.QWidget):
             return None
         s, n, e = eps[idx + 1]
         name = cur.get("series_name") or ""
-        title = e.get("title") or f"Episode {n}"
         return {
             "kind": "series",
-            "title": f"{name} - S{s}E{n} {title}".strip(),
+            "title": browsers.episode_title(
+                name, s, n, e.get("title")),
             "url": self.client.series_url(e.get("id"),
                                           e.get("container_extension", "mp4")),
             "fav_key": f"episode:{e.get('id')}",

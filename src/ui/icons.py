@@ -363,41 +363,54 @@ def download_window(color=None, keep_disabled=False):
 
 
 # ---- autoplay next / play next ----
-# Both buttons use the user's own original glyph design: an OUTLINED play
-# triangle with a two-crest squiggle running under its lower edge. The
-# triangle is drawn ~10% larger than the sketch and the squiggle is one
-# segment shorter (it ends at the second crest instead of hooking back
-# down), so the whole glyph sits cleanly inside the 24px button box.
-def _next_glyph(p, c):
-    # outlined triangle (no fill), apex pointing right
-    _pen(p, c, 2.2)
+# Both glyphs follow the user's mockups: a rounded-rectangle outline
+# framing the design, line-art only (hollow strokes, no fills).
+def _glyph_frame(p, c):
+    """The rounded-rect frame both buttons share."""
+    _pen(p, c, 1.8)
+    p.setBrush(QtCore.Qt.NoBrush)
+    p.drawRoundedRect(QtCore.QRectF(3.2, 4.4, 17.6, 15.2), 3.0, 3.0)
+
+
+def _hollow_triangle(p, c, x0, y0, y1, apex_x, w=1.8):
+    """An outlined right-pointing triangle occupying [x0, apex_x]."""
+    _pen(p, c, w)
     p.setBrush(QtCore.Qt.NoBrush)
     p.drawPolygon(QtGui.QPolygonF(
-        [_F(5.4, 4.9), _F(5.4, 19.5), _F(18.2, 12.2)]))
-    # the squiggle: starts just below the triangle's lower edge, rises to
-    # crest 1, dips to the trough, rises to crest 2 — and ENDS there
-    _polyline(p, c, [(12.6, 17.6), (15.3, 12.2), (18.0, 17.2), (20.7, 11.8)],
-              2.2)
+        [_F(x0, y0), _F(x0, y1), _F(apex_x, (y0 + y1) / 2.0)]))
 
 
 def autoplay(on):
-    """Autoplay-next toggle: the user's triangle+wave glyph; OFF strikes an
-    X through it, the mute-button convention for 'disabled'."""
+    """Autoplay-next toggle, per the user's sketch: inside the rounded
+    frame, an outlined play triangle whose stroke continues as a
+    serpentine loop — play feeding into the next thing. OFF strikes an X
+    over it, the mute-button convention for 'disabled'."""
     def draw(p, c):
-        _next_glyph(p, c)
+        _glyph_frame(p, c)
+        _hollow_triangle(p, c, 5.6, 8.4, 15.6, 10.6)
+        # the serpentine: leaves the triangle's apex, one S-swing down
+        # and up, ending in a small vertical tick (the "into the next"
+        # hook)
+        _polyline(p, c, [(10.8, 12.0), (12.4, 14.6), (14.4, 9.4),
+                         (16.2, 13.2)], 1.8)
+        _polyline(p, c, [(17.8, 10.2), (17.8, 14.6)], 1.8)
         if not on:
             _pen(p, c, 2.0)
             p.drawLine(_F(4.6, 6.2), _F(19.4, 18.4))
             p.drawLine(_F(19.4, 6.2), _F(4.6, 18.4))
-    return _icon("autoplay2" + ("on" if on else "off"), draw)
+    return _icon("autoplay3" + ("on" if on else "off"), draw)
 
 
 def play_next():
-    """Play next (next episode / next channel): the user's original
-    triangle + wave design."""
+    """Play next (next episode / next channel), per the user's sketch:
+    inside the rounded frame, two outlined right-pointing triangles with
+    a vertical bar between them — a skip-forward glyph."""
     def draw(p, c):
-        _next_glyph(p, c)
-    return _icon("play_next2", draw)
+        _glyph_frame(p, c)
+        _hollow_triangle(p, c, 5.9, 8.6, 15.4, 10.1)
+        _polyline(p, c, [(12.1, 8.4), (12.1, 15.6)], 1.8)
+        _hollow_triangle(p, c, 13.9, 8.6, 15.4, 18.1)
+    return _icon("play_next3", draw)
 
 
 def check():

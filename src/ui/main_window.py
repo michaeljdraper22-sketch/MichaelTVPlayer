@@ -381,7 +381,22 @@ class MainWindow(QtWidgets.QMainWindow):
         no neighbours to step through."""
         cur = self.player_view.current or {}
         sid = cur.get("stream_id") if cur.get("kind") == "live" else None
-        items = self.live_tab.all_items
+        # Step through the rows the user actually SEES — the list widget —
+        # not all_items: all_items goes stale when the tab shows Recently
+        # Played (playable mode keeps the old category's items), and it
+        # ignores the search box's filter, so the next channel could be
+        # one the displayed list doesn't contain and the blue selection
+        # could never follow playback.
+        lw = self.live_tab.list
+        items = [lw.item(i).data(QtCore.Qt.UserRole) or {}
+                 for i in range(lw.count())]
+        items = [it for it in items if it.get("stream_id") is not None]
+        if len(items) < 2:
+            # the display has no OTHER channel to step to (e.g. a
+            # one-entry Recently-Played view) — fall back to the tab's
+            # full item list so "next" still zaps somewhere
+            items = [it for it in (self.live_tab.all_items or [])
+                     if it.get("stream_id") is not None]
         if sid is None or not items:
             self.statusBar().showMessage(
                 "No channel list to advance from", 3000)
@@ -393,7 +408,10 @@ class MainWindow(QtWidgets.QMainWindow):
                 "Current channel is not in the Live list", 3000)
             return
         nxt = items[(idx + 1) % len(items)]
-        playable = self.live_tab.make_playable(nxt)
+        # playable-mode rows are already playables (they carry "url");
+        # plain category rows are raw provider dicts needing make_playable
+        playable = (nxt if nxt.get("url")
+                    else self.live_tab.make_playable(nxt))
         self.play(playable)
         self._select_playing(playable)
 
@@ -406,21 +424,30 @@ class MainWindow(QtWidgets.QMainWindow):
                "series": self.series_tab}.get(kind)
         if tab is None:
             return
-        sid = playable.get("stream_id")
-        fkey = playable.get("fav_key")
-        title = playable.get("title")
-        for i in range(tab.list.count()):
-            data = tab.list.item(i).data(QtCore.Qt.UserRole) or {}
-            if sid is not None:
-                if data.get("stream_id") == sid:
-                    tab.list.setCurrentRow(i)
-                    return
-            elif fkey and data.get("fav_key") == fkey:
-                tab.list.setCurrentRow(i)
-                return
-            elif data.get("title") == title:
-                tab.list.setCurrentRow(i)
-                return
+
+        def _match_row():
+            sid = playable.get("stream_id")
+            fkey = playable.get("fav_key")
+            title = playable.get("title")
+            for i in range(tab.list.count()):
+                data = tab.list.item(i).data(QtCore.Qt.UserRole) or {}
+                if sid is not None and data.get("stream_id") == sid:
+                    return i
+                if fkey and data.get("fav_key") == fkey:
+                    return i
+                if title and data.get("title") == title:
+                    return i
+            return -1
+
+        row = _match_row()
+        if row < 0 and getattr(tab, "_playable_mode", False):
+            # Recently-Played view: the item was added to config.recents
+            # after the rows were built, so rebuild and look again —
+            # otherwise the blue bar can never reach the new channel.
+            tab._apply_filter(tab.search.text())
+            row = _match_row()
+        if row >= 0:
+            tab.list.setCurrentRow(row)
 
     # ---- manual update (Settings ▸ Check for updates…; never auto) ----
     def check_for_updates(self):
