@@ -365,28 +365,31 @@ def download_window(color=None, keep_disabled=False):
 # 2026-08-28 105013 for autoplay, 121619 for play next).
 def autoplay(on):
     """Autoplay-next toggle, per the user's mockup: an OUTLINED play
-    triangle with a single-stroke squiggle running out from under it —
-    one hump up, one hump down, tip flicking up at the end. No chip
-    frame (every other button is frameless). OFF strikes an X over it,
-    the mute-button convention for 'disabled'."""
+    triangle with a tall serpentine squiggle beside it — dips into a
+    rounded U, climbs into a narrow center peak taller than the
+    triangle, a second U, then a blunt upward tip. No chip frame and no
+    checked-state ring: frameless like every other button, state shown
+    by the X strike only. OFF strikes an X over it, the mute-button
+    convention for 'disabled'."""
     def draw(p, c):
-        # outlined play triangle (left half of the canvas)
+        # outlined play triangle (left, wave keeps clear of it)
         _pen(p, c, 2.0)
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawPolygon(QtGui.QPolygonF(
-            [_F(4.8, 6.0), _F(4.8, 18.0), _F(14.6, 12.0)]))
-        # the squiggle: one continuous stroke starting under the triangle,
-        # humping up then down, ending with the tip pointing up
-        _pen(p, c, 2.0)
-        path = QtGui.QPainterPath(_F(8.2, 19.6))
-        path.quadTo(_F(10.6, 11.2), _F(13.8, 16.6))
-        path.quadTo(_F(16.4, 21.4), _F(19.8, 12.6))
+            [_F(4.6, 7.0), _F(4.6, 18.4), _F(14.0, 12.7)]))
+        # the serpentine: single stroke starting under the triangle's
+        # bottom-right corner — U, tall narrow peak, second U, blunt tip
+        path = QtGui.QPainterPath(_F(13.6, 19.2))
+        path.quadTo(_F(15.2, 23.0), _F(16.8, 18.2))   # first rounded U
+        path.quadTo(_F(17.6, -3.6), _F(18.9, 12.2))   # tall center peak
+        path.quadTo(_F(19.8, 21.8), _F(21.0, 13.0))   # second rounded U
+        path.quadTo(_F(21.5, 10.6), _F(21.7, 8.8))    # blunt rising tip
         p.drawPath(path)
         if not on:
             _pen(p, c, 2.0)
-            p.drawLine(_F(4.6, 6.2), _F(19.4, 18.4))
-            p.drawLine(_F(19.4, 6.2), _F(4.6, 18.4))
-    return _icon("autoplay5" + ("on" if on else "off"), draw)
+            p.drawLine(_F(4.2, 6.6), _F(21.4, 18.8))
+            p.drawLine(_F(21.4, 6.6), _F(4.2, 18.8))
+    return _icon("autoplay6" + ("on" if on else "off"), draw)
 
 
 def play_next():

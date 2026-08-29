@@ -938,13 +938,6 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_auto = ctl_btn(ic.autoplay(self.config.autoplay_next),
                                 "Autoplay next episode", checkable=True)
         self.btn_auto.setChecked(self.config.autoplay_next)
-        # subtle white ring while ON (1px border in BOTH states so the
-        # button's size hint — and the whole control row's pixel layout —
-        # never changes when the state flips)
-        self.btn_auto.setStyleSheet(
-            "QToolButton { background: transparent;"
-            " border: 1px solid transparent; border-radius: 4px; }"
-            "QToolButton:checked { border: 1px solid rgba(255,255,255,90); }")
         # play next: next episode for series, the next recorded program for
         # catch-up, the next channel for live TV (movies get neither)
         self.btn_next = ctl_btn(ic.play_next(), "Play next (N)")
