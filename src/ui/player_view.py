@@ -634,8 +634,10 @@ class PlayerView(QtWidgets.QWidget):
         #                              # media (never rescue on a never-moving
         #                              # clock — garbage timestamps)
         self._cap_relay_gen = 0       # session the attached relay belongs
-        #                              # to (stale-delivery guard, see
-        #                              # _cap_relay_live)
+        self._vod_raw_wall = 0.0      # VOD stall watchdog: wall time raw last
+        #                              # moved (series/movies, like catch-up)
+        self._vod_rescues = 0         # rescues this media (cap: 2)
+        self._cap_relay_gen = 0       # session the attached relay belongs
         self._relay_start_offset = 0  # byte offset for the NEXT relay start
         #                                 # (resume / mid-movie subtitle
         #                                 # engage — consumed by
@@ -1277,6 +1279,48 @@ class PlayerView(QtWidgets.QWidget):
     _CU_END_MARGIN_S = 15.0  # this close to the program end, stopping is
     #                          # natural (recording ran out) — never rescue
 
+    # VOD (series/movies) stall watchdog — same disease as catch-up's
+    # (provider/relay connection dies mid-episode, VLC freezes on the last
+    # frame, pause/play do nothing and autoplay never fires because the
+    # player never reaches "ended"; seen live on 2026-08-29 autoplay of
+    # Adventure Time S3E19: log silent from 12:47 to the 18:58 close).
+    _VOD_FREEZE_S = 30.0     # raw frozen this long while playing = rescue
+    _VOD_MAX_RESCUES = 2     # then give up (logged at ERROR = auto-report)
+
+    def _vod_stall_watchdog(self, now, playing, raw_s, dur_s, raw_moved):
+        if (self._closing or self._live_paused or self._seeking
+                or not self.current
+                or self.current.get("kind") not in ("series", "movie",
+                                                    "vod")):
+            self._vod_raw_wall = now
+            return
+        if raw_moved:
+            self._vod_raw_wall = now
+            return
+        if not playing or self._vid_s >= dur_s - self._CU_END_MARGIN_S:
+            self._vod_raw_wall = now   # near-end/natural stop isn't a stall
+            return
+        if now - self._vod_raw_wall < self._VOD_FREEZE_S:
+            return
+        self._vod_raw_wall = now
+        cur = dict(self.current)
+        pos_s = max(0.0, self._vid_s)
+        from .. import feedback
+        feedback.stat("vod_stalls")
+        if self._vod_rescues >= self._VOD_MAX_RESCUES:
+            log.error("VOD stalled twice at %.0fs and gave up: %r "
+                      "(pause/play dead, autoplay blocked)", pos_s,
+                      cur.get("title"))
+            return
+        self._vod_rescues += 1
+        log.error("VOD stall rescue %d: clock frozen at %.0fs — reopening "
+                  "'%s'", self._vod_rescues, pos_s, cur.get("title"))
+        feedback.crumb("VOD stall rescue at %.0fs: %r"
+                       % (pos_s, cur.get("title")))
+        # cap the resume position a little before the freeze point so the
+        # reopened stream doesn't land straight back on the dead edge
+        self.play_media(cur, start_at=max(0.0, pos_s - 3.0))
+
     def _catchup_watchdog(self, now, playing, raw_s, dur_s, raw_moved):
         if (self._closing or self._live_paused or self._seeking
                 or not self.current):
@@ -1535,6 +1579,12 @@ class PlayerView(QtWidgets.QWidget):
             log.info("play_media kind=%s title=%r", kind, title)
         except Exception:
             pass
+        try:
+            from .. import feedback
+            feedback.crumb("play %s %r" % (kind, title))
+            feedback.usage("play_" + kind)
+        except Exception:
+            pass
         self._last_epg = ""
         self.show_info(title, sticky=True)
         # Per-channel reset: DVR / Record never carry over to the next channel.
@@ -1624,6 +1674,9 @@ class PlayerView(QtWidgets.QWidget):
         self._scrub_on = False
         self._vid_s = 0.0
         self._eof_next_done = False   # re-arm autoplay-next for this media
+        if (self.current or {}).get("url") != playable.get("url"):
+            self._vod_rescues = 0     # same-media rescue reopens keep the cap
+        self._vod_raw_wall = now_s()
         self._last_raw = None
         self._raw_change_wall = 0.0
         self._video_wh = (0, 0)   # next media's size is unknown until the
@@ -3028,6 +3081,15 @@ class PlayerView(QtWidgets.QWidget):
                     self.config.record_folder = folder
                     self.config.save()
             if not folder or not (self.current and self.current.get("url")):
+                try:
+                    from .. import feedback
+                    feedback.stat("recording_failures")
+                    feedback.crumb("record failed: no folder/stream")
+                except Exception:
+                    pass
+                log.error("recording failed to start: %s",
+                          "no record folder chosen"
+                          if not folder else "nothing playable")
                 self.btn_rec.blockSignals(True)
                 self.btn_rec.setChecked(False)
                 self.btn_rec.setIcon(ic.rec(False))
@@ -3039,6 +3101,13 @@ class PlayerView(QtWidgets.QWidget):
             self._rec_path = os.path.join(
                 folder, f"{safe}_{time.strftime('%Y%m%d_%H%M%S')}.ts"
             )
+            try:
+                from .. import feedback
+                feedback.usage("record")
+                feedback.crumb("record -> %s" % os.path.basename(
+                    self._rec_path))
+            except Exception:
+                pass
             if self.dvr and self.dvr.running:
                 # Recorder already owns the single connection (chase mode):
                 # restart it with the recording file as a second output
@@ -3883,6 +3952,9 @@ class PlayerView(QtWidgets.QWidget):
             if self._is_catchup():
                 self._catchup_watchdog(now, playing, raw_s,
                                        length / 1000.0, raw_moved)
+            elif self.current.get("kind") in ("series", "movie", "vod"):
+                self._vod_stall_watchdog(now, playing, raw_s,
+                                         length / 1000.0, raw_moved)
             self._maybe_autoplay_next(playing, length, raw)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None

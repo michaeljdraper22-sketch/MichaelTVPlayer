@@ -227,6 +227,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_tab_changed(self, idx):
         self.config.last_tab = idx
         self.config.save()
+        try:
+            from .. import feedback
+            name = (self.tabs.tabText(idx) or "?").lower()
+            feedback.usage("tab_" + name.split()[0].lower())
+            feedback.crumb("tab -> %s" % name)
+        except Exception:
+            pass
 
     def _exit_fullscreen_only(self):
         """Esc: leave fullscreen, never re-enter it (F is the toggle).

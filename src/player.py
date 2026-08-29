@@ -146,6 +146,13 @@ class VLCPlayer:
         try:
             em = player.event_manager()
             em.attach(vlc.EventType.MediaPlayerPlaying, self._on_playing_event)
+            try:
+                em.attach(vlc.EventType.MediaPlayerEncounteredError,
+                          self._on_vlc_error_event)
+                em.attach(vlc.EventType.MediaPlayerBuffering,
+                          self._on_buffering_event)
+            except Exception:
+                pass   # older binding without these events — log only
             self._ems.append(em)
             if len(self._ems) > 8:
                 self._ems = self._ems[-4:]
@@ -158,10 +165,41 @@ class VLCPlayer:
     def _on_playing_event(self, _event) -> None:
         """VLC thread context: only thread-safe libvlc audio calls, no Qt."""
         try:
+            self._start_ok = True   # playback-start watchdog clears here
+        except Exception:
+            pass
+        try:
             self._apply_volume(self.player)
             self._apply_effective_mute(self.player)
             self._unmute_late(self.player)
             self._apply_spu_delay(self.player)
+        except Exception:
+            pass
+
+    def _on_vlc_error_event(self, _event) -> None:
+        """VLC thread context: libvlc gives no error detail, so record the
+        event + state and let the auto-diagnostics report carry it."""
+        try:
+            from . import feedback
+            feedback.stat("vlc_errors")
+            url = getattr(self, "_current_url", "")
+            log.error("VLC playback error event (state=%s url=%s)",
+                      self.state_name(), url)
+        except Exception:
+            pass
+
+    def _on_buffering_event(self, event) -> None:
+        """VLC thread context: count REBUFFER events (a drop back below
+        99%% cache after playback was established), not every cache tick."""
+        try:
+            cache = getattr(event, "u", None)
+            cache = getattr(cache, "new_cache", -1.0) if cache else -1.0
+            was = getattr(self, "_last_cache", 100.0)
+            self._last_cache = cache
+            if was >= 99.0 and 0.0 <= cache < 99.0 \
+                    and getattr(self, "_start_ok", False):
+                from . import feedback
+                feedback.stat("rebuffer_events")
         except Exception:
             pass
 
@@ -293,6 +331,53 @@ class VLCPlayer:
             self._bind_window(self.player)
         self.player.set_media(self.media)
         self.player.play()
+        self._watch_playback_start(url)
+
+    def _watch_playback_start(self, url: str, wait_s: float = 20.0) -> None:
+        """Daemon timer: if playback never reaches Playing within ~20 s,
+        that is the classic 'black window, no error' failure — log it at
+        ERROR (auto-report) and probe the stream URL so the report shows
+        whether the provider's stream itself is dead."""
+        self._current_url = url
+        self._start_ok = False
+        self._last_cache = 100.0
+        try:
+            self._start_token = getattr(self, "_start_token", 0) + 1
+        except Exception:
+            self._start_token = 1
+        token = self._start_token
+
+        def _check():
+            if token != getattr(self, "_start_token", 0):
+                return   # a newer play_at superseded this one
+            try:
+                if self._start_ok or self.player.is_playing():
+                    from . import feedback
+                    feedback.stat("plays_started")
+                    return
+            except Exception:
+                return
+            from . import feedback
+            feedback.stat("plays_never_started")
+            log.error("playback never started within %.0fs (state=%s "
+                      "url=%s) — probing stream", wait_s,
+                      self.state_name(), url)
+
+            def _probe():
+                try:
+                    res = feedback.probe_url(url)
+                    log.error("stream probe: %s — url=%s", res, url)
+                except Exception:
+                    pass
+            threading.Thread(target=_probe, name="mtp-probe",
+                             daemon=True).start()
+
+        try:
+            t = threading.Timer(wait_s, _check)
+            t.daemon = True
+            t.start()
+        except Exception:
+            pass
 
     def play(self, url: str, timeshift: bool = None,
              start_seconds: float = 0.0) -> None:

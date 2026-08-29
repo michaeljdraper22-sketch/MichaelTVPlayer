@@ -166,6 +166,8 @@ def collect_system_info(config) -> dict:
         "python": platform.python_version(),
         "frozen": bool(getattr(sys, "frozen", False)),
         "uptime_min": round((time.time() - _STARTED_AT) / 60.0, 1),
+        "prev_version_seen": config.data.get("prev_version_seen", ""),
+        "prev_version_ts": config.data.get("prev_version_ts", 0),
         "settings": {
             "network_caching": config.network_caching,
             "chase_delay": config.chase_delay,
@@ -223,6 +225,70 @@ def _swap_log_section() -> str:
         return "(swap log unavailable)"
 
 
+def _feedback_section() -> str:
+    """Session stats + user-action breadcrumbs + feature usage from
+    src.feedback — the 'what was happening' half of any report."""
+    try:
+        from . import feedback
+        snap = feedback.snapshot()
+        out = []
+        if snap["prev_session_dirty"]:
+            out.append("- **PREVIOUS SESSION DID NOT SHUT DOWN CLEANLY** "
+                       "(crash / kill / power loss)")
+        stats = snap.get("stats") or {}
+        if stats:
+            out.append("- **counters:** %s"
+                       % json.dumps(stats, sort_keys=True))
+        crumbs = snap.get("crumbs") or []
+        if crumbs:
+            out.append("- **last actions (oldest first):**")
+            out.extend("  - %s %s" % (time.strftime("%H:%M:%S",
+                                                    time.localtime(ts)),
+                                      c) for ts, c in crumbs[-15:])
+        usage = snap.get("usage") or {}
+        if usage:
+            out.append("- **feature usage:** %s"
+                       % json.dumps(usage, sort_keys=True))
+        return "\n".join(out) if out else "(nothing recorded this session)"
+    except Exception as exc:
+        return "(feedback snapshot unavailable: %r)" % (exc,)
+
+
+def _network_section() -> str:
+    """Panel reachability/latency from the upload thread (capped, best
+    effort). The host name itself is deliberately NOT included."""
+    try:
+        from . import feedback
+        return json.dumps(feedback.probe_panel_network(), sort_keys=True)
+    except Exception as exc:
+        return "(network probe unavailable: %r)" % (exc,)
+
+
+def _eventlog_section() -> str:
+    """Recent ERROR entries from the Windows Application event log that
+    mention this app — native crashes (DLL load, GPU driver resets) that
+    Python never sees land here. Best effort, capped."""
+    if sys.platform != "win32":
+        return "(non-Windows)"
+    try:
+        q = ("*[System[(Level=1 or Level=2) and "
+             "TimeCreated[timediff(@SystemTime) <= 259200000]]]")
+        r = subprocess.run(
+            ["wevtutil", "qe", "Application", "/q:" + q,
+             "/c:40", "/f:text", "/rd:true"],
+            capture_output=True, timeout=15)
+        text = r.stdout.decode("utf-8", "replace")
+        keep, buf = [], []
+        for block in text.split("\r\n\r\n"):
+            if "michaeltv" in block.lower():
+                keep.append(block.strip())
+        out = "\n\n".join(keep)[:4_000]
+        return scrub(out) if out else "(no app-related errors in the " \
+                                      "Windows Application log (3 days))"
+    except Exception as exc:
+        return "(event log unavailable: %r)" % (exc,)
+
+
 def _provider_section() -> str:
     """Provider snapshot from the Xtream client's live stats — what the
     provider returned this session (counts, never content or credentials).
@@ -271,10 +337,14 @@ def build_report(config, reason: str) -> tuple:
             lines.append("- **%s:** %s" % (k, scrub(str(v))))
     lines += ["", "## Provider (this session, no credentials)", "",
               _provider_section(), ""]
-    lines += ["## Recent log (redacted)", "",
+    lines += ["## Session feedback", "", _feedback_section(), "",
+              "## Network", "", _network_section(), "",
+              "## Recent log (redacted)", "",
               "```", _tail(os.path.join(LOG_DIR, "player.log"),
                            _LOG_TAIL_CHARS), "```", "",
               "## Crash dumps", "", _crash_section(LOG_DIR), "",
+              "## Windows event log (app errors, 3d)", "", "```",
+              _eventlog_section(), "```", "",
               "## Update swap log", "", "```", _swap_log_section(),
               "```"]
     title = "Diag %s %s — %s" % (
@@ -448,7 +518,14 @@ def startup_heartbeat(config) -> None:
             return
         if time.time() - config.telemetry_last_sent < _HEARTBEAT_S:
             return
-        schedule_upload(config, "startup heartbeat")
+        reason = "startup heartbeat"
+        try:
+            from . import feedback
+            if feedback.prev_session_dirty():
+                reason = "startup heartbeat (previous session ended DIRTY)"
+        except Exception:
+            pass
+        schedule_upload(config, reason)
     except Exception:
         pass
 

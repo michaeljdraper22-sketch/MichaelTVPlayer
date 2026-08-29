@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -134,6 +135,14 @@ def main() -> int:
         setup_logging()
     except Exception:
         pass
+    # Dirty-session marker + version-drift record (proves a previous run
+    # died without a clean exit; shows when this machine last changed
+    # versions — the "stuck on an old build" detector).
+    try:
+        from src import feedback
+        feedback.session_start()
+    except Exception:
+        pass
     # A crashed previous run can strand GB-sized DVR buffers and VOD
     # splitter caches in %TEMP%.
     cleanup_stale_temp_files()
@@ -175,6 +184,21 @@ def main() -> int:
 
     config = Config.load()
     try:
+        from src.config import APP_VERSION
+        if config.data.get("prev_version_seen") != APP_VERSION:
+            if config.data.get("prev_version_seen"):
+                log.info("version change: %s -> %s "
+                         "(in-app update or manual replace)",
+                         config.data.get("prev_version_seen"), APP_VERSION)
+            config.data["prev_version_seen"] = APP_VERSION
+            config.data["prev_version_ts"] = time.time()
+            try:
+                config.save()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
         from src import diagnostics
         diagnostics.capture_screen_info()   # main thread only (no Qt off it)
     except Exception:
@@ -194,6 +218,18 @@ def main() -> int:
 
     win = MainWindow(config)
     win.show()
+
+    # UI freeze watchdog: a Qt timer stamps liveness; the daemon thread in
+    # start_ui_watchdog alarms (and can still upload) if the loop stalls.
+    try:
+        from src import feedback
+        _beat = QtCore.QTimer()
+        _beat.timeout.connect(feedback.ui_beat)
+        _beat.start(5000)
+        feedback.start_ui_watchdog()
+    except Exception:
+        pass
+
     code = app.exec_()
 
     # Hard exit once the Qt loop is done: tearing down a libvlc instance at
@@ -203,6 +239,11 @@ def main() -> int:
     try:
         logging.shutdown()
     except Exception:  # noqa: BLE001
+        pass
+    try:
+        from src import feedback
+        feedback.session_end()   # clean exit — clear the dirty marker
+    except Exception:
         pass
     os._exit(code)
 

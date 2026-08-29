@@ -96,6 +96,8 @@ class XtreamClient:
             with _stats_lock:
                 PROVIDER_STATS["server_hash"] = hashlib.sha256(
                     self.base.encode("utf-8", "replace")).hexdigest()[:12]
+            from . import feedback
+            feedback.set_server(self.base)
         except Exception:
             pass
 
