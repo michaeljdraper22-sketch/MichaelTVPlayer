@@ -101,6 +101,23 @@ class _OutsideCloser(QtCore.QObject):
 
 
 if sys.platform == "win32":
+    def _logical_pos(x: int, y: int) -> QtCore.QPoint:
+        """Native messages carry PHYSICAL screen pixels; every rect they
+        are compared against here is Qt LOGICAL (high-DPI) geometry. On a
+        2x/3x screen the raw point lands 2x/3x past every logical rect,
+        which made ANY press count as 'outside' — the card closed on the
+        row click itself, so picks never fired and menus read as dead.
+        Divide by the DPR of the screen the press landed on."""
+        fallback = None
+        for scr in QtWidgets.QApplication.screens():
+            dpr = scr.devicePixelRatio()
+            cand = QtCore.QPoint(int(round(x / dpr)), int(round(y / dpr)))
+            if scr.geometry().contains(cand):
+                return cand
+            if fallback is None:
+                fallback = cand
+        return fallback or QtCore.QPoint(x, y)
+
     class _NativePressCloser(QtCore.QAbstractNativeEventFilter):
         """Windows backstop for _OutsideCloser: presses on windows Qt does
         not own never become QEvents — most importantly libvlc's own video
@@ -124,7 +141,7 @@ if sys.platform == "win32":
                     if msg.message in (self.WM_LBUTTONDOWN,
                                        self.WM_RBUTTONDOWN):
                         self._closer.maybe_close_at(
-                            QtCore.QPoint(msg.pt.x, msg.pt.y))
+                            _logical_pos(msg.pt.x, msg.pt.y))
             except Exception:  # noqa: BLE001
                 pass
             # PyQt5 requires (boolhandled, result) — a bare False here
@@ -160,8 +177,8 @@ if sys.platform == "win32":
                             rect = QtCore.QRect(
                                 d.mapToGlobal(QtCore.QPoint(0, 0)),
                                 d.frameGeometry().size())
-                            if not rect.contains(QtCore.QPoint(msg.pt.x,
-                                                                msg.pt.y)):
+                            if not rect.contains(_logical_pos(msg.pt.x,
+                                                               msg.pt.y)):
                                 _log("dialog: closed by outside press")
                                 d.close()
             except Exception:  # noqa: BLE001

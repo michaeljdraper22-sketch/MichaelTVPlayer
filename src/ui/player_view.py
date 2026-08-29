@@ -4260,18 +4260,20 @@ class PlayerView(QtWidgets.QWidget):
     def _refresh_spu_button(self):
         """Paint the CC button only on state changes — this runs every tick
         and repeated setIcon/tooltip writes repaint the overlay. The button
-        is ALWAYS clickable: with no tracks it still opens the settings."""
+        is dormant (dimmed, unclickable) until a stream starts, then live
+        for the rest of the session."""
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
             tracks = []
         enabled = bool(tracks) or self._cap_on
         on = self._spu_want != -1 or self._cap_on
-        state = (enabled, on, self._spu_name if on else "")
+        streaming = self.current is not None
+        state = (enabled, on, streaming, self._spu_name if on else "")
         if state == self._spu_ui:
             return
         self._spu_ui = state
-        self.btn_cc.setEnabled(True)
+        self.btn_cc.setEnabled(streaming)
         self.btn_cc.setIcon(ic.cc(on))
         label = self._spu_name if on else "Off"
         self.btn_cc.setToolTip(
