@@ -209,6 +209,20 @@ def _crash_section(log_dir: str) -> str:
     return "\n\n".join(out) if out else "(no crash dumps present)"
 
 
+def _swap_log_section() -> str:
+    """Tail of the update swap helper's log — the ONLY trace of an in-app
+    update that copied nothing / never restarted (e.g. a machine still on a
+    pre-1.4.2 helper, or robocopy losing to antivirus)."""
+    try:
+        import tempfile
+        p = os.path.join(tempfile.gettempdir(), "MichaelTV-swap.log")
+        if not (os.path.exists(p) and os.path.getsize(p) > 0):
+            return "(no update swap log present)"
+        return _tail(p, 8_000)
+    except Exception:
+        return "(swap log unavailable)"
+
+
 def _provider_section() -> str:
     """Provider snapshot from the Xtream client's live stats — what the
     provider returned this session (counts, never content or credentials).
@@ -255,12 +269,14 @@ def build_report(config, reason: str) -> tuple:
             lines.append("- **%s:** %s" % (k, json.dumps(v, sort_keys=True)))
         else:
             lines.append("- **%s:** %s" % (k, scrub(str(v))))
-        lines += ["", "## Provider (this session, no credentials)", "",
-                  _provider_section(), ""]
-        lines += ["## Recent log (redacted)", "",
+    lines += ["", "## Provider (this session, no credentials)", "",
+              _provider_section(), ""]
+    lines += ["## Recent log (redacted)", "",
               "```", _tail(os.path.join(LOG_DIR, "player.log"),
                            _LOG_TAIL_CHARS), "```", "",
-              "## Crash dumps", "", _crash_section(LOG_DIR)]
+              "## Crash dumps", "", _crash_section(LOG_DIR), "",
+              "## Update swap log", "", "```", _swap_log_section(),
+              "```"]
     title = "Diag %s %s — %s" % (
         time.strftime("%Y%m%d-%H%M"), info["install_id"],
         scrub(str(reason)).strip().replace("\n", " ")[:60] or "report")

@@ -468,6 +468,8 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_update_checked(self, result):
         ok, val = result
         if ok != "ok":
+            logging.getLogger("mtp").error(
+                "update check failed: %s", val)
             QtWidgets.QMessageBox.information(
                 self, "MichaelTV — Update",
                 f"Could not check for updates:\n{val}")
@@ -516,6 +518,8 @@ class MainWindow(QtWidgets.QMainWindow):
         prog.close()
         ok, val = result
         if ok != "ok":
+            logging.getLogger("mtp").error(
+                "update download failed: %s", val)
             QtWidgets.QMessageBox.warning(
                 self, "MichaelTV — Update",
                 f"The download failed:\n{val}")
@@ -524,6 +528,8 @@ class MainWindow(QtWidgets.QMainWindow):
             ver, zip_path = val
             helper, _staging = updater.stage_update(zip_path)
         except Exception as exc:  # noqa: BLE001
+            logging.getLogger("mtp").error(
+                "update staging failed: %r", exc)
             QtWidgets.QMessageBox.warning(
                 self, "MichaelTV — Update",
                 f"The update could not be prepared:\n{exc}")
