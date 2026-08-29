@@ -919,6 +919,10 @@ class PlayerView(QtWidgets.QWidget):
         # subtitle tracks are discovered — movies/series almost always carry
         # SRT language tracks, live channels occasionally carry DVB ones)
         self.btn_cc = ctl_btn(ic.cc(False), "Subtitles (C)")
+        # right-click = track/style menu (left-click is the on/off toggle)
+        self.btn_cc.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+        self.btn_cc.customContextMenuRequested.connect(
+            lambda _pos: self._subs_panel())
         # audio track picker: opens the track menu (multi-language streams
         # list their dubs; enabled always — Auto works without tracks)
         self.btn_audio = ctl_btn(ic.audio(), "Audio tracks (A)")
@@ -4271,7 +4275,8 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_cc.setIcon(ic.cc(on))
         label = self._spu_name if on else "Off"
         self.btn_cc.setToolTip(
-            f"Subtitles — {label} (C)" if enabled
+            f"Subtitles — {label} (C — click: on/off, right-click: tracks)"
+            if enabled
             else "Subtitles — settings (none on this stream)")
 
     def _select_spu(self, track_id: int, name: str = ""):
@@ -4910,11 +4915,20 @@ class PlayerView(QtWidgets.QWidget):
         return None
 
     def _subs_menu(self):
-        """CC button: with subtitles OFF, one click STARTS the recommended
-        English captions (the same English-first pick the C key makes) —
-        no menu, no fuss; the track/style menu is what the button opens
-        once something is already on (and what a stream without an
-        auto-startable track falls back to)."""
+        """CC button is a TOGGLE: with subtitles OFF, one click STARTS the
+        recommended English captions (the same English-first pick the C
+        key makes) — no menu, no fuss. With subtitles ON, one click turns
+        them OFF again (flash "Subtitles: Off") — a button that only ever
+        opens the track menu could never be turned off by clicking it,
+        which read as "stuck blue". The track/style menu lives on
+        RIGHT-CLICK (and is what a stream without an auto-startable
+        track falls back to on left-click, so a foreign show can still
+        be subtitled deliberately)."""
+        if self._ctl_panel.isVisible() and self._ctl_panel_btn is self.btn_cc:
+            # its own card is open: this click just dismisses it (the
+            # pre-toggle muscle memory stays intact)
+            self._ctl_panel.close_panel("toggle")
+            return
         if not self._closing and self._spu_want == -1 and not self._cap_on:
             try:
                 tracks = self.vlc.spu_tracks()
@@ -4933,6 +4947,20 @@ class PlayerView(QtWidgets.QWidget):
                 self._spu_name = "English CC"
                 self._engage_caption_overlay()
                 return
+        elif not self._closing and (self._spu_want != -1 or self._cap_on):
+            # ON -> click turns captions OFF: the toggle the blue button
+            # promises, with the same on-screen confirmation as the
+            # English one-click start
+            self._select_spu(-1)
+            self._flash_spu(-1, "")
+            return
+        self._subs_panel()
+
+    def _subs_panel(self):
+        """The track/style card (right-click on the CC button, or the
+        left-click fallback when no track can auto-start)."""
+        if self._closing:
+            return
         try:
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
