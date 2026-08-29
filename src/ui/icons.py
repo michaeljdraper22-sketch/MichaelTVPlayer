@@ -363,40 +363,30 @@ def download_window(color=None, keep_disabled=False):
 # ---- autoplay next / play next ----
 # Both glyphs are direct translations of the user's mockups (Screenshot
 # 2026-08-28 105013 for autoplay, 121619 for play next).
-def _glyph_frame(p, c):
-    """The rounded-rect chip frame the autoplay button wears."""
-    _pen(p, c, 1.8)
-    p.setBrush(QtCore.Qt.NoBrush)
-    p.drawRoundedRect(QtCore.QRectF(3.2, 4.4, 17.6, 15.2), 3.0, 3.0)
-
-
 def autoplay(on):
-    """Autoplay-next toggle, per the user's mockup: inside the rounded chip,
-    a SOLID play triangle whose run curves into two tall overlapping loops
-    (an upright infinity sign) — one play rolling endlessly into the next.
-    OFF strikes an X over it, the mute-button convention for 'disabled'."""
+    """Autoplay-next toggle, per the user's mockup: an OUTLINED play
+    triangle with a single-stroke squiggle running out from under it —
+    one hump up, one hump down, tip flicking up at the end. No chip
+    frame (every other button is frameless). OFF strikes an X over it,
+    the mute-button convention for 'disabled'."""
     def draw(p, c):
-        _glyph_frame(p, c)
-        # the solid play triangle (left third of the chip)
-        p.setPen(QtCore.Qt.NoPen)
-        p.setBrush(c)
-        p.drawPolygon(QtGui.QPolygonF(
-            [_F(5.4, 9.2), _F(5.4, 14.8), _F(10.2, 12.0)]))
-        # the double loop: two tall ellipses sharing their middle stroke
-        _pen(p, c, 1.7)
+        # outlined play triangle (left half of the canvas)
+        _pen(p, c, 2.0)
         p.setBrush(QtCore.Qt.NoBrush)
-        p.drawEllipse(QtCore.QRectF(10.1, 6.2, 5.0, 11.6))
-        p.drawEllipse(QtCore.QRectF(13.6, 6.2, 5.0, 11.6))
-        # the swoosh: sweeps out from under the triangle into the first
-        # loop's bottom — the "feeds into the next" stroke of the sketch
-        path = QtGui.QPainterPath(_F(6.6, 15.7))
-        path.quadTo(_F(9.6, 18.6), _F(12.6, 17.7))
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(4.8, 6.0), _F(4.8, 18.0), _F(14.6, 12.0)]))
+        # the squiggle: one continuous stroke starting under the triangle,
+        # humping up then down, ending with the tip pointing up
+        _pen(p, c, 2.0)
+        path = QtGui.QPainterPath(_F(8.2, 19.6))
+        path.quadTo(_F(10.6, 11.2), _F(13.8, 16.6))
+        path.quadTo(_F(16.4, 21.4), _F(19.8, 12.6))
         p.drawPath(path)
         if not on:
             _pen(p, c, 2.0)
             p.drawLine(_F(4.6, 6.2), _F(19.4, 18.4))
             p.drawLine(_F(19.4, 6.2), _F(4.6, 18.4))
-    return _icon("autoplay4" + ("on" if on else "off"), draw)
+    return _icon("autoplay5" + ("on" if on else "off"), draw)
 
 
 def play_next():
