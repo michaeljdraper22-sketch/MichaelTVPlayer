@@ -2,13 +2,62 @@
 
 import base64
 import binascii
+import hashlib
+import logging
 import math
+import threading
 import time
 import urllib.parse
 
 import requests
 
 from .models import EpgEntry, UserInfo
+
+log = logging.getLogger("mtp.xtream")
+
+# ---- provider snapshot (feeds the diagnostics uploads) ----
+# Everything the automatic bug reports need about the PROVIDER side of a
+# failure: which API calls happened, what they returned (item counts, not
+# content), and what the account looked like. No credentials ever enter
+# this dict — the server is stored as a salted-free sha256 prefix and the
+# account fields are the provider's own status metadata.
+PROVIDER_STATS = {
+    "server_hash": "",   # sha256(base URL)[:12] — identifies the panel
+    "account": {},       # status / exp_date / active_cons / max_connections / is_trial
+    "actions": {},       # action -> {"n": calls, "items_last": len, "ts": epoch}
+    "errors": [],        # last 20 {"action","error","ts"} — reasons, no creds
+}
+_stats_lock = threading.Lock()
+
+
+def _record_action(action: str, data) -> None:
+    try:
+        with _stats_lock:
+            entry = PROVIDER_STATS["actions"].setdefault(
+                action, {"n": 0, "items_last": -1, "ts": 0})
+            entry["n"] += 1
+            entry["ts"] = time.time()
+            if isinstance(data, list):
+                entry["items_last"] = len(data)
+                if not data:
+                    log.warning("xtream %s: provider returned an EMPTY list",
+                                action)
+            elif isinstance(data, dict):
+                entry["items_last"] = len(data)
+    except Exception:
+        pass
+
+
+def _record_error(action: str, message: str) -> None:
+    try:
+        with _stats_lock:
+            errs = PROVIDER_STATS["errors"]
+            errs.append({"action": action or "auth",
+                         "error": str(message)[:200],
+                         "ts": time.time()})
+            del errs[:-20]
+    except Exception:
+        pass
 
 
 class XtreamError(Exception):
@@ -43,6 +92,12 @@ class XtreamClient:
         self.timeout = timeout
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "MichaelTVPlayer/1.0"})
+        try:
+            with _stats_lock:
+                PROVIDER_STATS["server_hash"] = hashlib.sha256(
+                    self.base.encode("utf-8", "replace")).hexdigest()[:12]
+        except Exception:
+            pass
 
     # ---- low level ----
     def _api(self, action=None, timeout=None, **extra):
@@ -57,21 +112,43 @@ class XtreamClient:
             resp = self.session.get(url, params=params,
                                     timeout=timeout or self.timeout)
         except requests.RequestException as exc:
+            _record_error(action, "connection: %r" % (exc,))
+            log.error("xtream %s: connection failed: %r",
+                      action or "auth", exc)
             raise XtreamError(f"Connection failed: {exc}") from exc
         if resp.status_code != 200:
+            _record_error(action, "HTTP %d" % resp.status_code)
+            log.error("xtream %s: server returned HTTP %d",
+                      action or "auth", resp.status_code)
             raise XtreamError(f"Server returned HTTP {resp.status_code}")
         try:
             data = resp.json()
         except ValueError as exc:
+            _record_error(action, "non-JSON response")
+            log.error("xtream %s: server did not return valid JSON",
+                      action or "auth")
             raise XtreamError("Server did not return valid JSON") from exc
         if isinstance(data, dict) and data.get("user_info", {}).get("auth") == 0:
+            _record_error(action, "auth rejected")
+            log.error("xtream: invalid username or password")
             raise XtreamError("Invalid username or password")
+        _record_action(action or "auth", data)
         return data
 
     # ---- account ----
     def authenticate(self) -> UserInfo:
         data = self._api()
         ui = data.get("user_info", {}) if isinstance(data, dict) else {}
+        try:
+            with _stats_lock:
+                PROVIDER_STATS["account"] = {
+                    k: ui.get(k, "")
+                    for k in ("status", "exp_date", "is_trial",
+                              "active_cons", "max_connections",
+                              "created_at")
+                }
+        except Exception:
+            pass
         return UserInfo(
             username=ui.get("username", ""),
             status=ui.get("status", ""),

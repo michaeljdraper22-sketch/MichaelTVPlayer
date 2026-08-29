@@ -209,6 +209,40 @@ def _crash_section(log_dir: str) -> str:
     return "\n\n".join(out) if out else "(no crash dumps present)"
 
 
+def _provider_section() -> str:
+    """Provider snapshot from the Xtream client's live stats — what the
+    provider returned this session (counts, never content or credentials).
+    Empty movie/series/catch-up lists show up here even when nothing
+    crashed, which is exactly the 'it silently didn't work' case."""
+    try:
+        from . import xtream
+        stats = xtream.PROVIDER_STATS
+        if not stats["actions"] and not stats["errors"]:
+            return "(no provider API activity this session)"
+        out = ["- **panel:** server hash %s" % (stats.get("server_hash")
+                                                or "(unknown)")]
+        acct = stats.get("account") or {}
+        if acct:
+            out.append("- **account:** %s" % json.dumps(acct, sort_keys=True))
+        out.append("- **API calls:**")
+        for action, e in sorted(stats.get("actions", {}).items()):
+            when = time.strftime("%H:%M:%S", time.localtime(e.get("ts", 0)))
+            out.append("  - `%s` ×%d, last %s: %s item(s)"
+                       % (action, e.get("n", 0), when, e.get("items_last")))
+        errs = stats.get("errors") or []
+        if errs:
+            out.append("- **provider errors (last %d):**" % len(errs))
+            for e in errs[-10:]:
+                when = time.strftime("%H:%M:%S",
+                                     time.localtime(e.get("ts", 0)))
+                out.append("  - %s `%s`: %s"
+                           % (when, e.get("action"), scrub(e.get("error",
+                                                                 ""))))
+        return "\n".join(scrub(x) for x in out)
+    except Exception as exc:
+        return "(provider snapshot unavailable: %r)" % (exc,)
+
+
 def build_report(config, reason: str) -> tuple:
     """(title, markdown body) for a diagnostics issue."""
     from .logging_setup import LOG_DIR
@@ -221,7 +255,9 @@ def build_report(config, reason: str) -> tuple:
             lines.append("- **%s:** %s" % (k, json.dumps(v, sort_keys=True)))
         else:
             lines.append("- **%s:** %s" % (k, scrub(str(v))))
-    lines += ["", "## Recent log (redacted)", "",
+        lines += ["", "## Provider (this session, no credentials)", "",
+                  _provider_section(), ""]
+        lines += ["## Recent log (redacted)", "",
               "```", _tail(os.path.join(LOG_DIR, "player.log"),
                            _LOG_TAIL_CHARS), "```", "",
               "## Crash dumps", "", _crash_section(LOG_DIR)]
