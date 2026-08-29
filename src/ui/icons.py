@@ -364,32 +364,39 @@ def download_window(color=None, keep_disabled=False):
 # Both glyphs are direct translations of the user's mockups (Screenshot
 # 2026-08-28 105013 for autoplay, 121619 for play next).
 def autoplay(on):
-    """Autoplay-next toggle, per the user's mockup: an OUTLINED play
-    triangle with a tall serpentine squiggle beside it — dips into a
-    rounded U, climbs into a narrow center peak taller than the
-    triangle, a second U, then a blunt upward tip. No chip frame and no
-    checked-state ring: frameless like every other button, state shown
-    by the X strike only. OFF strikes an X over it, the mute-button
-    convention for 'disabled'."""
+    """Autoplay-next toggle, per the user's mockup (measured from the
+    mockup pixels): an OUTLINED play triangle with a two-trough wave
+    stroke under/beside it — starts as a rounded stub under the
+    triangle's right half, dips into a wide rounded trough, rises
+    steeply past the apex into a tall narrow crest, drops into a second
+    trough, then rises one last time and ENDS mid-air with its cap
+    pointing up. Frameless; OFF strikes an X over it (mute-button
+    convention)."""
     def draw(p, c):
-        # outlined play triangle (left, wave keeps clear of it)
+        # outlined play triangle — sized per the user's eye, larger than
+        # the mockup's small solid one
         _pen(p, c, 2.0)
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawPolygon(QtGui.QPolygonF(
             [_F(4.6, 7.0), _F(4.6, 18.4), _F(14.0, 12.7)]))
-        # the serpentine: single stroke starting under the triangle's
-        # bottom-right corner — U, tall narrow peak, second U, blunt tip
-        path = QtGui.QPainterPath(_F(13.6, 19.2))
-        path.quadTo(_F(15.2, 23.0), _F(16.8, 18.2))   # first rounded U
-        path.quadTo(_F(17.6, -3.6), _F(18.9, 12.2))   # tall center peak
-        path.quadTo(_F(19.8, 21.8), _F(21.0, 13.0))   # second rounded U
-        path.quadTo(_F(21.5, 10.6), _F(21.7, 8.8))    # blunt rising tip
+        # the wave, traced from the mockup's centerline and re-fitted to
+        # the canvas (crest pushed right to clear the bigger apex)
+        path = QtGui.QPainterPath(_F(8.6, 18.8))
+        path.quadTo(_F(10.0, 21.8), _F(12.0, 21.6))   # stub down into trough 1
+        path.quadTo(_F(14.0, 21.5), _F(14.9, 19.0))   # wide flat bottom
+        path.quadTo(_F(16.4, 16.4), _F(16.7, 13.5))   # steep rise past apex
+        path.quadTo(_F(17.0, 9.0), _F(17.5, 6.2))
+        path.quadTo(_F(17.8, 4.9), _F(19.0, 5.6))     # rounded crest top
+        path.quadTo(_F(19.8, 8.0), _F(19.9, 13.0))    # steep descent
+        path.quadTo(_F(20.0, 17.5), _F(20.6, 21.4))   # into trough 2
+        path.quadTo(_F(20.9, 21.5), _F(21.3, 18.0))   # final rise
+        path.quadTo(_F(21.7, 13.5), _F(22.2, 8.6))    # capped end, pointing up
         p.drawPath(path)
         if not on:
             _pen(p, c, 2.0)
             p.drawLine(_F(4.2, 6.6), _F(21.4, 18.8))
             p.drawLine(_F(21.4, 6.6), _F(4.2, 18.8))
-    return _icon("autoplay6" + ("on" if on else "off"), draw)
+    return _icon("autoplay7" + ("on" if on else "off"), draw)
 
 
 def play_next():
