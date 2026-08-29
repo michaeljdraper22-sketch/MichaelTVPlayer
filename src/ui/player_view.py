@@ -27,7 +27,7 @@ from ..mkv_subs import (is_text_codec, is_language_name, lang_matches,
 from . import browsers
 from . import icons as ic
 from .caption_overlay import (CaptionOverlay, CueStore, displayed_video_rect)
-from .track_panel import TrackPanel
+from .track_panel import NativeDialogCloser, TrackPanel
 from .worker import AsyncRunner, FileDownloader
 
 log = logging.getLogger("mtp")
@@ -4275,14 +4275,18 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_cc.setIcon(ic.cc(on))
         label = self._spu_name if on else "Off"
         self.btn_cc.setToolTip(
-            f"Subtitles — {label} (C — click: on/off, right-click: tracks)"
-            if enabled
+            f"Subtitles — {label} (C)" if enabled
             else "Subtitles — settings (none on this stream)")
 
     def _select_spu(self, track_id: int, name: str = ""):
         """User picked a track from the menu (or -1 for Off)."""
         self._spu_want = int(track_id)
         self._spu_name = name or ""
+        try:
+            log.info("subtitles: select id=%d name=%r", track_id,
+                     self._spu_name or "Off")
+        except Exception:  # noqa: BLE001
+            pass
         if track_id != -1 and self._cap_eligible(name):
             # text track: the app overlay renders it (VLC's spu stays off)
             self._engage_caption_overlay()
@@ -4915,20 +4919,11 @@ class PlayerView(QtWidgets.QWidget):
         return None
 
     def _subs_menu(self):
-        """CC button is a TOGGLE: with subtitles OFF, one click STARTS the
-        recommended English captions (the same English-first pick the C
-        key makes) — no menu, no fuss. With subtitles ON, one click turns
-        them OFF again (flash "Subtitles: Off") — a button that only ever
-        opens the track menu could never be turned off by clicking it,
-        which read as "stuck blue". The track/style menu lives on
-        RIGHT-CLICK (and is what a stream without an auto-startable
-        track falls back to on left-click, so a foreign show can still
-        be subtitled deliberately)."""
-        if self._ctl_panel.isVisible() and self._ctl_panel_btn is self.btn_cc:
-            # its own card is open: this click just dismisses it (the
-            # pre-toggle muscle memory stays intact)
-            self._ctl_panel.close_panel("toggle")
-            return
+        """CC button: with subtitles OFF, one click STARTS the recommended
+        English captions (the same English-first pick the C key makes) —
+        no menu, no fuss. With subtitles already ON (or when no track can
+        auto-start), the click opens the track/style card. Right-click
+        opens the card from either state."""
         if not self._closing and self._spu_want == -1 and not self._cap_on:
             try:
                 tracks = self.vlc.spu_tracks()
@@ -4947,18 +4942,12 @@ class PlayerView(QtWidgets.QWidget):
                 self._spu_name = "English CC"
                 self._engage_caption_overlay()
                 return
-        elif not self._closing and (self._spu_want != -1 or self._cap_on):
-            # ON -> click turns captions OFF: the toggle the blue button
-            # promises, with the same on-screen confirmation as the
-            # English one-click start
-            self._select_spu(-1)
-            self._flash_spu(-1, "")
-            return
         self._subs_panel()
 
     def _subs_panel(self):
-        """The track/style card (right-click on the CC button, or the
-        left-click fallback when no track can auto-start)."""
+        """The track/style card (right-click on the CC button, left-click
+        once captions are on, and the left-click fallback when no track
+        can auto-start)."""
         if self._closing:
             return
         try:
@@ -5007,9 +4996,25 @@ class PlayerView(QtWidgets.QWidget):
             self.overlay.show()
             self._layout_overlays()
         self._cap_wid.set_preview("Subtitle preview")
-        SubtitleDialog(self.config, self._apply_sub_delay,
-                       apply_live=self._apply_sub_style_live,
-                       parent=self.window()).exec_()
+        dlg = SubtitleDialog(self.config, self._apply_sub_delay,
+                             apply_live=self._apply_sub_style_live,
+                             parent=self.window())
+        closer = None
+        if NativeDialogCloser is not None:
+            # click outside the dialog = done (settings apply live, so a
+            # dismiss finalizes exactly like OK)
+            closer = NativeDialogCloser(dlg)
+            QtWidgets.QApplication.instance() \
+                .installNativeEventFilter(closer)
+        try:
+            dlg.exec_()
+        finally:
+            if closer is not None:
+                try:
+                    QtWidgets.QApplication.instance() \
+                        .removeNativeEventFilter(closer)
+                except Exception:  # noqa: BLE001
+                    pass
         self._cap_wid.set_preview("")
         if subtitle_instance_args(self.config.subtitle_appearance) != before:
             if self._cap_on:

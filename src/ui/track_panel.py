@@ -106,9 +106,12 @@ if sys.platform == "win32":
         not own never become QEvents — most importantly libvlc's own video
         child HWND, which covers the whole video area during playback.
         Clicking the video (the most obvious "outside") therefore has to be
-        caught at the native message level or the card stays open."""
+        caught at the native message level or the card stays open. Right
+        presses count too — a card that survives a right-click outside
+        reads as "cannot be dismissed"."""
 
         WM_LBUTTONDOWN = 0x0201
+        WM_RBUTTONDOWN = 0x0204
 
         def __init__(self, closer):
             super().__init__()
@@ -118,7 +121,8 @@ if sys.platform == "win32":
             try:
                 if bytes(eventType) == b"windows_generic_MSG":
                     msg = ctypes.wintypes.MSG.from_address(int(message))
-                    if msg.message == self.WM_LBUTTONDOWN:
+                    if msg.message in (self.WM_LBUTTONDOWN,
+                                       self.WM_RBUTTONDOWN):
                         self._closer.maybe_close_at(
                             QtCore.QPoint(msg.pt.x, msg.pt.y))
             except Exception:  # noqa: BLE001
@@ -126,8 +130,46 @@ if sys.platform == "win32":
             # PyQt5 requires (boolhandled, result) — a bare False here
             # raises inside the message pump and takes the app down
             return False, 0
+
+    class NativeDialogCloser(QtCore.QAbstractNativeEventFilter):
+        """Dismiss a modal dialog on a left press outside its frame — the
+        same "click outside to close" the popup cards have. Guards: while
+        a popup (combobox dropdown, menu) is open, or another modal
+        window sits on top (color picker), presses belong to THAT window
+        and are ignored."""
+
+        WM_LBUTTONDOWN = 0x0201
+
+        def __init__(self, dialog):
+            super().__init__()
+            self._dialog = dialog
+
+        def nativeEventFilter(self, eventType, message):
+            try:
+                if bytes(eventType) == b"windows_generic_MSG":
+                    msg = ctypes.wintypes.MSG.from_address(int(message))
+                    if msg.message == self.WM_LBUTTONDOWN:
+                        app = QtWidgets.QApplication.instance()
+                        if app.activePopupWidget() is not None:
+                            return False, 0
+                        modal = app.activeModalWidget()
+                        if modal is not None and modal is not self._dialog:
+                            return False, 0
+                        d = self._dialog
+                        if d.isVisible():
+                            rect = QtCore.QRect(
+                                d.mapToGlobal(QtCore.QPoint(0, 0)),
+                                d.frameGeometry().size())
+                            if not rect.contains(QtCore.QPoint(msg.pt.x,
+                                                                msg.pt.y)):
+                                _log("dialog: closed by outside press")
+                                d.close()
+            except Exception:  # noqa: BLE001
+                pass
+            return False, 0
 else:
     _NativePressCloser = None
+    NativeDialogCloser = None
 
 
 class _Row(QtWidgets.QWidget):
