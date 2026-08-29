@@ -364,39 +364,32 @@ def download_window(color=None, keep_disabled=False):
 # Both glyphs are direct translations of the user's mockups (Screenshot
 # 2026-08-28 105013 for autoplay, 121619 for play next).
 def autoplay(on):
-    """Autoplay-next toggle, per the user's mockup (measured from the
-    mockup pixels): an OUTLINED play triangle with a two-trough wave
-    stroke under/beside it — starts as a rounded stub under the
-    triangle's right half, dips into a wide rounded trough, rises
-    steeply past the apex into a tall narrow crest, drops into a second
-    trough, then rises one last time and ENDS mid-air with its cap
-    pointing up. Frameless; OFF strikes an X over it (mute-button
-    convention)."""
+    """Autoplay-next toggle, co-designed with the user: a smaller
+    OUTLINED play triangle with a coil wave beside it — straight
+    vertical strokes joined by semicircular U-turns (bottom, top,
+    bottom), a short start nub under the triangle's right side, and a
+    final leg rising to the height of the top U's peak. OFF strikes an
+    X over it, the mute-button convention for 'disabled'."""
     def draw(p, c):
-        # outlined play triangle — sized per the user's eye, larger than
-        # the mockup's small solid one
-        _pen(p, c, 2.0)
+        _pen(p, c, 2.2)
         p.setBrush(QtCore.Qt.NoBrush)
         p.drawPolygon(QtGui.QPolygonF(
-            [_F(4.6, 7.0), _F(4.6, 18.4), _F(14.0, 12.7)]))
-        # the wave, traced from the mockup's centerline and re-fitted to
-        # the canvas (crest pushed right to clear the bigger apex)
-        path = QtGui.QPainterPath(_F(8.6, 18.8))
-        path.quadTo(_F(10.0, 21.8), _F(12.0, 21.6))   # stub down into trough 1
-        path.quadTo(_F(14.0, 21.5), _F(14.9, 19.0))   # wide flat bottom
-        path.quadTo(_F(16.4, 16.4), _F(16.7, 13.5))   # steep rise past apex
-        path.quadTo(_F(17.0, 9.0), _F(17.5, 6.2))
-        path.quadTo(_F(17.8, 4.9), _F(19.0, 5.6))     # rounded crest top
-        path.quadTo(_F(19.8, 8.0), _F(19.9, 13.0))    # steep descent
-        path.quadTo(_F(20.0, 17.5), _F(20.6, 21.4))   # into trough 2
-        path.quadTo(_F(20.9, 21.5), _F(21.3, 18.0))   # final rise
-        path.quadTo(_F(21.7, 13.5), _F(22.2, 8.6))    # capped end, pointing up
+            [_F(3.5, 9.0), _F(3.5, 17.0), _F(10.0, 13.0)]))
+        # K*r control offsets give circular semicircles from cubics
+        path = QtGui.QPainterPath(_F(9.2, 17.0))
+        path.lineTo(9.2, 18.0)                                          # start nub
+        path.cubicTo(_F(9.2, 20.667), _F(13.2, 20.667), _F(13.2, 18.0))  # U bottom
+        path.lineTo(13.2, 11.0)                                         # up
+        path.cubicTo(_F(13.2, 8.333), _F(17.2, 8.333), _F(17.2, 11.0))   # U top
+        path.lineTo(17.2, 18.0)                                         # down
+        path.cubicTo(_F(17.2, 20.667), _F(21.2, 20.667), _F(21.2, 18.0))  # U bottom
+        path.lineTo(21.2, 9.0)                                          # end at U-peak height
         p.drawPath(path)
         if not on:
-            _pen(p, c, 2.0)
-            p.drawLine(_F(4.2, 6.6), _F(21.4, 18.8))
-            p.drawLine(_F(21.4, 6.6), _F(4.2, 18.8))
-    return _icon("autoplay7" + ("on" if on else "off"), draw)
+            _pen(p, c, 2.2)
+            p.drawLine(_F(3.9, 6.4), _F(21.7, 20.4))
+            p.drawLine(_F(21.7, 6.4), _F(3.9, 20.4))
+    return _icon("autoplay8" + ("on" if on else "off"), draw)
 
 
 def play_next():
