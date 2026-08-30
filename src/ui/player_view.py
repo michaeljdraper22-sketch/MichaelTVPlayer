@@ -1354,6 +1354,27 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._cu_raw_wall = now_s()
         self._cu_raw_moved = False
+        self._cu_rescues = getattr(self, "_cu_rescues", 0) + 1
+        cur = self.current or {}
+        if self._cu_rescues >= 2 and cur.get("kind") == "catchup" \
+                and getattr(self, "client", None):
+            # Repeat failures on this very stream: the catch-up URL FORM
+            # itself may be wrong for this panel (panels support only one
+            # of the two families — see XtreamClient.timeshift_url).
+            # Flip legacy/modern and replay from scratch via the relay.
+            try:
+                dur_min = max(1, math.ceil(
+                    (cur.get("utc_end", 0) - cur.get("utc_start", 0))
+                    / 60.0)) or 60
+                cur = dict(cur)
+                cur["url"] = self.client.timeshift_url(
+                    cur["stream_id"], cur["utc_start"], dur_min)
+                self._catchup_local_url = ""
+                self.current = cur
+                self.play_media(cur, start_at=max(0.0, pos_ms / 1000.0))
+                return
+            except Exception as exc:  # noqa: BLE001
+                log.warning("catchup form-flip replay failed: %r", exc)
         url = self._catchup_local_url \
             or (self.current or {}).get("url", "")
         if not url:
@@ -1674,6 +1695,7 @@ class PlayerView(QtWidgets.QWidget):
         self._scrub_on = False
         self._vid_s = 0.0
         self._eof_next_done = False   # re-arm autoplay-next for this media
+        self._cu_rescues = 0         # re-arm catch-up rescue/form-flip
         if (self.current or {}).get("url") != playable.get("url"):
             self._vod_rescues = 0     # same-media rescue reopens keep the cap
         self._vod_raw_wall = now_s()

@@ -102,7 +102,7 @@ class XtreamClient:
             pass
 
     # ---- low level ----
-    def _api(self, action=None, timeout=None, **extra):
+    def _api(self, action=None, timeout=None, _retries=1, **extra):
         params = {"username": self.username, "password": self.password}
         if action:
             params["action"] = action
@@ -114,6 +114,11 @@ class XtreamClient:
             resp = self.session.get(url, params=params,
                                     timeout=timeout or self.timeout)
         except requests.RequestException as exc:
+            if _retries > 0:
+                # transient network blip — one quiet retry before declaring
+                # the panel unreachable (auto-reported either way on fail)
+                time.sleep(1.0)
+                return self._api(action, timeout, _retries - 1, **extra)
             _record_error(action, "connection: %r" % (exc,))
             log.error("xtream %s: connection failed: %r",
                       action or "auth", exc)
@@ -124,18 +129,44 @@ class XtreamClient:
                       action or "auth", resp.status_code)
             raise XtreamError(f"Server returned HTTP {resp.status_code}")
         try:
+            self._record_panel_hints(resp)
             data = resp.json()
         except ValueError as exc:
-            _record_error(action, "non-JSON response")
-            log.error("xtream %s: server did not return valid JSON",
-                      action or "auth")
+            body = (resp.text or "")[:120]
+            _record_error(action, "non-JSON response: %s" % body)
+            log.error("xtream %s: server did not return valid JSON "
+                      "(body starts: %r)", action or "auth", body)
             raise XtreamError("Server did not return valid JSON") from exc
         if isinstance(data, dict) and data.get("user_info", {}).get("auth") == 0:
             _record_error(action, "auth rejected")
             log.error("xtream: invalid username or password")
             raise XtreamError("Invalid username or password")
+        if isinstance(data, dict) and "user_info" not in data \
+                and "error" in data:
+            # some panels answer errors as 200 + {"error": "..."} instead of
+            # a real payload — surface it instead of acting on garbage
+            msg = str(data.get("error"))[:200]
+            _record_error(action, "panel error payload: %s" % msg)
+            log.error("xtream %s: panel returned an error payload: %s",
+                      action or "auth", msg)
+            raise XtreamError(f"Panel error: {msg}")
         _record_action(action or "auth", data)
         return data
+
+    def _record_panel_hints(self, resp) -> None:
+        """Fingerprint the panel once (server header etc.) for diagnostics —
+        different Xtream/XUI forks behave differently, and knowing which
+        family a user is on is half the diagnosis."""
+        try:
+            with _stats_lock:
+                hints = PROVIDER_STATS.setdefault("panel_hints", {})
+                if not hints:
+                    for h in ("server", "x-powered-by"):
+                        v = resp.headers.get(h)
+                        if v:
+                            hints[h] = v[:60]
+        except Exception:
+            pass
 
     # ---- account ----
     def authenticate(self) -> UserInfo:
@@ -175,8 +206,20 @@ class XtreamClient:
     def vod_streams(self, category_id=None, timeout=None):
         # No category = the provider's ENTIRE movie library, which can be a
         # multi-MB JSON that takes far longer than the default timeout.
-        return self._api("get_vod_streams", category_id=category_id,
-                         timeout=timeout) or []
+        try:
+            data = self._api("get_vod_streams", category_id=category_id,
+                             timeout=timeout) or []
+        except XtreamError as exc:
+            _record_error("get_vod_streams", "falling back to m3u (%s)"
+                          % exc)
+            data = []
+        if not data and not category_id:
+            # Some panels omit/break the JSON VOD endpoint but still serve
+            # the classic playlist export — try it once per session before
+            # showing the user an empty Movies tab (the brother-machine bug
+            # class). Items carry the same keys the JSON form uses.
+            return self._m3u_fallback("vod")
+        return data
 
     def vod_info(self, vod_id):
         return self._api("get_vod_info", vod_id=vod_id) or {}
@@ -187,11 +230,82 @@ class XtreamClient:
 
     def series(self, category_id=None, timeout=None):
         # Same as VOD: the full series list can be huge.
-        return self._api("get_series", category_id=category_id,
-                         timeout=timeout) or []
+        try:
+            data = self._api("get_series", category_id=category_id,
+                             timeout=timeout) or []
+        except XtreamError as exc:
+            _record_error("get_series", "falling back to m3u (%s)" % exc)
+            data = []
+        if not data and not category_id:
+            return self._m3u_fallback("series")
+        return data
 
     def series_info(self, series_id):
         return self._api("get_series_info", series_id=series_id) or {}
+
+    # ---- playlist-export fallback (panels with broken JSON endpoints) ----
+    _m3u_tried = set()   # sections already attempted this process
+
+    def _m3u_fallback(self, section):
+        """Classic get.php playlist export — the oldest, most universal
+        Xtream endpoint there is. Used ONLY when the JSON VOD/series action
+        came back empty/failed: panels that skip the JSON endpoints
+        usually still serve this. One attempt per section per session."""
+        try:
+            if section in XtreamClient._m3u_tried:
+                return []
+            XtreamClient._m3u_tried.add(section)
+            r = self.session.get(
+                f"{self.base}/get.php",
+                params={"username": self.username,
+                        "password": self.password,
+                        "type": section, "output": "ts"},
+                timeout=90)
+            if r.status_code != 200:
+                _record_error("get.php %s" % section,
+                              "HTTP %d" % r.status_code)
+                return []
+            items = self._parse_m3u(
+                r.content.decode("utf-8", "replace"), section)
+            if items:
+                log.warning("xtream: JSON %s endpoint unusable — recovered "
+                            "%d item(s) from get.php playlist export",
+                            section, len(items))
+                try:
+                    from . import feedback
+                    feedback.stat("m3u_fallback_used")
+                    feedback.crumb("m3u fallback: %d %s items"
+                                   % (len(items), section))
+                except Exception:
+                    pass
+                _record_action("get.php_%s_fallback" % section, items)
+            return items
+        except Exception as exc:  # noqa: BLE001
+            _record_error("get.php %s" % section, "%r" % (exc,))
+            return []
+
+    @staticmethod
+    def _parse_m3u(text, section):
+        """Playlist lines -> the same dict keys the JSON actions use."""
+        id_key = "stream_id" if section == "vod" else "series_id"
+        items, title = [], None
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("#EXTINF"):
+                title = line.split(",", 1)[1].strip() if "," in line else ""
+            elif line.startswith(("http://", "https://")) and title:
+                # .../movie/u/p/<id>.<ext> — the id rides the FILENAME
+                fname = line.rstrip("/").split("/")[-1]
+                if "." in fname:
+                    item_id, ext = fname.rsplit(".", 1)
+                    ext = ext.lower()
+                else:
+                    item_id, ext = fname, "mp4"
+                items.append({id_key: item_id, "name": title,
+                              "container_extension": ext,
+                              "category_id": ""})
+                title = None
+        return items
 
     # ---- epg ----
     def short_epg(self, stream_id, limit: int = 4):
@@ -224,22 +338,57 @@ class XtreamClient:
     def live_url(self, stream_id, ext: str = "ts") -> str:
         return f"{self.base}/live/{self.username}/{self.password}/{stream_id}.{ext}"
 
-    def timeshift_url(self, stream_id, utc_start: int, duration_min: int) -> str:
+    # Which catch-up URL form this panel serves. Panels differ: this one
+    # answers the modern path with HTTP 513 and only the legacy
+    # streaming/timeshift.php works (probed 2026-08-24) — other panels are
+    # the reverse. The preference is per-session, remembered in PROVIDER_
+    # STATS, and flipped by the catch-up rescue path when a stream will
+    # not start at all ("legacy" first because it is the one verified here).
+    TIMESHIFT_FORM_DEFAULT = "legacy"
+
+    @property
+    def timeshift_form(self) -> str:
+        try:
+            with _stats_lock:
+                return PROVIDER_STATS.get(
+                    "timeshift_form", self.TIMESHIFT_FORM_DEFAULT)
+        except Exception:
+            return self.TIMESHIFT_FORM_DEFAULT
+
+    def flip_timeshift_form(self) -> str:
+        """Switch to the other catch-up URL form and report it (called by
+        the rescue path after a form's streams repeatedly fail to start)."""
+        new = "modern" if self.timeshift_form == "legacy" else "legacy"
+        try:
+            with _stats_lock:
+                PROVIDER_STATS["timeshift_form"] = new
+        except Exception:
+            pass
+        log.warning("xtream: switching catch-up URL form to '%s' "
+                    "(panel serves the other path)", new)
+        return new
+
+    def timeshift_url(self, stream_id, utc_start: int, duration_min: int,
+                      form: str = None) -> str:
         """Catch-up (archive) stream: the provider serves the recorded
         broadcast from ``utc_start`` (epoch seconds) for ``duration_min``
         minutes.  Times are UTC, formatted YYYY-MM-DD:HH-MM.
 
-        This panel's modern path form (/timeshift/u/p/id/start/dur) answers
-        HTTP 513 — the legacy streaming endpoint is the one that works
-        (probed 2026-08-24: 200, video/mp2t, duration honored, arbitrary
-        mid-program starts honored)."""
+        Two URL families exist (legacy query-string script vs modern path
+        form) and panels support only one — see ``timeshift_form``."""
         start = time.strftime("%Y-%m-%d:%H-%M", time.gmtime(int(utc_start)))
+        dur = max(1, math.ceil(duration_min))
+        if (form or self.timeshift_form) == "modern":
+            return (f"{self.base}/timeshift"
+                    f"/{urllib.parse.quote(self.username, safe='')}"
+                    f"/{urllib.parse.quote(self.password, safe='')}"
+                    f"/{int(stream_id)}/{start}/{dur}/ts")
         return (
             f"{self.base}/streaming/timeshift.php"
             f"?username={urllib.parse.quote(self.username, safe='')}"
             f"&password={urllib.parse.quote(self.password, safe='')}"
             f"&stream={int(stream_id)}&start={start}"
-            f"&duration={max(1, math.ceil(duration_min))}&extension=ts"
+            f"&duration={dur}&extension=ts"
         )
 
     def vod_url(self, stream_id, container_extension: str = "mp4") -> str:
