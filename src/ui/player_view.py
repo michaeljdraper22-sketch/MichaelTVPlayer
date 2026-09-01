@@ -592,6 +592,7 @@ class PlayerView(QtWidgets.QWidget):
         self._attached = False     # video surface bound to the VLC player yet?
         self._attach_done = False  # attach finished (ok or gave up) — unblocks playback
         self._pending_media = None # play_media() queued before attach finished
+        self._pending_media_start = 0.0  # its start_at, kept through the deferral
         self._dvr_base = 0.0       # content-seconds written by earlier recorder runs
         self._dvr_first_data = None  # wall clock when current run first wrote data
         self._dvr_content_s = 0.0  # CONFIRMED content-seconds this run (see _note_dvr_data)
@@ -1550,12 +1551,14 @@ class PlayerView(QtWidgets.QWidget):
         if self._pending_media is None:
             return
         pending, self._pending_media = self._pending_media, None
+        start_at = self._pending_media_start or 0.0
+        self._pending_media_start = 0.0
         try:
             log.info("vlc attach resolved: starting deferred playback %r",
                      pending.get("title", ""))
         except Exception:
             pass
-        self.play_media(pending)
+        self.play_media(pending, start_at)
 
     def show_info(self, title: str, epg: str = "", sticky: bool = False):
         """Show the now-playing banner.
@@ -1604,6 +1607,7 @@ class PlayerView(QtWidgets.QWidget):
             # queue the item — the attach callback starts playback as soon
             # as the surface is bound (or audio-only if attach gives up).
             self._pending_media = playable
+            self._pending_media_start = start_at
             try:
                 log.info("play_media deferred until vlc attach: %r",
                          playable.get("title", ""))
@@ -1769,7 +1773,8 @@ class PlayerView(QtWidgets.QWidget):
             self._relay_start_offset = 1 if start_at > 3.0 else 0
             self.vlc.play(self._effective_url(url, kind),
                           timeshift=False, start_seconds=start_at,
-                          start_wait_s=60.0 if kind == "stremio" else 20.0)
+                          start_wait_s=60.0 if kind == "stremio" else 20.0,
+                          sub_file=playable.get("sub_file") or None)
         self._poke_audio()
         self._poke_rate()
         self._wake()

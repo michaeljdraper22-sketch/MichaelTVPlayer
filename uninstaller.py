@@ -75,6 +75,19 @@ def main():
         except OSError:
             pass
 
+    # restore Stremio's original server.js if we redirected its
+    # "open in VLC" button at MichaelTV (streampatch keeps a .mtpbak)
+    try:
+        sj = os.path.expandvars(
+            r"%LOCALAPPDATA%\Programs\Stremio\server.js")
+        bak = sj + ".mtpbak"
+        if os.path.isfile(bak) and os.path.isfile(sj):
+            import shutil
+            shutil.copy2(bak, sj)
+            os.remove(bak)
+    except Exception:  # noqa: BLE001
+        pass
+
     # registry: the Stremio-handoff .m3u registration (self-contained —
     # the uninstaller exe does not bundle the src package). If we are the
     # current default, clear the UserChoice too so nothing dangles.

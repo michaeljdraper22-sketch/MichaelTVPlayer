@@ -183,12 +183,14 @@ def main() -> int:
         return 1
 
     # Single instance: if MichaelTV is already running, hand it our args
-    # (a Stremio playlist open, or a plain re-launch) and exit — a second
-    # full process used to spawn a second player + recorder.
+    # (a Stremio handoff, or a plain re-launch) and exit — a second full
+    # process used to spawn a second player + recorder. Dash-style flags
+    # (--start-time/--sub-file from the Stremio server) ride along; the
+    # GATE below only counts real (non-flag) args.
     from src.singleinst import SingleInstance
     inst = SingleInstance("MichaelTVPlayer-single")
     forwarded = _forwardable_args(sys.argv[1:])
-    if inst.forward_if_running(forwarded):
+    if inst.forward_if_running(sys.argv[1:]):
         try:
             from src import feedback
             feedback.session_end()   # this was a relay, not a session
@@ -252,6 +254,16 @@ def main() -> int:
     except Exception:
         pass
 
+    # Stremio's "open in VLC" is the local streaming server spawning a
+    # hardcoded vlc.exe — redirect that button at MichaelTV (own file,
+    # backup kept; VLC itself is never touched). Re-applied after Stremio
+    # updates; takes effect once Stremio restarts.
+    try:
+        from src import streampatch
+        streampatch.patch_if_needed()
+    except Exception:
+        pass
+
     # The login gate blocks MainWindow when no account is saved; a launch
     # WITH a handoff arg steps around it (play the stream first — the
     # tabs just show the account-error hint until File > Account).
@@ -274,7 +286,8 @@ def main() -> int:
     try:
         inst.received.connect(win.handle_handoff)
         if forwarded:
-            QtCore.QTimer.singleShot(50, lambda: win.handle_handoff(forwarded))
+            QtCore.QTimer.singleShot(
+                50, lambda: win.handle_handoff(sys.argv[1:]))
     except Exception:
         pass
 

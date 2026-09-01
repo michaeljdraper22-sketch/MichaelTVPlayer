@@ -369,12 +369,27 @@ class MainWindow(QtWidgets.QMainWindow):
         act_update.triggered.connect(self.check_for_updates)
         settings_menu.addAction(act_update)
 
+        # Button-style menu-bar item (no dropdown): open the tip jar.
+        act_support = menu_bar.addAction("\u2665 Support Developer")
+        act_support.triggered.connect(self.support_developer)
+
         help_menu = menu_bar.addMenu("&Help")
         act_help = QtWidgets.QAction("About / Shortcuts", self)
         act_help.triggered.connect(self._show_help)
         help_menu.addAction(act_help)
 
-    def play(self, playable: dict):
+    def support_developer(self):
+        """♥ Support Developer button: open the Cash App tip link
+        ($Michaeljdraper) in the user's default browser."""
+        try:
+            from .. import feedback
+            feedback.usage("support_click")
+        except Exception:  # noqa: BLE001
+            pass
+        QtGui.QDesktopServices.openUrl(
+            QtCore.QUrl("https://cash.app/$Michaeljdraper"))
+
+    def play(self, playable: dict, start_at: float = 0.0):
         if playable.get("kind") == "series_meta":
             # A series entry was somehow activated directly; open its episodes.
             self.series_tab._open_series(playable)
@@ -383,7 +398,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # Direct activation of an archive channel: open its program picker
             self.catchup_tab._open_picker(playable)
             return
-        self.player_view.play_media(playable)
+        self.player_view.play_media(playable, start_at)
         self.config.add_recent(playable)
         self.config.data["last_channel"] = playable
         self.config.save()
@@ -392,27 +407,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self.player_view.setFocus(QtCore.Qt.OtherFocusReason)
 
     def handle_handoff(self, args):
-        """Args from an external launch (Stremio playlist.m3u opened with
-        us, a relayed second launch): play the stream they name and come
-        forward. With nothing playable, just surface the window — that is
-        the 'launched while already running' case."""
-        url = ""
+        """Args from an external launch — either the patched Stremio
+        streaming server invoking us exactly like it invoked VLC
+        (--start-time=N [--sub-file=x.srt] "<url>") or a Windows
+        .m3u association launch (playlist path). Parse, play, come
+        forward. With nothing playable, just surface the window."""
+        launch = None
         try:
             from .. import stremio
-            for arg in args or []:
-                url = stremio.parse_handoff_arg(arg)
-                if url:
-                    break
+            launch = stremio.parse_launch_args(args)
         except Exception:  # noqa: BLE001
-            url = ""
-        if url:
+            launch = None
+        if launch:
             try:
                 from .. import feedback
                 feedback.usage("stremio_handoff")
                 feedback.crumb("stremio handoff")
             except Exception:  # noqa: BLE001
                 pass
-            self.play(stremio.playable_from_url(url))
+            playable = stremio.playable_from_url(launch["url"])
+            if launch.get("sub_file"):
+                playable["sub_file"] = launch["sub_file"]
+            self.play(playable, launch.get("start_at") or 0.0)
         if self.isMinimized():
             self.showNormal()
         self.raise_()

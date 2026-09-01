@@ -80,6 +80,44 @@ def parse_m3u(text: str) -> str:
     return ""
 
 
+def parse_launch_args(args):
+    """Full command-line parse of an external-player launch (the patched
+    Stremio streaming server invokes MichaelTV exactly like it invoked
+    VLC: ``--start-time=<sec> --no-video-title-show [--sub-file=<srt>]
+    "<url>"``; Windows .m3u association launches pass just the playlist
+    path). Returns ``{url, start_at, sub_file}`` or None if nothing
+    playable. Unknown dash-args are ignored (and their values are never
+    mistaken for the URL)."""
+    start_at = 0.0
+    sub_file = ""
+    url = ""
+    args = [str(a).strip().strip('"') for a in (args or []) if str(a).strip()]
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        low = arg.lower()
+        if low.startswith("--start-time="):
+            try:
+                start_at = max(0.0, float(arg.split("=", 1)[1]))
+            except ValueError:
+                pass
+        elif low.startswith("--sub-file="):
+            # cmd.exe does not quote it; a path with spaces arrives glued
+            # to the next flag — re-join up to the next " --" if needed
+            sub_file = arg.split("=", 1)[1]
+            if sub_file and not os.path.isfile(sub_file) \
+                    and " --" in sub_file:
+                sub_file = sub_file.rsplit(" --", 1)[0]
+        elif arg.startswith("-"):
+            pass                      # --no-video-title-show & friends
+        elif not url:
+            url = parse_handoff_arg(arg)
+        i += 1
+    if not url:
+        return None
+    return {"url": url, "start_at": start_at, "sub_file": sub_file}
+
+
 _SERVER_URL_RE = re.compile(
     r"^https?://(?P<host>[^/]+)/(?P<hash>[0-9a-fA-F]{40})(?:/(?P<idx>\d+))?"
     r"(?:[/?#]|$)")

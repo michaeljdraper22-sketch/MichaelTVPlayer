@@ -2,20 +2,25 @@
 """Offscreen/live probe for the Stremio handoff feature.
 
 [A] pure parsing (offline): m3u / handoff args / server URLs / S-E
-    markers / name cleanup / bencode / stream ranking
+    markers / name cleanup / bencode / stream ranking / vlc-style
+    launch args (--start-time / --sub-file)
 [B] live catalog + addon chain (Cinemeta, Torrentio): episode lists,
     search, next-episode, stream ranking
 [C] live streaming server (127.0.0.1:11470): health, create, identity
     resolution of a real torrent play URL, full next_playable chain
-[D] single-instance socket relay
-[E] offscreen GUI handoff: playlist arg -> MainWindow.handle_handoff ->
-    PlayerView plays (VLC stubbed to record, no real playback)
+[D] single-instance socket relay (cross-process, like the real exe)
+[E] offscreen GUI handoff in an isolated subprocess: vlc-style launch
+    args -> MainWindow.handle_handoff -> PlayerView plays (VLC stubbed
+    to record, no real playback) -> identity resolution
 [F] fileassoc register/unregister round-trip (does NOT touch UserChoice)
+[G] streampatch round-trip on a temp copy (the live server.js is never
+    touched by the probe)
 
 Run:  .venv\\Scripts\\python.exe probe_stremio.py
 """
 
 import os
+import re
 import sys
 import tempfile
 import time
@@ -82,6 +87,19 @@ def leg_a():
     t = stremio._bdecode(
         b"d4:infod4:name6:Sintel6:lengthi10eee")
     check("bdecode", t == {b"info": {b"name": b"Sintel", b"length": 10}})
+
+    la = stremio.parse_launch_args(
+        ["--start-time=30", "--no-video-title-show",
+         "http://127.0.0.1:11470/" + "a" * 40 + "/2"])
+    check("launch args (vlc-style)", la and la["url"].endswith("/2")
+          and la["start_at"] == 30.0 and la["sub_file"] == "", la)
+    la = stremio.parse_launch_args(
+        ["--sub-file=C:\\x y\\s.srt --no-video-title-show",
+         "https://e/z.mkv"])
+    check("launch args (sub-file)", la and la["url"] == "https://e/z.mkv"
+          and la["sub_file"] == "C:\\x y\\s.srt", la)
+    check("launch args (junk -> None)",
+          stremio.parse_launch_args(["--nothing", "notafile"]) is None)
 
     cfg = Config(dict(DEFAULTS), None)
     fake = [{"name": "A", "title": "S01E01 720p \U0001F464 30 \U0001F4BE 2.0 GB",
@@ -222,73 +240,100 @@ def leg_d():
 
 # ------------------------------------------------------- [E] GUI handoff
 def leg_e():
-    print("\n[E] offscreen GUI handoff")
-    import src.player as player_mod
-    from src.ui.main_window import MainWindow
+    """The GUI leg runs in its own process: building MainWindow (real
+    libVLC) on top of everything legs A-D leave behind proved flaky
+    offscreen."""
+    print("\n[E] offscreen GUI handoff (isolated subprocess)")
+    import subprocess
+    inner = os.path.join(_APPDATA, "leg_e_inner.py")
+    with open(inner, "w", encoding="utf-8") as f:
+        f.write(LEG_E_SRC)
+    env = dict(os.environ)
+    env["MTP_PROBE_URL"] = REAL_URL[0] or ""
+    try:
+        r = subprocess.run([sys.executable, "-u", inner], env=env,
+                           capture_output=True, text=True, timeout=240)
+    except subprocess.TimeoutExpired:
+        check("leg E subprocess finished", False, "timeout after 240s")
+        return
+    out = (r.stdout or "") + (r.stderr or "")
+    saw = 0
+    for line in out.splitlines():
+        if line.startswith("LEG_E "):
+            body = line[6:]
+            m = re.search(r" (OK|FAIL)\|", body)
+            if m:
+                check(body[:m.start()], m.group(1) == "OK", body[m.end():])
+                saw += 1
+    check("leg E produced checks", saw >= 5, "%d checks" % saw)
+    check("leg E subprocess clean exit", r.returncode == 0,
+          out[-300:] if r.returncode else "")
 
-    plays = []
-    orig_play = player_mod.VLCPlayer.play
 
-    def _fake_play(self, url, timeshift=None, start_seconds=0.0,
-                   start_wait_s=20.0):
-        plays.append((url, start_wait_s))
-        self._start_ok = True
-    player_mod.VLCPlayer.play = _fake_play
+LEG_E_SRC = r'''
+import os, sys, time, tempfile
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["APPDATA"] = tempfile.mkdtemp(prefix="mtp_legE_")
+sys.path.insert(0, r"D:\Coding\MichaelTVPlayer")
 
-    app = QtWidgets.QApplication.instance()
-    cfg = Config.load()
-    if not cfg.has_account():
-        # mirror main.py's no-account handoff bypass: dummy unreachable
-        # panel so MainWindow (and its player) can build
-        cfg.data["server_url"] = "http://127.0.0.1:9"
-    win = MainWindow(cfg)
-    path = os.path.join(_APPDATA, "handoff.m3u")
-    url = REAL_URL[0] or ("http://127.0.0.1:11470/"
-                          "8ac2f2df3db05b8f9e7a4b11c8dbf8a1c3d5e7f9/1")
-    with open(path, "w", encoding="utf-8") as f:
-        f.write("#EXTM3U\n#EXTINF:0\n%s\n" % url)
-    win.handle_handoff([path])
-    # offscreen the video-surface attach is pending — play_media defers
-    # until the attach callback runs (the normal first-launch path), so
-    # wait for it instead of checking immediately
-    cur = {}
-    for _ in range(150):
+def report(name, ok, detail=""):
+    print("LEG_E %s %s|%s" % (name, "OK" if ok else "FAIL", detail),
+          flush=True)
+
+from PyQt5 import QtWidgets
+app = QtWidgets.QApplication(sys.argv)
+import src.player as player_mod
+plays = []
+
+def _fake_play(self, url, timeshift=None, start_seconds=0.0,
+               start_wait_s=20.0, sub_file=None):
+    plays.append((url, start_wait_s, sub_file, start_seconds))
+    self._start_ok = True
+
+player_mod.VLCPlayer.play = _fake_play
+from src.config import Config
+cfg = Config.load()
+if not cfg.has_account():
+    cfg.data["server_url"] = "http://127.0.0.1:9"
+from src.ui.main_window import MainWindow
+win = MainWindow(cfg)
+url = os.environ.get("MTP_PROBE_URL") or (
+    "http://127.0.0.1:11470/8ac2f2df3db05b8f9e7a4b11c8dbf8a1c3d5e7f9/1")
+m3u = os.path.join(os.environ["APPDATA"], "handoff.m3u")
+with open(m3u, "w", encoding="utf-8") as f:
+    f.write("#EXTM3U\n#EXTINF:0\n%s\n" % url)
+# exactly what the patched Stremio server sends: vlc flags + the source
+win.handle_handoff(["--start-time=12", "--no-video-title-show",
+                    "--sub-file=does-not-exist.srt", m3u])
+cur = {}
+for _ in range(150):
+    app.processEvents()
+    cur = win.player_view.current or {}
+    if cur.get("kind") == "stremio":
+        break
+    time.sleep(0.05)
+report("handoff -> playing", cur.get("kind") == "stremio"
+       and "11470" in cur.get("url", ""), str(cur.get("url", ""))[:60])
+report("stremio start wait 60s", bool(plays) and plays[0][1] == 60.0)
+report("start-time carried", bool(plays) and plays[0][3] == 12.0)
+n_before = len(plays)
+win.handle_handoff(["not-a-file"])
+report("junk handoff ignored", len(plays) == n_before)
+report("recents got it", any(r.get("fav_key") == cur.get("fav_key")
+                             for r in cfg.recents))
+if os.environ.get("MTP_PROBE_URL"):
+    ident = False
+    for _ in range(200):
         app.processEvents()
-        cur = win.player_view.current or {}
-        if cur.get("kind") == "stremio":
+        c = win.player_view.current or {}
+        ident = bool(c.get("stremio_imdb") and c.get("season"))
+        if ident:
             break
-        time.sleep(0.05)
-    check("handoff -> playing", cur.get("kind") == "stremio" and
-          "11470" in cur.get("url", ""), cur)
-    check("stremio start wait 60s", plays and plays[0][1] == 60.0, plays)
-    check("recents got it", any(r.get("fav_key") == cur.get("fav_key")
-                                for r in cfg.recents))
-    # relaunch-with-junk just raises the window (no crash, no play)
-    n_before = len(plays)
-    win.handle_handoff(["not-a-file"])
-    check("junk handoff ignored", len(plays) == n_before)
-
-    # identity resolution fires (network) and fills the playable
-    ident_ok = [False]
-
-    def _poll():
-        ident_ok[0] = bool(win.player_view.current.get("stremio_imdb")
-                           and win.player_view.current.get("season"))
-    if REAL_URL[0]:
-        for _ in range(200):          # up to ~30s for the catalog chain
-            app.processEvents()
-            _poll()
-            if ident_ok[0]:
-                break
-            time.sleep(0.15)
-        check("identity resolved into playable", ident_ok[0],
-              win.player_view.current.get("title"))
-    else:
-        print("SKIP identity resolved into playable (leg C had no live "
-              "server URL)")
-
-    player_mod.VLCPlayer.play = orig_play
-    win.close()
+        time.sleep(0.15)
+    report("identity resolved into playable", ident,
+           str(win.player_view.current.get("title", "")))
+win.close()
+'''
 
 
 # ---------------------------------------------------------- [F] fileassoc
@@ -320,15 +365,45 @@ def leg_f():
         check("unregister removed progid", True)
 
 
+# ------------------------------------------------ [G] streampatch
+def leg_g():
+    print("\n[G] streampatch round-trip (temp copy - live file untouched)")
+    from src import streampatch as sp
+    # the sample file embeds the module's own _ORIGINAL line, so the
+    # fixture can never drift from what the patcher expects
+    sample = "x: 1,\n            win32: {\n" + sp._ORIGINAL \
+        + "\n            }\n"
+    tmp = os.path.join(tempfile.mkdtemp(prefix="mtp_sp_"), "server.js")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(sample)
+    real_finder = sp.find_server_js
+    sp.find_server_js = lambda: tmp
+    try:
+        check("not patched initially", not sp.is_patched())
+        check("patch applies", sp.patch())
+        with open(tmp, "r", encoding="utf-8") as f:
+            patched = f.read()
+        check("patch redirects vlc paths",
+              "VideoLAN" not in patched and "MichaelTV" in patched
+              and sp._MARKER in patched, patched[:120])
+        check("patch idempotent", sp.patch() and sp.is_patched())
+        check("restore round-trips", sp.restore())
+        with open(tmp, "r", encoding="utf-8") as f:
+            check("restore byte-identical", f.read() == sample)
+    finally:
+        sp.find_server_js = real_finder
+
+
 if __name__ == "__main__":
     from PyQt5 import QtWidgets
-    app = QtWidgets.QApplication(sys.argv)   # one app for legs D + E
+    app = QtWidgets.QApplication(sys.argv)   # one app for leg D
     leg_a()
     leg_b()
     leg_c()
     leg_d()
     leg_e()
     leg_f()
+    leg_g()
     print("\n%s (%d failures)" % ("ALL PASS" if not FAILS else "FAILURES",
                                   len(FAILS)))
     for f in FAILS:

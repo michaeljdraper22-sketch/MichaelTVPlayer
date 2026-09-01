@@ -253,7 +253,8 @@ class VLCPlayer:
     def play_at(self, url: str, start_seconds: float = 0.0,
                 record_path: str = None,
                 append: bool = False, timeshift: bool = None,
-                start_wait_s: float = 20.0) -> None:
+                start_wait_s: float = 20.0,
+                sub_file: str = None) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
@@ -292,6 +293,16 @@ class VLCPlayer:
             except Exception as exc:
                 try:
                     log.warning("play_at: add start-time failed: %r", exc)
+                except Exception:
+                    pass
+        if sub_file:
+            # external subtitle file (e.g. the srt Stremio downloads for
+            # its external players) — attach it as the media's sub-file
+            try:
+                self.media.add_option("sub-file=%s" % sub_file)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    log.warning("play_at: add sub-file failed: %r", exc)
                 except Exception:
                     pass
         try:
@@ -381,9 +392,10 @@ class VLCPlayer:
             pass
 
     def play(self, url: str, timeshift: bool = None,
-             start_seconds: float = 0.0, start_wait_s: float = 20.0) -> None:
+             start_seconds: float = 0.0, start_wait_s: float = 20.0,
+             sub_file: str = None) -> None:
         self.play_at(url, start_seconds, timeshift=timeshift,
-                     start_wait_s=start_wait_s)
+                     start_wait_s=start_wait_s, sub_file=sub_file)
 
     def play_and_record(self, url: str, path: str, append: bool = False) -> None:
         """Backwards-compatible wrapper around play_at()."""

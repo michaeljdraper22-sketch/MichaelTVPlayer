@@ -47,6 +47,24 @@ class StremioDialog(QtWidgets.QDialog):
         row.addStretch(1)
         lay.addLayout(row)
 
+        lay.addSpacing(4)
+
+        # ---- Stremio's own "open in VLC" button ----------------------
+        # (that button is the local streaming server spawning a hardcoded
+        # vlc.exe; the patch redirects it at MichaelTV)
+        self.patch_lbl = QtWidgets.QLabel("")
+        self.patch_lbl.setWordWrap(True)
+        lay.addWidget(self.patch_lbl)
+        row2 = QtWidgets.QHBoxLayout()
+        self.btn_repatch = QtWidgets.QPushButton("Redirect it to MichaelTV")
+        self.btn_repatch.clicked.connect(self._repatch)
+        self.btn_unpatch = QtWidgets.QPushButton("Restore VLC")
+        self.btn_unpatch.clicked.connect(self._unpatch)
+        row2.addWidget(self.btn_repatch)
+        row2.addWidget(self.btn_unpatch)
+        row2.addStretch(1)
+        lay.addLayout(row2)
+
         lay.addSpacing(8)
 
         # ---- next-episode sources ------------------------------------
@@ -94,6 +112,42 @@ class StremioDialog(QtWidgets.QDialog):
         lay.addWidget(bb)
 
         self._refresh_status()
+        self._refresh_patch_status()
+
+    # ---- Stremio button redirect ----
+
+    def _refresh_patch_status(self):
+        from .. import streampatch
+        st = streampatch.status()
+        if not st["found"]:
+            self.patch_lbl.setText(
+                "Stremio’s streaming server (server.js) was not found "
+            "— the in-player “Open in VLC” button will keep "
+            "opening VLC.")
+            self.btn_repatch.setEnabled(False)
+            self.btn_unpatch.setEnabled(False)
+            return
+        self.btn_repatch.setEnabled(True)
+        self.btn_unpatch.setEnabled(st["patched"] and st["backup"])
+        if st["patched"]:
+            self.patch_lbl.setText(
+                "✓ Stremio’s “Open in VLC” button "
+                "launches MichaelTV (takes effect after Stremio restarts; "
+                "re-applied automatically after Stremio updates).")
+        else:
+            self.patch_lbl.setText(
+                "Stremio’s “Open in VLC” button currently "
+                "launches VLC. Redirect it to MichaelTV?")
+
+    def _repatch(self):
+        from .. import streampatch
+        streampatch.patch()
+        self._refresh_patch_status()
+
+    def _unpatch(self):
+        from .. import streampatch
+        streampatch.restore()
+        self._refresh_patch_status()
 
     # ---- default handler ----
 
