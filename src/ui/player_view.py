@@ -6120,6 +6120,13 @@ class PlayerView(QtWidgets.QWidget):
         """
         if not self.config.profanity.get("enabled"):
             return
+        if kind == "stremio":
+            # the relay (embedded tracks) was already routed in
+            # _effective_url; the handoff's EXTERNAL subtitle file is the
+            # other half — most debrid/torrent files carry no text track
+            # at all, so without it the filter has nothing to read
+            self._load_stremio_sub_cues()
+            return
         if kind != "live" or not self._is_dvrable():
             return
         if not find_ccextractor():
@@ -6131,6 +6138,40 @@ class PlayerView(QtWidgets.QWidget):
             return
         if self._mode == "chase" and self._cc_source is None:
             self._start_cc_when_buffer(tries_left=75)
+
+    def _load_stremio_sub_cues(self):
+        """Stremio handoff: feed the handed-off subtitle file's cues to the
+        filter. The file's timestamps sit on the video's own timeline
+        (VLC's get_time axis) — pre-timed like a VOD track, so the same
+        measured mute lead applies. Safe to re-run when the user toggles
+        the filter mid-stream: identical windows merge."""
+        cur = self.current or {}
+        path = cur.get("sub_file") or ""
+        if self._closing or cur.get("kind") != "stremio" or not path:
+            return
+        text = prof_mod.read_subtitle_text(path)
+        if not text:
+            try:
+                log.warning("profanity: stremio sub file unreadable: %r",
+                            path)
+            except Exception:
+                pass
+            return
+        parser = prof_mod.SrtParser()
+        cues = parser.feed(text) + parser.flush()
+        for start, end, line in cues:
+            self._filter_engine.add_cue(start, end, line,
+                                        lead_s=_VOD_MUTE_LEAD_S)
+        if cues:
+            # direct playback (relay refused the stream) never started the
+            # evaluation loop — without it the windows pile up unapplied
+            self._filter_timer.start()
+        try:
+            log.info("profanity: stremio external subs — %d cues, %d "
+                     "mute windows (%s)", len(cues),
+                     len(self._filter_engine.windows), path)
+        except Exception:
+            pass
 
     def _start_cc_when_buffer(self, tries_left: int = 75):
         """Wait for the DVR buffer to hold data, then start the caption
@@ -6442,7 +6483,8 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing or not self._filter_engine.enabled \
                 or not self._filter_engine.windows:
             return
-        if self._mode == "chase" or self._is_vod():
+        if (self._mode == "chase" or self._is_vod()
+                or (self.current or {}).get("kind") == "stremio"):
             self._filter_engine.evaluate(self._caption_clock_s())
 
     def _stop_profanity(self, keep_windows: bool = False):

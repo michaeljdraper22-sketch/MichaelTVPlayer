@@ -265,6 +265,28 @@ def mask_text(text: str, words) -> str:
     return "".join(out)
 
 
+def read_subtitle_text(path: str):
+    """External subtitle file -> text, or None when unreadable.
+
+    Stremio hands its subtitles over as a file (--sub-file=...); encodings
+    vary by source (UTF-8 with/without BOM, occasionally UTF-16). A BOM
+    settles it; otherwise UTF-8 with replacement characters — a mojibake
+    word or two beats losing the whole filter pass.
+    """
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if data.startswith(b"\xff\xfe"):
+        return data[2:].decode("utf-16-le", "replace")
+    if data.startswith(b"\xfe\xff"):
+        return data[2:].decode("utf-16-be", "replace")
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    return data.decode("utf-8", "replace")
+
+
 def find_ffmpeg() -> str:
     """Locate ffmpeg.exe (PATH, then the common winget location).
 
