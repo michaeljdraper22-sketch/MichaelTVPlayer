@@ -114,6 +114,38 @@ def leg_a():
     check("SE marker 2x05", stremio.parse_se("Show 2x05 REPACK") == (2, 5))
     check("SE marker none", stremio.parse_se("A Movie 2023 1080p") is None)
 
+    # url_episode_seed: the S/E marker in a handoff URL seeds the playable
+    # at OPEN (episode buttons visible immediately; identity refines later)
+    seed = stremio.url_episode_seed(
+        "https://torrentio.strem.fun/resolve/torbox/"
+        "1f7be332-5fea-4aa8-8814-46eabea63736/"
+        "03727f0bdebfd938dc6d56986ae7dc45429416dd/"
+        "Adventure.Time.S02E25.1080p.BluRay.EAC3.AV1-TiZU.mkv/50/"
+        "Adventure.Time.S02E25.1080p.BluRay.EAC3.AV1-TiZU.mkv")
+    check("seed from torrentio resolve URL", seed.get("season") == 2
+          and seed.get("episode") == 25
+          and "S02E25" in (seed.get("file_name") or ""), seed)
+    seed = stremio.url_episode_seed(
+        "https://addon.debridio.com/play/series/premiumize/k/h/h/"
+        "Silo.S03E07.WEB-DL.2160p.DV.HDR10.mkv")
+    check("seed from debridio URL", seed.get("season") == 3
+          and seed.get("episode") == 7, seed)
+    seed = stremio.url_episode_seed(
+        "https://addon.debridio.com/play/movie/premiumize/k/h/h/"
+        "%D0%91%D0%B5%D1%88%D0%B5%D0%BD%D1%8B%D0%B5%20%D0%BF%D1%81%D1%8B"
+        "%20Reservoir.Dogs.1992.2160p.mkv")
+    check("seed: movie URL -> empty", seed == {}, seed)
+    p = stremio.playable_from_url(
+        "https://addon.debridio.com/play/series/premiumize/k/h/h/"
+        "Silo.S03E07.WEB-DL.2160p.DV.HDR10.mkv")
+    check("playable_from_url carries the seed at open",
+          p.get("season") == 3 and p.get("episode") == 7
+          and p.get("kind") == "stremio", (p.get("season"),
+                                           p.get("episode")))
+    p = stremio.playable_from_url("https://cdn.example/movie.mkv")
+    check("playable_from_url plain movie: no seed",
+          "season" not in p and "episode" not in p, p.get("season"))
+
     # find_series single-word floor: a one-word show name ("Silo") used
     # to produce ZERO queries (range(min(4, len-1)) == range(0)) — the
     # live identity dead-end behind the missing episode buttons

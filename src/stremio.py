@@ -694,9 +694,43 @@ def resolve_identity(url: str, server: StreamingServer):
     }
 
 
+def url_episode_seed(url: str) -> dict:
+    """Season/episode parsed straight from a handoff URL's file name.
+
+    Debrid/addon resolve links carry the episode file name in the path
+    (torrentio duplicates it as the last segment, Debridio ends in the
+    .mkv name), so the season/episode marker is available the moment the
+    handoff arrives — no catalog round-trip. The player seeds the playable
+    with it so the episode buttons exist from OPEN instead of after the
+    background identity lookup (10-30 s on a cold addon chain);
+    resolve_identity still runs and refines series/imdb/episode-name.
+    Returns {} when the tail carries no S/E marker (movies, server URLs).
+    """
+    tail = url.rstrip("/").split("/")[-1]
+    tail = re.sub(r"\.(mkv|mp4|avi|ts|webm|strm)(\?.*)?$", "", tail,
+                  flags=re.IGNORECASE)
+    try:
+        from urllib.parse import unquote
+        tail = unquote(tail)
+    except Exception:  # noqa: BLE001
+        pass
+    se = parse_se(tail)
+    if not se:
+        return {}
+    return {"season": se[0], "episode": se[1], "file_name": tail}
+
+
 def playable_from_url(url: str) -> dict:
     """The initial playable for a handed-off URL (identity fields are
-    filled in later, in place, by resolve_identity)."""
+    filled in later, in place, by resolve_identity). A season/episode
+    marker visible in the URL itself is seeded right away — see
+    url_episode_seed."""
+    p = _playable_base(url)
+    p.update(url_episode_seed(url))
+    return p
+
+
+def _playable_base(url: str) -> dict:
     parsed = parse_server_url(url)
     if parsed:
         info_hash, file_idx = parsed

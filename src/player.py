@@ -657,10 +657,18 @@ class VLCPlayer:
         self.player.set_position(max(0.0, min(1.0, float(frac))))
 
     def jump_to_live(self) -> None:
-        """Seek to the live edge of the timeshift buffer."""
+        """Seek to the live edge of the timeshift buffer — or the END of
+        the file for VOD. The target lands 1.5 s SHORT of the length:
+        real VLC clamps a set_time at exactly the length back to the last
+        cue and then crawls for tens of seconds WITHOUT ever raising
+        end-of-media (measured 16.8 s on a 20 s http mkv; the 2026-09-01
+        18:13 incident — LIVE pressed twice on a Stremio episode, zero
+        effect, autoplay never fired). 1.5 s short, VLC plays the final
+        instants and reaches genuine "ended" in ~2 s, which is what the
+        park-at-end scrubber and autoplay-next both key on."""
         length = self.get_length()
         if length > 0:
-            self.player.set_time(int(length))
+            self.player.set_time(max(0, int(length) - 1500))
         else:
             try:
                 self.player.set_position(0.999)
