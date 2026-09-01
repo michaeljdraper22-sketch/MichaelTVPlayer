@@ -395,14 +395,16 @@ def autoplay(on):
 def play_next():
     """Play next (next episode / next channel), per the user's mockup: a
     chunky SOLID right-pointing triangle with a SOLID rounded-cap bar on
-    its heel — the skip-forward glyph, no frame."""
+    its heel — the skip-forward glyph, no frame. Drawn at 75% of the
+    mockup's extent so its white area matches the play / live glyphs
+    (full-canvas it read visually larger than every other button)."""
     def draw(p, c):
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(c)
         p.drawPolygon(QtGui.QPolygonF(
-            [_F(1.8, 5.4), _F(1.8, 18.6), _F(17.8, 12.0)]))
-        p.drawRoundedRect(QtCore.QRectF(19.4, 5.4, 2.6, 13.2), 1.3, 1.3)
-    return _icon("play_next4", draw)
+            [_F(4.3, 7.0), _F(4.3, 17.0), _F(16.3, 12.0)]))
+        p.drawRoundedRect(QtCore.QRectF(17.5, 7.0, 2.0, 10.0), 1.0, 1.0)
+    return _icon("play_next5", draw)
 
 
 def play_prev():
@@ -412,9 +414,9 @@ def play_prev():
         p.setPen(QtCore.Qt.NoPen)
         p.setBrush(c)
         p.drawPolygon(QtGui.QPolygonF(
-            [_F(22.2, 5.4), _F(22.2, 18.6), _F(6.2, 12.0)]))
-        p.drawRoundedRect(QtCore.QRectF(2.0, 5.4, 2.6, 13.2), 1.3, 1.3)
-    return _icon("play_prev", draw)
+            [_F(19.7, 7.0), _F(19.7, 17.0), _F(7.7, 12.0)]))
+        p.drawRoundedRect(QtCore.QRectF(4.5, 7.0, 2.0, 10.0), 1.0, 1.0)
+    return _icon("play_prev2", draw)
 
 
 def check():
