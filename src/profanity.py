@@ -287,6 +287,63 @@ def read_subtitle_text(path: str):
     return data.decode("utf-8", "replace")
 
 
+def _parse_ass_clock(s: str):
+    """ASS timestamp 'H:MM:SS.CS' ('0:00:20.00') -> seconds, or None.
+
+    Centiseconds are the format default, but a third digit (milliseconds)
+    is tolerated — the divisor follows the digit count either way."""
+    m = re.match(r"^(\d+):(\d{1,2}):(\d{1,2})[.,](\d{1,3})$",
+                 (s or "").strip())
+    if not m:
+        return None
+    h, mnt, sec, frac = m.group(1), m.group(2), m.group(3), m.group(4)
+    return (int(h) * 3600 + int(mnt) * 60 + int(sec)
+            + int(frac) / (1000.0 if len(frac) == 3 else 100.0))
+
+
+def _parse_ass_events(text: str) -> list:
+    """An ASS/SSA file's [Events] section -> [(start_s, end_s, text)].
+
+    Dialogue lines carry 10 comma fields (Layer,Start,End,...,Text); the
+    Text field flattens exactly like an embedded MKV ASS payload does
+    (mkv_subs.flatten_ass_text: override blocks, drawings and tags drop,
+    \\N becomes a line break). Comment: events are skipped."""
+    from .mkv_subs import flatten_ass_text   # mkv_subs imports nothing app-side
+    cues = []
+    for ln in text.splitlines():
+        low = ln.strip().lower()
+        if not low.startswith(("dialogue:", "comment:")):
+            continue
+        parts = ln.split(",", 9)
+        if len(parts) < 10 or low.startswith("comment:"):
+            continue
+        start = _parse_ass_clock(parts[1])
+        end = _parse_ass_clock(parts[2])
+        if start is None or end is None:
+            continue
+        body = flatten_ass_text(parts[9])
+        if body:
+            cues.append((start, end, body))
+    return cues
+
+
+def parse_subtitle_cues(text: str) -> list:
+    """A subtitle file's whole text -> [(start_s, end_s, text)] cues.
+
+    SRT and WebVTT ride the tolerant SRT parser (dot timing and cue
+    settings already accepted); ASS/SSA files are read off their
+    Dialogue lines. Line breaks inside a cue are preserved — the caption
+    overlay renders multi-line windows; the filter matches whole text
+    either way. Anything unrecognised yields [] so callers can fall back
+    to VLC's own rendering."""
+    if not text:
+        return []
+    if re.search(r"(?im)^\s*dialogue\s*:", text):
+        return _parse_ass_events(text)
+    parser = SrtParser(keep_lines=True)
+    return parser.feed(text) + parser.flush()
+
+
 def find_ffmpeg() -> str:
     """Locate ffmpeg.exe (PATH, then the common winget location).
 

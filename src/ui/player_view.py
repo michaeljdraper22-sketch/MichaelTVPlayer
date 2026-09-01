@@ -32,6 +32,10 @@ from .worker import AsyncRunner, FileDownloader
 
 log = logging.getLogger("mtp")
 
+# VLC's name for an external sub-file slave: a bare "Track N" with no
+# language evidence after it (see PlayerView._stremio_ext_slave)
+_EXT_SLAVE_RE = re.compile(r"^track \d+$", re.I)
+
 
 def now_s() -> float:
     """Wall-clock seconds for every timing gate in the playback/caption
@@ -674,6 +678,11 @@ class PlayerView(QtWidgets.QWidget):
         # caption overlay: app-rendered subtitles, one style for every
         # text source (live CC via CCExtractor, VOD SRT via the relay)
         self._cap_cues = CueStore()   # every cue, both sources
+        self._stremio_sub_cues = []   # the Stremio handoff's sub file, parsed
+        self._stremio_sub_path = ""   # the file those cues came from
+        self._cap_store_ext = False   # the handoff file owns _cap_cues
+        #                              # (relay cues then feed the FILTER
+        #                              # only — no double-painted lines)
         self._cap_tick_errs = set()   # distinct _caption_tick errors
         #                              # already logged (once-per-error)
         self._cap_on = False          # the overlay owns caption rendering
@@ -1304,6 +1313,12 @@ class PlayerView(QtWidgets.QWidget):
                     and self.current.get("kind") in ("vod", "series",
                                                      "catchup"))
 
+    def _is_stremio(self) -> bool:
+        """A Stremio handoff stream: plays in plain live mode (no DVR
+        chase), yet its cues are pre-timed on the file's own timeline —
+        caption-wise it behaves like VOD."""
+        return bool(self.current and self.current.get("kind") == "stremio")
+
     def _is_catchup(self) -> bool:
         """A provider catch-up (archive) program — window-downloadable."""
         return bool(self.current and self.current.get("kind") == "catchup")
@@ -1695,6 +1710,9 @@ class PlayerView(QtWidgets.QWidget):
         # then the live caption reader + filter windows go.
         self._set_cap_on(False)
         self._cap_fail = False
+        self._cap_store_ext = False
+        self._stremio_sub_cues = []
+        self._stremio_sub_path = ""
         self._stop_profanity()
         self._cap_cues.clear()
         self._cap_tick_errs.clear()   # a new media logs its own errors
@@ -1831,6 +1849,10 @@ class PlayerView(QtWidgets.QWidget):
         # tick) re-selects a track with the same NAME once the new media's
         # tracks appear, and leaves subtitles off when it has none.
         self._on_media_for_profanity(kind)
+        if kind == "stremio":
+            # the handoff's own subtitle file: restyle it at OPEN (VLC
+            # would auto-show it with freetype/libass styling otherwise)
+            self._auto_stremio_subs()
         if kind == "live" and self.client and playable.get("stream_id"):
             self.runner.run(self.client.short_epg, playable["stream_id"], 4)
 
@@ -4841,6 +4863,14 @@ class PlayerView(QtWidgets.QWidget):
             if self._cap_on:
                 if self.vlc.active_spu() != -1:
                     self.vlc.set_spu(-1)
+                if self._cap_store_ext and self._spu_want == -1:
+                    # the handoff's slave track finally surfaced in VLC's
+                    # list: adopt its id+name so the CC menu checkmark and
+                    # any VLC fallback point at the right row
+                    for tid, name in self.vlc.spu_tracks():
+                        if self._stremio_ext_slave(name):
+                            self._spu_want, self._spu_name = tid, name
+                            break
                 self._refresh_spu_button()
                 return
             tracks = self.vlc.spu_tracks()
@@ -4948,11 +4978,13 @@ class PlayerView(QtWidgets.QWidget):
 
     def _cap_eligible(self, name: str) -> bool:
         """Can the overlay render this track? Text always; ASS and plain
-        names only on VOD (the relay's MKV parser flattens ASS to text
-        there — live has no ASS tracks, so VLC keeps those)."""
+        names on VOD and Stremio handoffs (the relay's MKV parser
+        flattens ASS to text there, and a Stremio handoff's own sub FILE
+        is parsed directly — live has no ASS tracks, so VLC keeps those)."""
         kind = self._cap_track_kind(name)
         return (kind == "text"
-                or (kind in ("other", "ass") and self._is_vod()))
+                or (kind in ("other", "ass")
+                    and (self._is_vod() or self._is_stremio())))
 
     @staticmethod
     def _cap_lang_hint(name: str) -> str:
@@ -4979,7 +5011,9 @@ class PlayerView(QtWidgets.QWidget):
         overlay with ONE style. Live: CCSource tails the DVR buffer (zero
         extra connections). VOD: playback routes through the local relay
         so the MKV parser can feed cues (restarts in place when the relay
-        isn't up yet)."""
+        isn't up yet). Stremio: the handoff's own sub FILE is parsed
+        directly (no relay needed); an embedded pick rides the relay
+        exactly like VOD."""
         if self._closing or self._cap_fail:
             return
         self._cap_want = True
@@ -4995,6 +5029,23 @@ class PlayerView(QtWidgets.QWidget):
                 self._start_cc_when_buffer(tries_left=75)
             # buffer still filling (or REC pre-chase): _start_chase_now
             # engages the moment chase playback enters
+        elif self._is_stremio():
+            if (self.current or {}).get("sub_file") and (
+                    self._vod_relay is None
+                    or self._stremio_ext_slave(self._spu_name)):
+                # the handoff's own file: parse it directly, no relay
+                self._engage_stremio_external()
+            elif self._vod_relay is not None:
+                # an embedded pick: the relay's parser feeds the overlay.
+                # Ownership flips — the file's cues must leave the store,
+                # or newest-wins flickers between the two sources.
+                if self._cap_store_ext:
+                    self._cap_cues.clear()
+                    self._cap_store_ext = False
+                self._set_cap_on(True)
+                self._schedule_cap_vod_check()
+            else:
+                self._restart_through_relay()
         elif self._is_vod():
             if self._vod_relay is not None:
                 self._set_cap_on(True)
@@ -5011,6 +5062,91 @@ class PlayerView(QtWidgets.QWidget):
                 self._schedule_cap_vod_check()
             else:
                 self._restart_through_relay()
+
+    def _stremio_ext_slave(self, name: str) -> bool:
+        """Is this VLC track the handoff's external sub-file slave?
+
+        VLC names the sub-file slave GENERICTALLY — 'Track 1', never the
+        file's name (measured with the bundled VLC: a plain x.srt and a
+        'S01E02-English- [opensubtitles.com].srt' both list as Track 1,
+        auto-selected) — while embedded MKV tracks carry language
+        evidence ('English (United States) - [English]', or at least
+        'Track 2 - [Eng]'). A bare 'Track N' with nothing after it is
+        the slave's signature."""
+        return bool(_EXT_SLAVE_RE.match((name or "").strip()))
+
+    def _stremio_handoff_cues(self) -> list:
+        """The handoff's external subtitle file, parsed once per media.
+
+        Stremio downloads the user's subtitle pick and hands it over as a
+        file (--sub-file=...): SRT/VTT/ASS, its cues pre-timed on the
+        video's own timeline (VLC's get_time axis). Cached by path so the
+        filter pass, the overlay engage and mid-stream re-engages all
+        share ONE read/parse. [] when there is nothing to render."""
+        cur = self.current or {}
+        path = cur.get("sub_file") or ""
+        if self._closing or cur.get("kind") != "stremio" or not path:
+            return []
+        if self._stremio_sub_path != path:
+            text = prof_mod.read_subtitle_text(path)
+            cues = prof_mod.parse_subtitle_cues(text) if text else []
+            if text is None:
+                try:
+                    log.warning("stremio subs: file unreadable: %r", path)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._stremio_sub_cues = cues
+            self._stremio_sub_path = path
+            try:
+                log.info("stremio subs: %d cues from %s", len(cues), path)
+            except Exception:  # noqa: BLE001
+                pass
+        return self._stremio_sub_cues
+
+    def _engage_stremio_external(self):
+        """Overlay renders the handoff's sub file with the app's ONE
+        style (font/size/colors/placement live from the config — VLC's
+        freetype/libass rendering stays wired as the fallback)."""
+        if self._closing:
+            return
+        cues = self._stremio_handoff_cues()
+        if not cues:
+            # unreadable or a foreign format: VLC keeps the file itself
+            self._cap_fail = True
+            return
+        if not self._cap_store_ext:
+            # the file owns the store: relay cues (if the filter routed
+            # the stream through the relay) stop painting — same lines,
+            # slightly different timing, newest-wins would flicker
+            self._cap_cues.clear()
+            self._cap_store_ext = True
+        for start, end, text in cues:
+            self._cap_cues.add(start, end, text)
+        self._cap_fail = False       # the file just parsed: source alive
+        self._set_cap_on(True)       # and VLC's own spu goes OFF
+
+    def _auto_stremio_subs(self):
+        """play_media(): a Stremio handoff carries the user's subtitle
+        pick as a FILE — VLC auto-shows it with its OWN renderer (freetype
+        styling that ignores the app's), so take it over at open and let
+        the overlay render it instead. Quiet: no pill, no flash.
+
+        The file outranks the app's STICKY language pick (it is the more
+        recent deliberate choice); only an overlay already engaged for
+        this media (the sticky language rode the relay in) defers. An
+        unparseable file stays on VLC."""
+        cur = self.current or {}
+        if self._closing or cur.get("kind") != "stremio":
+            return
+        if not cur.get("sub_file") or self._cap_on:
+            return
+        cues = self._stremio_handoff_cues()
+        if not cues:
+            return
+        self._spu_want = -1      # adopted once VLC lists the slave track
+        self._spu_name = os.path.splitext(
+            os.path.basename(cur.get("sub_file")))[0]
+        self._engage_stremio_external()
 
     def _disengage_caption_overlay(self):
         """Subtitles Off (or a VLC-rendered track): stop the overlay. The
@@ -5215,7 +5351,7 @@ class PlayerView(QtWidgets.QWidget):
             return
         try:
             chase = self._mode == "chase" and self.dvr
-            if chase or self._is_vod():
+            if chase or self._is_vod() or self._is_stremio():
                 if chase:
                     # the deferred arrival-batch anchor lands here (see
                     # _cc_flush_pending) — before the paint decision
@@ -5371,11 +5507,12 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_note("Subtitles: switched to VLC rendering")
 
     def _restart_through_relay(self):
-        """Re-open the current VOD through the local relay so the caption
-        overlay can read its subtitle track (ONE connection: the direct
-        provider stream is replaced, never duplicated). Playback resumes
-        at the current position."""
-        if self._closing or not self._is_vod() or self._vod_relay:
+        """Re-open the current VOD (or Stremio handoff) through the local
+        relay so the caption overlay can read its subtitle track (ONE
+        connection: the direct provider stream is replaced, never
+        duplicated). Playback resumes at the current position."""
+        if self._closing or not (self._is_vod() or self._is_stremio()) \
+                or self._vod_relay:
             return
         cur = dict(self.current or {})
         if not cur.get("url"):
@@ -5392,9 +5529,27 @@ class PlayerView(QtWidgets.QWidget):
             60, lambda: None if self._closing
             else self.play_media(cur, start_at=start_at))
 
+    def _stremio_external_takeover(self) -> bool:
+        """A relay/embedded dead-end on a Stremio handoff: if the handoff's
+        own sub FILE parses, the overlay renders IT (app styling) instead
+        of falling back to VLC's freetype or going dark. True when the
+        takeover happened."""
+        if not (self._is_stremio() and (self.current or {}).get("sub_file")):
+            return False
+        if not self._stremio_handoff_cues():
+            return False
+        self._spu_want = -1     # re-adopted once VLC lists the slave
+        self._spu_name = ""
+        self._engage_stremio_external()
+        return True
+
     def _cap_vod_handoff(self, note: str, log_msg: str, *log_args):
         """Give VOD captions back to VLC's own renderer (the overlay can
         offer nothing on this file) and latch the failure for the media."""
+        if self._stremio_external_takeover():
+            # the handoff's own FILE survives the relay dead-end — the
+            # overlay keeps rendering, app-styled
+            return
         try:
             log.info(log_msg, *log_args)
         except Exception:
@@ -5466,6 +5621,9 @@ class PlayerView(QtWidgets.QWidget):
             # stay OFF. Deliberately NOT the VLC handoff — that re-enabled
             # VLC's own track selection, which then rendered the non-English
             # track (the "subtitles default to a foreign language" bug).
+            # A Stremio handoff's own FILE escapes the dark-out instead.
+            if self._stremio_external_takeover():
+                return
             metas = getattr(relay, "parser_tracks_meta", None) or {}
             langs = sorted({str(m.get("lang") or m.get("name") or "?")
                             for m in metas.values()})
@@ -6112,7 +6270,13 @@ class PlayerView(QtWidgets.QWidget):
         # measured ~0.5 s late-mute trim applies (see _VOD_MUTE_LEAD_S)
         self._filter_engine.add_cue(start, end, text,
                                     lead_s=_VOD_MUTE_LEAD_S)
-        self._cap_cues.add(start, end, text)
+        if not self._cap_store_ext:
+            # while the Stremio handoff's FILE owns the overlay store, the
+            # relay's embedded cues still reach the FILTER (muting) but
+            # never the painter — the two sources are usually the same
+            # lines on slightly different timing, and the store's
+            # newest-wins policy would flicker between them
+            self._cap_cues.add(start, end, text)
 
     def _on_media_for_profanity(self, kind: str = None):
         """play_media(): fresh media decides whether the filter engages.
@@ -6153,32 +6317,21 @@ class PlayerView(QtWidgets.QWidget):
         filter. The file's timestamps sit on the video's own timeline
         (VLC's get_time axis) — pre-timed like a VOD track, so the same
         measured mute lead applies. Safe to re-run when the user toggles
-        the filter mid-stream: identical windows merge."""
-        cur = self.current or {}
-        path = cur.get("sub_file") or ""
-        if self._closing or cur.get("kind") != "stremio" or not path:
+        the filter mid-stream: identical windows merge. The parse itself
+        is shared with the caption overlay (see _stremio_sub_cues)."""
+        cues = self._stremio_handoff_cues()
+        if self._closing or not cues:
             return
-        text = prof_mod.read_subtitle_text(path)
-        if not text:
-            try:
-                log.warning("profanity: stremio sub file unreadable: %r",
-                            path)
-            except Exception:
-                pass
-            return
-        parser = prof_mod.SrtParser()
-        cues = parser.feed(text) + parser.flush()
         for start, end, line in cues:
             self._filter_engine.add_cue(start, end, line,
                                         lead_s=_VOD_MUTE_LEAD_S)
-        if cues:
-            # direct playback (relay refused the stream) never started the
-            # evaluation loop — without it the windows pile up unapplied
-            self._filter_timer.start()
+        # direct playback (relay refused the stream) never started the
+        # evaluation loop — without it the windows pile up unapplied
+        self._filter_timer.start()
         try:
             log.info("profanity: stremio external subs — %d cues, %d "
-                     "mute windows (%s)", len(cues),
-                     len(self._filter_engine.windows), path)
+                     "mute windows", len(cues),
+                     len(self._filter_engine.windows))
         except Exception:
             pass
 

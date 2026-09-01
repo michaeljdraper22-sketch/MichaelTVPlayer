@@ -302,6 +302,7 @@ class _EligShim:
     the wanted kind, borrowing the real classifier methods."""
 
     _is_vod = PlayerView._is_vod
+    _is_stremio = PlayerView._is_stremio
     _cap_track_kind = staticmethod(PlayerView._cap_track_kind)
 
     def __init__(self, kind):
@@ -323,6 +324,13 @@ check("plain names are overlay-eligible on VOD (SRT MKVs carry them)",
       elig("vod", "English (United States) - [English]"))
 check("plain names stay on VLC for live",
       not elig("live", "English (United States) - [English]"))
+# Stremio handoffs: the sub-file slave lists as a bare "Track N" and the
+# handoff's FILE is parsed directly (probe_subname.py measured the name),
+# so plain/ASS names are overlay fodder there too
+check("plain/ASS names are overlay-eligible on Stremio handoffs",
+      elig("stremio", "Track 1") and elig("stremio", "English (ASS)"))
+check("bitmap tracks stay on VLC for Stremio too",
+      not elig("stremio", "English (DVB)"))
 check("DVB bitmap tracks are never overlay-eligible",
       not elig("vod", "English (DVB)") and not elig("live", "Danish (DVB)"))
 check("CC/SRT text tracks are overlay-eligible everywhere",
