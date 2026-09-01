@@ -747,6 +747,10 @@ class PlayerView(QtWidgets.QWidget):
         # fetch can never clobber the EPG display
         self._next_runner = AsyncRunner()
         self._next_runner.finished.connect(self._on_next_fetched)
+        # Stremio handoff identity lookups (torrent name -> episode ->
+        # show) — separate so a slow catalog search can't touch the others
+        self._stremio_runner = AsyncRunner()
+        self._stremio_runner.finished.connect(self._on_stremio_identity)
         self._eof_next_done = False   # one autoplay shot per media
         self.vlc = VLCPlayer(
             timeshift=config.timeshift, volume=config.volume,
@@ -1764,10 +1768,16 @@ class PlayerView(QtWidgets.QWidget):
             # main provider stream — see VodRelay.start).
             self._relay_start_offset = 1 if start_at > 3.0 else 0
             self.vlc.play(self._effective_url(url, kind),
-                          timeshift=False, start_seconds=start_at)
+                          timeshift=False, start_seconds=start_at,
+                          start_wait_s=60.0 if kind == "stremio" else 20.0)
         self._poke_audio()
         self._poke_rate()
         self._wake()
+        if kind == "stremio":
+            # figure out what this handed-off stream is (show / season /
+            # episode) in the background — that is what makes autoplay-
+            # next and the title work
+            self._begin_stremio_identity(playable)
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
         # tick) re-selects a track with the same NAME once the new media's
         # tracks appear, and leaves subtitles off when it has none.
@@ -1789,6 +1799,48 @@ class PlayerView(QtWidgets.QWidget):
         title = self.current.get("title", "") if self.current else ""
         self.show_info(title, text)
 
+    # ---- stremio handoff: identify the stream, autoplay the next episode ----
+
+    def _begin_stremio_identity(self, playable):
+        """Background: what a handed-off Stremio URL is playing (torrent
+        name -> S/E marker -> catalog search). Updates the playable (and
+        its shown title) in place; autoplay-next needs the result."""
+        if not playable or playable.get("stremio_imdb"):
+            return
+        base = playable.get("fav_key")
+
+        def _work():
+            from .. import stremio
+            server = stremio.StreamingServer(
+                self.config.data.get("stremio_server") or "")
+            return base, stremio.resolve_identity(
+                playable.get("url", ""), server)
+        self._stremio_runner.run(_work)
+
+    def _on_stremio_identity(self, result):
+        ok, val = result
+        if self._closing:
+            return
+        if ok != "ok" or not val:
+            if ok != "ok":
+                try:
+                    log.warning("stremio identity lookup failed: %s", val)
+                except Exception:
+                    pass
+            self.show_info("Could not identify this stream \u2014 "
+                           "autoplay unavailable")
+            return
+        base, ident = val
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
+            return          # the user moved on while the lookup ran
+        cur.update(ident)
+        title = "%s \u2014 S%02dE%02d" % (ident.get("series_name", "Series"),
+                                         int(ident.get("season") or 0),
+                                         int(ident.get("episode") or 0))
+        cur["title"] = title
+        self.show_info(title, sticky=True)
+
     # ---- play next / autoplay next ----
     def _on_autoplay_toggled(self, on):
         self.config.autoplay_next = bool(on)
@@ -1802,6 +1854,11 @@ class PlayerView(QtWidgets.QWidget):
             return
         if cur.get("kind") == "live":
             self.request_next_channel.emit()
+            return
+        if cur.get("kind") == "stremio":
+            self.show_info("Finding next\u2026")
+            base = cur.get("fav_key")
+            self._next_runner.run(lambda: (base, self._fetch_next(cur)))
             return
         if cur.get("kind") not in ("series", "catchup") or not self.client:
             return
@@ -1829,7 +1886,25 @@ class PlayerView(QtWidgets.QWidget):
             return self._fetch_series_next(cur)
         if cur.get("kind") == "catchup":
             return self._fetch_catchup_next(cur)
+        if cur.get("kind") == "stremio":
+            return self._fetch_stremio_next(cur)
         return None
+
+    def _fetch_stremio_next(self, cur):
+        """Worker-thread: the next episode of a handed-off Stremio stream.
+        Identity is resolved on demand (the background lookup may still be
+        in flight, or may have failed); the next episode's stream comes
+        from the configured addons and, for torrents, is started on the
+        local Stremio streaming server."""
+        try:
+            from .. import stremio
+            return stremio.next_playable(self.config, cur)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("stremio next-episode lookup failed: %r", exc)
+            except Exception:
+                pass
+            return None
 
     def _fetch_series_next(self, cur):
         info = self.client.series_info(cur["series_id"]) or {}
@@ -1923,9 +1998,12 @@ class PlayerView(QtWidgets.QWidget):
         if cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran
         if not nxt:
-            self.show_info("No more episodes in this series"
-                           if cur.get("kind") == "series"
-                           else "No later programs in the archive")
+            self.show_info(
+                "No more episodes in this series"
+                if cur.get("kind") == "series"
+                else "No stream found for the next episode"
+                if cur.get("kind") == "stremio"
+                else "No later programs in the archive")
             return
         self._start_next(nxt)
 
@@ -1950,7 +2028,7 @@ class PlayerView(QtWidgets.QWidget):
         if self._eof_next_done or self._closing:
             return
         cur = self.current or {}
-        if cur.get("kind") not in ("series", "catchup"):
+        if cur.get("kind") not in ("series", "catchup", "stremio"):
             return
         if not self.btn_auto.isChecked() or length_ms <= 0:
             return
@@ -5518,7 +5596,11 @@ class PlayerView(QtWidgets.QWidget):
                 and not self._closing:
             return self._start_catchup_relay(url) or url
         want_caps = self._cap_want and not self._cap_fail
-        if kind not in ("vod", "series") or self._closing \
+        # Stremio handoff streams ride the same relay as VOD when the
+        # caption overlay / profanity filter wants text — that relay is
+        # the user's main reason for Stremio web, so it must survive the
+        # move. Falls back to the direct URL on any hesitation, as always.
+        if kind not in ("vod", "series", "stremio") or self._closing \
                 or not (want_caps or self.config.profanity.get("enabled")) \
                 or not vod_splitter.VOD_SPLITTER_READY:
             return url

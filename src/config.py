@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.4.5"
+APP_VERSION = "1.5.0"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -98,6 +98,13 @@ DEFAULTS = {
     "telemetry_id": "",            # random install id, set on first send
     "telemetry_last_sent": 0.0,    # epoch of the last uploaded report
     "telemetry_repo": "",          # "" = diagnostics.REPO
+    # Stremio handoff (Settings > Stremio handoff…): addon URLs queried
+    # for next-episode streams (Torrentio-shaped /stream/series/… API),
+    # the local Stremio streaming server that turns torrents into HTTP,
+    # and the resolution preferred when picking a stream.
+    "stremio_addons": ["https://torrentio.strem.fun"],
+    "stremio_server": "http://127.0.0.1:11470",
+    "stremio_prefer_resolution": 1080,
 }
 
 BUTTON_KEYS = (
@@ -531,3 +538,59 @@ class Config:
             self.data["telemetry_last_sent"] = float(value)
         except (TypeError, ValueError):
             pass
+
+    # ---- Stremio handoff (Settings > Stremio handoff…) ----
+
+    @property
+    def stremio_addons(self) -> list:
+        raw = self.data.get("stremio_addons") \
+            or DEFAULTS["stremio_addons"]
+        out = []
+        if isinstance(raw, list):
+            for base in raw:
+                base = str(base or "").strip().rstrip("/")
+                if base.startswith(("http://", "https://")):
+                    out.append(base)
+        return out or list(DEFAULTS["stremio_addons"])
+
+    @stremio_addons.setter
+    def stremio_addons(self, value) -> None:
+        clean = []
+        for base in (value or []):
+            base = str(base or "").strip().rstrip("/")
+            if base.endswith("/manifest.json"):
+                base = base[: -len("/manifest.json")].rstrip("/")
+            if base.startswith(("http://", "https://")) and base not in clean:
+                clean.append(base)
+        self.data["stremio_addons"] = clean \
+            or list(DEFAULTS["stremio_addons"])
+
+    @property
+    def stremio_server(self) -> str:
+        base = str(self.data.get("stremio_server", "") or "").strip().rstrip("/")
+        return base if base.startswith(("http://", "https://")) \
+            else DEFAULTS["stremio_server"]
+
+    @stremio_server.setter
+    def stremio_server(self, value: str) -> None:
+        base = str(value or "").strip().rstrip("/")
+        self.data["stremio_server"] = base \
+            if base.startswith(("http://", "https://")) \
+            else DEFAULTS["stremio_server"]
+
+    @property
+    def stremio_prefer_resolution(self) -> int:
+        try:
+            val = int(self.data.get("stremio_prefer_resolution", 1080))
+        except (TypeError, ValueError):
+            val = 1080
+        return val if val in (0, 480, 720, 1080, 1440, 2160) else 1080
+
+    @stremio_prefer_resolution.setter
+    def stremio_prefer_resolution(self, value: int) -> None:
+        try:
+            val = int(value)
+        except (TypeError, ValueError):
+            val = 1080
+        self.data["stremio_prefer_resolution"] = \
+            val if val in (0, 480, 720, 1080, 1440, 2160) else 1080

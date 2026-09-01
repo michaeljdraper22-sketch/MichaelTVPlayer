@@ -98,7 +98,7 @@
  [],
  False,
  False,
- 1787873083,
+ 1788298170,
  [('runw.exe',
    'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

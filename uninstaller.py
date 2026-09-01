@@ -75,6 +75,49 @@ def main():
         except OSError:
             pass
 
+    # registry: the Stremio-handoff .m3u registration (self-contained —
+    # the uninstaller exe does not bundle the src package). If we are the
+    # current default, clear the UserChoice too so nothing dangles.
+    try:
+        import winreg
+
+        def _del(root, path, value=None):
+            try:
+                if value is None:
+                    winreg.DeleteKey(root, path)
+                else:
+                    with winreg.OpenKey(root, path, 0,
+                                        winreg.KEY_SET_VALUE) as k:
+                        winreg.DeleteValue(k, value)
+            except OSError:
+                pass
+
+        progid = "MichaelTVPlayer.Playlist"
+        uc = (r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+              r"\FileExts\.m3u\UserChoice")
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, uc) as k:
+                cur, _ = winreg.QueryValueEx(k, "ProgId")
+            if cur == progid:
+                _del(winreg.HKEY_CURRENT_USER, uc)
+        except OSError:
+            pass
+        _del(winreg.HKEY_CURRENT_USER,
+             r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+             r"\FileExts\.m3u\OpenWithProgids", progid)
+        for sub in (r"\shell\open\command", r"\shell\open", r"\shell",
+                    r"\DefaultIcon", ""):
+            _del(winreg.HKEY_CURRENT_USER,
+                 r"Software\Classes\%s%s" % (progid, sub))
+        _del(winreg.HKEY_CURRENT_USER,
+             r"Software\MichaelTVPlayer\Capabilities\FileAssociations")
+        _del(winreg.HKEY_CURRENT_USER,
+             r"Software\MichaelTVPlayer\Capabilities")
+        _del(winreg.HKEY_CURRENT_USER, r"Software\RegisteredApplications",
+             "MichaelTV")
+    except Exception:  # noqa: BLE001
+        pass
+
     if not keep_data:
         cfg = os.path.join(appdata, "MichaelTVPlayer")
         try:

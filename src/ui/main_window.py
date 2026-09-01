@@ -348,10 +348,13 @@ class MainWindow(QtWidgets.QMainWindow):
         act_dvr_window.triggered.connect(self.edit_dvr_window)
         act_delay = QtWidgets.QAction("Live delay (behind live)\u2026", self)
         act_delay.triggered.connect(self.edit_chase_delay)
-        act_cache = QtWidgets.QAction("Network cache size…", self)
+        act_cache = QtWidgets.QAction("Network cache size\u2026", self)
         act_cache.triggered.connect(self.edit_cache)
+        act_stremio = QtWidgets.QAction("Stremio handoff\u2026", self)
+        act_stremio.triggered.connect(self.edit_stremio)
         settings_menu.addAction(act_buttons)
         settings_menu.addAction(act_pf)
+        settings_menu.addAction(act_stremio)
         settings_menu.addSeparator()
         settings_menu.addAction(act_folder)
         settings_menu.addAction(act_dlfolder)
@@ -387,6 +390,37 @@ class MainWindow(QtWidgets.QMainWindow):
         # Watching now: hand the keyboard to the player so Space (and the
         # other player keys) work even if focus sat in a browser search box.
         self.player_view.setFocus(QtCore.Qt.OtherFocusReason)
+
+    def handle_handoff(self, args):
+        """Args from an external launch (Stremio playlist.m3u opened with
+        us, a relayed second launch): play the stream they name and come
+        forward. With nothing playable, just surface the window — that is
+        the 'launched while already running' case."""
+        url = ""
+        try:
+            from .. import stremio
+            for arg in args or []:
+                url = stremio.parse_handoff_arg(arg)
+                if url:
+                    break
+        except Exception:  # noqa: BLE001
+            url = ""
+        if url:
+            try:
+                from .. import feedback
+                feedback.usage("stremio_handoff")
+                feedback.crumb("stremio handoff")
+            except Exception:  # noqa: BLE001
+                pass
+            self.play(stremio.playable_from_url(url))
+        if self.isMinimized():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def edit_stremio(self):
+        from src.ui.stremio_dialog import StremioDialog
+        StremioDialog(self.config, self).exec_()
 
     def play_next_channel(self):
         """Live TV "Play next": advance to the next channel in the Live

@@ -252,7 +252,8 @@ class VLCPlayer:
     # ---- playback ----
     def play_at(self, url: str, start_seconds: float = 0.0,
                 record_path: str = None,
-                append: bool = False, timeshift: bool = None) -> None:
+                append: bool = False, timeshift: bool = None,
+                start_wait_s: float = 20.0) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
@@ -331,7 +332,7 @@ class VLCPlayer:
             self._bind_window(self.player)
         self.player.set_media(self.media)
         self.player.play()
-        self._watch_playback_start(url)
+        self._watch_playback_start(url, wait_s=start_wait_s)
 
     def _watch_playback_start(self, url: str, wait_s: float = 20.0) -> None:
         """Daemon timer: if playback never reaches Playing within ~20 s,
@@ -380,8 +381,9 @@ class VLCPlayer:
             pass
 
     def play(self, url: str, timeshift: bool = None,
-             start_seconds: float = 0.0) -> None:
-        self.play_at(url, start_seconds, timeshift=timeshift)
+             start_seconds: float = 0.0, start_wait_s: float = 20.0) -> None:
+        self.play_at(url, start_seconds, timeshift=timeshift,
+                     start_wait_s=start_wait_s)
 
     def play_and_record(self, url: str, path: str, append: bool = False) -> None:
         """Backwards-compatible wrapper around play_at()."""

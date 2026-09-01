@@ -128,6 +128,13 @@ def vlc_available() -> bool:
         return False
 
 
+def _forwardable_args(argv) -> list:
+    """Non-option command-line args (a Stremio playlist path / stream URL
+    handed to us by Windows) — Qt's own flags (-style, -platform, …) are
+    dropped so they never leak into the running instance."""
+    return [a for a in argv if not str(a).startswith("-")]
+
+
 def main() -> int:
     # Diagnostics first: rotating log + native crash dump, before Qt/VLC start.
     try:
@@ -175,6 +182,20 @@ def main() -> int:
         )
         return 1
 
+    # Single instance: if MichaelTV is already running, hand it our args
+    # (a Stremio playlist open, or a plain re-launch) and exit — a second
+    # full process used to spawn a second player + recorder.
+    from src.singleinst import SingleInstance
+    inst = SingleInstance("MichaelTVPlayer-single")
+    forwarded = _forwardable_args(sys.argv[1:])
+    if inst.forward_if_running(forwarded):
+        try:
+            from src import feedback
+            feedback.session_end()   # this was a relay, not a session
+        except Exception:
+            pass
+        return 0
+
     from src.config import Config
     from src.ui.login_dialog import LoginDialog
     from src.ui.main_window import MainWindow
@@ -212,12 +233,50 @@ def main() -> int:
         diagnostics.install_trigger(config)
     except Exception:
         pass
-    if not config.has_account():
+    # Stremio handoff plumbing: put MichaelTV in the .m3u "Open with"
+    # list every run (cheap, idempotent), and once per install try to
+    # become the default .m3u handler via the documented Windows API —
+    # that is the artifact Stremio's "Play in external player: M3U
+    # Playlist" hands to the OS. VLC is never touched by any of this.
+    try:
+        from src import fileassoc
+        fileassoc.register()
+        if not config.data.get("_m3u_default_attempted"):
+            config.data["_m3u_default_attempted"] = True
+            try:
+                config.save()
+            except Exception:
+                pass
+            if not fileassoc.is_default():
+                fileassoc.try_set_default()
+    except Exception:
+        pass
+
+    # The login gate blocks MainWindow when no account is saved; a launch
+    # WITH a handoff arg steps around it (play the stream first — the
+    # tabs just show the account-error hint until File > Account).
+    if not config.has_account() and not forwarded:
         if LoginDialog.configure(config).exec_() != QtWidgets.QDialog.Accepted:
             return 0
+    if not config.has_account() and forwarded:
+        # XtreamClient refuses to build without a server; a dummy
+        # unreachable one keeps the window (and the player) alive in its
+        # normal account-error mode. Not saved — the login gate returns
+        # on the next normal launch.
+        if not config.normalized_server():
+            config.data["server_url"] = "http://127.0.0.1:9"
 
     win = MainWindow(config)
     win.show()
+
+    # External handoffs: args this instance was launched with, plus any
+    # future second launches relayed over the single-instance socket.
+    try:
+        inst.received.connect(win.handle_handoff)
+        if forwarded:
+            QtCore.QTimer.singleShot(50, lambda: win.handle_handoff(forwarded))
+    except Exception:
+        pass
 
     # UI freeze watchdog: a Qt timer stamps liveness; the daemon thread in
     # start_ui_watchdog alarms (and can still upload) if the loop stalls.
