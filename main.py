@@ -235,22 +235,16 @@ def main() -> int:
         diagnostics.install_trigger(config)
     except Exception:
         pass
-    # Stremio handoff plumbing: put MichaelTV in the .m3u "Open with"
-    # list every run (cheap, idempotent), and once per install try to
-    # become the default .m3u handler via the documented Windows API —
-    # that is the artifact Stremio's "Play in external player: M3U
-    # Playlist" hands to the OS. VLC is never touched by any of this.
+    # Stremio handoff plumbing: stay in the .m3u "Open with" list every
+    # run (cheap, idempotent) so manual playlist opens work. Becoming
+    # the DEFAULT .m3u handler is no longer pushed: Win11 locks the
+    # UserChoice to the Store Media Player, and the Downloads watcher
+    # (started below) plays Stremio's playlist downloads without any
+    # association at all. The manual switch lives in the Stremio
+    # handoff dialog.
     try:
         from src import fileassoc
         fileassoc.register()
-        if not config.data.get("_m3u_default_attempted"):
-            config.data["_m3u_default_attempted"] = True
-            try:
-                config.save()
-            except Exception:
-                pass
-            if not fileassoc.is_default():
-                fileassoc.try_set_default()
     except Exception:
         pass
 
@@ -288,6 +282,21 @@ def main() -> int:
         if forwarded:
             QtCore.QTimer.singleShot(
                 50, lambda: win.handle_handoff(sys.argv[1:]))
+    except Exception:
+        pass
+
+    # Stremio's stream-list handoff on Windows is the browser saving
+    # playlist.m3u into Downloads (see src/watchfolder.py — the .m3u
+    # association itself is tamper-locked to the Store Media Player on
+    # Win11, so we watch the folder instead). MichaelTV must be running
+    # for it, which is the normal case while browsing Stremio.
+    try:
+        if config.stremio_watch_downloads:
+            from src.watchfolder import DownloadsWatcher
+            _watcher = DownloadsWatcher(parent=win)
+            if _watcher.start():
+                _watcher.handoff.connect(win.handle_handoff)
+                win._downloads_watcher = _watcher   # keep it alive
     except Exception:
         pass
 

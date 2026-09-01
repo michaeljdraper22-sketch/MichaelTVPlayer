@@ -9,9 +9,12 @@ streaming server (stremio-service / the desktop runtime, port 11470):
 
     http://127.0.0.1:11470/{infoHash}/{fileIdx}
 
-For addon HTTP sources it is the direct stream URL. MichaelTV receives the
-playlist path as a command-line argument (it registers as the .m3u handler
-— see src/fileassoc.py) or a plain URL.
+For addon HTTP sources it is the direct stream URL. That download is
+picked up by src/watchfolder.py (MichaelTV watches the Downloads
+folder — Windows 11's .m3u UserChoice is tamper-locked to the Store
+Media Player, so waiting for an association launch is a dead end), or
+handed in directly by the patched Stremio server's VLC-style launch
+line (src/streampatch.py).
 
 Next-episode autoplay never talks to the Stremio app: it uses the same
 public plumbing Stremio itself uses —

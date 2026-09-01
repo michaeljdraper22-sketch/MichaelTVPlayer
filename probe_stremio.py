@@ -14,7 +14,11 @@
     to record, no real playback) -> identity resolution
 [F] fileassoc register/unregister round-trip (does NOT touch UserChoice)
 [G] streampatch round-trip on a temp copy (the live server.js is never
-    touched by the probe)
+    touched by the probe) — path redirect + "Play in MichaelTV" title
+    relabel + v1->v2 migration + restore
+[H] watchfolder: the Downloads auto-play — name gate, baseline (old
+    files never replay), new-download pickup, .mtpdone consume, name
+    reuse, url-less files ignored
 
 Run:  .venv\\Scripts\\python.exe probe_stremio.py
 """
@@ -321,6 +325,30 @@ win.handle_handoff(["not-a-file"])
 report("junk handoff ignored", len(plays) == n_before)
 report("recents got it", any(r.get("fav_key") == cur.get("fav_key")
                              for r in cfg.recents))
+# the Downloads auto-play path: a Stremio playlist download lands in a
+# (temp) Downloads folder -> watcher -> handle_handoff -> playing
+import tempfile as _tf
+dl = _tf.mkdtemp(prefix="mtp_legE_dl_")
+from src.watchfolder import DownloadsWatcher
+w = DownloadsWatcher(directory=dl, parent=win)
+w.handoff.connect(win.handle_handoff)
+report("watcher started", w.start())
+with open(os.path.join(dl, "playlist.m3u"), "w") as f:
+    f.write("#EXTM3U\n#EXTINF:0\n%s\n" % url)
+n2 = len(plays)
+played2 = False
+for _ in range(200):
+    app.processEvents()
+    if len(plays) > n2:
+        played2 = True
+        break
+    time.sleep(0.05)
+report("watchfolder handoff -> playing", played2)
+c2 = win.player_view.current or {}
+report("watchfolder played the right url", c2.get("url") == url)
+report("watchfile consumed",
+       os.path.isfile(os.path.join(dl, "playlist.m3u.mtpdone")))
+w.stop()
 if os.environ.get("MTP_PROBE_URL"):
     ident = False
     for _ in range(200):
@@ -369,10 +397,12 @@ def leg_f():
 def leg_g():
     print("\n[G] streampatch round-trip (temp copy - live file untouched)")
     from src import streampatch as sp
-    # the sample file embeds the module's own _ORIGINAL line, so the
-    # fixture can never drift from what the patcher expects
-    sample = "x: 1,\n            win32: {\n" + sp._ORIGINAL \
-        + "\n            }\n"
+    # the sample file embeds the module's own _ORIGINAL/_TITLE_ORIG
+    # lines, so the fixture can never drift from what the patcher expects
+    sample = ("x: 1,\n            vlc: {\n                "
+              + sp._TITLE_ORIG + ",\n                args: [ "
+              "\"--no-video-title-show\" ],\n                win32: {\n"
+              + sp._ORIGINAL + "\n            }\n")
     tmp = os.path.join(tempfile.mkdtemp(prefix="mtp_sp_"), "server.js")
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(sample)
@@ -386,7 +416,19 @@ def leg_g():
         check("patch redirects vlc paths",
               "VideoLAN" not in patched and "MichaelTV" in patched
               and sp._MARKER in patched, patched[:120])
+        check("patch relabels menu title",
+              sp._TITLE_NEW in patched and sp._TITLE_ORIG not in patched)
         check("patch idempotent", sp.patch() and sp.is_patched())
+        # v1->v2 migration: a file patched by the previous MichaelTV
+        # (path swapped, title still "VLC") must be upgraded in place
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(sample.replace(sp._ORIGINAL, sp._patched_line()))
+        check("v1 file reads unpatched", not sp.is_patched())
+        check("v1 file upgraded", sp.patch() and sp.is_patched())
+        with open(tmp, "r", encoding="utf-8") as f:
+            up = f.read()
+        check("v1 upgrade keeps redirect",
+              sp._patched_line() in up and sp._TITLE_NEW in up)
         check("restore round-trips", sp.restore())
         with open(tmp, "r", encoding="utf-8") as f:
             check("restore byte-identical", f.read() == sample)
@@ -394,9 +436,79 @@ def leg_g():
         sp.find_server_js = real_finder
 
 
+# ------------------------------------------------ [H] watchfolder
+def leg_h():
+    print("\n[H] watchfolder (Downloads auto-play)")
+    from src.watchfolder import DownloadsWatcher, _NAME_RE
+    from PyQt5 import QtWidgets  # noqa: F401  (instance() in wait_for)
+    for name, ok in (("playlist.m3u", True), ("playlist (1).m3u", True),
+                     ("playlist-2.m3u8", True), ("Playlist.M3U", True),
+                     ("mylist.m3u", False), ("playlist.m3u.txt", False),
+                     ("playlist.m3u.mtpdone", False),
+                     ("playlistx.m3u", False)):
+        check("name gate %r" % name, bool(_NAME_RE.match(name)) == ok)
+
+    tmpdir = tempfile.mkdtemp(prefix="mtp_watch_")
+
+    def m3u(url):
+        return "#EXTM3U\n#EXTINF:0\n%s\n" % url
+
+    def wait_for(cond, seconds=8.0):
+        qapp = QtWidgets.QApplication.instance()
+        end = time.time() + seconds
+        while time.time() < end:
+            qapp.processEvents()
+            if cond():
+                return True
+            time.sleep(0.05)
+        return False
+
+    # pre-existing downloads are baselined, never replayed at startup
+    with open(os.path.join(tmpdir, "playlist.m3u"), "w") as f:
+        f.write(m3u("http://OLD/should-not-play"))
+    w = DownloadsWatcher(directory=tmpdir)
+    got = []
+    w.handoff.connect(lambda args: got.append(list(args)))
+    check("start ok", w.start())
+    QtWidgets.QApplication.instance().processEvents()
+
+    # a new Stremio-shaped download plays through handoff
+    new = os.path.join(tmpdir, "playlist (1).m3u")
+    url1 = "http://127.0.0.1:11470/" + "a" * 40 + "/2"
+    with open(new, "w") as f:
+        f.write(m3u(url1))
+    check("new download picked up",
+          wait_for(lambda: len(got) >= 1), got)
+    check("handoff payload is the stream url",
+          got and got[0] == [url1], got)
+    check("consumed file renamed", os.path.isfile(new + ".mtpdone"))
+
+    # a non-matching name is ignored even with a valid playlist inside
+    got.clear()
+    with open(os.path.join(tmpdir, "iptv-list.m3u"), "w") as f:
+        f.write(m3u("http://IGNORED/x"))
+    check("unrelated playlist ignored", not wait_for(
+        lambda: got, seconds=3.0), got)
+
+    # the same filename can hand off again (rename freed the name)
+    with open(new, "w") as f:
+        f.write(m3u("http://SECOND/handoff"))
+    check("name reuse hands off again",
+          wait_for(lambda: len(got) >= 1), got)
+    check("second handoff url", got and got[0] == ["http://SECOND/handoff"])
+
+    # a playlist with no URL never fires and eventually settles
+    got.clear()
+    with open(os.path.join(tmpdir, "playlist (2).m3u"), "w") as f:
+        f.write("#EXTM3U\n")
+    check("url-less file ignored", not wait_for(
+        lambda: got, seconds=4.0), got)
+    w.stop()
+
+
 if __name__ == "__main__":
     from PyQt5 import QtWidgets
-    app = QtWidgets.QApplication(sys.argv)   # one app for leg D
+    app = QtWidgets.QApplication(sys.argv)   # one app for legs D/H
     leg_a()
     leg_b()
     leg_c()
@@ -404,6 +516,7 @@ if __name__ == "__main__":
     leg_e()
     leg_f()
     leg_g()
+    leg_h()
     print("\n%s (%d failures)" % ("ALL PASS" if not FAILS else "FAILURES",
                                   len(FAILS)))
     for f in FAILS:

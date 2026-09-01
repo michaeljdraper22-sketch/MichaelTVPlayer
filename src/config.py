@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -105,6 +105,8 @@ DEFAULTS = {
     "stremio_addons": ["https://torrentio.strem.fun"],
     "stremio_server": "http://127.0.0.1:11470",
     "stremio_prefer_resolution": 1080,
+    "stremio_watch_downloads": True,   # auto-play Stremio's playlist.m3u
+                                       # the moment it lands in Downloads
 }
 
 BUTTON_KEYS = (
@@ -594,3 +596,11 @@ class Config:
             val = 1080
         self.data["stremio_prefer_resolution"] = \
             val if val in (0, 480, 720, 1080, 1440, 2160) else 1080
+
+    @property
+    def stremio_watch_downloads(self) -> bool:
+        return bool(self.data.get("stremio_watch_downloads", True))
+
+    @stremio_watch_downloads.setter
+    def stremio_watch_downloads(self, value: bool) -> None:
+        self.data["stremio_watch_downloads"] = bool(value)

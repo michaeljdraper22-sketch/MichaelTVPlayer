@@ -1,12 +1,22 @@
 """Settings for the Stremio handoff (Settings > Stremio handoff…).
 
-The handoff itself needs no configuration to work: with Stremio's
-"Play in external player" set to "M3U Playlist", opening a stream hands
-Windows a playlist.m3u, and MichaelTV (registered as an .m3u player)
-plays the stream URL inside it. This dialog controls what happens AFTER
-that: which stream addons are queried for the next episode, the local
-Stremio streaming server that serves torrent streams, and the preferred
-resolution — plus the "make me the default .m3u player" switch.
+Two independent handoffs get a Stremio stream into MichaelTV:
+
+* Stream list: with Stremio's "Play in external player" set to "M3U
+  Playlist" (the only option Stremio offers on Windows), clicking a
+  stream downloads a tiny playlist.m3u into the browser's Downloads
+  folder. MichaelTV watches that folder and plays it the moment it
+  lands — no file-association or download-bar click needed (Win11
+  locks the .m3u default to the Store Media Player, so watching is the
+  reliable route).
+* In the Stremio player: the "external player" menu entry (which the
+  server.js patch relabels "MichaelTV") asks the local Stremio
+  streaming server to spawn the player directly.
+
+This dialog controls both, plus what happens AFTER a handoff: which
+stream addons are queried for the next episode, the local Stremio
+streaming server that serves torrent streams, and the preferred
+resolution.
 """
 
 from PyQt5 import QtCore, QtWidgets
@@ -19,21 +29,39 @@ class StremioDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.config = config
         self.setWindowTitle("Stremio handoff")
+        self.main_window = parent
 
         lay = QtWidgets.QVBoxLayout(self)
 
         intro = QtWidgets.QLabel(
-            "How it works: in Stremio (app or web), set Settings \u25b8 "
-            "Player \u25b8 \u201cPlay in external player\u201d to "
-            "\u201cM3U Playlist\u201d. Opening a stream then hands "
-            "MichaelTV the stream, and MichaelTV autoplays the next "
-            "episode on its own \u2014 no Stremio needed once playback "
-            "starts. Your VLC is never touched.")
+            "In Stremio (app or web), set Settings \u25b8 Player \u25b8 "
+            "\u201cPlay in external player\u201d to \u201cM3U "
+            "Playlist\u201d. Opening a stream then downloads playlist.m3u "
+            "\u2014 MichaelTV (while running) picks it up from Downloads "
+            "and plays it straight away, then autoplays the next episode "
+            "on its own. Your VLC is never touched.")
         intro.setWordWrap(True)
         lay.addWidget(intro)
 
+        # ---- Downloads auto-play ------------------------------------
+        watch_box = QtWidgets.QGroupBox("Downloads auto-play")
+        watch_lay = QtWidgets.QVBoxLayout(watch_box)
+        self.watch_chk = QtWidgets.QCheckBox(
+            "Auto-play Stremio playlist downloads (playlist.m3u landing "
+            "in the Downloads folder)")
+        self.watch_chk.setChecked(config.stremio_watch_downloads)
+        watch_lay.addWidget(self.watch_chk)
+        self.watch_lbl = QtWidgets.QLabel("")
+        self.watch_lbl.setWordWrap(True)
+        watch_lay.addWidget(self.watch_lbl)
+        lay.addWidget(watch_box)
+
+        lay.addSpacing(4)
+
         # ---- default .m3u handler -----------------------------------
-        lay.addWidget(QtWidgets.QLabel("Playlist (.m3u) handling:"))
+        lay.addWidget(QtWidgets.QLabel(
+            "Playlist (.m3u) handling (only matters for files you open "
+            "by hand):"))
         self.status_lbl = QtWidgets.QLabel("")
         self.status_lbl.setWordWrap(True)
         lay.addWidget(self.status_lbl)
@@ -49,9 +77,10 @@ class StremioDialog(QtWidgets.QDialog):
 
         lay.addSpacing(4)
 
-        # ---- Stremio's own "open in VLC" button ----------------------
-        # (that button is the local streaming server spawning a hardcoded
-        # vlc.exe; the patch redirects it at MichaelTV)
+        # ---- Stremio's in-player external-player menu ---------------
+        # (that menu entry is the local streaming server spawning a
+        # hardcoded vlc.exe; the patch redirects it at MichaelTV and
+        # relabels it)
         self.patch_lbl = QtWidgets.QLabel("")
         self.patch_lbl.setWordWrap(True)
         lay.addWidget(self.patch_lbl)
@@ -111,10 +140,28 @@ class StremioDialog(QtWidgets.QDialog):
         bb.rejected.connect(self.reject)
         lay.addWidget(bb)
 
+        self._refresh_watch_status()
         self._refresh_status()
         self._refresh_patch_status()
 
-    # ---- Stremio button redirect ----
+    # ---- Downloads auto-play ----
+
+    def _refresh_watch_status(self):
+        from ..watchfolder import downloads_dir
+        folder = downloads_dir()
+        running = bool(getattr(self.main_window, "_downloads_watcher",
+                               None))
+        if running and self.watch_chk.isChecked():
+            self.watch_lbl.setText("\u2713 Watching %s" % folder)
+        elif self.watch_chk.isChecked():
+            self.watch_lbl.setText(
+                "Starts with MichaelTV \u2014 keep MichaelTV running "
+                "while you browse Stremio. Will watch:\n%s" % folder)
+        else:
+            self.watch_lbl.setText(
+                "Off \u2014 Stremio playlist downloads are ignored.")
+
+    # ---- Stremio in-player menu redirect ----
 
     def _refresh_patch_status(self):
         from .. import streampatch
@@ -122,7 +169,7 @@ class StremioDialog(QtWidgets.QDialog):
         if not st["found"]:
             self.patch_lbl.setText(
                 "Stremio’s streaming server (server.js) was not found "
-            "— the in-player “Open in VLC” button will keep "
+            "— the in-player external-player menu will keep "
             "opening VLC.")
             self.btn_repatch.setEnabled(False)
             self.btn_unpatch.setEnabled(False)
@@ -131,12 +178,16 @@ class StremioDialog(QtWidgets.QDialog):
         self.btn_unpatch.setEnabled(st["patched"] and st["backup"])
         if st["patched"]:
             self.patch_lbl.setText(
-                "✓ Stremio’s “Open in VLC” button "
-                "launches MichaelTV (takes effect after Stremio restarts; "
-                "re-applied automatically after Stremio updates).")
+                "✓ Stremio’s in-player menu offers “Play in "
+                "MichaelTV” and it launches MichaelTV (takes effect "
+                "after Stremio restarts; re-applied automatically after "
+                "Stremio updates).")
+        elif st["titled"] or st["backup"]:
+            self.patch_lbl.setText(
+                "Partly set up — redirect it to MichaelTV?")
         else:
             self.patch_lbl.setText(
-                "Stremio’s “Open in VLC” button currently "
+                "Stremio’s in-player external-player menu currently "
                 "launches VLC. Redirect it to MichaelTV?")
 
     def _repatch(self):
@@ -212,5 +263,25 @@ class StremioDialog(QtWidgets.QDialog):
         self.config.stremio_prefer_resolution = \
             self.res_combo.currentData() or 1080
         self.config.stremio_server = self.srv_edit.text()
+        self.config.stremio_watch_downloads = \
+            self.watch_chk.isChecked()
         self.config.save()
+        # Apply the watcher change live when we can reach the running
+        # instance's watcher (the dialog's parent is the main window).
+        win = self.main_window
+        if isinstance(win, QtWidgets.QWidget):
+            watcher = getattr(win, "_downloads_watcher", None)
+            try:
+                if self.watch_chk.isChecked():
+                    if watcher is None:
+                        from ..watchfolder import DownloadsWatcher
+                        watcher = DownloadsWatcher(parent=win)
+                        if watcher.start():
+                            watcher.handoff.connect(win.handle_handoff)
+                            win._downloads_watcher = watcher
+                elif watcher is not None:
+                    watcher.stop()
+                    win._downloads_watcher = None
+            except Exception:  # noqa: BLE001
+                pass
         super().accept()
