@@ -487,6 +487,17 @@ class VLCPlayer:
                     old.release()
                 except Exception:
                     pass
+                # Both players shared the video HWND while this one sat
+                # wedged; the teardown above can invalidate the CURRENT
+                # player's running video output, and libVLC then re-creates
+                # it detached — its OWN small top-level window the app
+                # cannot control (live-seen: switching from a hung Stremio
+                # stream to live TV). Re-asserting the binding re-parents
+                # the running vout back onto our surface.
+                try:
+                    self._bind_window(self.player)
+                except Exception:
+                    pass
                 try:
                     log.info("display stop: wedged player finally stopped; "
                              "released")
