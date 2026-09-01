@@ -471,10 +471,9 @@ def find_series(name: str):
     return None
 
 
-def next_episode(meta: dict, season: int, episode: int):
-    """The (season, episode) AFTER the given one in the meta's episode
-    list (season finales roll into the next season; specials/season 0 are
-    skipped unless that is where the user already is)."""
+def _ordered_episodes(meta: dict, season: int):
+    """The meta's episodes as a sorted (season, episode) list (specials /
+    season 0 are skipped unless that is where the user already is)."""
     eps = set()
     for v in meta.get("videos") or []:
         try:
@@ -484,12 +483,31 @@ def next_episode(meta: dict, season: int, episode: int):
             continue
         if s >= 0 and e >= 1 and (s > 0 or season == 0):
             eps.add((s, e))
-    ordered = sorted(eps)
+    return sorted(eps)
+
+
+def next_episode(meta: dict, season: int, episode: int):
+    """The (season, episode) AFTER the given one in the meta's episode
+    list (season finales roll into the next season; specials/season 0 are
+    skipped unless that is where the user already is)."""
+    ordered = _ordered_episodes(meta, season)
     try:
         idx = ordered.index((season, episode))
     except ValueError:
         return None
     return ordered[idx + 1] if idx + 1 < len(ordered) else None
+
+
+def prev_episode(meta: dict, season: int, episode: int):
+    """The (season, episode) BEFORE the given one — a season premiere
+    rolls back to the previous season's finale; S01E01 has nothing
+    before it."""
+    ordered = _ordered_episodes(meta, season)
+    try:
+        idx = ordered.index((season, episode))
+    except ValueError:
+        return None
+    return ordered[idx - 1] if idx > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +736,16 @@ def next_playable(config, cur: dict):
     """Worker-thread heart of autoplay: resolve the current playable's
     identity if missing, then find + prepare the NEXT episode's playable.
     Returns the playable, or None (nothing found)."""
+    return _adjacent_playable(config, cur, +1)
+
+
+def prev_playable(config, cur: dict):
+    """Worker-thread backend of the ⏮ button: the same resolution /
+    stream / server chain as next_playable, one episode EARLIER."""
+    return _adjacent_playable(config, cur, -1)
+
+
+def _adjacent_playable(config, cur: dict, step: int):
     server = StreamingServer(
         (config.data.get("stremio_server") if config else None) or "")
 
@@ -735,7 +763,10 @@ def next_playable(config, cur: dict):
     season = int(cur.get("season") or 0)
     episode = int(cur.get("episode") or 0)
     meta = series_meta(imdb)
-    nxt = next_episode(meta, season, episode)
+    if step > 0:
+        nxt = next_episode(meta, season, episode)
+    else:
+        nxt = prev_episode(meta, season, episode)
     if not nxt:
         return None
     s, e = nxt

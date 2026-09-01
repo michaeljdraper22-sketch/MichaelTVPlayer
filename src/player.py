@@ -624,7 +624,10 @@ class VLCPlayer:
                 pass
             return 0.0
 
-    def seek_ms(self, delta_ms: int) -> None:
+    def seek_ms(self, delta_ms: int) -> int:
+        """Relative seek. Returns the clamped target ms (the caller's
+        position tracker rebases on it — VLC's own clock only catches up
+        after the seek lands)."""
         length = self.get_length()
         current = self.get_time()
         if current < 0:
@@ -633,6 +636,7 @@ class VLCPlayer:
         if length > 0:
             target = min(target, length)
         self.player.set_time(int(target))
+        return int(target)
     def set_time(self, ms: int) -> None:
         self.player.set_time(int(ms))
 

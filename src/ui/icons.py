@@ -405,6 +405,18 @@ def play_next():
     return _icon("play_next4", draw)
 
 
+def play_prev():
+    """Play previous — play_next mirrored left/right: the same solid
+    triangle pointing LEFT with the rounded-cap bar on its (left) heel."""
+    def draw(p, c):
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(22.2, 5.4), _F(22.2, 18.6), _F(6.2, 12.0)]))
+        p.drawRoundedRect(QtCore.QRectF(2.0, 5.4, 2.6, 13.2), 1.3, 1.3)
+    return _icon("play_prev", draw)
+
+
 def check():
     """Checkmark — the selected row marker in the track picker panel."""
     def draw(p, c):

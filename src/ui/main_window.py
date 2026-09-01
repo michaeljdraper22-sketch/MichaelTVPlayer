@@ -280,6 +280,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.player_view._cycle_audio)
         QtWidgets.QShortcut(QtGui.QKeySequence("N"), self,
                             activated=self.player_view._play_next_clicked)
+        QtWidgets.QShortcut(QtGui.QKeySequence("P"), self,
+                            activated=self.player_view._play_prev_clicked)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
@@ -330,9 +332,12 @@ class MainWindow(QtWidgets.QMainWindow):
         act_stop.triggered.connect(self.player_view.stop)
         act_next = QtWidgets.QAction("Play next (N)", self)
         act_next.triggered.connect(self.player_view._play_next_clicked)
+        act_prev = QtWidgets.QAction("Play previous (P)", self)
+        act_prev.triggered.connect(self.player_view._play_prev_clicked)
         play_menu.addAction(act_pause)
         play_menu.addAction(act_live)
         play_menu.addAction(act_next)
+        play_menu.addAction(act_prev)
         play_menu.addAction(act_stop)
 
         settings_menu = menu_bar.addMenu("&Settings")
@@ -740,6 +745,7 @@ class MainWindow(QtWidgets.QMainWindow):
             ("scale", "Video scaling"), ("speed", "Playback speed"),
             ("autoplay", "Autoplay next episode"),
             ("playnext", "Play next"),
+            ("playprev", "Play previous"),
             ("mute", "Mute"), ("volume", "Volume slider"),
             ("timebar", "Time bar (live rewind)"),
         ]

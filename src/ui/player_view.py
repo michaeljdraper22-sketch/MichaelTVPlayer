@@ -748,6 +748,8 @@ class PlayerView(QtWidgets.QWidget):
         # fetch can never clobber the EPG display
         self._next_runner = AsyncRunner()
         self._next_runner.finished.connect(self._on_next_fetched)
+        self._prev_runner = AsyncRunner()
+        self._prev_runner.finished.connect(self._on_prev_fetched)
         # Stremio handoff identity lookups (torrent name -> episode ->
         # show) — separate so a slow catalog search can't touch the others
         self._stremio_runner = AsyncRunner()
@@ -1000,6 +1002,11 @@ class PlayerView(QtWidgets.QWidget):
         # play next: next episode for series, the next recorded program for
         # catch-up, the next channel for live TV (movies get neither)
         self.btn_next = ctl_btn(ic.play_next(), "Play next (N)")
+        # play previous: the mirrored twin of play next — previous episode
+        # for series / Stremio, earlier recorded program for catch-up.
+        # Live TV keeps next-only (reverse channel-zapping wasn't asked
+        # for), movies get neither.
+        self.btn_prev = ctl_btn(ic.play_prev(), "Play previous (P)")
         self.sep3 = ctl_sep()
         self.btn_mute = ctl_btn(ic.volume(True), "Mute (M)", checkable=True)
         # JumpSlider = click anywhere on the bar to set the volume directly
@@ -1020,7 +1027,7 @@ class PlayerView(QtWidgets.QWidget):
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
                   self.btn_dl, self.btn_win, self.btn_rec, self.sep2,
                   self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
-                  self.btn_auto, self.btn_next, self.sep3,
+                  self.btn_auto, self.btn_prev, self.btn_next, self.sep3,
                   self.btn_mute, self.vol_slider):
             rl.addWidget(w)
         ctl_lay.addWidget(row)
@@ -1034,7 +1041,7 @@ class PlayerView(QtWidgets.QWidget):
         for b in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.btn_begin, self.btn_live,
                   self.btn_rec, self.btn_audio,
-                  self.btn_next):
+                  self.btn_next, self.btn_prev):
             b.setEnabled(False)
 
         # DVR start-up pill ("DVR 12s / 20s buffered…"), centered on the
@@ -1069,6 +1076,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_speed.clicked.connect(self._speed_menu)
         self.btn_auto.toggled.connect(self._on_autoplay_toggled)
         self.btn_next.clicked.connect(self._play_next_clicked)
+        self.btn_prev.clicked.connect(self._play_prev_clicked)
         self.btn_mute.toggled.connect(self._on_mute)
         self.btn_dl.clicked.connect(self._start_download)
         self.btn_win.clicked.connect(self._on_win_btn)
@@ -1881,6 +1889,9 @@ class PlayerView(QtWidgets.QWidget):
             title += " %s" % ident["episode_name"]
         cur["title"] = title
         self.show_info(title, sticky=True)
+        # the episode buttons (prev/next/autoplay) are gated on the
+        # identity's season/episode — surface them now that it's known
+        self._update_control_state()
         self._begin_stremio_lookahead()
 
     # ---- stremio: prefetch the next episode while this one plays ----
@@ -2024,6 +2035,21 @@ class PlayerView(QtWidgets.QWidget):
         base = cur.get("fav_key")
         self._next_runner.run(lambda: (base, self._fetch_next(cur)))
 
+    def _play_prev_clicked(self):
+        """The ⏮ twin of play-next: previous episode (series / Stremio) or
+        earlier recorded program (catch-up). Live TV has no prev."""
+        cur = self.current
+        if self._closing or not cur:
+            return
+        if cur.get("kind") not in ("series", "catchup", "stremio"):
+            return
+        if cur.get("kind") == "series" and cur.get("series_id") is None:
+            self.show_info("No episode list for this item")
+            return
+        self.show_info("Finding previous\u2026")
+        base = cur.get("fav_key")
+        self._prev_runner.run(lambda: (base, self._fetch_prev(cur)))
+
     @staticmethod
     def _nn(v):
         """Tolerant int() for provider episode/season numbers."""
@@ -2043,6 +2069,16 @@ class PlayerView(QtWidgets.QWidget):
             return self._fetch_catchup_next(cur)
         if cur.get("kind") == "stremio":
             return self._fetch_stremio_next(cur)
+        return None
+
+    def _fetch_prev(self, cur):
+        """Worker-thread lookup: the playable BEFORE ``cur``, or None."""
+        if cur.get("kind") == "series":
+            return self._fetch_series_prev(cur)
+        if cur.get("kind") == "catchup":
+            return self._fetch_catchup_prev(cur)
+        if cur.get("kind") == "stremio":
+            return self._fetch_stremio_prev(cur)
         return None
 
     def _fetch_stremio_next(self, cur):
@@ -2067,8 +2103,49 @@ class PlayerView(QtWidgets.QWidget):
                 pass
             return None
 
+    def _fetch_stremio_prev(self, cur):
+        """Worker-thread: the previous episode of a handed-off Stremio
+        stream — the ⏮ twin of _fetch_stremio_next (on-demand: no
+        lookahead cache to consult)."""
+        try:
+            from .. import stremio
+            return stremio.prev_playable(self.config, cur)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("stremio prev-episode lookup failed: %r", exc)
+            except Exception:
+                pass
+            return None
+
     def _fetch_series_next(self, cur):
-        info = self.client.series_info(cur["series_id"]) or {}
+        eps = self._ordered_series_episodes(
+            self.client.series_info(cur["series_id"]) or {})
+        season = self._nn(cur.get("season"))
+        episode = self._nn(cur.get("episode"))
+        idx = next((i for i, (s, n, _e) in enumerate(eps)
+                    if s == season and n == episode), None)
+        if idx is None or idx + 1 >= len(eps):
+            return None
+        s, n, e = eps[idx + 1]
+        return self._series_episode_playable(cur, s, n, e)
+
+    def _fetch_series_prev(self, cur):
+        """Worker-thread: the episode BEFORE ``cur`` (a season premiere
+        rolls back to the previous season's finale; E01S01 has nothing)."""
+        eps = self._ordered_series_episodes(
+            self.client.series_info(cur["series_id"]) or {})
+        season = self._nn(cur.get("season"))
+        episode = self._nn(cur.get("episode"))
+        idx = next((i for i, (s, n, _e) in enumerate(eps)
+                    if s == season and n == episode), None)
+        if idx is None or idx <= 0:
+            return None
+        s, n, e = eps[idx - 1]
+        return self._series_episode_playable(cur, s, n, e)
+
+    def _ordered_series_episodes(self, info):
+        """(season, episode_num, raw_episode) sorted, in both the modern
+        {"episodes": {"1": [...]}} shape and the legacy seasons list."""
         eps = []
         ep_map = info.get("episodes")
         if isinstance(ep_map, dict) and ep_map:
@@ -2084,13 +2161,9 @@ class PlayerView(QtWidgets.QWidget):
                     eps.append((self._nn(sm.get("season_number")),
                                 self._nn(e.get("episode_num")), e))
         eps.sort(key=lambda t: (t[0], t[1]))
-        season = self._nn(cur.get("season"))
-        episode = self._nn(cur.get("episode"))
-        idx = next((i for i, (s, n, _e) in enumerate(eps)
-                    if s == season and n == episode), None)
-        if idx is None or idx + 1 >= len(eps):
-            return None
-        s, n, e = eps[idx + 1]
+        return eps
+
+    def _series_episode_playable(self, cur, s, n, e):
         name = cur.get("series_name") or ""
         return {
             "kind": "series",
@@ -2144,6 +2217,43 @@ class PlayerView(QtWidgets.QWidget):
             "icon": cur.get("icon", ""),
         }
 
+    def _fetch_catchup_prev(self, cur):
+        """Worker-thread: the latest recorded program that starts BEFORE
+        the current one (they have all begun, so the archive holds them)."""
+        started_before = int(cur.get("utc_start") or 0)
+        if not started_before or cur.get("stream_id") is None:
+            return None
+        best = None
+        for e in self.client.epg_table(cur["stream_id"]) or []:
+            try:
+                st = int(str(e.start_timestamp).strip())
+                sp = int(str(e.stop_timestamp).strip())
+            except (TypeError, ValueError):
+                continue
+            if st >= started_before:
+                continue
+            if best is None or st > best[0]:
+                best = (st, sp, e)
+        if best is None:
+            return None
+        st, sp, e = best
+        if sp <= st:
+            sp = st + 1800
+        title = _decode(e.title) or "Program"
+        dur_min = max(1, math.ceil((sp - st) / 60.0))
+        return {
+            "kind": "catchup",
+            "title": f"{cur.get('channel', '')} \u2014 {title}",
+            "url": self.client.timeshift_url(cur["stream_id"], st, dur_min),
+            "stream_id": cur["stream_id"],
+            "utc_start": st,
+            "utc_end": sp,
+            "channel": cur.get("channel", ""),
+            "program": title,
+            "fav_key": f"catchup:{cur['stream_id']}:{st}",
+            "icon": cur.get("icon", ""),
+        }
+
     def _on_next_fetched(self, result):
         ok, val = result
         if self._closing or ok != "ok":
@@ -2167,6 +2277,30 @@ class PlayerView(QtWidgets.QWidget):
                 else "No later programs in the archive")
             return
         self._start_next(nxt)
+
+    def _on_prev_fetched(self, result):
+        ok, val = result
+        if self._closing or ok != "ok":
+            if not self._closing:
+                try:
+                    log.warning("prev-episode lookup failed: %s", val)
+                except Exception:
+                    pass
+                self.show_info("Could not look up the previous item")
+            return
+        base, prv = val
+        cur = self.current or {}
+        if cur.get("fav_key") != base:
+            return          # the user moved on while the lookup ran
+        if not prv:
+            self.show_info(
+                "No earlier episodes in this series"
+                if cur.get("kind") == "series"
+                else "No stream found for the previous episode"
+                if cur.get("kind") == "stremio"
+                else "No earlier programs in the archive")
+            return
+        self._start_next(prv)
 
     def _start_next(self, nxt):
         """Switch playback to the next item through the same bookkeeping
@@ -2752,7 +2886,12 @@ class PlayerView(QtWidgets.QWidget):
             self._catchup_seek_to(self._vid_s * 1000.0 + ms)
             return
         # Live / VOD: normal seek (works for VOD; live streams ignore it).
-        self.vlc.seek_ms(ms)
+        # Re-base the tracked position to the seek target — the tick's 3 s
+        # snap guard would otherwise reject VLC's post-seek clock and leave
+        # the scrubber creeping from the pre-seek spot (same family as the
+        # jump-to-beginning indicator bug).
+        self._vid_s = max(0.0, self.vlc.seek_ms(ms) / 1000.0)
+        self._last_raw = None
 
     def _jump_begin(self):
         """The inverse of LIVE: restart playback at the very beginning of
@@ -2763,8 +2902,27 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_seek(0.0, resume=True)
         elif self._is_catchup():
             self._catchup_seek_to(0.0)
-        elif self.vlc.get_length() > 0:
+        elif self.vlc.get_length() > 0 or self._last_vod_len_ms > 0:
+            # VOD / Stremio episode (the sticky length keeps this branch
+            # alive at end-of-media, where VLC drops get_length()).
+            try:
+                down = self.vlc.state_name() in ("ended", "stopped", "error")
+            except Exception:  # noqa: BLE001
+                down = False
+            if down and self.current and self.current.get("url"):
+                # past EOF: set_time is a no-op once VLC ended — replay the
+                # item from the top (the natural "watch it again" after
+                # staying at the end with autoplay off)
+                self.play_media(dict(self.current), start_at=0.0)
+                return
+            # set_time(0) moves VLC's clock but the tick's 3 s snap guard
+            # then rejects the new raw position as "too far" — the scrubber
+            # kept creeping from the pre-jump position (user-seen). Re-base
+            # the tracked position ourselves; the tick snaps within a
+            # second. (A plain-live stream ignores set_time — harmless.)
             self.vlc.set_time(0)
+            self._vid_s = 0.0
+            self._last_raw = None
 
     def _chase_seek(self, target_s: float, resume: bool = False,
                     jump_live: bool = False):
@@ -2960,18 +3118,30 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_seek(edge, resume=True, jump_live=True)
             return
         # Plain LIVE mode (timeshift) / VOD skip-to-end
+        kind = (self.current or {}).get("kind")
         try:
             down = self.vlc.state_name() in ("ended", "stopped", "error")
         except Exception:  # noqa: BLE001
             down = False
         if down and self.current and self.current.get("url") \
-                and not self._is_vod():
-            # long-paused past the provider's patience: reconnect at live
+                and not (self._is_vod() or kind == "stremio"):
+            # long-paused past the provider's patience: reconnect at live.
+            # (VOD AND Stremio skip this: for them "live" is the END of
+            # the file — reconnecting would restart the episode, which is
+            # exactly what LIVE must not do there.)
             self._reopen_display()
             self._live_paused = False
             self._update_control_state()
             return
+        # VOD / Stremio: skip to the END of the file. Re-base the tracked
+        # position so the scrubber lands on the end immediately; with
+        # autoplay off end-of-media then simply holds there (the video
+        # stays at the end until the user does something else).
         self.vlc.jump_to_live()
+        length = self.vlc.get_length()
+        if length > 0:
+            self._vid_s = length / 1000.0
+            self._last_raw = None
         if self._live_paused:
             self._live_paused = False
             self.vlc.resume()
@@ -4262,11 +4432,14 @@ class PlayerView(QtWidgets.QWidget):
             self._last_vod_len_ms = length
         elif (self._scrub_on and self._last_vod_len_ms > 0
                 and (self.current or {}).get("kind")
-                in ("series", "movie", "vod")):
+                in ("series", "movie", "vod", "stremio")):
             # VLC drops get_length() the moment a network VOD ends —
             # without the last known length the tick flips to "live"
             # here, the scrubber vanishes, and end-of-media autoplay
-            # never runs (the 2026-09-01 black-screen-at-credits)
+            # never runs (the 2026-09-01 black-screen-at-credits). With
+            # autoplay off the sticky length is what keeps the scrubber
+            # parked at the end ("stays at the end until I do something
+            # else") instead of collapsing to a live-style bar.
             length = self._last_vod_len_ms
         vod = length > 0
         if vod != self._scrub_on:
@@ -4390,7 +4563,9 @@ class PlayerView(QtWidgets.QWidget):
         # (and hoverable) from app open, before anything plays — flipping
         # it pre-stream just sets what the next series/catch-up will do.
         self.btn_auto.setEnabled(True)
-        self.btn_next.setEnabled(kind in ("live", "series", "catchup"))
+        self.btn_next.setEnabled(kind in ("live", "series", "catchup",
+                                          "stremio"))
+        self.btn_prev.setEnabled(kind in ("series", "catchup", "stremio"))
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled(vod and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
@@ -4423,8 +4598,13 @@ class PlayerView(QtWidgets.QWidget):
             "speed": self.btn_speed, "mute": self.btn_mute,
             "volume": self.vol_slider,
             "autoplay": self.btn_auto, "playnext": self.btn_next,
+            "playprev": self.btn_prev,
         }
         kind = (self.current or {}).get("kind")
+        # a Stremio handoff is "kind=stremio" for movies too — the episode
+        # buttons only make sense once identity resolved a season/episode
+        stremio_ep = kind == "stremio" and bool(
+            (self.current or {}).get("season"))
         for key, w in widgets.items():
             on = bool(vis.get(key, True)) and key not in compact
             if key == "rec":
@@ -4443,13 +4623,22 @@ class PlayerView(QtWidgets.QWidget):
                 self.btn_dl.setVisible(on and vod and not catchup)
                 self.btn_win.setVisible(on and catchup)
             elif key == "autoplay":
-                # series episodes + catch-up programs only (never movies,
-                # never live TV — there is no "next" to roll into)
-                w.setVisible(on and kind in ("series", "catchup"))
+                # series episodes + catch-up programs + identified Stremio
+                # episodes only (never movies, never live TV — there is no
+                # "next" to roll into)
+                w.setVisible(on and (kind in ("series", "catchup")
+                                     or stremio_ep))
             elif key == "playnext":
                 # "play next channel" on live TV, "play next episode" on
-                # series / catch-up; hidden for movies and pre-stream
-                w.setVisible(on and kind in ("live", "series", "catchup"))
+                # series / catch-up / identified Stremio episodes; hidden
+                # for movies and pre-stream
+                w.setVisible(on and (kind in ("live", "series", "catchup")
+                                     or stremio_ep))
+            elif key == "playprev":
+                # "play previous episode" on series / catch-up /
+                # identified Stremio episodes (live TV is next-only)
+                w.setVisible(on and (kind in ("series", "catchup")
+                                     or stremio_ep))
             else:
                 w.setVisible(on)
 
@@ -6469,5 +6658,7 @@ class PlayerView(QtWidgets.QWidget):
             self._cycle_audio()
         elif key == QtCore.Qt.Key_N:
             self._play_next_clicked()
+        elif key == QtCore.Qt.Key_P:
+            self._play_prev_clicked()
         else:
             super().keyPressEvent(event)

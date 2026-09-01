@@ -168,6 +168,80 @@ def leg_a():
     check("eof: seeked back, paused mid",
           fin(False, L, 240000, 240.0, "paused") is False)
 
+    # prev-episode maths (the ⏮ button's backend): synthetic meta
+    smeta = {"videos": [
+        {"season": 0, "episode": 1},
+        {"season": 1, "episode": 1, "name": "Winter Is Coming"},
+        {"season": 1, "episode": 2, "name": "The Kingsroad"},
+        {"season": 1, "episode": 3, "name": "Lord Snow"},
+        {"season": 2, "episode": 1, "name": "The North Remembers"}]}
+    check("prev_episode 1x2 -> 1x1",
+          stremio.prev_episode(smeta, 1, 2) == (1, 1))
+    check("prev_episode season premiere -> finale",
+          stremio.prev_episode(smeta, 2, 1) == (1, 3))
+    check("prev_episode 1x1 -> None",
+          stremio.prev_episode(smeta, 1, 1) is None)
+    check("prev_episode skips specials (from s1)",
+          stremio.prev_episode(smeta, 1, 1) is None)
+    check("next_episode intact through shared core",
+          stremio.next_episode(smeta, 1, 2) == (1, 3))
+
+    # prev_playable unit chain: monkeypatched catalog/addon/server so the
+    # full next/prev shared core runs without touching the network
+    saved = (stremio.series_meta, stremio.addon_streams,
+             stremio.StreamingServer)
+    full_meta = {"name": "Game of Thrones", "poster": "http://p/poster.jpg",
+                 "videos": smeta["videos"]}
+
+    class _FakeServer:
+        def __init__(self, base=""):
+            self.created = []
+
+        def create(self, info_hash, trackers=()):
+            self.created.append(info_hash)
+            return True
+
+        @staticmethod
+        def play_url(info_hash, file_idx):
+            return "http://127.0.0.1:11470/%s/%d" % (info_hash, file_idx)
+
+    fake_server = _FakeServer()
+    stremio.series_meta = lambda imdb: dict(full_meta)
+    stremio.addon_streams = lambda cfg, imdb, s, e: [
+        {"name": "A", "title": "S01E01 1080p \U0001F464 9 \U0001F4BE 2.2 GB",
+         "infoHash": "c" * 40, "fileIdx": 3}]
+    stremio.StreamingServer = lambda base="": fake_server
+    prv = stremio.prev_playable(cfg, {
+        "kind": "stremio", "url": "http://x/s", "fav_key": "stremio:zz:0",
+        "stremio_imdb": "tt9", "season": 1, "episode": 2,
+        "series_name": "Game of Thrones"})
+    check("prev_playable -> S01E01 via local server",
+          prv and prv.get("season") == 1 and prv.get("episode") == 1
+          and prv.get("info_hash") == "c" * 40
+          and prv.get("url") == "http://127.0.0.1:11470/%s/3" % ("c" * 40),
+          prv and prv.get("title"))
+    check("prev_playable title carries episode name",
+          prv and "Winter Is Coming" in prv.get("title", ""),
+          prv and prv.get("title", ""))
+    check("prev_playable carries series identity",
+          prv and prv.get("stremio_imdb") == "tt9"
+          and prv.get("series_name") == "Game of Thrones")
+    check("prev_playable created the torrent on the server",
+          fake_server.created == ["c" * 40])
+    check("prev_playable E1 -> None",
+          stremio.prev_playable(cfg, {
+              "kind": "stremio", "url": "http://x/s",
+              "stremio_imdb": "tt9", "season": 1, "episode": 1}) is None)
+    nxt = stremio.next_playable(cfg, {
+        "kind": "stremio", "url": "http://x/s", "stremio_imdb": "tt9",
+        "season": 1, "episode": 2, "series_name": "Game of Thrones"})
+    check("next_playable intact through the shared core",
+          nxt and nxt.get("episode") == 3
+          and "Lord Snow" in nxt.get("title", ""),
+          nxt and nxt.get("title", ""))
+    stremio.series_meta, stremio.addon_streams, stremio.StreamingServer \
+        = saved
+
 
 # ------------------------------------------------------------- [B] catalog
 def leg_b():
@@ -182,6 +256,12 @@ def leg_b():
                                      int(v.get("episode") or 0))
                                     for v in meta["videos"]] if s == 1))
     check("season finale rolls into S02E01", nxt is None or nxt[0] == 2, nxt)
+    check("prev_episode 1x2 -> 1x1",
+          stremio.prev_episode(meta, 1, 2) == (1, 1),
+          stremio.prev_episode(meta, 1, 2))
+    s2e1 = stremio.prev_episode(meta, 2, 1)
+    check("prev_episode S02E01 -> S01 finale",
+          s2e1 is not None and s2e1[0] == 1, s2e1)
     hit = stremio.find_series("Game of Thrones")
     check("find_series", hit and hit[0] == "tt0944947", hit)
 
@@ -250,6 +330,12 @@ def leg_c():
           nxt.get("stremio_imdb") == "tt0944947" and
           nxt.get("season") == 1 and nxt.get("episode") == 2,
           nxt and (nxt.get("title"), nxt.get("url", "")[:60]))
+    # ...and the ⏮ chain back down (live addons + server create)
+    prv = st.prev_playable(cfg, dict(nxt))
+    check("prev_playable chain (E2 -> E1)", prv is not None and
+          prv.get("stremio_imdb") == "tt0944947" and
+          prv.get("season") == 1 and prv.get("episode") == 1,
+          prv and (prv.get("title"), prv.get("url", "")[:60]))
     return True
 
 
@@ -372,6 +458,11 @@ report("handoff -> playing", cur.get("kind") == "stremio"
        and "11470" in cur.get("url", ""), str(cur.get("url", ""))[:60])
 report("stremio start wait 60s", bool(plays) and plays[0][1] == 60.0)
 report("start-time carried", bool(plays) and plays[0][3] == 12.0)
+# episode buttons stay hidden until identity resolves a season/episode
+# (a Stremio movie never grows them)
+_pv = win.player_view
+pre_ident_hidden = (_pv.btn_prev.isHidden() and _pv.btn_next.isHidden()
+                    and _pv.btn_auto.isHidden())
 n_before = len(plays)
 win.handle_handoff(["not-a-file"])
 report("junk handoff ignored", len(plays) == n_before)
@@ -417,6 +508,14 @@ if os.environ.get("MTP_PROBE_URL"):
     t = str(win.player_view.current.get("title", ""))
     report("identity title has episode name",
            ident and len(t.split(" — ", 1)[-1].split(" ", 2)) >= 3, t)
+    # the ⏮/⏭/autoplay buttons surface the moment identity lands
+    report("episode buttons hidden before identity", pre_ident_hidden)
+    report("prev btn visible + enabled once identified",
+           not _pv.btn_prev.isHidden() and _pv.btn_prev.isEnabled())
+    report("next btn visible for stremio episode",
+           not _pv.btn_next.isHidden())
+    report("autoplay btn visible for stremio episode",
+           not _pv.btn_auto.isHidden())
     # lookahead: the next episode is prefetched while this one plays
     look = None
     for _ in range(300):
