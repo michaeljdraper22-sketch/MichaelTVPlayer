@@ -367,6 +367,10 @@ class VLCPlayer:
                     from . import feedback
                     feedback.stat("plays_started")
                     return
+                if self.state_name() == "ended":
+                    # played AND finished inside the wait window — not
+                    # the never-started black window this watches for
+                    return
             except Exception:
                 return
             from . import feedback

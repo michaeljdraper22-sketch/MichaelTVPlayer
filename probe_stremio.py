@@ -382,6 +382,26 @@ if os.environ.get("MTP_PROBE_URL"):
         time.sleep(0.15)
     report("identity resolved into playable", ident,
            str(win.player_view.current.get("title", "")))
+    # episode NAME in the identity title (Cinemeta videos carry it in
+    # "name", not "title" — the bare "Show — S01E01" bug)
+    t = str(win.player_view.current.get("title", ""))
+    report("identity title has episode name",
+           ident and len(t.split(" — ", 1)[-1].split(" ", 2)) >= 3, t)
+    # lookahead: the next episode is prefetched while this one plays
+    look = None
+    for _ in range(300):
+        app.processEvents()
+        look = win.player_view._stremio_lookahead
+        if look and look[0] == (win.player_view.current or {}).get(
+                "fav_key") and look[1]:
+            break
+        time.sleep(0.2)
+    nxt = look[1] if (look and look[1]) else None
+    report("lookahead prefetched next episode", bool(nxt),
+           str((nxt or {}).get("title", ""))[:60])
+    report("lookahead title has episode name", bool(nxt) and len(
+        str(nxt.get("title", "")).split(" — ", 1)[-1].split(" ", 2)) >= 3,
+        str((nxt or {}).get("title", ""))[:60])
 win.close()
 '''
 

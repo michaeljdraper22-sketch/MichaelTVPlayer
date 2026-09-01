@@ -486,23 +486,31 @@ def _addon_bases(config) -> list:
 
 def addon_streams(config, imdb_id: str, season: int, episode: int):
     """Merged /stream/series/{imdb}:{s}:{e}.json results from every
-    configured addon (add-ons answer 204/empty when they have nothing)."""
+    configured addon (add-ons answer 204/empty when they have nothing).
+    One quiet retry on connection blips — a single ReadTimeout was seen
+    live leaving a "no usable stream" dead end at end-of-episode."""
     streams = []
     for base in _addon_bases(config):
-        try:
-            resp = _session.get(
-                "%s/stream/series/%s:%d:%d.json"
-                % (base, imdb_id, season, episode), timeout=25)
-            if resp.status_code != 200:
-                continue
-            data = resp.json()
-            for s in (data or {}).get("streams") or []:
-                if isinstance(s, dict):
-                    s = dict(s)
-                    s["_addon"] = base
-                    streams.append(s)
-        except Exception as exc:  # noqa: BLE001
-            log.info("stremio: addon %s query failed: %r", base, exc)
+        url = "%s/stream/series/%s:%d:%d.json" % (base, imdb_id,
+                                                  season, episode)
+        for attempt in (1, 2):
+            try:
+                resp = _session.get(url, timeout=25)
+                if resp.status_code != 200:
+                    break
+                data = resp.json()
+                for s in (data or {}).get("streams") or []:
+                    if isinstance(s, dict):
+                        s = dict(s)
+                        s["_addon"] = base
+                        streams.append(s)
+                break
+            except requests.exceptions.HTTPError:
+                break          # the addon answered — don't retry those
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 1:
+                    continue
+                log.info("stremio: addon %s query failed: %r", base, exc)
     return streams
 
 
@@ -618,9 +626,19 @@ def resolve_identity(url: str, server: StreamingServer):
         log.info("stremio: catalog search found no show for %r",
                  clean_show_name(file_name or torrent_name))
         return None
+    episode_name = ""
+    try:
+        # fetch (and cache) the series meta here on the worker: it
+        # carries the episode's display name AND pre-warms the cache
+        # next_playable needs minutes later at end-of-episode
+        episode_name = _episode_title(series_meta(hit[0]),
+                                      se[0], se[1])
+    except Exception:  # noqa: BLE001
+        pass
     return {
         "stremio_imdb": hit[0], "series_name": hit[1],
         "season": se[0], "episode": se[1],
+        "episode_name": episode_name,
         "torrent_name": torrent_name, "file_name": file_name,
     }
 
@@ -724,7 +742,10 @@ def _episode_title(meta: dict, season: int, episode: int) -> str:
         try:
             if int(v.get("season", -1)) == season and \
                     int(v.get("episode", -1)) == episode:
-                return str(v.get("title") or "")
+                # Cinemeta's series videos carry the episode name in
+                # "name" ("title" is null there — that gap was why the
+                # player showed bare "Show — S01E02" lines)
+                return str(v.get("name") or v.get("title") or "")
         except (TypeError, ValueError):
             continue
     return ""

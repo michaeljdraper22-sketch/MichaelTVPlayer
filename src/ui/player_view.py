@@ -752,6 +752,13 @@ class PlayerView(QtWidgets.QWidget):
         # show) — separate so a slow catalog search can't touch the others
         self._stremio_runner = AsyncRunner()
         self._stremio_runner.finished.connect(self._on_stremio_identity)
+        # Stremio next-episode PREFETCH (lookahead while the current
+        # episode plays) — separate so it can run beside a live
+        # end-of-episode fetch without queueing behind it
+        self._look_runner = AsyncRunner()
+        self._look_runner.finished.connect(self._on_stremio_lookahead)
+        self._look_busy = ""          # fav_key of the in-flight lookahead
+        self._stremio_lookahead = None   # (fav_key, playable|None, when)
         self._eof_next_done = False   # one autoplay shot per media
         self._eof_note_done = False   # one end-of-media log per media
         self._last_vod_len_ms = 0     # sticky VOD length through EOF
@@ -1847,8 +1854,50 @@ class PlayerView(QtWidgets.QWidget):
         title = "%s \u2014 S%02dE%02d" % (ident.get("series_name", "Series"),
                                          int(ident.get("season") or 0),
                                          int(ident.get("episode") or 0))
+        if ident.get("episode_name"):
+            title += " %s" % ident["episode_name"]
         cur["title"] = title
         self.show_info(title, sticky=True)
+        self._begin_stremio_lookahead()
+
+    # ---- stremio: prefetch the next episode while this one plays ----
+
+    def _begin_stremio_lookahead(self):
+        """Kick a background next-episode lookup for the CURRENT stremio
+        episode. End-of-episode then switches in well under a second
+        instead of a 10-30 s black-screen chain (catalog + addons +
+        debrid resolve + torrent engine warm-up all happen up front,
+        while the user is still watching)."""
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or not cur.get("stremio_imdb"):
+            return
+        base = cur.get("fav_key")
+        if self._look_busy == base:
+            return
+        self._look_busy = base
+
+        def _work():
+            from .. import stremio
+            nxt = stremio.next_playable(self.config, dict(cur))
+            return base, nxt
+        self._look_runner.run(_work)
+
+    def _on_stremio_lookahead(self, result):
+        ok, val = result
+        self._look_busy = ""
+        if ok != "ok" or self._closing:
+            return
+        base, nxt = val
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
+            return          # the user moved on while the lookup ran
+        self._stremio_lookahead = (base, nxt, now_s())
+        if nxt:
+            try:
+                log.info("stremio lookahead: next ready — %r",
+                         nxt.get("title", "")[:70])
+            except Exception:
+                pass
 
     # ---- play next / autoplay next ----
     def _on_autoplay_toggled(self, on):
@@ -1905,6 +1954,12 @@ class PlayerView(QtWidgets.QWidget):
         in flight, or may have failed); the next episode's stream comes
         from the configured addons and, for torrents, is started on the
         local Stremio streaming server."""
+        # the lookahead (kicked off as soon as this episode was
+        # identified) usually has it ready — switch instantly
+        look = self._stremio_lookahead
+        if look and look[0] == cur.get("fav_key") \
+                and now_s() - look[2] < 1800:
+            return look[1]
         try:
             from .. import stremio
             return stremio.next_playable(self.config, cur)
@@ -2023,6 +2078,10 @@ class PlayerView(QtWidgets.QWidget):
         self.config.data["last_channel"] = nxt
         self.config.save()
         self.play_media(nxt)
+        # keep the chain going: prefetch THIS episode's successor too
+        if (nxt.get("kind") == "stremio" and nxt.get("stremio_imdb")):
+            QtCore.QTimer.singleShot(
+                2000, self._begin_stremio_lookahead)
         # move the browser tab's blue selection to the new episode/program
         try:
             win = self.window()
@@ -2084,7 +2143,12 @@ class PlayerView(QtWidgets.QWidget):
                 or self._downloading:
             return
         self._eof_next_done = True
-        self.show_info("Up next\u2026")
+        look = self._stremio_lookahead
+        if look and look[0] == cur.get("fav_key") and look[1]:
+            self.show_info("Up next: %s" % (look[1].get("title", "")
+                                            or "\u2026"))
+        else:
+            self.show_info("Up next\u2026")
         base = cur.get("fav_key")
         self._next_runner.run(lambda: (base, self._fetch_next(cur)))
 
