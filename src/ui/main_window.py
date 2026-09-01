@@ -384,6 +384,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.config.add_recent(playable)
         self.config.data["last_channel"] = playable
         self.config.save()
+        # Watching now: hand the keyboard to the player so Space (and the
+        # other player keys) work even if focus sat in a browser search box.
+        self.player_view.setFocus(QtCore.Qt.OtherFocusReason)
 
     def play_next_channel(self):
         """Live TV "Play next": advance to the next channel in the Live

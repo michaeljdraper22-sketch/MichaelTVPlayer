@@ -16,6 +16,10 @@ QPushButton { background-color: #3a3a3a; color: #e6e6e6; border: 1px solid #4a4a
 QPushButton:hover { background-color: #46464a; border-color: #5a5a5a; }
 QPushButton:pressed { background-color: #0a84ff; }
 QPushButton:disabled { color: #777; background: #2b2b2b; }
+/* checkable player toggles (autoplay / mute / record): lit blue while
+   ON so the active state is unmistakable at a glance */
+QToolButton:checked { background-color: #0a84ff; border-radius: 4px; }
+QToolButton:checked:hover { background-color: #2b95ff; }
 QLineEdit, QSpinBox, QComboBox { background-color: #2b2b2b; color: #e6e6e6;
                                  border: 1px solid #4a4a4a; padding: 5px; border-radius: 3px;
                                  selection-background-color: #0a84ff; }

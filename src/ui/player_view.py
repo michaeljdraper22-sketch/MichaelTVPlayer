@@ -475,6 +475,7 @@ class VideoSurface(QtWidgets.QWidget):
     """Native render target handed to libvlc. Forwards mouse/wheel gestures."""
 
     double_clicked = QtCore.pyqtSignal()
+    single_clicked = QtCore.pyqtSignal()
     wheel_changed = QtCore.pyqtSignal(int)
     hovered = QtCore.pyqtSignal()
 
@@ -488,8 +489,28 @@ class VideoSurface(QtWidgets.QWidget):
         self.setPalette(pal)
         self.setMinimumSize(160, 90)
         self.setMouseTracking(True)
+        # Single vs double click must be told apart BEFORE acting: a left
+        # press arms a one-shot timer, and Qt's double-click event (which
+        # REPLACES the second press) cancels it. Only a press not followed
+        # by a second click fires single_clicked -> pause/play, so a
+        # double-click never pauses on its way to fullscreen. The interval
+        # IS the OS double-click window, so our classification and Qt's
+        # can never disagree.
+        self._click_timer = QtCore.QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(
+            QtWidgets.QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self.single_clicked.emit)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self._click_timer.start()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
 
     def mouseDoubleClickEvent(self, event):
+        self._click_timer.stop()
         self.double_clicked.emit()
 
     def wheelEvent(self, event):
@@ -552,6 +573,11 @@ class PlayerView(QtWidgets.QWidget):
         # opaque black VideoSurface child covers this everywhere except
         # the exact expose strips.)
         self.setAttribute(QtCore.Qt.WA_StyledBackground, True)
+        # Accepts keyboard focus so MainWindow.play() can hand it over the
+        # moment a stream starts: keys (Space etc.) then belong to the
+        # player instead of whatever was focused in the browser panel —
+        # a focused search box would otherwise swallow Space as text.
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
         self._seeking = False
         self._fullscreen = False
         self._zen = False
@@ -941,8 +967,11 @@ class PlayerView(QtWidgets.QWidget):
         # episode. Live from app open (sticky preference, like CC/scale/
         # speed — it only flips the setting until a stream plays). OFF
         # strikes an X through the glyph, mute-button style.
-        self.btn_auto = ctl_btn(ic.autoplay(self.config.autoplay_next),
-                                "Autoplay next episode", checkable=True)
+        self.btn_auto = ctl_btn(
+            ic.autoplay(self.config.autoplay_next),
+            "Autoplay next episode — ON"
+            if self.config.autoplay_next
+            else "Autoplay next episode — OFF", checkable=True)
         self.btn_auto.setChecked(self.config.autoplay_next)
         # play next: next episode for series, the next recorded program for
         # catch-up, the next channel for live TV (movies get neither)
@@ -1026,6 +1055,7 @@ class PlayerView(QtWidgets.QWidget):
         self.vol_slider.sliderMoved.connect(self._on_volume)
         self.vol_slider.sliderReleased.connect(self._on_volume_released)
         self.surface.double_clicked.connect(self.request_fullscreen.emit)
+        self.surface.single_clicked.connect(self._on_surface_clicked)
         self.surface.wheel_changed.connect(self._on_wheel)
         self.surface.hovered.connect(self._on_hover)
 
@@ -1943,6 +1973,16 @@ class PlayerView(QtWidgets.QWidget):
         self._next_runner.run(lambda: (base, self._fetch_next(cur)))
 
     # ---- controls ----
+    def _on_surface_clicked(self):
+        """Single left click on the video. Click-away for an open control
+        popup (audio/scale/speed card); otherwise pause/play — the VLC /
+        YouTube convention. Nothing loaded pre-stream: _toggle_pause's
+        guard quietly ignores it."""
+        if self._ctl_panel.isVisible():
+            self._ctl_panel.close_panel("video-click")
+            return
+        self._toggle_pause()
+
     def _toggle_pause(self):
         if not self.current:
             return          # nothing loaded (pre-stream Space key)

@@ -81,6 +81,18 @@ class BaseBrowser(QtWidgets.QWidget):
     def make_playable(self, it):
         return {"kind": self.kind, "title": self.item_display(it)}
 
+    def _search_activate(self):
+        """Enter in the search box: activate the first row of the current
+        (filtered) list. Flushes the 250 ms filter debounce first so the
+        list matches what was typed. Playback activation moves keyboard
+        focus to the player, so Space goes back to pause/play instead of
+        typing into the filter."""
+        if self._search_timer.isActive():
+            self._search_timer.stop()
+            self._apply_filter(self.search.text())
+        if self.list.count() > 0:
+            self._activate(self.list.item(0))
+
     def _build_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(6, 6, 6, 6)
@@ -98,6 +110,9 @@ class BaseBrowser(QtWidgets.QWidget):
         self.search.textChanged.connect(
             lambda _t: self._search_timer.start()
         )
+        # Enter in the search box plays the first filtered row — the row
+        # the user is looking at (see _search_activate).
+        self.search.returnPressed.connect(self._search_activate)
         self.cat_combo = QtWidgets.QComboBox()
         self.cat_combo.currentIndexChanged.connect(self._on_category)
         top = QtWidgets.QHBoxLayout()
