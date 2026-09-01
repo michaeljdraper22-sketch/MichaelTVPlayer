@@ -454,11 +454,13 @@ def find_series(name: str):
     must share a word with the query so a bad parse can't match a
     completely unrelated show; release-group/site prefix spam (which the
     cleaner can't know about) is handled by re-searching with leading
-    words progressively dropped."""
+    words progressively dropped. Single-word names get their one query
+    too (range floor of 1 — "Silo" silently never searched, which left
+    the episode buttons/autoplay dead on one-word-titled shows)."""
     if not name:
         return None
     words = [w for w in re.split(r"\W+", name) if len(w) > 2]
-    for trim in range(min(4, max(0, len(words) - 1))):
+    for trim in range(max(1, min(4, len(words) - 1))):
         query = " ".join(words[trim:])
         if not query:
             break

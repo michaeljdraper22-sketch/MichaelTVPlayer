@@ -319,6 +319,29 @@ check("stremio ended: BEGIN replays from the top",
       bool(stub.plays) and stub.plays[-1][1] == 0.0)
 pv.vlc = real_vlc
 
+print("[9] stremio identity-failure regression (the Silo crash)")
+pv.current = {"kind": "stremio", "title": "Stremio stream",
+              "url": "http://x/s", "fav_key": "stremio:zz:0"}
+try:
+    pv._on_stremio_identity(("ok", ("stremio:zz:0", None)))
+    check("identity None: no crash (message path)", True)
+except Exception as exc:
+    check("identity None: no crash (message path)", False, repr(exc))
+try:
+    pv._on_stremio_identity(("ok", None))
+    check("result None: no crash", True)
+except Exception as exc:
+    check("result None: no crash", False, repr(exc))
+check("failed identity left the playable untouched",
+      pv.current.get("title") == "Stremio stream")
+ident = {"stremio_imdb": "tt1", "series_name": "Silo", "season": 3,
+         "episode": 7, "episode_name": "The Book of Quinn"}
+pv._on_stremio_identity(("ok", ("stremio:zz:0", dict(ident))))
+check("identity success still lands (title + episode buttons)",
+      pv.current.get("season") == 3
+      and "S03E07" in pv.current.get("title", "")
+      and not pv.btn_prev.isHidden() and not pv.btn_next.isHidden())
+
 pv.stop()
 app.processEvents()
 print(f"\n{'ALL PASS' if fails[0] == 0 else str(fails[0]) + ' FAILURES'}")

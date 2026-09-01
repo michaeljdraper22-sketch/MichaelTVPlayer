@@ -1868,7 +1868,13 @@ class PlayerView(QtWidgets.QWidget):
         ok, val = result
         if self._closing:
             return
-        if ok != "ok" or not val:
+        # the worker returns (fav_key, identity-or-None): the old
+        # `not val` guard never caught the None (the TUPLE is truthy) and
+        # cur.update(None) crashed the slot — the identity failure took
+        # the buttons, the title AND the error message down with it
+        # (live-seen: "Silo" handoff, 2026-09-01 17:05)
+        base, ident = val if isinstance(val, tuple) else (None, None)
+        if ok != "ok" or not ident:
             if ok != "ok":
                 try:
                     log.warning("stremio identity lookup failed: %s", val)
@@ -1877,7 +1883,6 @@ class PlayerView(QtWidgets.QWidget):
             self.show_info("Could not identify this stream \u2014 "
                            "autoplay unavailable")
             return
-        base, ident = val
         cur = self.current or {}
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran

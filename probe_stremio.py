@@ -114,6 +114,23 @@ def leg_a():
     check("SE marker 2x05", stremio.parse_se("Show 2x05 REPACK") == (2, 5))
     check("SE marker none", stremio.parse_se("A Movie 2023 1080p") is None)
 
+    # find_series single-word floor: a one-word show name ("Silo") used
+    # to produce ZERO queries (range(min(4, len-1)) == range(0)) — the
+    # live identity dead-end behind the missing episode buttons
+    saved_search = stremio.search_series
+    calls = []
+    stremio.search_series = lambda q: (calls.append(q) or [
+        {"id": "ttS", "name": "Silo", "type": "series"}])
+    check("find_series single-word name queries + matches",
+          stremio.find_series("Silo") == ("ttS", "Silo")
+          and calls == ["Silo"], str(calls))
+    calls.clear()
+    stremio.search_series = lambda q: (calls.append(q) or [])
+    stremio.find_series("Bad Parse")
+    check("find_series two words: one combined query (unchanged)",
+          calls == ["Bad Parse"], str(calls))
+    stremio.search_series = saved_search
+
     cleaned = stremio.clean_show_name(
         "Game.of.Thrones.S02E05.1080p.WEB-DL.x265-QTZ")
     check("clean show name", cleaned == "Game of Thrones", repr(cleaned))
@@ -264,6 +281,9 @@ def leg_b():
           s2e1 is not None and s2e1[0] == 1, s2e1)
     hit = stremio.find_series("Game of Thrones")
     check("find_series", hit and hit[0] == "tt0944947", hit)
+    hit1 = stremio.find_series("Silo")
+    check("find_series single-word (live: the user's Silo case)",
+          hit1 is not None, hit1)
 
     cfg = Config(dict(DEFAULTS), None)
     streams = stremio.addon_streams(cfg, "tt0944947", 1, 2)
@@ -458,9 +478,17 @@ report("handoff -> playing", cur.get("kind") == "stremio"
        and "11470" in cur.get("url", ""), str(cur.get("url", ""))[:60])
 report("stremio start wait 60s", bool(plays) and plays[0][1] == 60.0)
 report("start-time carried", bool(plays) and plays[0][3] == 12.0)
+_pv = win.player_view
+# identity-failure regression: a (fav_key, None) result used to crash
+# _on_stremio_identity (cur.update(None)) instead of showing the honest
+# "could not identify" message
+try:
+    _pv._on_stremio_identity(("ok", ("no-such-fav", None)))
+    report("identity None result: no crash", True)
+except Exception as exc:  # noqa: BLE001
+    report("identity None result: no crash", False, repr(exc))
 # episode buttons stay hidden until identity resolves a season/episode
 # (a Stremio movie never grows them)
-_pv = win.player_view
 pre_ident_hidden = (_pv.btn_prev.isHidden() and _pv.btn_next.isHidden()
                     and _pv.btn_auto.isHidden())
 n_before = len(plays)
