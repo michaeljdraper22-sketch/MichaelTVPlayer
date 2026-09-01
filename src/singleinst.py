@@ -43,7 +43,8 @@ class SingleInstance(QtNetwork.QLocalServer):
                 pass
             sock.disconnectFromServer()
             log.info("single-instance: forwarded %d args to the running "
-                     "instance", len(args or []))
+                     "instance: %r", len(args or []),
+                     [str(a)[:300] for a in (args or [])])
             return True
         # Not running — or a stale socket from a crashed run is blocking
         # listen(); clearing it is exactly what the stale case needs.
@@ -73,7 +74,10 @@ class SingleInstance(QtNetwork.QLocalServer):
             conn.disconnectFromServer()
             args = json.loads(line.decode("utf-8", "replace") or "[]")
             if isinstance(args, list) and args:
-                self.received.emit([str(a) for a in args])
+                args = [str(a) for a in args]
+                log.info("single-instance: received %d arg(s): %r",
+                         len(args), [a[:300] for a in args])
+                self.received.emit(args)
         except Exception as exc:  # noqa: BLE001
             log.warning("single-instance: bad payload: %r", exc)
         conn.deleteLater()

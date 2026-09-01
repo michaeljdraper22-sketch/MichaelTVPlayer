@@ -409,9 +409,16 @@ class MainWindow(QtWidgets.QMainWindow):
     def handle_handoff(self, args):
         """Args from an external launch — either the patched Stremio
         streaming server invoking us exactly like it invoked VLC
-        (--start-time=N [--sub-file=x.srt] "<url>") or a Windows
-        .m3u association launch (playlist path). Parse, play, come
-        forward. With nothing playable, just surface the window."""
+        (--start-time=N [--sub-file=x.srt] "<url>"), a Windows .m3u
+        association launch (playlist path), or the Downloads watcher
+        (plain stream URL). Parse, play, come forward. With nothing
+        playable, say so — a silent no-op reads as "it worked" when
+        something else happens to be playing."""
+        args = [str(a) for a in (args or [])]
+        try:
+            log.info("handoff args: %r", [a[:300] for a in args])
+        except Exception:  # noqa: BLE001
+            pass
         launch = None
         try:
             from .. import stremio
@@ -429,6 +436,17 @@ class MainWindow(QtWidgets.QMainWindow):
             if launch.get("sub_file"):
                 playable["sub_file"] = launch["sub_file"]
             self.play(playable, launch.get("start_at") or 0.0)
+        else:
+            real = [a for a in args if not a.startswith("-")]
+            if real:
+                log.warning("handoff: nothing playable in %r",
+                            [a[:200] for a in real])
+                try:
+                    self.statusBar().showMessage(
+                        "Stremio handoff: nothing playable in %r"
+                        % real[0][:120], 8000)
+                except Exception:  # noqa: BLE001
+                    pass
         if self.isMinimized():
             self.showNormal()
         self.raise_()

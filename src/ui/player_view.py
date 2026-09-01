@@ -753,6 +753,8 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_runner = AsyncRunner()
         self._stremio_runner.finished.connect(self._on_stremio_identity)
         self._eof_next_done = False   # one autoplay shot per media
+        self._eof_note_done = False   # one end-of-media log per media
+        self._last_vod_len_ms = 0     # sticky VOD length through EOF
         self.vlc = VLCPlayer(
             timeshift=config.timeshift, volume=config.volume,
             network_caching=config.network_caching,
@@ -1733,6 +1735,8 @@ class PlayerView(QtWidgets.QWidget):
         self._scrub_on = False
         self._vid_s = 0.0
         self._eof_next_done = False   # re-arm autoplay-next for this media
+        self._eof_note_done = False
+        self._last_vod_len_ms = 0
         self._cu_rescues = 0         # re-arm catch-up rescue/form-flip
         if (self.current or {}).get("url") != playable.get("url"):
             self._vod_rescues = 0     # same-media rescue reopens keep the cap
@@ -2027,6 +2031,23 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
 
+    @staticmethod
+    def _media_finished(playing, length_ms, raw_ms, vid_s, state):
+        """True when playback has genuinely reached the end of the item.
+
+        VLC state "ended" is the clean signal, but network-relayed VOD
+        (the panel's split streams, the Stremio server) often ends
+        differently: the state stalls at "playing"/"stopped" while the
+        clock resets to 0. The wall-integrated tracked position
+        (``vid_s``) survives that reset and is the fallback."""
+        if state == "ended":
+            return True
+        if playing:
+            return False
+        if length_ms > 0 and raw_ms >= length_ms - 1500:
+            return True
+        return vid_s > 0 and vid_s * 1000.0 >= length_ms - 2000.0
+
     def _maybe_autoplay_next(self, playing, length_ms, raw_ms):
         """Natural end of a series episode / catch-up program: roll into
         the next item when the autoplay toggle is on."""
@@ -2035,21 +2056,33 @@ class PlayerView(QtWidgets.QWidget):
         cur = self.current or {}
         if cur.get("kind") not in ("series", "catchup", "stremio"):
             return
-        if not self.btn_auto.isChecked() or length_ms <= 0:
+        if length_ms <= 0:
+            return
+        state = ""
+        try:
+            state = self.vlc.state_name() or ""
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._media_finished(playing, length_ms, raw_ms,
+                                    self._vid_s, state):
+            return
+        if not self._eof_note_done:
+            # end-of-media is otherwise invisible in the log — this one
+            # line answers "why did/didn't autoplay fire" for good
+            self._eof_note_done = True
+            try:
+                log.info("autoplay-next: media finished — kind=%s "
+                         "state=%s raw=%dms vid=%.1fs len=%dms "
+                         "playing=%s auto=%s", cur.get("kind"),
+                         state or "?", raw_ms, self._vid_s, length_ms,
+                         playing, self.btn_auto.isChecked())
+            except Exception:
+                pass
+        if not self.btn_auto.isChecked():
             return
         if self._seeking or self._live_paused or self._win_sel \
                 or self._downloading:
             return
-        ended = False
-        try:
-            ended = self.vlc.state_name() == "ended"
-        except Exception:  # noqa: BLE001
-            pass
-        if not ended:
-            # indexless catch-up TS may never report "ended" — the clock
-            # sitting at the end with playback stopped is the same signal
-            if playing or raw_ms <= 0 or raw_ms < length_ms - 1500:
-                return
         self._eof_next_done = True
         self.show_info("Up next\u2026")
         base = cur.get("fav_key")
@@ -4064,6 +4097,16 @@ class PlayerView(QtWidgets.QWidget):
             # VLC cannot size these indexless TS streams; the program
             # window IS the length (the scrubber + markers rely on it)
             length = self._catchup_dur_ms()
+        if length > 0:
+            self._last_vod_len_ms = length
+        elif (self._scrub_on and self._last_vod_len_ms > 0
+                and (self.current or {}).get("kind")
+                in ("series", "movie", "vod")):
+            # VLC drops get_length() the moment a network VOD ends —
+            # without the last known length the tick flips to "live"
+            # here, the scrubber vanishes, and end-of-media autoplay
+            # never runs (the 2026-09-01 black-screen-at-credits)
+            length = self._last_vod_len_ms
         vod = length > 0
         if vod != self._scrub_on:
             self._scrub_on = vod

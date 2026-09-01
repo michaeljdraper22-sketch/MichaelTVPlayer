@@ -116,6 +116,28 @@ def leg_a():
           best and best["infoHash"] == "b" * 40,
           best and best["title"][:20])
 
+    # end-of-media detection: state "ended" OR the tracked-position
+    # fallback (VLC resets raw to 0 / stalls the state when a
+    # network-relayed VOD finishes — the black-screen-at-credits bug)
+    from src.ui.player_view import PlayerView as _PV
+    fin = _PV._media_finished
+    L = 11 * 60 * 1000
+    check("eof: state ended", fin(True, L, 0, 0.0, "ended") is True)
+    check("eof: raw at end",
+          fin(False, L, L - 900, 600.0, "stopped") is True)
+    check("eof: clock reset, tracked pos at end",
+          fin(False, L, 0, (L - 1500) / 1000.0, "stopped") is True)
+    check("eof: clock reset, stalled state playing",
+          fin(False, L, 0, (L - 100) / 1000.0, "playing") is True)
+    check("eof: mid-episode not finished",
+          fin(False, L, 0, 300.0, "stopped") is False)
+    check("eof: playing near end not finished",
+          fin(True, L, L - 3000, (L - 3000) / 1000.0, "playing") is False)
+    check("eof: nothing loaded",
+          fin(False, 0, 0, 0.0, "idle") is False)
+    check("eof: seeked back, paused mid",
+          fin(False, L, 240000, 240.0, "paused") is False)
+
 
 # ------------------------------------------------------------- [B] catalog
 def leg_b():
