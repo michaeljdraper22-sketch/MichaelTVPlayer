@@ -128,15 +128,20 @@ class StremioDialog(QtWidgets.QDialog):
 
     def _make_default(self):
         fileassoc.register()
-        ok = fileassoc.try_set_default()
-        if not ok:
+        if not fileassoc.try_set_default():
+            # Windows 11 refuses silent switches — hand the user the
+            # system's own chooser (with the "Always" checkbox) pre-
+            # focused on a playlist
+            fileassoc.prompt_default()
+        if not fileassoc.is_default():
             QtWidgets.QMessageBox.information(
                 self, "Stremio handoff",
-                "Windows did not let the app switch the default "
-                "silently.\n\nIn the screen that just opened, choose "
-                "MichaelTV under \u201c.m3u\u201d.\n\n(Or right-click any "
-                ".m3u \u25b8 Open with \u25b8 MichaelTV \u25b8 Always.)")
-            self._open_defaults()
+                "MichaelTV is in the .m3u \u201cOpen with\u201d menu but "
+                "not the default yet.\n\nEasiest: when Stremio downloads "
+                "playlist.m3u, click it once in the browser\u2019s "
+                "download bar and pick MichaelTV (\u201cAlways\u201d).\n"
+                "Or right-click any .m3u \u25b8 Open with \u25b8 MichaelTV "
+                "\u25b8 Always.")
         self._refresh_status()
 
     def _open_defaults(self):

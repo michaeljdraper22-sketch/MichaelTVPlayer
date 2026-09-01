@@ -168,6 +168,40 @@ def try_set_default() -> bool:
         return False
 
 
+def prompt_default() -> bool:
+    """Pop Windows' own "How do you want to open this file?" for a
+    playlist — the supported way to get the "Always use this app" choice
+    in front of the user (SHOpenWithDialog). Returns True if we are the
+    default afterwards."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    import ctypes.wintypes as wt
+    import tempfile
+
+    class _OPENASINFO(ctypes.Structure):
+        _fields_ = [("pcszFile", wt.LPCWSTR), ("pcszClass", wt.LPCWSTR),
+                    ("oaifInFlags", ctypes.c_uint)]
+
+    OAIF_ALLOW_REGISTRATION = 0x1     # show the "Always" checkbox
+    path = ""
+    try:
+        fd, path = tempfile.mkstemp(suffix=".m3u")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("#EXTM3U\n")
+        info = _OPENASINFO(path, None, OAIF_ALLOW_REGISTRATION)
+        ctypes.windll.shell32.SHOpenWithDialog(None, ctypes.byref(info))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("fileassoc: SHOpenWithDialog failed: %r", exc)
+    finally:
+        try:
+            if path:
+                os.remove(path)
+        except OSError:
+            pass
+    return is_default()
+
+
 def unregister() -> None:
     """Remove everything register() wrote (uninstaller / settings)."""
     if sys.platform != "win32":
