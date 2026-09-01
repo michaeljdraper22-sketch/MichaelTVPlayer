@@ -1,0 +1,162 @@
+# -*- coding: utf-8 -*-
+"""Headless probe: live TV "Play previous" — the channel ABOVE in the list.
+
+Offscreen, VLC never starts (play_media is stubbed to a recorder): the
+⏮ button on a live channel must emit request_prev_channel and step to the
+channel above the current one in the Live tab's visible list, wrapping to
+the bottom at the top — the exact twin of play-next.
+"""
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
+
+app = QtWidgets.QApplication(sys.argv)
+fails = [0]
+
+
+def check(name, cond, extra=""):
+    print(("  ok   " if cond else "  FAIL ") + name + ("" if cond else extra))
+    if not cond:
+        fails[0] += 1
+
+
+from src.config import DEFAULTS, Config  # noqa: E402
+from src.ui.main_window import MainWindow  # noqa: E402
+
+MainWindow._restore_state = lambda self: None
+cfg = Config(dict(DEFAULTS, server_url="http://dummy", username="u",
+                  password="p", parent_dir=None), None)
+win = MainWindow(cfg)
+win._save_state = lambda: None
+
+pv = win.player_view
+
+# VLC never starts in this probe: play_media records what it was handed
+# and adopts it as current — exactly what the real play_media does minus
+# the media player itself.
+plays = []
+
+
+def fake_play_media(playable, start_at=0.0):
+    plays.append(dict(playable))
+    pv.current = dict(playable)
+
+
+pv.play_media = fake_play_media
+
+
+class FakeLiveClient:
+    def live_url(self, sid):
+        return f"http://x/live/{sid}"
+
+
+win.live_tab.client = FakeLiveClient()
+
+# Four raw provider rows in the visible list (the shape _show_items puts
+# in UserRole): stream_ids 11, 22, 33, 44 in list order.
+ROWS = [{"stream_id": s, "name": f"Chan {s}", "stream_icon": ""}
+        for s in (11, 22, 33, 44)]
+for it in ROWS:
+    wi = QtWidgets.QListWidgetItem(it["name"])
+    wi.setData(QtCore.Qt.UserRole, dict(it))
+    win.live_tab.list.addItem(wi)
+win.live_tab.all_items = [dict(it) for it in ROWS]
+
+
+def current_at(sid):
+    pv.current = {"kind": "live", "title": f"Chan {sid}", "stream_id": sid,
+                  "fav_key": f"live:{sid}", "url": f"http://x/live/{sid}"}
+
+
+def played_sid():
+    return plays[-1].get("stream_id") if plays else None
+
+
+print("[1] visibility + enabled for a live channel")
+current_at(22)
+pv._update_control_state()
+app.processEvents()
+check("live: prev button visible + enabled",
+      not pv.btn_prev.isHidden() and pv.btn_prev.isEnabled())
+check("live: next button still visible + enabled",
+      not pv.btn_next.isHidden() and pv.btn_next.isEnabled())
+
+print("[2] stepping via the real button (click -> signal -> main window)")
+pv.btn_prev.click()
+app.processEvents()
+check("prev from 22 plays 22-1 = 11", played_sid() == 11,
+      f" got {played_sid()}")
+check("selection followed playback to 11",
+      win.live_tab.list.currentRow() == 0)
+check("playable is kind=live with a made URL",
+      plays[-1].get("kind") == "live"
+      and plays[-1].get("url") == "http://x/live/11")
+
+pv.btn_next.click()
+app.processEvents()
+check("next from 11 plays 22 (next still works)", played_sid() == 22)
+
+print("[3] wrap-around both ways")
+current_at(11)
+pv.btn_prev.click()
+app.processEvents()
+check("prev from the TOP wraps to the bottom (44)",
+      played_sid() == 44, f" got {played_sid()}")
+current_at(44)
+pv.btn_next.click()
+app.processEvents()
+check("next from the BOTTOM wraps to the top (11)",
+      played_sid() == 11, f" got {played_sid()}")
+
+print("[4] P key routes live to prev-channel too")
+current_at(33)
+ev = QtGui.QKeyEvent(QtCore.QEvent.KeyPress, QtCore.Qt.Key_P,
+                      QtCore.Qt.NoModifier)
+pv.keyPressEvent(ev)
+app.processEvents()
+check("P on live steps to 22", played_sid() == 22, f" got {played_sid()}")
+
+print("[5] guards: not playing live / not in the list")
+plays.clear()
+pv.current = {"kind": "vod", "title": "Movie", "fav_key": "vod:1",
+              "url": "http://x/m.mkv"}
+pv._update_control_state()
+check("movie: prev hidden again",
+      pv.btn_prev.isHidden())
+pv._play_prev_clicked()
+app.processEvents()
+check("movie: P/button does nothing", not plays)
+
+current_at(99)   # not one of the visible rows
+sb = win.statusBar()
+sb.clearMessage()
+win.play_prev_channel()
+check("current not in list: status explains, nothing plays",
+      not plays and "not in the Live list" in sb.currentMessage())
+
+print("[6] next-channel regression: refactored core identical for next")
+current_at(33)
+win.play_next_channel()
+check("direct next 33 -> 44", played_sid() == 44, f" got {played_sid()}")
+current_at(22)
+win.play_next_channel()
+check("direct next 22 -> 33", played_sid() == 33, f" got {played_sid()}")
+
+print("[7] one-row list falls back to all_items (Recently-Played shape)")
+win.live_tab.list.clear()
+wi = QtWidgets.QListWidgetItem("Chan 22")
+wi.setData(QtCore.Qt.UserRole, dict(ROWS[1]))
+win.live_tab.list.addItem(wi)
+current_at(22)
+win.play_prev_channel()
+check("single visible row: fallback steps within all_items",
+      played_sid() == 11, f" got {played_sid()}")
+
+pv.stop()
+app.processEvents()
+print(f"\n{'ALL PASS' if fails[0] == 0 else str(fails[0]) + ' FAILURES'}")
+sys.exit(1 if fails[0] else 0)

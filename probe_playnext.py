@@ -181,9 +181,10 @@ check("all three hidden for a movie",
 pv.play_media({"kind": "live", "title": "Chan", "url": "http://x/l",
                "stream_id": 9, "fav_key": "live:9"})
 app.processEvents()
-check("live: autoplay+prev hidden, play-next enabled",
+check("live: autoplay hidden, prev+next visible and enabled",
       pv.btn_auto.isHidden() and not pv.btn_next.isHidden()
-      and pv.btn_next.isEnabled() and pv.btn_prev.isHidden())
+      and pv.btn_next.isEnabled() and not pv.btn_prev.isHidden()
+      and pv.btn_prev.isEnabled())
 
 # stremio handoff with NO identity yet (a movie can never grow one — the
 # episode buttons must stay hidden until a season/episode is known)

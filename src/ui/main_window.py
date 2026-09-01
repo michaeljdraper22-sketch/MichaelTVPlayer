@@ -155,6 +155,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.player_view.request_toggle_panel.connect(self.toggle_zen)
         self.player_view.request_toggle_channels.connect(self.toggle_channels)
         self.player_view.request_next_channel.connect(self.play_next_channel)
+        self.player_view.request_prev_channel.connect(self.play_prev_channel)
 
         self.splitter.addWidget(self.tabs)
         self.splitter.addWidget(self.player_view)
@@ -466,14 +467,22 @@ class MainWindow(QtWidgets.QMainWindow):
         tab's current (filtered) list, wrapping back to the top at the end.
         The current channel must be in that list — a custom-URL stream has
         no neighbours to step through."""
+        self._live_channel_step(+1)
+
+    def play_prev_channel(self):
+        """Live TV "Play previous": the ⏮ twin — step to the channel ABOVE
+        the current one in the same list, wrapping to the bottom at the top."""
+        self._live_channel_step(-1)
+
+    def _live_channel_step(self, delta: int):
+        """Shared core of play next/prev channel: walk the Live tab's rows
+        the user actually SEES — the list widget — not all_items: all_items
+        goes stale when the tab shows Recently Played (playable mode keeps
+        the old category's items), and it ignores the search box's filter,
+        so the neighbouring channel could be one the displayed list doesn't
+        contain and the blue selection could never follow playback."""
         cur = self.player_view.current or {}
         sid = cur.get("stream_id") if cur.get("kind") == "live" else None
-        # Step through the rows the user actually SEES — the list widget —
-        # not all_items: all_items goes stale when the tab shows Recently
-        # Played (playable mode keeps the old category's items), and it
-        # ignores the search box's filter, so the next channel could be
-        # one the displayed list doesn't contain and the blue selection
-        # could never follow playback.
         lw = self.live_tab.list
         items = [lw.item(i).data(QtCore.Qt.UserRole) or {}
                  for i in range(lw.count())]
@@ -481,7 +490,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if len(items) < 2:
             # the display has no OTHER channel to step to (e.g. a
             # one-entry Recently-Played view) — fall back to the tab's
-            # full item list so "next" still zaps somewhere
+            # full item list so the step still zaps somewhere
             items = [it for it in (self.live_tab.all_items or [])
                      if it.get("stream_id") is not None]
         if sid is None or not items:
@@ -494,7 +503,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self.statusBar().showMessage(
                 "Current channel is not in the Live list", 3000)
             return
-        nxt = items[(idx + 1) % len(items)]
+        nxt = items[(idx + delta) % len(items)]
         # playable-mode rows are already playables (they carry "url");
         # plain category rows are raw provider dicts needing make_playable
         playable = (nxt if nxt.get("url")

@@ -559,6 +559,8 @@ class PlayerView(QtWidgets.QWidget):
     # live TV "Play next": PlayerView has no channel list — MainWindow
     # resolves the next channel in the Live tab's current list
     request_next_channel = QtCore.pyqtSignal()
+    # live TV "Play previous": the twin — the channel ABOVE in that list
+    request_prev_channel = QtCore.pyqtSignal()
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
@@ -2041,10 +2043,14 @@ class PlayerView(QtWidgets.QWidget):
         self._next_runner.run(lambda: (base, self._fetch_next(cur)))
 
     def _play_prev_clicked(self):
-        """The ⏮ twin of play-next: previous episode (series / Stremio) or
-        earlier recorded program (catch-up). Live TV has no prev."""
+        """The ⏮ twin of play-next: previous channel (live TV — the channel
+        ABOVE the current one in the Live list), previous episode (series /
+        Stremio) or earlier recorded program (catch-up)."""
         cur = self.current
         if self._closing or not cur:
+            return
+        if cur.get("kind") == "live":
+            self.request_prev_channel.emit()
             return
         if cur.get("kind") not in ("series", "catchup", "stremio"):
             return
@@ -4570,7 +4576,8 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_auto.setEnabled(True)
         self.btn_next.setEnabled(kind in ("live", "series", "catchup",
                                           "stremio"))
-        self.btn_prev.setEnabled(kind in ("series", "catchup", "stremio"))
+        self.btn_prev.setEnabled(kind in ("live", "series", "catchup",
+                                          "stremio"))
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled(vod and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
@@ -4640,9 +4647,11 @@ class PlayerView(QtWidgets.QWidget):
                 w.setVisible(on and (kind in ("live", "series", "catchup")
                                      or stremio_ep))
             elif key == "playprev":
-                # "play previous episode" on series / catch-up /
-                # identified Stremio episodes (live TV is next-only)
-                w.setVisible(on and (kind in ("series", "catchup")
+                # "play previous channel" on live TV (the channel above in
+                # the list), "play previous episode" on series / catch-up /
+                # identified Stremio episodes; hidden for movies and
+                # pre-stream
+                w.setVisible(on and (kind in ("live", "series", "catchup")
                                      or stremio_ep))
             else:
                 w.setVisible(on)
