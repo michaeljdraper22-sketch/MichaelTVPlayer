@@ -79,6 +79,36 @@ def leg_a():
     check("server url reject plain",
           stremio.parse_server_url("https://cdn.example/abc.mkv") is None)
 
+    # debrid resolve/play links carry the torrent identity (fallback
+    # fuel when the debrid link itself stalls)
+    torbox = ("https://torrentio.strem.fun/resolve/torbox/"
+              "1f7be332-5fea-4aa8-8814-46eabea63736/"
+              "30df1b0b3bb8dbfb3bf2b25862b35d7828619721/"
+              "Adventure.Time.S02E25.Mortal.Recoil.1080p.AMZN.WEB-DL.mkv"
+              "/24/Adventure.Time.S02E25.Mortal.Recoil.1080p.AMZN.WEB-DL"
+              ".mkv")
+    check("resolve url (torrentio, idx)",
+          stremio.parse_resolve_url(torbox)
+          == ("30df1b0b3bb8dbfb3bf2b25862b35d7828619721", 24))
+    debridio = ("https://addon.debridio.com/play/series/premiumize/"
+                "0889be7cbed8417f47e58540afea55c0/tdgs5gcukfk2fcc3/"
+                "bf2671f9d1521fa85249b7b5920e7d3294defa80/"
+                "Adventure.Time.S02E25.Mortal.Recoil.BluRay.1080p.DD.2.0"
+                ".VC-1.REMUX-FraMeSToR.mkv")
+    check("resolve url (debridio, no idx)",
+          stremio.parse_resolve_url(debridio)
+          == ("bf2671f9d1521fa85249b7b5920e7d3294defa80", 0))
+    check("resolve url reject plain",
+          stremio.parse_resolve_url(
+              "https://cdn.example/abc.mkv") is None)
+    p = stremio.playable_from_url(torbox)
+    check("playable from resolve url",
+          p.get("kind") == "stremio"
+          and p.get("info_hash")
+          == "30df1b0b3bb8dbfb3bf2b25862b35d7828619721"
+          and p.get("file_idx") == 24, (p.get("info_hash"),
+                                        p.get("file_idx")))
+
     check("SE marker SxxExx", stremio.parse_se(
         "Game.of.Thrones.S02E05.720p.x264") == (2, 5))
     check("SE marker 2x05", stremio.parse_se("Show 2x05 REPACK") == (2, 5))

@@ -759,6 +759,16 @@ class PlayerView(QtWidgets.QWidget):
         self._look_runner.finished.connect(self._on_stremio_lookahead)
         self._look_busy = ""          # fav_key of the in-flight lookahead
         self._stremio_lookahead = None   # (fav_key, playable|None, when)
+        # debrid-stall fallback (see _stremio_guard_tick): play the
+        # handoff's torrent through the local Stremio server when the
+        # debrid link itself refuses to start
+        self._fb_runner = AsyncRunner()
+        self._fb_runner.finished.connect(self._on_stremio_fallback)
+        self._stremio_guard = QtCore.QTimer(self)
+        self._stremio_guard.setInterval(2000)
+        self._stremio_guard.timeout.connect(self._stremio_guard_tick)
+        self._stremio_fallback_done = False
+        self._stremio_guard_t0 = 0.0
         self._eof_next_done = False   # one autoplay shot per media
         self._eof_note_done = False   # one end-of-media log per media
         self._last_vod_len_ms = 0     # sticky VOD length through EOF
@@ -1794,6 +1804,19 @@ class PlayerView(QtWidgets.QWidget):
             # episode) in the background — that is what makes autoplay-
             # next and the title work
             self._begin_stremio_identity(playable)
+            # a debrid link that hasn't started in ~10 s is dead (live
+            # seen: transient resolve-endpoint 502s) — watch for it and
+            # fall back to the same torrent on the local server. Server
+            # URLs (fresh torrents) skip the guard on purpose.
+            try:
+                from .. import stremio as _st
+                if (playable.get("info_hash")
+                        and not _st.parse_server_url(url)):
+                    self._stremio_fallback_done = False
+                    self._stremio_guard_t0 = now_s()
+                    self._stremio_guard.start()
+            except Exception:  # noqa: BLE001
+                pass
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
         # tick) re-selects a track with the same NAME once the new media's
         # tracks appear, and leaves subtitles off when it has none.
@@ -1898,6 +1921,80 @@ class PlayerView(QtWidgets.QWidget):
                          nxt.get("title", "")[:70])
             except Exception:
                 pass
+
+    # ---- stremio: debrid-stall fallback (local-server torrent) ----
+
+    def _stremio_guard_tick(self):
+        """Every 2 s after a debrid handoff opens: if VLC still hasn't
+        started after ~10 s the debrid link is dead (live-seen: transient
+        502s from torrentio's resolve endpoint) — switch to the same
+        torrent on the local Stremio server. Server-URL handoffs never
+        arm this guard (fresh torrents legitimately take minutes; the
+        60 s start watchdog covers those)."""
+        cur = self.current or {}
+        if self._closing or cur.get("kind") != "stremio":
+            self._stremio_guard.stop()
+            return
+        try:
+            alive = self.vlc.is_playing() or self.vlc.state_name() in (
+                "playing", "paused", "ended")
+        except Exception:  # noqa: BLE001
+            alive = False
+        if alive:
+            self._stremio_guard.stop()
+            return
+        if now_s() - self._stremio_guard_t0 < 10.0:
+            return
+        self._stremio_guard.stop()
+        if self._stremio_fallback_done:
+            log.warning("stremio: stream never started, no fallback "
+                        "left — %r", cur.get("title", ""))
+            self.show_info("Stream failed to open")
+            return
+        self._begin_stremio_fallback()
+
+    def _begin_stremio_fallback(self):
+        """Worker: create the handoff's torrent on the local Stremio
+        streaming server and hand back its play URL."""
+        cur = dict(self.current or {})
+        if cur.get("kind") != "stremio" or not cur.get("info_hash"):
+            return
+        self._stremio_fallback_done = True
+        self.show_info("Debrid link stalled \u2014 switching to the "
+                       "torrent\u2026")
+        base = cur.get("fav_key")
+
+        def _work():
+            from .. import stremio
+            server = stremio.StreamingServer(
+                self.config.data.get("stremio_server") or "")
+            info_hash = str(cur["info_hash"]).lower()
+            if not server.create(info_hash):
+                return base, None
+            return base, server.play_url(
+                info_hash, int(cur.get("file_idx") or 0))
+        self._fb_runner.run(_work)
+
+    def _on_stremio_fallback(self, result):
+        ok, val = result
+        if ok != "ok" or self._closing:
+            return
+        base, url = val
+        cur = self.current or {}
+        if cur.get("fav_key") != base:
+            return          # the user moved on while the fallback ran
+        if not url:
+            log.warning("stremio: torrent fallback refused by the "
+                        "streaming server")
+            self.show_info("Stream failed to open")
+            return
+        try:
+            log.info("stremio: falling back to the local-server torrent "
+                     "after the debrid stall: %s", url)
+        except Exception:
+            pass
+        cur["url"] = url
+        self.play_media(cur, 0.0)
 
     # ---- play next / autoplay next ----
     def _on_autoplay_toggled(self, on):

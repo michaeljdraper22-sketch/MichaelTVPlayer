@@ -125,6 +125,37 @@ _SERVER_URL_RE = re.compile(
     r"^https?://(?P<host>[^/]+)/(?P<hash>[0-9a-fA-F]{40})(?:/(?P<idx>\d+))?"
     r"(?:[/?#]|$)")
 
+# Torrentio-style debrid resolve links (what "Play in external player"
+# hands over when the stream was debrid-resolved):
+#   /resolve/{provider}/{userKey}/{infoHash}/{fileName}/{fileIdx}/{fileName}
+# Debridio's play links carry the hash too, without an index:
+#   /play/series/{provider}/{userKey}/{addonId}/{infoHash}/{fileName}
+# Either way the infoHash (+ fileIdx when present) lets playback fall
+# back to the local Stremio server's torrent when the debrid link
+# itself stalls (seen live: transient 502s from the resolve endpoint).
+_RESOLVE_URL_RE = re.compile(
+    r"/resolve/[a-zA-Z0-9]+/[^/]+/(?P<hash>[0-9a-fA-F]{40})/[^/]+"
+    r"/(?P<idx>\d+)/", re.IGNORECASE)
+_HASH_SEG_RE = re.compile(r"/(?P<hash>[0-9a-fA-F]{40})(?:/|$)")
+
+
+def parse_resolve_url(url: str):
+    """(info_hash, file_idx) if ``url`` is a debrid resolve/play link
+    carrying its torrent's info hash, else None. Torrentio links carry
+    the file index; others default to 0 (episode releases are
+    single-file, and the debrid link itself was already file-specific)."""
+    m = _RESOLVE_URL_RE.search(url or "")
+    if m:
+        try:
+            return (m.group("hash").lower(), int(m.group("idx") or 0))
+        except ValueError:
+            return None
+    if "resolve/" in (url or "") or "/play/" in (url or ""):
+        m = _HASH_SEG_RE.search(url)
+        if m:
+            return (m.group("hash").lower(), 0)
+    return None
+
 
 def parse_server_url(url: str):
     """(info_hash, file_idx) if ``url`` is a Stremio streaming-server play
@@ -649,6 +680,20 @@ def playable_from_url(url: str) -> dict:
     parsed = parse_server_url(url)
     if parsed:
         info_hash, file_idx = parsed
+        return {
+            "kind": "stremio",
+            "title": "Stremio stream",
+            "url": url,
+            "fav_key": "stremio:%s:%d" % (info_hash[:16], file_idx),
+            "icon": "",
+            "info_hash": info_hash,
+            "file_idx": file_idx,
+        }
+    resolved = parse_resolve_url(url)
+    if resolved:
+        # debrid resolve link: carries the torrent identity for the
+        # local-server fallback when the debrid link stalls
+        info_hash, file_idx = resolved
         return {
             "kind": "stremio",
             "title": "Stremio stream",
