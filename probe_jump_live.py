@@ -128,11 +128,21 @@ def main():
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{port}/media.mkv"
 
+    # INVISIBLE playback: with no HWND bound, libVLC spawns its own video
+    # window — a testsrc box popped up on the desktop during the first
+    # runs (the user closed one). sub_args rides the instance arg list
+    # (the freetype slot accepts any libVLC option); the dummy vout
+    # decodes but never opens a window. Audio keeps decoding at volume 0
+    # so the seek/end timing stays faithful to what shipped (v1.5.12).
+    # (Monkeypatching vlc.Instance does NOT work — vlc.py's lazy ctypes
+    # binding treats it as a type and media_player_new explodes.)
+    QUIET = {"sub_args": ["--vout=dummy"]}
+
     from src.player import VLCPlayer
 
     def jump_epsilon(eps):
         """Play, then seek to length-eps; how long until state=ended?"""
-        w = VLCPlayer(volume=0)   # silent: the user is watching TV
+        w = VLCPlayer(volume=0, **QUIET)   # silent + invisible
         try:
             w.play(url)
             st = wait_state(w, ("playing",), 20)
@@ -165,7 +175,7 @@ def main():
                   detail)
 
         # ---- the FIX under test: the wrapper itself --------------------
-        w = VLCPlayer(volume=0)
+        w = VLCPlayer(volume=0, **QUIET)
         try:
             w.play(url)
             wait_state(w, ("playing",), 20)
