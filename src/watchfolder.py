@@ -56,6 +56,31 @@ def downloads_dir() -> str:
         os.path.join(os.path.expanduser("~"), "Downloads")))
 
 
+def purge_consumed(max_age_days: float = 7.0) -> None:
+    """Delete consumed Stremio handoffs (*.mtpdone — the files the
+    watcher renames after playing) older than ``max_age_days``. They
+    are ~100 bytes each, so this is insurance against slow clutter,
+    not a space problem. Best-effort; never raises. Unconsumed
+    playlist*.m3u files are NEVER touched — only our own rename
+    artifacts."""
+    import time as _time
+    try:
+        folder = downloads_dir()
+        cutoff = _time.time() - max_age_days * 86400.0
+        for name in os.listdir(folder):
+            if not name.lower().endswith(".mtpdone"):
+                continue
+            path = os.path.join(folder, name)
+            try:
+                if os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+                    log.info("watchfolder: purged old handoff %s", name)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
 class DownloadsWatcher(QtCore.QObject):
     """Plays Stremio playlist downloads through ``handoff`` (emit payload
     is the argv-style list ``[playlist_path]`` — exactly what

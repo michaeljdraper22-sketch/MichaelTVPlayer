@@ -577,6 +577,29 @@ def leg_h():
         lambda: got, seconds=4.0), got)
     w.stop()
 
+    # purge_consumed: week-old .mtpdone files go, fresh ones and
+    # unconsumed playlists stay
+    from src.watchfolder import purge_consumed
+    import src.watchfolder as _wf
+    old = os.path.join(tmpdir, "playlist.m3u.mtpdone")
+    new = os.path.join(tmpdir, "playlist (9).m3u.mtpdone")
+    keep = os.path.join(tmpdir, "real.m3u")
+    for p in (old, new, keep):
+        with open(p, "w") as f:
+            f.write("x")
+    os.utime(old, (time.time() - 30 * 86400,) * 2)
+    _orig_dir = _wf.downloads_dir
+    _wf.downloads_dir = lambda: tmpdir
+    try:
+        purge_consumed()
+    finally:
+        _wf.downloads_dir = _orig_dir
+    check("purge removes old consumed handoffs",
+          not os.path.exists(old))
+    check("purge keeps fresh consumed handoffs", os.path.exists(new))
+    check("purge never touches unconsumed playlists",
+          os.path.exists(keep))
+
 
 if __name__ == "__main__":
     from PyQt5 import QtWidgets

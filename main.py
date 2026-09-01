@@ -153,6 +153,13 @@ def main() -> int:
     # A crashed previous run can strand GB-sized DVR buffers and VOD
     # splitter caches in %TEMP%.
     cleanup_stale_temp_files()
+    # Consumed Stremio playlist handoffs (*.mtpdone in Downloads) are
+    # tiny but immortal — trim the week-old ones.
+    try:
+        from src.watchfolder import purge_consumed
+        purge_consumed()
+    except Exception:  # noqa: BLE001
+        pass
     _setup_windows_identity()
     _setup_bundled_vlc()
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
