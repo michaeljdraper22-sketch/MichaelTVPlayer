@@ -5813,14 +5813,18 @@ class PlayerView(QtWidgets.QWidget):
         app-rendered captions NOW — the overlay re-reads the config on
         every paint, so font/size/colors/position land mid-drag (the
         dialog already wrote the config). Re-layout too: the black-bar
-        placement toggle is geometry, not paint. VLC-rendered tracks
-        cannot restyle at runtime; the dialog-close path rebuilds the
-        player once for those."""
+        placement toggle is geometry, not paint.
+
+        The repaint must happen EVEN when the overlay is not the active
+        renderer: the dialog's PREVIEW line lives on the same widget, and
+        a preview frozen at the dialog-open style is exactly what made
+        style changes look dead while VLC rendered the subs. VLC-rendered
+        tracks still cannot restyle at runtime; the dialog-close path
+        rebuilds the player once for those."""
         if self._closing:
             return
-        if self._cap_on:
-            self._layout_overlays()
-            self._cap_wid.update()
+        self._layout_overlays()
+        self._cap_wid.update()      # hidden/empty widget: a no-op
 
     def _reapply_sub_style(self):
         """Subtitle style args are read once at vlc.Instance() creation —
@@ -5834,7 +5838,11 @@ class PlayerView(QtWidgets.QWidget):
             return          # nothing playing: next playback picks them up
         kind = cur.get("kind", "live")
         start_at = 0.0
-        if kind in ("vod", "series", "catchup"):
+        if kind in ("vod", "series", "catchup", "stremio"):
+            # stremio is a seekable file like any VOD (get_time is the
+            # file timeline) — without this a style change with the
+            # overlay NOT engaged (subs Off / VLC-rendered pick) rebuilt
+            # the player and restarted the episode from 0:00
             try:
                 t = self.vlc.get_time() / 1000.0
                 if t > 2.0:
