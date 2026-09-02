@@ -255,7 +255,7 @@ _CC_JOIN_BACK_S = 8.0
 # cues are arrival-anchored to display times already.
 _VOD_MUTE_LEAD_S = 0.4
 
-# Playback speeds offered by the speed button (chase mode / VOD).
+# Playback speeds offered by the speed button (chase mode / VOD / Stremio).
 # Capped at 4x: VLC mutes the audio output entirely above ~4x playback
 # speed ("fast forward 5x goes silent").
 _SPEEDS = (0.125, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
@@ -835,7 +835,10 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_wid.bind_config(lambda: self.config.subtitle_appearance)
         self._btn_panel = QtWidgets.QPushButton(self.overlay)
         self._btn_ovfs = QtWidgets.QPushButton(self.overlay)
-        for b in (self._btn_panel, self._btn_ovfs):
+        # reload/refresh stream — LEFT of the zen button (user-placed):
+        # reconnects whatever is playing at the same position
+        self._btn_reload = QtWidgets.QPushButton(self.overlay)
+        for b in (self._btn_panel, self._btn_ovfs, self._btn_reload):
             b.setObjectName("ovButton")
             b.setFixedSize(34, 28)
             b.setCursor(QtCore.Qt.PointingHandCursor)
@@ -845,8 +848,13 @@ class PlayerView(QtWidgets.QWidget):
         self._btn_panel.setToolTip("Zen mode (H) — hide all controls")
         self._btn_ovfs.setIcon(ic.fullscreen())
         self._btn_ovfs.setToolTip("Fullscreen (F)")
+        self._btn_reload.setIcon(ic.refresh())
+        self._btn_reload.setToolTip(
+            "Reload stream (Ctrl+R) — reconnect at the same position")
+        self._btn_reload.setEnabled(False)   # nothing playing yet
         self._btn_panel.clicked.connect(self.request_toggle_panel.emit)
         self._btn_ovfs.clicked.connect(self.request_fullscreen.emit)
+        self._btn_reload.clicked.connect(self._reload_stream)
 
         # floating "show channel list" chevron (only while the panel is
         # hidden — MainWindow drives that via set_panel_hidden())
@@ -959,9 +967,10 @@ class PlayerView(QtWidgets.QWidget):
                                  "Jump to the beginning of the stream")
         self.btn_live = ctl_btn(ic.live(), "Jump to the live edge "
                                            "(from pause or rewind)")
-        # replaces the Record button while a movie / series episode plays
-        # (the file is already fully seekable — there is nothing to
-        # timeshift; recording a stream re-encodes, a download is verbatim)
+        # replaces the Record button while a movie / series episode /
+        # Stremio stream plays (the file is already fully seekable — there
+        # is nothing to timeshift; recording a stream re-encodes, a download
+        # is verbatim)
         self.btn_dl = ctl_btn(ic.download(),
                               "Download this video to the downloads folder")
         # catch-up programs get the WINDOW download instead of REC/DL: the
@@ -997,7 +1006,8 @@ class PlayerView(QtWidgets.QWidget):
         # area felt imprecise at the standard 34 px
         self.btn_scale.setFixedSize(42, 30)
         self.btn_speed = ctl_btn(ic.speed(), "Playback speed "
-                                              "(live rewind, movies & series)")
+                                              "(live rewind, movies, "
+                                              "series & Stremio)")
         # autoplay-next toggle (series episodes / catch-up programs): ON by
         # default — the natural end of an episode rolls straight into the
         # next one, and a season finale into the next season's first
@@ -1220,7 +1230,9 @@ class PlayerView(QtWidgets.QWidget):
         self.info_overlay.move(g.left() + m, g.top() + m)
         self.info_overlay.raise_()
         x = g.right() - m
-        for b in (self._btn_ovfs, self._btn_panel):
+        # right-to-left order: fullscreen (rightmost), zen, reload — so the
+        # reload button sits LEFT of the zen button, per the user's spec
+        for b in (self._btn_ovfs, self._btn_panel, self._btn_reload):
             x -= (b.width() + 4)
             b.move(x, g.top() + m)
             b.raise_()
@@ -3134,12 +3146,82 @@ class PlayerView(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(700, self._poke_rate_late)
 
     def _poke_rate_late(self):
-        if self._closing or (self._mode != "chase" and not self._is_vod()):
+        if self._closing or (self._mode != "chase" and not self._is_vod()
+                             and not self._is_stremio()):
             return
         try:
             self.vlc.set_rate(self._rate)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- reload / refresh stream (corner button, Ctrl+R) ----
+    def _reload_stream(self):
+        """Reconnect whatever is playing — same position, same picks.
+
+        The end result for every kind is a fresh network path to the SAME
+        content at the SAME point:
+          chase (live TV)  restart the single-connection recorder (fresh
+                           dial; the DVR buffer file is REUSED so the
+                           timeline survives) and reopen the buffer AT the
+                           tracked content position. REC, the caption
+                           reader and the speed pick all carry over.
+          plain live       (chase gave up earlier) reconnect at the edge —
+                           a live stream has no position to preserve.
+          vod / series /   replay the same playable at t-1 through
+          catchup / stremio play_media — the same resume path the subtitle
+                           style rebuild uses. Speed/subtitles/scale are
+                           sticky by design; the per-program AUDIO pick is
+                           restored around the replay so it survives too.
+        """
+        if self._closing:
+            return
+        cur = self.current
+        if not cur or not cur.get("url"):
+            return
+        kind = cur.get("kind", "live")
+        try:
+            log.info("reload stream: kind=%s title=%r",
+                     kind, cur.get("title", ""))
+        except Exception:
+            pass
+        try:
+            from .. import feedback
+            feedback.usage("reload_stream")
+            feedback.crumb("reload %s %r" % (kind, cur.get("title", "")))
+        except Exception:
+            pass
+        if self._mode == "chase" and self.dvr:
+            # the DISPLAYED content-axis position (same convention as
+            # _seek_ms: the caption clock when live, else the tracker)
+            pos = max(self._cap_clock_s, self._vid_s) \
+                if self._cap_clock_s > 0.0 else self._vid_s
+            pos = max(0.0, pos)
+            self._restart_recorder(record=self.btn_rec.isChecked())
+            if not self._reopen_display(at=pos):
+                # recorder produced no buffer to return to — a from-scratch
+                # chase engagement (edge entry) beats a dead screen
+                self._engage_chase()
+        elif kind == "live":
+            self._reopen_display()
+        else:
+            start_at = 0.0
+            try:
+                t = self.vlc.get_time() / 1000.0
+                if t <= 0.0:
+                    t = self._vid_s   # wedged VLC clock: the tracked copy
+                if t > 2.0:
+                    start_at = t - 1.0
+            except Exception:  # noqa: BLE001
+                start_at = 0.0
+            audio = (self._audio_want, self._audio_name)
+            self.play_media(dict(cur), start_at=start_at)
+            # play_media resets the audio pick to Auto (correct for a NEW
+            # program) — put the user's pick back so a reload keeps it
+            self._audio_want, self._audio_name = audio
+        self._set_dvr_status("Stream reloaded")
+        QtCore.QTimer.singleShot(
+            1500, lambda: self._set_dvr_status("")
+            if self._dvr_status.text() == "Stream reloaded" else None)
 
     def _jump_live(self):
         """The single "go to live" control.
@@ -3731,11 +3813,31 @@ class PlayerView(QtWidgets.QWidget):
                 self.config.save()
         return folder or ""
 
+    # extensions accepted for a download's output file — anything else in
+    # the URL/file name is ignored (a debrid query string, a local-server
+    # path segment) and the fallback ext kicks in
+    _DL_MEDIA_EXTS = {".mp4", ".mkv", ".avi", ".ts", ".webm", ".m4v",
+                      ".mov", ".flv", ".wmv"}
+
+    def _dl_extension(self, url: str) -> str:
+        """File extension for a download. VOD URLs carry it in the path;
+        a Stremio local-server URL never does (…/<hash>/<idx>), so the
+        identity-resolved file name is consulted before the .mp4
+        fallback."""
+        for candidate in (os.path.splitext(
+                              urllib.parse.urlparse(url).path)[1],
+                          os.path.splitext(
+                              (self.current or {}).get("file_name")
+                              or "")[1]):
+            if candidate.lower() in self._DL_MEDIA_EXTS:
+                return candidate
+        return ".mp4"
+
     def _start_download(self):
-        """Save the original movie/episode file to the downloads folder.
-        Unlike REC (which re-records the decode), this copies the provider's
-        bytes verbatim in a background thread."""
-        if self._downloading or not self._is_vod():
+        """Save the original movie/episode/Stremio file to the downloads
+        folder.  Unlike REC (which re-records the decode), this copies the
+        provider's bytes verbatim in a background thread."""
+        if self._downloading or not (self._is_vod() or self._is_stremio()):
             return
         if not (self.current and self.current.get("url")):
             return
@@ -3743,7 +3845,7 @@ class PlayerView(QtWidgets.QWidget):
         if not folder:
             return
         url = self.current["url"]
-        ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".mp4"
+        ext = self._dl_extension(url)
         safe = re.sub(r"[^\w\-.]+", "_",
                       self.current.get("title", "video")).strip("._")[:60]
         safe = safe or "video"
@@ -3773,7 +3875,7 @@ class PlayerView(QtWidgets.QWidget):
 
     def _on_dl_finished(self, ok, msg):
         self._downloading = False
-        self.btn_dl.setEnabled(self._is_vod())
+        self.btn_dl.setEnabled(self._is_vod() or self._is_stremio())
         self.btn_win.setEnabled(self._is_catchup())
         self.btn_win.setIcon(ic.download_window())
         if ok:
@@ -4144,9 +4246,9 @@ class PlayerView(QtWidgets.QWidget):
 
     def _wake(self):
         """Show the on-video controls (stream start, channel change, cursor
-        move). The zen/fullscreen corner buttons are always shown: in normal
-        windowed mode they never auto-hide — only the bottom control bar and
-        the restore chevron follow the idle timer."""
+        move). The zen/fullscreen/reload corner buttons are always shown: in
+        normal windowed mode they never auto-hide — only the bottom control
+        bar and the restore chevron follow the idle timer."""
         if self._closing:
             return
         if self._overlay_suppressed:
@@ -4171,7 +4273,8 @@ class PlayerView(QtWidgets.QWidget):
         if not self.overlay.isVisible():
             self.overlay.show()
             shown = True
-        for w in (self._btn_panel, self._btn_ovfs, self.ctl):
+        for w in (self._btn_panel, self._btn_ovfs, self._btn_reload,
+                  self.ctl):
             if not w.isVisible():
                 w.show()
                 shown = True
@@ -4228,17 +4331,19 @@ class PlayerView(QtWidgets.QWidget):
         if self._immersive:
             self._btn_panel.hide()
             self._btn_ovfs.hide()
+            self._btn_reload.hide()
             self.setCursor(QtCore.Qt.BlankCursor)
         if not any(w.isVisible() for w in (
-                self._btn_panel, self._btn_ovfs, self._btn_showpanel,
-                self.info_overlay, self._dvr_status, self._cap_wid)):
+                self._btn_panel, self._btn_ovfs, self._btn_reload,
+                self._btn_showpanel, self.info_overlay, self._dvr_status,
+                self._cap_wid)):
             self.overlay.hide()   # nothing left to show over the video
         # captions may sit lower now that the control bar is gone
         self._layout_overlays()
 
     def _cursor_on_controls(self) -> bool:
         for w in (self.ctl, self._btn_panel, self._btn_ovfs,
-                  self._btn_showpanel):
+                  self._btn_reload, self._btn_showpanel):
             if w.isVisible() and w.underMouse():
                 return True
         return False
@@ -4498,8 +4603,10 @@ class PlayerView(QtWidgets.QWidget):
         vod = length > 0
         if vod != self._scrub_on:
             self._scrub_on = vod
+            # stremio counts as vod here (a seekable FILE): speed joins the
+            # transport flip so the button tracks the mode honestly
             for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                      self.btn_begin):
+                      self.btn_begin, self.btn_speed):
                 b.setEnabled(vod)
             self.btn_win.setEnabled(
                 vod and self._is_catchup() and not self._downloading)
@@ -4594,24 +4701,29 @@ class PlayerView(QtWidgets.QWidget):
 
         Live TV is always in DVR chase mode (recorder on the single
         connection, playback watching the buffer), so the transport buttons
-        (rewinds, begin, speed) are enabled for live AND movies / series —
-        the whole file/buffer exists, so both are seekable. LIVE jumps to
-        the buffer's write frontier (chase) or skips to the file end (VOD).
-        A Download button replaces Record for movies / series."""
+        (rewinds, begin, speed) are enabled for live AND movies / series /
+        Stremio — the whole file/buffer exists, so both are seekable. LIVE
+        jumps to the buffer's write frontier (chase) or skips to the file
+        end (VOD). A Download button replaces Record for movies / series /
+        Stremio streams."""
         chase = self._mode == "chase"
         vod = self._is_vod()
+        stremio = self._is_stremio()
         # Pre-stream (no media yet) the transport group stays enabled: the
         # speed pick is sticky and applies to whatever stream starts next.
         live_prestream = self.current is None
+        # Stremio handoffs play as plain "live" mode but ARE seekable files
+        # — the rewinds and the speed pick apply to them exactly like VOD.
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
                   self.btn_begin, self.btn_speed):
-            b.setEnabled(chase or vod or live_prestream)
+            b.setEnabled(chase or vod or stremio or live_prestream)
         self.btn_live.setEnabled(chase or vod or bool(self.current))
         # play/pause + audio need SOMETHING loaded; REC needs the DVR
         # recorder of a live chase stream (VOD/catch-up swap the slot to
         # Download/Window) — never disable it mid-recording
         self.btn_play.setEnabled(bool(self.current))
         self.btn_audio.setEnabled(bool(self.current))
+        self._btn_reload.setEnabled(bool(self.current))
         kind = (self.current or {}).get("kind")
         # autoplay is a sticky preference, not a stream action: selectable
         # (and hoverable) from app open, before anything plays — flipping
@@ -4622,7 +4734,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_prev.setEnabled(kind in ("live", "series", "catchup",
                                           "stremio"))
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
-        self.btn_dl.setEnabled(vod and not self._downloading)
+        self.btn_dl.setEnabled((vod or stremio) and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
         self._scrub_on = chase
         self._set_scrub_visible(chase)
@@ -4643,6 +4755,7 @@ class PlayerView(QtWidgets.QWidget):
         compact = self._compact_hidden
         vod = self._is_vod()
         catchup = self._is_catchup()
+        stremio = self._is_stremio()
         widgets = {
             "back60": self.btn_back60, "back10": self.btn_back10,
             "play": self.btn_play, "fwd10": self.btn_fwd10,
@@ -4670,12 +4783,17 @@ class PlayerView(QtWidgets.QWidget):
                 # whenever playback runs through the caption relay (the
                 # account allows one) and breaks the overlay's cue feed.
                 # Download covers the same want verbatim, in the background,
-                # without touching playback. Catch-up programs get the
-                # WINDOW download button instead (pick a start/end stretch
-                # of the recording). Evaluated end-to-end and deliberately
-                # left as the swap.
-                w.setVisible(on and not vod)
-                self.btn_dl.setVisible(on and vod and not catchup)
+                # without touching playback. A Stremio handoff is exactly
+                # the same case: a seekable FILE on a debrid/local-server
+                # URL — the download copies it verbatim while playback runs
+                # on untouched (recording it through VLC's record output
+                # would re-mux to TS from position 0 and lose the position).
+                # Catch-up programs get the WINDOW download button instead
+                # (pick a start/end stretch of the recording). Evaluated
+                # end-to-end and deliberately left as the swap.
+                w.setVisible(on and not vod and not stremio)
+                self.btn_dl.setVisible(on and (vod or stremio)
+                                       and not catchup)
                 self.btn_win.setVisible(on and catchup)
             elif key == "autoplay":
                 # series episodes + catch-up programs + identified Stremio
@@ -4822,7 +4940,7 @@ class PlayerView(QtWidgets.QWidget):
     def _set_rate(self, rate):
         rate = max(0.125, min(5.0, float(rate)))
         if self.current is not None and self._mode != "chase" \
-                and not self._is_vod():
+                and not self._is_vod() and not self._is_stremio():
             rate = 1.0   # plain-live fallback has no speed control; a
             #              PRE-stream pick (current is None) is kept and
             #              applied when the next stream starts
@@ -4833,7 +4951,8 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
         self.btn_speed.setToolTip(
-            f"Playback speed — {rate:g}\u00d7 (live rewind, movies & series)")
+            f"Playback speed — {rate:g}\u00d7 "
+            "(live rewind, movies, series & Stremio)")
 
     def _scale_menu(self):
         rows = [{"id": mode, "main": label,

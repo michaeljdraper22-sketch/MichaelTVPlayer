@@ -88,6 +88,10 @@ class StubEpgClient:
     def epg_table(self, stream_id):
         return self.entries
 
+    # xtream.timeshift_url reads the negotiated form off the client; the
+    # stub never logs in, so pin the legacy default explicitly
+    timeshift_form = "legacy"
+
     def timeshift_url(self, stream_id, utc_start, duration_min):
         self.timeshift_calls.append((stream_id, int(utc_start),
                                      int(duration_min)))

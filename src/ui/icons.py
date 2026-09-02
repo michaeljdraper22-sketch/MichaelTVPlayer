@@ -310,6 +310,22 @@ def fullscreen():
     return _icon("fullscreen", draw)
 
 
+def refresh():
+    """Reload stream: an almost-full circle with an arrowhead at its
+    top-right opening — the universal refresh glyph."""
+    def draw(p, c):
+        p.setBrush(QtCore.Qt.NoBrush)
+        _pen(p, c, 2.2)
+        # circle centered (11,11) r=6.8, open on the right between 30°
+        # (top-right) and 330° (bottom-right); the sweep runs the long way
+        p.drawArc(QtCore.QRectF(4.2, 4.2, 13.6, 13.6), 30 * 16, 300 * 16)
+        # arrowhead at the 30° start, pointing along the counter-clockwise
+        # travel (up-left) — two barbs swept back from the tip
+        _polyline(p, c, [(19.8, 9.3), (16.9, 7.6)], 2.2)
+        _polyline(p, c, [(16.9, 11.0), (16.9, 7.6)], 2.2)
+    return _icon("refresh", draw)
+
+
 def panel_collapse():
     """Sidebar icon with a chevron — 'hide the channel list'."""
     def draw(p, c):

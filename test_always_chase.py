@@ -120,7 +120,10 @@ class FakeVLC:
         self.state = "playing"
 
     # playback
-    def play(self, url, timeshift=None, start_seconds=0.0):
+    def play(self, url, timeshift=None, start_seconds=0.0,
+             start_wait_s=20.0, sub_file=None):
+        # start_wait_s/sub_file: v1.5.15 grew the call signature (stremio
+        # open wait + external subs) — the stub accepts and ignores them
         self.calls.append(("play", url, timeshift, start_seconds))
 
     def play_at(self, url, start_seconds=0.0, record_path=None,

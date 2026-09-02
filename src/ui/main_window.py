@@ -275,6 +275,10 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self._exit_fullscreen_only)
         QtWidgets.QShortcut(QtGui.QKeySequence("F5"), self,
                             activated=self.reload_all)
+        # reload the STREAM in the player (the corner refresh button) — F5
+        # is taken by the channel-list reload, so the browser binding it is
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+R"), self,
+                            activated=self.player_view._reload_stream)
         QtWidgets.QShortcut(QtGui.QKeySequence("C"), self,
                             activated=self.player_view._cycle_spu)
         QtWidgets.QShortcut(QtGui.QKeySequence("A"), self,

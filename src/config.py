@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.5.15"
+APP_VERSION = "1.5.16"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
