@@ -49,24 +49,62 @@ log = logging.getLogger("mtp")
 # ---- word levels ----
 LEVELS = ("exact", "partial", "whole")
 
-# (word, level) starter list — every entry is editable/removable in the
-# dialog. "whole" masks compounds too (fuck -> fucked/fucking/motherfucker);
-# "exact" touches only the standalone word (safer for ambiguous stems).
+# Default word list — ported from the user's Advanced Profanity Filter
+# (Chrome) settings. Every entry is editable/removable in the dialog and
+# carries the word's SUGGESTED SUBSTITUTE: when subtitle substitution is on
+# (the default) the match is replaced with it on screen instead of being
+# starred out ("" = use the default substitution). Match levels:
+# "whole" masks compounds too (fuck -> fucked/fucking/motherfucker);
+# "exact" touches only the standalone word (safer for ambiguous stems);
+# "partial" matches the substring anywhere (bitch -> bitchy).
 DEFAULT_WORDS = (
-    ("fuck", "whole"),
-    ("shit", "whole"),
-    ("bitch", "whole"),
-    ("asshole", "whole"),
-    ("bastard", "exact"),
-    ("cunt", "whole"),
-    ("dick", "exact"),
-    ("piss", "exact"),
-    ("crap", "exact"),
-    ("damn", "exact"),
-    ("goddamn", "whole"),
-    ("whore", "whole"),
-    ("slut", "whole"),
+    ('ass', 'exact', 'butt'),
+    ('asses', 'exact', 'butts'),
+    ('bastard', 'exact', 'scumbag'),
+    ('damm', 'exact', 'dang'),
+    ('damn', 'exact', 'dang'),
+    ('dick', 'exact', 'stick'),
+    ('dicks', 'exact', 'sticks'),
+    ('god', 'exact', 'gosh'),
+    ('god damn', 'exact', 'gosh dang'),
+    ('god damned', 'exact', 'gosh danged'),
+    ('god damnit', 'exact', 'gosh dang'),
+    ('god dang', 'exact', 'gosh dang'),
+    ('godamit', 'exact', 'dangit'),
+    ('goddam', 'exact', 'gosh dang'),
+    ('goddammit', 'exact', 'gosh dang'),
+    ('goddamn', 'exact', 'gosh dang'),
+    ('goddamnit', 'exact', 'dangit'),
+    ('hell', 'exact', 'heck'),
+    ('pussies', 'exact', 'softies'),
+    ('twat', 'exact', 'dumbo'),
+    ('twats', 'exact', 'dumbos'),
+    ('wtf', 'exact', 'what'),
+    ('badass', 'partial', 'cool'),
+    ('bitch', 'partial', 'bench'),
+    ('cocksucker', 'partial', 'suckup'),
+    ('damned', 'partial', 'danged'),
+    ('dumbass', 'partial', 'idiot'),
+    ('fuck', 'partial', 'freak'),
+    ('funkin', 'partial', 'freakin'),
+    ('funking', 'partial', 'freaking'),
+    ('pissed', 'partial', 'ticked'),
+    ('tits', 'partial', 'chest'),
+    ('asshole', 'whole', 'jerk'),
+    ('bastards', 'whole', 'scumbags'),
+    ('cunt', 'whole', 'c***'),
+    ('dammit', 'whole', 'dangit'),
+    ('piss', 'whole', 'pee'),
+    ('pussy', 'whole', 'softie'),
+    ('shit', 'whole', 'crap'),
+    ('slut', 'whole', 'tramp'),
+    ('whore', 'whole', 'tramp'),
 )
+
+# Substitute used for a match whose entry carries no substitution of its
+# own (and for the whole match when "whole" extends it) — APF's
+# "defaultSubstitution".
+DEFAULT_SUBSTITUTION = "censored"
 
 _TAG_RE = re.compile(r"<[^>]+>")            # <i>, <b>, <font ...>
 _ASS_RE = re.compile(r"\{[^}]*\}")          # {\an8} style overrides
@@ -83,6 +121,13 @@ def clean_text(raw: str) -> str:
     return " ".join(t.split())
 
 
+def _word_level(entry) -> tuple:
+    """A word-list entry -> (word, level); tolerates [word, level, sub]."""
+    if isinstance(entry, (tuple, list)):
+        return str(entry[0]), (entry[1] if len(entry) > 1 else "exact")
+    return str(entry), "exact"
+
+
 def find_matches(text: str, words) -> list:
     """[(char_start, char_end)] of every bad-word occurrence in ``text``.
 
@@ -92,16 +137,14 @@ def find_matches(text: str, words) -> list:
     whole    — the substring anywhere; masks the whole containing word
                ('********')
     Matching is case-insensitive; spans are in ORIGINAL-text coordinates so
-    word timing can be derived from character positions.
+    word timing can be derived from character positions. Entries may carry
+    a third element (the suggested substitute) — it is ignored here.
     """
     spans = []
     low = text.lower()
     for entry in words or ():
-        if isinstance(entry, (tuple, list)) and len(entry) == 2:
-            word, level = entry
-        else:
-            word, level = entry, "exact"
-        word = str(word).strip().lower()
+        word, level = _word_level(entry)
+        word = word.strip().lower()
         if not word or level not in LEVELS:
             continue
         if level == "exact":
@@ -265,6 +308,90 @@ def mask_text(text: str, words) -> str:
     return "".join(out)
 
 
+def _entry_sub(entry, default_sub: str) -> str:
+    """A word-list entry's suggested substitute ("" -> default)."""
+    sub = entry[2] if isinstance(entry, (tuple, list)) and len(entry) > 2 \
+        else ""
+    sub = str(sub or "").strip()
+    return sub if sub else (default_sub or "")
+
+
+def match_spans_with_subs(text: str, words, default_sub: str = "") -> list:
+    """[(start, end, sub)] for every match — non-overlapping, longest wins.
+
+    Overlaps arise naturally once substitutions are in play ("goddamn"
+    exact sits inside "god damnit"'s reach in hand-made lists): at equal
+    starts the longer match replaces the shorter, and anything reaching
+    into an already-kept span is dropped."""
+    hits = []
+    low = text.lower()
+    for entry in words or ():
+        word, level = _word_level(entry)
+        word = word.strip().lower()
+        if not word or level not in LEVELS:
+            continue
+        sub = _entry_sub(entry, default_sub)
+        if level == "exact":
+            for m in re.finditer(r"\b" + re.escape(word) + r"\b", low):
+                hits.append((m.start(), m.end(), sub))
+        else:
+            start = 0
+            while True:
+                i = low.find(word, start)
+                if i < 0:
+                    break
+                if level == "partial":
+                    hits.append((i, i + len(word), sub))
+                else:   # whole — extend to the containing word chars
+                    s = i
+                    while s > 0 and (low[s - 1].isalnum()):
+                        s -= 1
+                    e = i + len(word)
+                    while e < len(low) and low[e].isalnum():
+                        e += 1
+                    hits.append((s, e, sub))
+                start = i + 1
+    hits.sort(key=lambda h: (h[0], -(h[1] - h[0])))
+    kept = []
+    last_end = -1
+    for s, e, sub in hits:
+        if s < last_end:
+            continue      # overlaps a longer match kept earlier
+        kept.append((s, e, sub))
+        last_end = e
+    return kept
+
+
+def match_case(text: str, sub: str) -> str:
+    """Carry the matched text's casing over to the substitute (ALL CAPS
+    and Capitalized subtitles stay that way after replacement)."""
+    if not sub:
+        return sub
+    if len(text) > 1 and text.isupper():
+        return sub.upper()
+    if text[:1].isupper():
+        return sub[:1].upper() + sub[1:]
+    return sub
+
+
+def replace_text(text: str, words, default_sub: str = "") -> str:
+    """Render ``text`` with matches replaced by their substitutes —
+    'freak in the heck' (a match without a substitute uses
+    ``default_sub``; an empty default falls back to masking)."""
+    hits = match_spans_with_subs(text, words, default_sub)
+    if not hits:
+        return text
+    out = []
+    pos = 0
+    for s, e, sub in hits:
+        out.append(text[pos:s])
+        out.append(match_case(text[s:e], sub) if sub
+                   else "*" * (e - s))
+        pos = e
+    out.append(text[pos:])
+    return "".join(out)
+
+
 def read_subtitle_text(path: str):
     """External subtitle file -> text, or None when unreadable.
 
@@ -383,12 +510,22 @@ class ProfanityEngine(QtCore.QObject):
         self.sync_s = 0.0             # + = mute later, − = earlier
         self.lead_s = 1.5             # captions lag speech: mute EARLIER by this
         self.whole_cue = False        # True = mute the whole cue, not the word
+        self.subs_enabled = True      # subtitles show the SUBSTITUTE, not ***
+        self.default_sub = DEFAULT_SUBSTITUTION
         self.windows = []             # sorted [(start, end)]
         self.enabled = False
         self.muted = False
         self._last_state = None
 
     # ---- data ----
+    def clean_line(self, text: str) -> str:
+        """One caption/subtitle line for DISPLAY: with substitution on the
+        matches read as their suggested substitutes ('freak in the heck'),
+        otherwise they are masked ('***** in the ****')."""
+        if self.subs_enabled:
+            return replace_text(text, self.words, self.default_sub)
+        return mask_text(text, self.words)
+
     def add_cue(self, start: float, end: float, text: str,
                 lead_s: float = None):
         """One caption/subtitle cue arrived: fold its bad-word windows in.

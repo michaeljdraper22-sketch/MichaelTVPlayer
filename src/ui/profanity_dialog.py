@@ -12,7 +12,7 @@ the sync offset.
 from PyQt5 import QtCore, QtWidgets
 
 from ..config import PROFANITY_DEFAULTS
-from ..profanity import DEFAULT_WORDS, LEVELS
+from ..profanity import DEFAULT_SUBSTITUTION, DEFAULT_WORDS, LEVELS
 
 
 class ProfanityDialog(QtWidgets.QDialog):
@@ -24,10 +24,11 @@ class ProfanityDialog(QtWidgets.QDialog):
         self._on_saved = on_saved
         prof = config.profanity
         self._words = [list(w) for w in
-                       (prof.get("words") or [list(d) for d in DEFAULT_WORDS])]
+                       (prof.get("words")
+                        or [list(d) for d in DEFAULT_WORDS])]
 
         self.setWindowTitle("Profanity filter")
-        self.setMinimumSize(460, 560)
+        self.setMinimumSize(560, 560)
         lay = QtWidgets.QVBoxLayout(self)
 
         self.ck_on = QtWidgets.QCheckBox(
@@ -92,17 +93,43 @@ class ProfanityDialog(QtWidgets.QDialog):
             "the mute spans the subtitle's full display time.")
         lay.addWidget(self.ck_whole)
 
+        # ---- subtitle substitution ----
+        self.ck_subs = QtWidgets.QCheckBox(
+            "Replace filtered words in subtitles with their substitutes "
+            "(instead of asterisks)")
+        self.ck_subs.setChecked(bool(prof.get(
+            "substitute_subtitles",
+            PROFANITY_DEFAULTS["substitute_subtitles"])))
+        self.ck_subs.setToolTip(
+            "On-screen captions/subtitles read 'freak in the heck' instead "
+            "of '***** in the ****'. Audio muting is unaffected.")
+        lay.addWidget(self.ck_subs)
+        sub_row = QtWidgets.QHBoxLayout()
+        sub_row.addWidget(QtWidgets.QLabel("Default substitute:"))
+        self.ed_defsub = QtWidgets.QLineEdit(
+            str(prof.get("default_substitution",
+                         PROFANITY_DEFAULTS["default_substitution"]) or ""))
+        self.ed_defsub.setMaximumWidth(160)
+        self.ed_defsub.setToolTip(
+            "Used for a filtered word that has no substitute of its own "
+            "(the Substitute column below).")
+        sub_row.addWidget(self.ed_defsub)
+        sub_row.addStretch(1)
+        lay.addLayout(sub_row)
+
         # ---- word list ----
         lay.addWidget(QtWidgets.QLabel("Filtered words"))
-        self.table = QtWidgets.QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["Word", "Match level"])
+        self.table = QtWidgets.QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(
+            ["Word", "Match level", "Substitute"])
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setColumnWidth(0, 170)
+        self.table.setColumnWidth(1, 110)
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         lay.addWidget(self.table, 1)
         for w in self._words:
-            self._add_row(w[0], w[1])
+            self._add_row(w[0], w[1], w[2] if len(w) > 2 else "")
 
         btns = QtWidgets.QHBoxLayout()
         b_add = QtWidgets.QPushButton("Add word\u2026")
@@ -138,7 +165,7 @@ class ProfanityDialog(QtWidgets.QDialog):
         lay.addWidget(bb)
 
     # ---- table handling ----
-    def _add_row(self, word: str, level: str):
+    def _add_row(self, word: str, level: str, sub: str = ""):
         r = self.table.rowCount()
         self.table.insertRow(r)
         it = QtWidgets.QTableWidgetItem(word)
@@ -148,6 +175,7 @@ class ProfanityDialog(QtWidgets.QDialog):
         cb.setCurrentIndex(list(LEVELS).index(level)
                            if level in LEVELS else 0)
         self.table.setCellWidget(r, 1, cb)
+        self.table.setItem(r, 2, QtWidgets.QTableWidgetItem(str(sub or "")))
 
     def _add_word(self):
         text, ok = QtWidgets.QInputDialog.getText(
@@ -158,8 +186,14 @@ class ProfanityDialog(QtWidgets.QDialog):
         level, ok = QtWidgets.QInputDialog.getItem(
             self, "Add word", f"Match level for '{text}':",
             list(LEVELS), 0, False)
+        if not ok:
+            return
+        sub, ok = QtWidgets.QInputDialog.getText(
+            self, "Add word",
+            f"Substitute for '{text}' (blank = default substitute):",
+            text="")
         if ok:
-            self._add_row(text, level)
+            self._add_row(text, level, sub.strip())
 
     def _remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()},
@@ -170,7 +204,7 @@ class ProfanityDialog(QtWidgets.QDialog):
     def _reset_words(self):
         self.table.setRowCount(0)
         for w in DEFAULT_WORDS:
-            self._add_row(w[0], w[1])
+            self._add_row(w[0], w[1], w[2] if len(w) > 2 else "")
 
     def _reset_all(self):
         """Every control back to factory defaults (the user can still
@@ -181,6 +215,10 @@ class ProfanityDialog(QtWidgets.QDialog):
         self.sp_lead.setValue(int(PROFANITY_DEFAULTS["lead_ms"]))
         self.sp_sync.setValue(int(PROFANITY_DEFAULTS["sync_ms"]))
         self.ck_whole.setChecked(bool(PROFANITY_DEFAULTS["whole_cue"]))
+        self.ck_subs.setChecked(bool(
+            PROFANITY_DEFAULTS["substitute_subtitles"]))
+        self.ed_defsub.setText(
+            str(PROFANITY_DEFAULTS["default_substitution"]))
         self._reset_words()
 
     def _collect_words(self):
@@ -194,7 +232,14 @@ class ProfanityDialog(QtWidgets.QDialog):
             w = it.text().strip().lower()
             if w and w not in seen:
                 seen.add(w)
-                words.append([w, cb.currentText()])
+                sub = ""
+                sub_it = self.table.item(r, 2)
+                if sub_it is not None:
+                    sub = sub_it.text().strip()
+                # no substitute of its own -> compact [word, level]; the
+                # default substitute applies at display time
+                words.append([w, cb.currentText(), sub] if sub
+                             else [w, cb.currentText()])
         return words
 
     # ---- save ----
@@ -208,6 +253,8 @@ class ProfanityDialog(QtWidgets.QDialog):
             "sync_ms": int(self.sp_sync.value()),
             "lead_ms": int(self.sp_lead.value()),
             "whole_cue": bool(self.ck_whole.isChecked()),
+            "substitute_subtitles": bool(self.ck_subs.isChecked()),
+            "default_substitution": self.ed_defsub.text().strip(),
         }
         self.config.save()
         try:

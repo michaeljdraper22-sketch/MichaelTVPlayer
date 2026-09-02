@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Tests for the profanity filter: matching levels, SRT parsing, windows,
-engine timing, mute layering, view integration and the settings dialog.
+"""Tests for the profanity filter: matching levels, subtitle substitution,
+SRT parsing, windows, engine timing, mute layering, view integration and
+the settings dialog.
 
 Run:  .venv\\Scripts\\python.exe test_profanity.py
 """
@@ -16,9 +17,11 @@ from PyQt5 import QtCore, QtWidgets  # noqa: E402
 
 from src.config import Config, PROFANITY_DEFAULTS  # noqa: E402
 from src.player import VLCPlayer  # noqa: E402
-from src.profanity import (DEFAULT_WORDS, SrtParser, find_matches,  # noqa: E402
-                           mask_text, merge_windows, windows_from_cues)
-from src.profanity import ProfanityEngine  # noqa: E402
+from src.profanity import (DEFAULT_SUBSTITUTION, DEFAULT_WORDS, SrtParser,  # noqa: E402
+                           find_matches, match_case, match_spans_with_subs,
+                           mask_text, merge_windows, replace_text,
+                           windows_from_cues)
+from src.profanity import LEVELS, ProfanityEngine  # noqa: E402
 from src.ui import player_view as pv_mod  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
 from src.ui.profanity_dialog import ProfanityDialog  # noqa: E402
@@ -355,13 +358,13 @@ def main():
     dlg = ProfanityDialog(cfg2, lambda: saved.append(True))
     check("starts with the default word list",
           dlg.table.rowCount() == len(DEFAULT_WORDS))
-    dlg._add_row("hell", "partial")
+    dlg._add_row("frig", "partial")   # not in the APF default list
     dlg.ck_on.setChecked(True)
     dlg.accept()
     check("toggle saves enabled", cfg2.profanity["enabled"] is True)
     dlg = ProfanityDialog(cfg2, lambda: saved.append(True))
-    dlg._add_row("hell", "partial")
-    dlg._add_row("hell", "whole")     # duplicate is dropped on collect
+    dlg._add_row("frig", "partial")
+    dlg._add_row("frig", "whole")     # duplicate is dropped on collect
     dlg.sp_before.setValue(300)
     dlg.sp_sync.setValue(-150)
     dlg.ck_on.setChecked(True)
@@ -370,8 +373,8 @@ def main():
     check("saved toggle + timing",
           prof["enabled"] and prof["pad_before_ms"] == 300
           and prof["sync_ms"] == -150)
-    check("custom word saved once", ["hell", "partial"] in prof["words"]
-          and sum(1 for w in prof["words"] if w[0] == "hell") == 1)
+    check("custom word saved once", ["frig", "partial"] in prof["words"]
+          and sum(1 for w in prof["words"] if w[0] == "frig") == 1)
     check("on_saved callback ran (both dialogs)",
           len(saved) == 2 and all(s is True for s in saved))
     dlg2 = ProfanityDialog(cfg2, saved.append)
@@ -425,6 +428,106 @@ def main():
           and prof3["whole_cue"] is False
           and [w[0] for w in prof3["words"]]
           == [w[0] for w in DEFAULT_WORDS])
+
+    print("[9] subtitle substitution — defaults, spans and casing")
+    check("default substitution is 'censored'",
+          DEFAULT_SUBSTITUTION == "censored")
+    check("default word list has 41 entries", len(DEFAULT_WORDS) == 41)
+    check("every default is a (word, level, substitute) triple",
+          all(isinstance(w, tuple) and len(w) == 3
+              and isinstance(w[0], str) and w[0].strip()
+              and w[1] in LEVELS
+              and isinstance(w[2], str) and w[2].strip()
+              for w in DEFAULT_WORDS))
+    spans = match_spans_with_subs("god damn", DEFAULT_WORDS)
+    check("longest match wins ('god damn' beats 'god'/'damn')",
+          spans == [(0, 8, "gosh dang")])
+    spans = match_spans_with_subs(
+        "goddamn it", [("goddamn", "exact", "gosh dang"),
+                       ("god", "partial", "gosh")])
+    check("equal starts keep the longer match",
+          spans == [(0, 7, "gosh dang")])
+    spans = match_spans_with_subs(
+        "dumbass", [("dumbass", "partial", "idiot"),
+                    ("ass", "partial", "butt")])
+    check("a match inside a kept span is dropped",
+          spans == [(0, 7, "idiot")])
+    spans = match_spans_with_subs(
+        "the hell and the damn",
+        [("hell", "exact", "heck"), ("damn", "exact", "dang")])
+    check("non-overlapping matches both kept, in order",
+          spans == [(4, 8, "heck"), (17, 21, "dang")])
+    spans = match_spans_with_subs("a twit moment", [("twit", "exact", "")],
+                                  DEFAULT_SUBSTITUTION)
+    check("word without a substitute uses the default",
+          spans == [(2, 6, DEFAULT_SUBSTITUTION)])
+    check("match_case: lower stays lower",
+          match_case("hell", "heck") == "heck")
+    check("match_case: Capitalized carries over",
+          match_case("Hell", "heck") == "Heck")
+    check("match_case: ALL-CAPS carries over",
+          match_case("HELL", "heck") == "HECK")
+    check("match_case: mixed casing falls back to Capitalized",
+          match_case("HeLL", "heck") == "Heck")
+    check("match_case: odd input (empty text) is safe",
+          match_case("", "heck") == "heck")
+    check("match_case: empty substitute stays empty",
+          match_case("HELL", "") == "")
+
+    print("[9b] replace_text + engine clean_line")
+    w_hell = [("hell", "exact", "heck")]
+    check("substitution renders the substitute",
+          replace_text("what the hell", w_hell) == "what the heck")
+    check("Capitalized line keeps Capitalized subs",
+          replace_text("What The Hell", w_hell) == "What The Heck")
+    check("ALL-CAPS line keeps ALL-CAPS subs",
+          replace_text("WHAT THE HELL", w_hell) == "WHAT THE HECK")
+    check("sub-less word uses the default substitution",
+          replace_text("you twit", [("twit", "exact", "")], "censored")
+          == "you censored")
+    check("sub-less word + empty default falls back to asterisks",
+          replace_text("you twit", [("twit", "exact", "")]) == "you ****")
+    check("clean line passes through untouched",
+          replace_text("a clean line", w_hell) == "a clean line")
+    fp4 = FakePlayer()
+    eng5 = ProfanityEngine(fp4)     # defaults: subs on, 'censored'
+    check("engine defaults: substitution on + default sub",
+          eng5.subs_enabled is True
+          and eng5.default_sub == DEFAULT_SUBSTITUTION)
+    check("clean_line swaps the default list's substitutes",
+          eng5.clean_line("what the hell") == "what the heck")
+    check("clean_line covers the whole-level extension",
+          eng5.clean_line("shitting") == "crap")
+    eng5.subs_enabled = False
+    check("substitution off masks instead",
+          eng5.clean_line("what the hell") == "what the ****")
+    eng5.subs_enabled = True
+    eng5.words = [("grawlix", "exact", "")]
+    eng5.default_sub = "beep"
+    check("custom default_sub applies to sub-less words",
+          eng5.clean_line("a grawlix moment") == "a beep moment")
+
+    print("[9c] dialog: reset paths keep the default substitutes")
+    cfg4 = temp_config()
+    dlg4 = ProfanityDialog(cfg4, lambda: None)
+
+    def table_words(d):
+        return [(d.table.item(r, 0).text(),
+                 d.table.cellWidget(r, 1).currentText(),
+                 d.table.item(r, 2).text())
+                for r in range(d.table.rowCount())]
+
+    check("initial population carries the substitutes",
+          table_words(dlg4) == [tuple(w) for w in DEFAULT_WORDS])
+    dlg4._reset_words()
+    check("restore-default-list keeps every substitute (41 rows)",
+          table_words(dlg4) == [tuple(w) for w in DEFAULT_WORDS])
+    dlg4._reset_all()
+    check("reset-all-settings keeps every substitute",
+          table_words(dlg4) == [tuple(w) for w in DEFAULT_WORDS])
+    dlg4.accept()
+    check("saved word list keeps the substitute column",
+          cfg4.profanity["words"] == [list(w) for w in DEFAULT_WORDS])
 
     print()
     if FAIL:
