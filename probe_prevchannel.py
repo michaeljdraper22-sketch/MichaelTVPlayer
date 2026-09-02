@@ -156,6 +156,107 @@ win.play_prev_channel()
 check("single visible row: fallback steps within all_items",
       played_sid() == 11, f" got {played_sid()}")
 
+# ---- favorites context: ⏭/⏮ must walk the FAVORITES list ----
+# Favorites in display order: two channels, a favorited MOVIE between
+# them (must be skipped — the button changes channels), and 22 last.
+FAVS = [
+    {"kind": "live", "title": "Chan 11", "stream_id": 11,
+     "fav_key": "live:11", "url": "http://x/live/11", "icon": ""},
+    {"kind": "vod", "title": "Movie M", "fav_key": "vod:77",
+     "url": "http://x/m.mkv", "icon": ""},
+    {"kind": "live", "title": "Chan 44", "stream_id": 44,
+     "fav_key": "live:44", "url": "http://x/live/44", "icon": ""},
+    {"kind": "live", "title": "Chan 22", "stream_id": 22,
+     "fav_key": "live:22", "url": "http://x/live/22", "icon": ""},
+]
+cfg.data["favorites"] = [dict(f) for f in FAVS]
+win.fav_tab.refresh()
+
+
+def launch_from_favs(row):
+    # through the real signal path: _activate -> media_activated ->
+    # _play_from_favorites (a direct play() here would hide a broken
+    # signal connection)
+    win.fav_tab._activate(win.fav_tab.list.item(row))
+    # the stubbed play_media skips the control-state refresh the real one
+    # does — without this the buttons stay whatever [5] last left them
+    pv._update_control_state()
+    app.processEvents()
+
+
+print("[8] launched from Favorites: steps walk the favorites list")
+launch_from_favs(3)          # Chan 22, the LAST favorite
+check("activation played favorite Chan 22", played_sid() == 22)
+check("nav context is favorites", win._live_nav_source == "favorites")
+pv.btn_next.click()
+app.processEvents()
+check("next from the favorites BOTTOM wraps to the top (11)",
+      played_sid() == 11, f" got {played_sid()}")
+check("favorites row highlight followed (row 0)",
+      win.fav_tab.list.currentRow() == 0)
+pv.btn_prev.click()
+app.processEvents()
+check("prev from the favorites TOP wraps to the bottom (22)",
+      played_sid() == 22, f" got {played_sid()}")
+check("favorites row highlight followed (row 3)",
+      win.fav_tab.list.currentRow() == 3)
+pv.btn_prev.click()
+app.processEvents()
+check("prev from 22 -> 44 (one up in favorites)",
+      played_sid() == 44, f" got {played_sid()}")
+pv.btn_prev.click()
+app.processEvents()
+check("prev from 44 -> 11, SKIPPING the favorited movie above it "
+      "(library order would give 33)",
+      played_sid() == 11, f" got {played_sid()}")
+check("favorites row highlight followed (row 0, past the movie)",
+      win.fav_tab.list.currentRow() == 0)
+pv.btn_next.click()
+app.processEvents()
+check("next from 11 -> 44, skipping the movie forward too "
+      "(library order would give 22)",
+      played_sid() == 44, f" got {played_sid()}")
+
+print("[9] launched from the Live tab: library stepping unchanged")
+win.play({"kind": "live", "title": "Chan 22", "stream_id": 22,
+          "fav_key": "live:22", "url": "http://x/live/22"})
+pv._update_control_state()
+app.processEvents()
+check("nav context back to live", win._live_nav_source == "live")
+pv.btn_next.click()
+app.processEvents()
+check("next from 22 uses the library list again (33)",
+      played_sid() == 33, f" got {played_sid()}")
+
+print("[10] favorites with a single live channel: explains, plays nothing")
+cfg.data["favorites"] = [dict(FAVS[0])]
+win.fav_tab.refresh()
+launch_from_favs(0)
+plays.clear()
+sb.clearMessage()
+win.play_next_channel()
+check("one live favorite: status explains, nothing plays",
+      not plays and "No other channel in Favorites" in sb.currentMessage())
+
+print("[11] favorites-launched but current left the list")
+cfg.data["favorites"] = [dict(f) for f in FAVS]
+win.fav_tab.refresh()
+launch_from_favs(3)          # Chan 22 from favorites
+current_at(99)               # now on a channel not in the favorites
+plays.clear()
+sb.clearMessage()
+win.play_next_channel()
+check("current not a favorite: status explains, nothing plays",
+      not plays and "not in the Favorites list" in sb.currentMessage())
+
+print("[12] search-filtered favorites view: full-list fallback")
+current_at(22)
+win.fav_tab.search.setText("Chan 22")   # view narrows to one row
+win.play_prev_channel()
+check("filtered view: falls back to the full favorites list (22 -> 44)",
+      played_sid() == 44, f" got {played_sid()}")
+win.fav_tab.search.clear()
+
 pv.stop()
 app.processEvents()
 print(f"\n{'ALL PASS' if fails[0] == 0 else str(fails[0]) + ' FAILURES'}")

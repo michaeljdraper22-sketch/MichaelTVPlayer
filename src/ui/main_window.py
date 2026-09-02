@@ -123,6 +123,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
+        # Which list the live-TV ⏭/⏮ buttons walk for the channel now
+        # playing: "favorites" when it was launched from the ★ Favorites
+        # tab (step through the favorites, wrapping), "live" for anything
+        # launched anywhere else.  Set on every play().
+        self._live_nav_source = "live"
         self.setWindowTitle("MichaelTV")
         self.resize(1340, 820)
         # Must fit the splitter's children minimums (170 + 6 handle + 280):
@@ -203,7 +208,7 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.catchup_tab):
             tab.media_activated.connect(self.play)
             tab.favorite_changed.connect(self.fav_tab.refresh)
-        self.fav_tab.media_activated.connect(self.play)
+        self.fav_tab.media_activated.connect(self._play_from_favorites)
         self.custom_tab.media_activated.connect(self.play)
         self.countries_dialog = CountriesDialog(config, self.client, self)
         self.countries_dialog.changed.connect(self._on_countries_changed)
@@ -399,7 +404,8 @@ class MainWindow(QtWidgets.QMainWindow):
         QtGui.QDesktopServices.openUrl(
             QtCore.QUrl("https://cash.app/$Michaeljdraper"))
 
-    def play(self, playable: dict, start_at: float = 0.0):
+    def play(self, playable: dict, start_at: float = 0.0,
+             nav_source: str = "live"):
         if playable.get("kind") == "series_meta":
             # A series entry was somehow activated directly; open its episodes.
             self.series_tab._open_series(playable)
@@ -408,6 +414,9 @@ class MainWindow(QtWidgets.QMainWindow):
             # Direct activation of an archive channel: open its program picker
             self.catchup_tab._open_picker(playable)
             return
+        # remember where this was launched from so the live-TV ⏭/⏮ walk
+        # THAT list (a favorites-launched channel steps through favorites)
+        self._live_nav_source = nav_source
         self.player_view.play_media(playable, start_at)
         self.config.add_recent(playable)
         self.config.data["last_channel"] = playable
@@ -466,6 +475,12 @@ class MainWindow(QtWidgets.QMainWindow):
         from src.ui.stremio_dialog import StremioDialog
         StremioDialog(self.config, self).exec_()
 
+    def _play_from_favorites(self, playable: dict):
+        """Favorites-tab activation: same as play(), but the live-TV
+        ⏭/⏮ buttons must step through the favorites list afterwards —
+        not the channel's neighbours in the Live tab's library."""
+        self.play(playable, nav_source="favorites")
+
     def play_next_channel(self):
         """Live TV "Play next": advance to the next channel in the Live
         tab's current (filtered) list, wrapping back to the top at the end.
@@ -479,14 +494,23 @@ class MainWindow(QtWidgets.QMainWindow):
         self._live_channel_step(-1)
 
     def _live_channel_step(self, delta: int):
-        """Shared core of play next/prev channel: walk the Live tab's rows
-        the user actually SEES — the list widget — not all_items: all_items
-        goes stale when the tab shows Recently Played (playable mode keeps
-        the old category's items), and it ignores the search box's filter,
-        so the neighbouring channel could be one the displayed list doesn't
-        contain and the blue selection could never follow playback."""
+        """Shared core of play next/prev channel: walk the rows the user
+        actually SEES — the list widget — not all_items: all_items goes
+        stale when the tab shows Recently Played (playable mode keeps the
+        old category's items), and it ignores the search box's filter, so
+        the neighbouring channel could be one the displayed list doesn't
+        contain and the blue selection could never follow playback.
+
+        WHICH list is walked depends on where the current channel was
+        launched from: a channel started from the ★ Favorites tab steps
+        through the favorites (skipping favorited movies/series so the
+        button still changes CHANNELS, wrapping top↔bottom) — not through
+        its neighbours in the original Live library list."""
         cur = self.player_view.current or {}
         sid = cur.get("stream_id") if cur.get("kind") == "live" else None
+        if self._live_nav_source == "favorites":
+            self._favorites_step(sid, delta)
+            return
         lw = self.live_tab.list
         items = [lw.item(i).data(QtCore.Qt.UserRole) or {}
                  for i in range(lw.count())]
@@ -512,16 +536,51 @@ class MainWindow(QtWidgets.QMainWindow):
         # plain category rows are raw provider dicts needing make_playable
         playable = (nxt if nxt.get("url")
                     else self.live_tab.make_playable(nxt))
-        self.play(playable)
+        self.play(playable, nav_source="live")
         self._select_playing(playable)
 
-    def _select_playing(self, playable: dict):
+    def _favorites_step(self, sid, delta: int):
+        """⏭/⏮ while a favorites-launched channel plays: the same walk
+        _live_channel_step does on the Live tab, but over the Favorites
+        tab — the visible rows first (search filter honoured), the full
+        favorites list when the view is filtered down.  Only live-channel
+        entries are steppable: the button changes channels, it must not
+        start playing a favorited movie or series."""
+        def _live_chans(rows):
+            return [it for it in rows
+                    if it.get("kind") == "live"
+                    and it.get("stream_id") is not None]
+
+        lw = self.fav_tab.list
+        items = _live_chans(lw.item(i).data(QtCore.Qt.UserRole) or {}
+                            for i in range(lw.count()))
+        if len(items) < 2:
+            items = _live_chans(self.config.favorites or [])
+        if sid is None or len(items) < 2:
+            self.statusBar().showMessage(
+                "No other channel in Favorites", 3000)
+            return
+        idx = next((i for i, it in enumerate(items)
+                    if it.get("stream_id") == sid), None)
+        if idx is None:
+            self.statusBar().showMessage(
+                "Current channel is not in the Favorites list", 3000)
+            return
+        nxt = items[(idx + delta) % len(items)]
+        # favorites rows are stored as full playables — they carry "url"
+        self.play(nxt, nav_source="favorites")
+        self._select_playing(nxt, tab=self.fav_tab)
+
+    def _select_playing(self, playable: dict, tab=None):
         """Move the blue selected row of the matching browser tab to whatever
         just started playing (Play next / autoplay next) — otherwise the old
-        row keeps the highlight while a different channel/episode plays."""
-        kind = playable.get("kind")
-        tab = {"live": self.live_tab, "vod": self.vod_tab,
-               "series": self.series_tab}.get(kind)
+        row keeps the highlight while a different channel/episode plays.
+        ``tab`` overrides the kind-derived default (favorites stepping
+        highlights the Favorites tab the user is stepping through)."""
+        if tab is None:
+            kind = playable.get("kind")
+            tab = {"live": self.live_tab, "vod": self.vod_tab,
+                   "series": self.series_tab}.get(kind)
         if tab is None:
             return
 
