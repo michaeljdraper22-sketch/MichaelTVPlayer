@@ -76,6 +76,18 @@ class StremioDialog(QtWidgets.QDialog):
         self.watch_lbl = self._wrap_label()
         sl.addWidget(self.watch_lbl)
 
+        self.subs_chk = QtWidgets.QCheckBox(
+            "Find subtitles online when none load")
+        self.subs_chk.setChecked(config.fetch_online_subs)
+        self.subs_chk.setToolTip(
+            "When a Stremio / VOD / series stream has no usable text "
+            "subtitle track (bitmap-only, wrong language, none at all), "
+            "the player silently searches a keyless OpenSubtitles addon "
+            "and renders the best match in the styled caption overlay.\n"
+            "If that search finds nothing, playback is exactly as it is "
+            "today. Live TV is exempt.")
+        sl.addWidget(self.subs_chk)
+
         rows = QtWidgets.QGridLayout()
         rows.setHorizontalSpacing(10)
         rows.setVerticalSpacing(6)
@@ -128,6 +140,23 @@ class StremioDialog(QtWidgets.QDialog):
         self.addons_edit.setPlainText(
             "\n".join(config.stremio_addons))
         pl.addWidget(self.addons_edit)
+
+        imp_row = QtWidgets.QHBoxLayout()
+        imp_row.setSpacing(10)
+        self.import_lbl = QtWidgets.QLabel("")
+        imp_row.addWidget(self.import_lbl, 1)
+        self.btn_import = QtWidgets.QPushButton(
+            "Import from installed Stremio")
+        self.btn_import.setToolTip(
+            "Reads the addon list from the desktop Stremio app on this "
+            "PC and fills the box above with its stream-capable addons, "
+            "in the recommended priority order \u2014 the status line "
+            "names each addon with its debrid provider.\nThe lines stay "
+            "fully editable afterwards: reorder them or add manual URLs "
+            "any time. Nothing is imported unless you click this.")
+        self.btn_import.clicked.connect(self._import_addons)
+        imp_row.addWidget(self.btn_import)
+        pl.addLayout(imp_row)
 
         form = QtWidgets.QFormLayout()
         form.setHorizontalSpacing(10)
@@ -314,6 +343,63 @@ class StremioDialog(QtWidgets.QDialog):
                 "\u25b8 Always.")
         self._refresh_status()
 
+    # ---- import from installed Stremio ----
+
+    @staticmethod
+    def _name_list(names, cap: int = 60) -> str:
+        """Comma-joined addon names for the import status line — kept
+        to one line (truncated with an ellipsis) so a long addon list
+        never wraps the dialog taller."""
+        out = ""
+        for name in names:
+            name = str(name or "").strip()
+            if not name:
+                continue
+            cand = "%s, %s" % (out, name) if out else name
+            if out and len(cand) > cap:
+                return out + ", \u2026"
+            out = cand
+        return out
+
+    def _import_addons(self):
+        """The Import button: fill the addon priority box from the
+        desktop Stremio app's installed addons. An explicit click only
+        (never on dialog open); on any failure the box is left exactly
+        as the user had it."""
+        from .. import stremio_profile
+        try:
+            found = stremio_profile.discover_stream_addons()
+        except Exception:  # noqa: BLE001 - unreadable profile etc.
+            found = None
+        if found is None:
+            self._set_status(
+                self.import_lbl, False, "Stremio not found on this PC",
+                "The desktop Stremio app\u2019s addon list could not be "
+                "read here (not installed, never run, or an unparsed "
+                "profile format) \u2014 nothing was changed. Paste addon "
+                "URLs above instead.")
+            return
+        if not found:
+            self._set_status(
+                self.import_lbl, False,
+                "Stremio has no stream addons installed",
+                "Stremio\u2019s addon list was read fine, but none of "
+                "its addons serve streams \u2014 nothing was changed. "
+                "Paste addon URLs above instead.")
+            return
+        ordered = stremio_profile.priority_sort(found)
+        urls = [str(e.get("url") or "") for e in ordered]
+        self.addons_edit.setPlainText("\n".join(u for u in urls if u))
+        self._set_status(
+            self.import_lbl, True,
+            "Imported %d addons from Stremio (%s)"
+            % (len(ordered), self._name_list(
+                [e.get("name") for e in ordered])),
+            "Filled in the recommended priority order (Torrentio family "
+            "first, then Debridio; TorBox before Premiumize). Edit or "
+            "reorder the lines freely \u2014 line 1 stays the preferred "
+            "addon.")
+
     # ---- save ----
 
     def accept(self):
@@ -328,6 +414,7 @@ class StremioDialog(QtWidgets.QDialog):
         self.config.stremio_server = self.srv_edit.text()
         self.config.stremio_watch_downloads = \
             self.watch_chk.isChecked()
+        self.config.fetch_online_subs = self.subs_chk.isChecked()
         self.config.save()
         # Apply the watcher change live when we can reach the running
         # instance's watcher (the dialog's parent is the main window).

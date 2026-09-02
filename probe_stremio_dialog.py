@@ -13,7 +13,9 @@ per setup row, width pinned 560-720.
 No window, no focus, no audio: WA_DontShowOnScreen + grab() for the
 render. Environment-touching modules (streampatch, fileassoc,
 watchfolder) are monkeypatched — no registry reads, no watcher, no
-writes outside a temp config.
+writes outside a temp config. Addon discovery (stremio_profile) is
+monkeypatched too, except one guarded live leg that runs against the
+real Stremio profile ONLY when this machine actually has one.
 """
 import json
 import os
@@ -24,7 +26,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from src import fileassoc, streampatch, watchfolder  # noqa: E402
+from src import fileassoc, streampatch, stremio_profile  # noqa: E402
+from src import watchfolder                              # noqa: E402
 from src.config import DEFAULTS, Config              # noqa: E402
 from src.ui.stremio_dialog import StremioDialog      # noqa: E402
 
@@ -176,7 +179,114 @@ check("hand-edited 33 GB gets a visible combo entry",
       and dd2.size_combo.currentText() == "33 GB",
       dd2.size_combo.currentText())
 
-print("[6] render grab (canonical healthy state)")
+print("[6] fetch_online_subs checkbox: default on, full round-trip")
+sd = make_dlg(Config(dict(DEFAULTS), None))
+check("checkbox exists in the streams group, defaults to on",
+      sd.subs_chk.isChecked(), sd.subs_chk.isChecked())
+check("tooltip names the addon and the live-TV exemption",
+      "OpenSubtitles" in sd.subs_chk.toolTip()
+      and "Live TV" in sd.subs_chk.toolTip(),
+      sd.subs_chk.toolTip()[:60])
+stmp = Path(tempfile.mkdtemp(prefix="mtp_probe_sdlg_")) / "settings.json"
+scfg = Config(dict(DEFAULTS), stmp)
+sd2 = make_dlg(scfg)
+sd2.subs_chk.setChecked(False)
+sd2.accept()
+disk = json.loads(stmp.read_text(encoding="utf-8"))
+check("unchecked accept persists fetch_online_subs=false on disk",
+      disk.get("fetch_online_subs") is False, disk.get("fetch_online_subs"))
+data = dict(DEFAULTS)
+data.update(disk)
+sd3 = make_dlg(Config(data, stmp))
+check("reopen shows the box unchecked", not sd3.subs_chk.isChecked())
+
+print("[7] import button: click behavior (discovery monkeypatched — "
+      "stremio_dialog resolves it off the stremio_profile module at "
+      "click time, so that attribute IS the import site)")
+check("button present in the picks group, tooltip explains the trade",
+      dlg.btn_import.text() == "Import from installed Stremio"
+      and "priority order" in dlg.btn_import.toolTip()
+      and "editable" in dlg.btn_import.toolTip(),
+      dlg.btn_import.toolTip()[:60])
+FAKE = [
+    {"url": "https://addon.debridio.com/eyJwcm92aWRlciI6InByZW1pdW1pemUifQ",
+     "name": "Debridio \u2014 Premiumize", "provider": "Premiumize",
+     "manifest_name": "Debridio"},
+    {"url": "https://torrentio.strem.fun/premiumize=PMKEY",
+     "name": "Torrentio \u2014 Premiumize", "provider": "Premiumize",
+     "manifest_name": "Torrentio"},
+    {"url": "https://curl.example/addon", "name": "Curl addon",
+     "provider": "", "manifest_name": ""},
+    {"url": "https://torrentio.strem.fun/torbox=TBKEY",
+     "name": "Torrentio \u2014 TorBox", "provider": "TorBox",
+     "manifest_name": "Torrentio"},
+]
+# priority_sort contract: Torrentio family, then Debridio, then rest;
+# TorBox before Premiumize within a family
+EXPECTED = [FAKE[3]["url"], FAKE[1]["url"], FAKE[0]["url"], FAKE[2]["url"]]
+orig_discover = stremio_profile.discover_stream_addons
+stremio_profile.discover_stream_addons = \
+    lambda: [dict(a) for a in FAKE]
+di = make_dlg(Config(dict(DEFAULTS), None))
+di.addons_edit.setPlainText("https://old.example/replace-me")
+di.btn_import.click()
+check("success: textarea replaced with the priority-ordered URLs",
+      di.addons_edit.toPlainText().splitlines() == EXPECTED,
+      di.addons_edit.toPlainText().splitlines())
+check("success: green one-line status names the count + providers",
+      di.import_lbl.text().startswith("\u2713")
+      and "Imported 4 addons" in di.import_lbl.text()
+      and "TorBox" in di.import_lbl.text()
+      and di.import_lbl.text().count("\n") == 0,
+      di.import_lbl.text())
+stremio_profile.discover_stream_addons = lambda: []
+di2 = make_dlg(Config(dict(DEFAULTS), None))
+di2.addons_edit.setPlainText("https://keep.example/a")
+di2.btn_import.click()
+check("empty discovery: textarea untouched, gray status",
+      di2.addons_edit.toPlainText() == "https://keep.example/a"
+      and di2.import_lbl.text()
+      and not di2.import_lbl.text().startswith("\u2713"),
+      di2.import_lbl.text())
+
+
+def _boom():
+    raise RuntimeError("profile unreadable")
+
+
+stremio_profile.discover_stream_addons = _boom
+di3 = make_dlg(Config(dict(DEFAULTS), None))
+di3.addons_edit.setPlainText("https://keep.example/b")
+di3.btn_import.click()
+check("raising discovery: textarea untouched, gray status",
+      di3.addons_edit.toPlainText() == "https://keep.example/b"
+      and di3.import_lbl.text()
+      and not di3.import_lbl.text().startswith("\u2713"),
+      di3.import_lbl.text())
+stremio_profile.discover_stream_addons = orig_discover
+
+print("[8] live discovery (guarded: only when this PC has a Stremio "
+      "WebView2 profile)")
+if not stremio_profile._leveldb_dirs():
+    print("  skip  no Stremio leveldb on this machine")
+else:
+    live = stremio_profile.discover_stream_addons()
+    check("live: profile read, >= 1 stream addon",
+          isinstance(live, list) and len(live) >= 1,
+          "None" if live is None else len(live or []))
+    check("live: entries carry a https url + a name",
+          all(str(a.get("url") or "").startswith("https://")
+              and str(a.get("name") or "") for a in live or []))
+    ordered_urls = [a["url"] for a in stremio_profile.priority_sort(live)]
+    check("live: priority order is a permutation of discovery",
+          sorted(ordered_urls) == sorted(a["url"] for a in live))
+    live_cfg = Config(dict(DEFAULTS), None)
+    live_cfg.stremio_addons = ordered_urls
+    check("live: URLs survive the config setter verbatim (textarea "
+          "format parity)", live_cfg.stremio_addons == ordered_urls,
+          live_cfg.stremio_addons)
+
+print("[9] render grab (canonical healthy state)")
 PATCH_STATE["status"] = {"found": True, "patched": True, "backup": True,
                          "titled": True}
 FA_STATE["is_default"] = True

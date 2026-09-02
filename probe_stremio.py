@@ -538,6 +538,75 @@ def leg_a():
     stremio.series_meta, stremio.addon_streams, stremio.StreamingServer \
         = saved
 
+    # ---- addon_streams: concurrency, retry, merge order, episode cache ----
+    # (live-seen 2026-09-02: the ⏮ click waited ~4.5 s on the serial addon
+    # chain; bounces re-asked the SAME episode every time)
+    import requests as _rq
+
+    class _Resp:
+        def __init__(self, payload):
+            self.status_code = 200
+            self._p = payload
+
+        def json(self):
+            return self._p
+
+    A3 = "https://addon-three.example"
+
+    class _FakeSession:
+        headers = {}
+        base_streams = {
+            A1: [{"title": "S01E01 1080p \U0001F464 5 \U0001F4BE 8 GB",
+                  "infoHash": "a" * 40, "fileIdx": 0}],
+            A2: [{"url": "https://debrid.example/file.mkv",
+                  "title": "S01E01 1080p"}],
+            A3: [],
+        }
+
+        def get(self, url, timeout=25):
+            base = url.split("/stream/")[0]
+            calls.append(base)
+            if base == A2 and calls.count(A2) == 1:
+                raise _rq.exceptions.ReadTimeout()   # one blip, retried
+            time.sleep(0.8)
+            return _Resp({"streams": _FakeSession.base_streams[base]})
+
+    saved_sess = stremio._session
+    saved_cache = dict(stremio._streams_cache)
+    stremio._streams_cache.clear()
+    stremio._session = _FakeSession()
+    cfg3 = pref_cfg(addons=(A1, A2, A3))
+    calls = []
+    t0 = time.time()
+    streams = stremio.addon_streams(cfg3, "ttX", 1, 1)
+    dt = time.time() - t0
+    check("addon_streams merges every addon in priority order",
+          len(streams) == 2 and streams[0]["_addon"] == A1
+          and streams[1]["_addon"] == A2,
+          [s.get("_addon") for s in streams])
+    check("addon_streams queries addons concurrently",
+          dt < 1.2, "%.2fs (serial would be >=1.6s)" % dt)
+    check("addon_streams retries a blipped addon exactly once",
+          calls.count(A2) == 2 and len(calls) == 4, calls)
+    again = stremio.addon_streams(cfg3, "ttX", 1, 1)
+    check("episode streams are served from the short cache",
+          again is streams and len(calls) == 4)
+    stremio.addon_streams(cfg3, "ttX", 1, 9)
+    check("a different episode still queries the addons",
+          len(calls) == 7, len(calls))
+    stremio.addon_streams(pref_cfg(addons=(A3,)), "ttY", 1, 1)
+    stremio.addon_streams(pref_cfg(addons=(A3,)), "ttY", 1, 1)
+    check("an empty addon answer is never cached",
+          len(calls) == 9, len(calls))
+    stale = stremio._streams_cache[("ttx", 1, 1)]
+    stremio._streams_cache[("ttx", 1, 1)] = (stale[0] - 601.0, stale[1])
+    stremio.addon_streams(cfg3, "ttX", 1, 1)
+    check("an expired cache entry re-queries the addons",
+          len(calls) == 12, len(calls))
+    stremio._session = saved_sess
+    stremio._streams_cache.clear()
+    stremio._streams_cache.update(saved_cache)
+
     # settings migration: stremio_prefer_resolution (int) ->
     # stremio_resolution_pref ("match"/"auto"/fixed pick); 2160 and the
     # legacy 0 both meant "no fixed target", so they land on auto
@@ -920,6 +989,19 @@ if os.environ.get("MTP_PROBE_URL"):
     report("lookahead title has episode name", bool(nxt) and len(
         str(nxt.get("title", "")).split(" — ", 1)[-1].split(" ", 2)) >= 3,
         str(nxt.get("title", ""))[:60])
+    # the prev prefetch fires alongside the lookahead; the live URL is a
+    # season-1 episode-1 file, so the honest cached answer is None
+    plook = None
+    for _ in range(300):
+        app.processEvents()
+        plook = win.player_view._stremio_prevlook
+        if plook and plook[0] == (win.player_view.current or {}).get(
+                "fav_key"):
+            break
+        time.sleep(0.2)
+    report("prevlook ran alongside the lookahead",
+           bool(plook) and plook[1] is None,
+           str((plook[1] or {}).get("title", "None"))[:60])
 # movie identity end-to-end (offline): a movie ident (no season) retitles
 # the banner "Name (Year)", keeps the episode buttons hidden, kicks no
 # lookahead, and a finished movie never rolls autoplay — all on a fresh
@@ -955,6 +1037,105 @@ _pv._downloading = False
 _pv._vid_s = 600.0
 win.player_view._maybe_autoplay_next(False, 600000, 599000)
 report("finished movie never rolls autoplay", not _pv._eof_next_done)
+
+# ---- debrid-stall guard: dead-on-arrival vs genuinely finished ----
+# (live 2026-09-02 16:01: a dead torrentio resolve URL left VLC "ended"
+# having played NOTHING; "ended" read as alive, the fallback never fired
+# and the user stared at a dead screen for 55 s until a manual reload)
+import src.stremio as _st
+_gfk = "stremio:guard:1"
+_fbs = []
+
+class _FBSrv:
+    def __init__(self, base=""):
+        pass
+
+    def create(self, h, trackers=()):
+        _fbs.append(h)
+        return True
+
+    @staticmethod
+    def play_url(h, i):
+        return "http://127.0.0.1:11470/%s/%d" % (h, i)
+
+_real_srv = _st.StreamingServer
+_st.StreamingServer = _FBSrv
+
+# shadow just the liveness probes on the REAL player instance (play_media
+# still needs its play/poke methods for the fallback replay)
+_real_live = (_pv.vlc.is_playing, _pv.vlc.state_name, _pv.vlc.get_time)
+win.player_view.current = {
+    "kind": "stremio", "fav_key": _gfk, "title": "t", "url":
+    "https://torrentio.strem.fun/resolve/torbox/k/" + "a" * 40 +
+    "/File.S01E02.mkv/3/File.S01E02.mkv", "info_hash": "a" * 40,
+    "file_idx": 3}
+_pv.vlc.is_playing = lambda: False
+_pv.vlc.state_name = lambda: "ended"
+_pv.vlc.get_time = lambda: 0
+_pv._stremio_fallback_done = False
+_pv._stremio_guard_t0 = time.time() - 20.0
+_pv._vid_s = 0.0
+n_before_fb = len(plays)
+_pv._stremio_guard_tick()
+fell = False
+for _ in range(100):
+    app.processEvents()
+    if len(plays) > n_before_fb:
+        fell = True
+        break
+    time.sleep(0.05)
+report("guard: dead-on-arrival 'ended' fires the torrent fallback",
+       fell and _fbs == ["a" * 40] and
+       plays[-1][0].endswith("11470/" + "a" * 40 + "/3"),
+       str(plays[-1][0][-60:]) if len(plays) > n_before_fb else "no replay")
+# genuinely finished (played 600 s) "ended" stays alive — end-of-media
+# owns that state, not the fallback
+_pv._stremio_fallback_done = False
+_pv._stremio_guard_t0 = time.time() - 20.0
+_pv._vid_s = 600.0
+_fbs.clear()
+_pv._stremio_guard_tick()
+report("guard: 'ended' AFTER real playback disarms (no fallback)",
+       len(plays) == n_before_fb + 1 and not _fbs)
+# paused mid-playback stays alive
+_pv._vid_s = 30.0
+_pv.vlc.state_name = lambda: "paused"
+_pv._stremio_guard_tick()
+report("guard: paused disarms (no fallback)",
+       len(plays) == n_before_fb + 1 and not _fbs)
+(_pv.vlc.is_playing, _pv.vlc.state_name, _pv.vlc.get_time) = _real_live
+_st.StreamingServer = _real_srv
+
+# ---- prevlook wiring: the ⏮ twin of the lookahead ----
+_cfk = "stremio:prevlook:1"
+_canned = {"kind": "stremio", "title": "Prev — S01E01", "fav_key":
+           "stremio:tt9:1:1", "url":
+           "http://127.0.0.1:11470/" + "b" * 40 + "/1",
+           "stremio_imdb": "tt9", "season": 1, "episode": 1}
+win.player_view.current = {"kind": "stremio", "fav_key": _cfk,
+                           "stremio_imdb": "tt9", "season": 1,
+                           "episode": 2, "series_name": "S",
+                           "url": "http://x", "title": "S01E02"}
+_rpp = _st.prev_playable
+_st.prev_playable = lambda cfg, cur: dict(_canned)
+_pv._prevlook_busy = ""
+_pv._begin_stremio_prevlook()
+ok_pl = False
+for _ in range(100):
+    app.processEvents()
+    pl_ = _pv._stremio_prevlook
+    if pl_ and pl_[0] == _cfk and pl_[1]:
+        ok_pl = True
+        break
+    time.sleep(0.05)
+report("prevlook prefetch populates the cache", ok_pl)
+_pcalls = []
+_st.prev_playable = lambda cfg, cur: (_pcalls.append(1), None)[1]
+got_prev = _pv._fetch_stremio_prev(win.player_view.current or {})
+_st.prev_playable = _rpp
+report("prev click serves from the prevlook cache",
+       got_prev is not None and not _pcalls
+       and (got_prev or {}).get("fav_key") == "stremio:tt9:1:1")
 win.close()
 '''
 

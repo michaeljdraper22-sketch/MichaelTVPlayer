@@ -693,6 +693,22 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_want = False        # user picked a text track (sticky)
         self._cap_fail = False        # source dead this media: VLC renders
         self._cap_vod_tries = 0       # _cap_vod_check retries (head parse)
+        # online-subtitle fetch (bitmap-only / no text track dead-ends):
+        # _sub_fetch_pending = a dead-end armed the fetch but the identity
+        #                     isn't known yet (stremio lookup in flight);
+        # _sub_fetching = search+download job running on _subfetch_runner;
+        # _sub_fetch_fail = THIS dead-end's classic body, zero-arg — run
+        #                   verbatim when the fetch fails, so failure
+        #                   restores exactly today's behavior;
+        # _sub_fetch_lang / _lang_name = ISO code + display word for the
+        #                   wanted language (the sticky pick's hint);
+        # _sub_fetch_gen = session generation the job belongs to.
+        self._sub_fetch_pending = False
+        self._sub_fetching = False
+        self._sub_fetch_lang = "eng"
+        self._sub_fetch_lang_name = "English"
+        self._sub_fetch_fail = None
+        self._sub_fetch_gen = -1
         self._cap_clock_s = 0.0       # caption timing clock (VLC display
         #                              # position; see _caption_clock_s)
         self._cap_raw_s = None        # last raw get_time() seen by the
@@ -776,11 +792,23 @@ class PlayerView(QtWidgets.QWidget):
         self._look_runner.finished.connect(self._on_stremio_lookahead)
         self._look_busy = ""          # fav_key of the in-flight lookahead
         self._stremio_lookahead = None   # (fav_key, playable|None, when)
+        # the ⏮ twin: a background PREV-episode lookup, so going back is
+        # as instant as next (the live-seen prev click ran the whole
+        # addon-query chain on demand — ~4-5 s "Finding previous…")
+        self._prevlook_runner = AsyncRunner()
+        self._prevlook_runner.finished.connect(self._on_stremio_prevlook)
+        self._prevlook_busy = ""
+        self._stremio_prevlook = None    # (fav_key, playable|None, when)
         # debrid-stall fallback (see _stremio_guard_tick): play the
         # handoff's torrent through the local Stremio server when the
         # debrid link itself refuses to start
         self._fb_runner = AsyncRunner()
         self._fb_runner.finished.connect(self._on_stremio_fallback)
+        # online-subtitle search+download (caption dead-end rescue) — its
+        # own runner: _stremio_runner's finished is wired to identity, and
+        # the fetch must never queue behind (or clobber) an identity lookup
+        self._subfetch_runner = AsyncRunner()
+        self._subfetch_runner.finished.connect(self._on_subs_fetched)
         self._stremio_guard = QtCore.QTimer(self)
         self._stremio_guard.setInterval(2000)
         self._stremio_guard.timeout.connect(self._stremio_guard_tick)
@@ -1758,6 +1786,12 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_store_ext = False
         self._stremio_sub_cues = []
         self._stremio_sub_path = ""
+        # any in-flight online-subtitle job belongs to the OLD media: its
+        # callback drops on the generation guard, and the dead-end state
+        # that armed it is gone with the old cur
+        self._sub_fetch_pending = False
+        self._sub_fetching = False
+        self._sub_fetch_fail = None
         self._stop_profanity()
         self._cap_cues.clear()
         self._cap_tick_errs.clear()   # a new media logs its own errors
@@ -1879,6 +1913,14 @@ class PlayerView(QtWidgets.QWidget):
             # episode) in the background — that is what makes autoplay-
             # next and the title work
             self._begin_stremio_identity(playable)
+            if playable.get("stremio_imdb") and not playable.get("movie"):
+                # an ALREADY-identified series playable (adjacent switch,
+                # Recently Played replay) never lands in the identity
+                # worker — prefetch both neighbors directly, staggered
+                QtCore.QTimer.singleShot(
+                    500, self._begin_stremio_lookahead)
+                QtCore.QTimer.singleShot(
+                    2000, self._begin_stremio_prevlook)
             # a debrid link that hasn't started in ~10 s is dead (live
             # seen: transient resolve-endpoint 502s) — watch for it and
             # fall back to the same torrent on the local server. Server
@@ -1951,6 +1993,11 @@ class PlayerView(QtWidgets.QWidget):
                     log.warning("stremio identity lookup failed: %s", val)
                 except Exception:
                     pass
+            if self._sub_fetch_pending:
+                # a caption dead-end armed the online-subtitle fetch on the
+                # promise of an imdb id that will never arrive — finish it
+                # with today's classic handoff, quietly (no second banner)
+                self._run_sub_fetch_fail()
             self.show_info("Could not identify this stream \u2014 "
                            "autoplay unavailable")
             return
@@ -1958,6 +2005,14 @@ class PlayerView(QtWidgets.QWidget):
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran
         cur.update(ident)
+        if self._sub_fetch_pending:
+            # the armed caption dead-end was waiting for exactly this
+            if ident.get("stremio_imdb"):
+                self._kick_online_sub_fetch()
+            else:
+                # a display-name-only partial carries no imdb — nothing to
+                # search with; finish with the classic handoff, quietly
+                self._run_sub_fetch_fail()
         if ident.get("movie"):
             # a movie: "Name (Year)" — no episode maths, no lookahead,
             # no episode buttons (their visibility gate keys on season)
@@ -1984,6 +2039,9 @@ class PlayerView(QtWidgets.QWidget):
         self._update_control_state()
         if not ident.get("movie"):
             self._begin_stremio_lookahead()
+            # staggered a beat so the two addon queries don't collide
+            QtCore.QTimer.singleShot(
+                1500, self._begin_stremio_prevlook)
 
     # ---- stremio: prefetch the next episode while this one plays ----
 
@@ -2025,6 +2083,44 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
 
+    # ---- stremio: prefetch the PREVIOUS episode while this one plays ----
+
+    def _begin_stremio_prevlook(self):
+        """The ⏮ twin of _begin_stremio_lookahead: resolve the previous
+        episode's playable up front so the button switches instantly
+        instead of running the catalog + addon + create chain on click."""
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or not cur.get("stremio_imdb") \
+                or cur.get("movie"):
+            return
+        base = cur.get("fav_key")
+        if self._prevlook_busy == base:
+            return
+        self._prevlook_busy = base
+
+        def _work():
+            from .. import stremio
+            prv = stremio.prev_playable(self.config, dict(cur))
+            return base, prv
+        self._prevlook_runner.run(_work)
+
+    def _on_stremio_prevlook(self, result):
+        ok, val = result
+        self._prevlook_busy = ""
+        if ok != "ok" or self._closing:
+            return
+        base, prv = val
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
+            return          # the user moved on while the lookup ran
+        self._stremio_prevlook = (base, prv, now_s())
+        if prv:
+            try:
+                log.info("stremio prevlook: previous ready — %r",
+                         prv.get("title", "")[:70])
+            except Exception:
+                pass
+
     # ---- stremio: debrid-stall fallback (local-server torrent) ----
 
     def _stremio_guard_tick(self):
@@ -2039,8 +2135,17 @@ class PlayerView(QtWidgets.QWidget):
             self._stremio_guard.stop()
             return
         try:
-            alive = self.vlc.is_playing() or self.vlc.state_name() in (
-                "playing", "paused", "ended")
+            state = self.vlc.state_name() or ""
+            alive = self.vlc.is_playing() or state in ("playing", "paused")
+            if not alive and state in ("ended", "stopped", "error"):
+                # A link that DIED can wear these states too: a dead-on-
+                # arrival debrid URL (live-seen 2026-09-02 16:01: torrentio
+                # resolve 502s) puts VLC straight into "ended" having played
+                # nothing — counting that as alive disarmed this guard and
+                # the fallback never fired (55 s dead screen, manual reload).
+                # Only a state reached AFTER real playback counts as alive;
+                # the end-of-media / stall paths own that territory.
+                alive = self._vid_s > 5.0
         except Exception:  # noqa: BLE001
             alive = False
         if alive:
@@ -2201,8 +2306,12 @@ class PlayerView(QtWidgets.QWidget):
 
     def _fetch_stremio_prev(self, cur):
         """Worker-thread: the previous episode of a handed-off Stremio
-        stream — the ⏮ twin of _fetch_stremio_next (on-demand: no
-        lookahead cache to consult)."""
+        stream — the ⏮ twin of _fetch_stremio_next (consults the
+        background prev-lookahead cache first)."""
+        look = self._stremio_prevlook
+        if look and look[0] == cur.get("fav_key") \
+                and now_s() - look[2] < 1800:
+            return look[1]
         try:
             from .. import stremio
             return stremio.prev_playable(self.config, cur)
@@ -2405,10 +2514,9 @@ class PlayerView(QtWidgets.QWidget):
         self.config.data["last_channel"] = nxt
         self.config.save()
         self.play_media(nxt)
-        # keep the chain going: prefetch THIS episode's successor too
-        if (nxt.get("kind") == "stremio" and nxt.get("stremio_imdb")):
-            QtCore.QTimer.singleShot(
-                2000, self._begin_stremio_lookahead)
+        # the neighbor prefetches (lookahead + prevlook) are kicked from
+        # play_media itself now — here they only fired for switches, never
+        # for replays, and ran a beat later than needed
         # move the browser tab's blue selection to the new episode/program
         try:
             win = self.window()
@@ -5257,16 +5365,23 @@ class PlayerView(QtWidgets.QWidget):
         return bool(_EXT_SLAVE_RE.match((name or "").strip()))
 
     def _stremio_handoff_cues(self) -> list:
-        """The handoff's external subtitle file, parsed once per media.
+        """The media's external subtitle file, parsed once per media.
 
         Stremio downloads the user's subtitle pick and hands it over as a
         file (--sub-file=...): SRT/VTT/ASS, its cues pre-timed on the
-        video's own timeline (VLC's get_time axis). Cached by path so the
-        filter pass, the overlay engage and mid-stream re-engages all
-        share ONE read/parse. [] when there is nothing to render."""
+        video's own timeline (VLC's get_time axis). A caption dead-end
+        (bitmap-only, no text track, wrong language) fetches a matching
+        TEXT subtitle online and stores it the same way — sub_file on a
+        Stremio handoff (so the whole existing takeover machinery rides
+        along), _fetched_sub on VOD/series. Cached by path so the filter
+        pass, the overlay engage and mid-stream re-engages all share ONE
+        read/parse. [] when there is nothing to render."""
         cur = self.current or {}
-        path = cur.get("sub_file") or ""
-        if self._closing or cur.get("kind") != "stremio" or not path:
+        if self._closing or cur.get("kind") not in ("stremio", "vod",
+                                                    "series"):
+            return []
+        path = (cur.get("sub_file") or cur.get("_fetched_sub") or "")
+        if not path:
             return []
         if self._stremio_sub_path != path:
             text = prof_mod.read_subtitle_text(path)
@@ -5295,12 +5410,14 @@ class PlayerView(QtWidgets.QWidget):
             # unreadable or a foreign format: VLC keeps the file itself
             self._cap_fail = True
             return
-        if not self._cap_store_ext:
-            # the file owns the store: relay cues (if the filter routed
-            # the stream through the relay) stop painting — same lines,
-            # slightly different timing, newest-wins would flicker
-            self._cap_cues.clear()
-            self._cap_store_ext = True
+        # the file owns the store: relay cues (if the filter routed the
+        # stream through the relay) stop painting — same lines, slightly
+        # different timing, newest-wins would flicker. The store is
+        # cleared on EVERY engage: a re-fetch while the previous file
+        # already owns it must drop the old cues or the two double-paint
+        # (the flip alone only guarded the first takeover).
+        self._cap_store_ext = True
+        self._cap_cues.clear()
         for start, end, text in cues:
             self._cap_cues.add(start, end, text)
         self._cap_fail = False       # the file just parsed: source alive
@@ -5725,7 +5842,11 @@ class PlayerView(QtWidgets.QWidget):
 
     def _cap_vod_handoff(self, note: str, log_msg: str, *log_args):
         """Give VOD captions back to VLC's own renderer (the overlay can
-        offer nothing on this file) and latch the failure for the media."""
+        offer nothing on this file) and latch the failure for the media —
+        UNLESS a fetched TEXT subtitle can still rescue the overlay: on
+        stremio/vod/series with the fetch enabled, the dead-end arms an
+        online search instead (VLC keeps its own rendering while it runs;
+        a failed fetch restores today's exact body)."""
         if self._stremio_external_takeover():
             # the handoff's own FILE survives the relay dead-end — the
             # overlay keeps rendering, app-styled
@@ -5734,6 +5855,27 @@ class PlayerView(QtWidgets.QWidget):
             log.info(log_msg, *log_args)
         except Exception:
             pass
+        if self._engage_fetched_sub():
+            # this media already fetched a parseable file once (re-run
+            # dead-end): render it again, no network
+            return
+        if self._arm_online_sub_fetch(
+                lambda: self._cap_vod_handoff_finish(note)):
+            # searching online: VLC's own (bitmap/foreign) rendering stays
+            # on, the failure stays unlatched — _on_subs_fetched finishes
+            # the story in both directions
+            self._set_cap_on(False)
+            try:
+                self.vlc.set_spu(self._spu_want)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        self._cap_vod_handoff_finish(note)
+
+    def _cap_vod_handoff_finish(self, note: str):
+        """The classic caption dead-end body — also the verbatim restore
+        target of a failed online-subtitle fetch: latch the failure, hand
+        rendering to VLC, pill."""
         self._cap_fail = True
         self._set_cap_on(False)
         try:
@@ -5801,8 +5943,12 @@ class PlayerView(QtWidgets.QWidget):
             # stay OFF. Deliberately NOT the VLC handoff — that re-enabled
             # VLC's own track selection, which then rendered the non-English
             # track (the "subtitles default to a foreign language" bug).
-            # A Stremio handoff's own FILE escapes the dark-out instead.
+            # A Stremio handoff's own FILE escapes the dark-out instead —
+            # and so does a fetched ONLINE subtitle (the wanted-language
+            # text may simply not exist inside this file).
             if self._stremio_external_takeover():
+                return
+            if self._engage_fetched_sub():
                 return
             metas = getattr(relay, "parser_tracks_meta", None) or {}
             langs = sorted({str(m.get("lang") or m.get("name") or "?")
@@ -5812,12 +5958,15 @@ class PlayerView(QtWidgets.QWidget):
                          "captions off", langs)
             except Exception:
                 pass
-            self._cap_fail = True
-            self._set_cap_on(False)
-            self._spu_want = -1
-            self._spu_name = ""
-            self._refresh_spu_button()
-            self._cap_note("Captions: no English text track on this file")
+            if self._arm_online_sub_fetch(self._cap_selnone_finish):
+                # searching online: captions dark meanwhile (exactly the
+                # classic outcome), but the dead-end stays unlatched
+                self._set_cap_on(False)
+                self._spu_want = -1
+                self._spu_name = ""
+                self._refresh_spu_button()
+                return
+            self._cap_selnone_finish()
             return
         meta = (getattr(relay, "parser_tracks_meta", None) or {}).get(sel)
         hint = self._cap_lang_hint(self._spu_name)
@@ -5839,6 +5988,214 @@ class PlayerView(QtWidgets.QWidget):
                 {m.get("lang") for m in
                  (getattr(relay, "parser_tracks_meta", None) or {}).values()
                  if is_text_codec(m.get("codec", ""))})
+
+    def _cap_selnone_finish(self):
+        """The classic 'no matching-language text track' body — also the
+        restore target of a failed online fetch: captions OFF (never the
+        VLC handoff — that re-enabled VLC's own selection and rendered
+        the foreign track, the live-seen foreign-default bug)."""
+        self._cap_fail = True
+        self._set_cap_on(False)
+        self._spu_want = -1
+        self._spu_name = ""
+        self._refresh_spu_button()
+        self._cap_note("Captions: no English text track on this file")
+
+    # ---- online subtitle fetch (caption dead-end rescue) ----
+
+    def _engage_fetched_sub(self) -> bool:
+        """This media already carries a fetched external subtitle that
+        still parses: (re-)render it in the overlay — the instant path
+        for a re-opened playable (Stremio autoplay reuses the dict) or a
+        re-run dead-end, no network."""
+        cur = self.current or {}
+        path = (cur.get("sub_file") if cur.get("kind") == "stremio"
+                else cur.get("_fetched_sub")) or ""
+        if not path or not os.path.isfile(path):
+            return False
+        if not self._stremio_handoff_cues():
+            return False
+        self._engage_stremio_external()
+        if not self._cap_on:
+            return False
+        lang = (cur.get("_fetched_lang") or "English")
+        self._spu_want = -1
+        self._spu_name = "%s (online)" % lang
+        self._load_stremio_sub_cues()
+        self._cap_note("Subtitles: %s (found online)" % lang)
+        self._refresh_spu_button()
+        return True
+
+    def _arm_online_sub_fetch(self, fail_fn, manual: bool = False) -> bool:
+        """A caption dead-end (bitmap-only, no track metadata, wrong
+        language, no matching-language track) on stremio/vod/series: arm
+        the online TEXT-subtitle search instead of latching failure.
+        True when armed — the caller keeps VLC's own rendering on and
+        RETURNS (no _cap_fail); fail_fn runs today's exact dead-end body
+        verbatim if the fetch finds nothing. manual=True (the subs card
+        row) bypasses the _cap_want/config gates — explicit user intent —
+        and pairs with fail_fn=None (failure just notes, latches
+        nothing)."""
+        cur = self.current or {}
+        if (self._closing or self._sub_fetching or self._sub_fetch_pending
+                or (not manual and not self._cap_want)
+                or cur.get("kind") not in ("stremio", "vod", "series")
+                or (not manual and
+                    not getattr(self.config, "fetch_online_subs", True))):
+            return False
+        hint = self._cap_lang_hint(self._spu_name)
+        self._sub_fetch_lang = lang_token(hint) if hint else "eng"
+        self._sub_fetch_lang_name = (hint or "english").capitalize()
+        self._sub_fetch_fail = fail_fn
+        self._sub_fetch_pending = True
+        self._cap_note("Subtitles: searching online\u2026")
+        self._kick_online_sub_fetch()
+        return True
+
+    def _kick_online_sub_fetch(self):
+        """Start the search+download job once the identity is ready. A
+        Stremio handoff whose identity lookup is still running stays
+        pending — _on_stremio_identity re-kicks with the imdb id (or
+        quietly finishes the classic dead-end when identity fails)."""
+        if (self._closing or self._sub_fetching
+                or not self._sub_fetch_pending):
+            return
+        cur = self.current or {}
+        if cur.get("kind") == "stremio" and not cur.get("stremio_imdb"):
+            return      # waiting on _on_stremio_identity
+        self._sub_fetch_pending = False
+        self._sub_fetching = True
+        self._sub_fetch_gen = self._session
+        kind = cur.get("kind")
+        is_movie = kind == "vod" or bool(cur.get("movie"))
+        lang = self._sub_fetch_lang or "eng"
+        imdb = str(cur.get("stremio_imdb") or "")
+        try:
+            season = int(cur.get("season") or 0)
+            episode = int(cur.get("episode") or 0)
+        except (TypeError, ValueError):
+            season = episode = 0
+        cur_snap = dict(cur)   # the worker must not race GUI mutation
+        file_hint = " ".join(str(cur_snap.get(k) or "")
+                             for k in ("file_name", "torrent_name",
+                                       "title")).strip()
+
+        def _work():
+            from .. import stremio
+            my_imdb, my_season, my_episode = imdb, season, episode
+            my_movie = is_movie
+            if not my_imdb:
+                # vod/series identity resolves HERE (lazy): catalog
+                # round-trips only ever happen for a caption dead-end
+                ident = stremio.resolve_vod_identity(cur_snap)
+                if not ident:
+                    return None
+                my_imdb = str(ident.get("stremio_imdb") or "")
+                if not my_imdb:
+                    return None
+                my_movie = bool(ident.get("movie"))
+                try:
+                    my_season = int(ident.get("season") or season or 0)
+                    my_episode = int(ident.get("episode") or episode or 0)
+                except (TypeError, ValueError):
+                    pass
+            # moviehash from the running relay's cached head/tail — the
+            # relay is up by construction on this path; resume sessions
+            # carry no head, and a missing hash only degrades ranking
+            vhash = ""
+            try:
+                relay = self._vod_relay
+                if (relay is not None
+                        and getattr(relay, "total", 0) > 131072
+                        and len(getattr(relay, "_head", b"") or b"") >= 65536
+                        and len(getattr(relay, "_tail", b"") or b"") >= 65536):
+                    vhash = "%016x" % stremio.opensubs_hash(
+                        relay._head[:65536], relay._tail, relay.total)
+            except Exception:  # noqa: BLE001 - hash is best-effort
+                vhash = ""
+            cands = stremio.search_online_subtitles(
+                "movie" if my_movie else "series", my_imdb,
+                season=my_season, episode=my_episode,
+                want_lang=lang, file_hint=file_hint, video_hash=vhash)
+            for cand in cands[:3]:
+                dest = stremio.subtitle_cache_path(my_imdb, cand["id"])
+                if not stremio.download_online_subtitle(cand["url"], dest):
+                    continue
+                text = prof_mod.read_subtitle_text(dest)
+                cues = prof_mod.parse_subtitle_cues(text) if text else []
+                if cues:
+                    return dest, (cand.get("name") or cand.get("release")
+                                  or "subtitle")
+            return None
+
+        self._subfetch_runner.run(_work)
+
+    def _on_subs_fetched(self, result):
+        """The online-subtitle job came back (any of the three kinds).
+        Stale results (the session generation moved on) drop silently;
+        failure runs the arming dead-end's classic body verbatim; success
+        renders the fetched file in the styled overlay. The engage is
+        called DIRECTLY — _engage_caption_overlay's _cap_fail early-out
+        must be bypassed because the dead-end deliberately left the
+        failure unlatched while the search ran."""
+        self._sub_fetching = False
+        ok, val = result
+        if self._closing or self._sub_fetch_gen != self._session:
+            return      # the user moved on — drop
+        cur = self.current or {}
+        if cur.get("kind") not in ("stremio", "vod", "series"):
+            return
+        if ok != "ok" or not val:
+            if ok != "ok":
+                try:
+                    log.info("online subs: fetch failed: %s", val)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._run_sub_fetch_fail()
+            return
+        path, _disp = val
+        if cur.get("kind") == "stremio":
+            # sub_file on stremio: the whole existing takeover machinery
+            # (auto-engage at open, restart, VLC slave adoption) rides
+            # along; VLC loads sub-file only at media open anyway, so
+            # this stores — the explicit engage below is what renders
+            cur["sub_file"] = path
+        else:
+            cur["_fetched_sub"] = path
+        cur["_fetched_lang"] = self._sub_fetch_lang_name or "English"
+        self._sub_fetch_fail = None
+        self._engage_stremio_external()
+        if not self._cap_on:
+            # the file stopped parsing between job and engage — classic
+            self._run_sub_fetch_fail()
+            return
+        self._spu_want = -1      # engage turned VLC's own spu OFF
+        self._spu_name = "%s (online)" % cur["_fetched_lang"]
+        self._load_stremio_sub_cues()   # profanity mute windows get cues
+        self._cap_note("Subtitles: %s (found online)"
+                       % cur["_fetched_lang"])
+        self._refresh_spu_button()
+
+    def _run_sub_fetch_fail(self):
+        """Finish an armed/pending fetch with failure: run the arming
+        dead-end's classic body verbatim (today's behavior restored
+        exactly). A MANUAL fetch armed no dead-end — note only, whatever
+        VLC was rendering keeps rendering."""
+        self._sub_fetch_pending = False
+        fn, self._sub_fetch_fail = self._sub_fetch_fail, None
+        if fn:
+            fn()
+        else:
+            self._cap_note("Subtitles: none found online")
+
+    def _manual_fetch_online_sub(self):
+        """The subs card's "Find subtitles online…" row (stremio/vod/
+        series): explicit user intent — runs even with the auto-fetch
+        setting off, and always FRESH (a fetched file may already be
+        rendering; the user asking again wants another try). While a
+        search runs, further asks are ignored."""
+        self._cap_want = True      # asking for subtitles IS wanting them
+        self._arm_online_sub_fetch(None, manual=True)
 
     def _cycle_spu(self):
         """C key: Off -> English-first track -> ... -> Off. English is the
@@ -5938,6 +6295,9 @@ class PlayerView(QtWidgets.QWidget):
                          f"Track {tid}", "sub": sub,
                          "checked": tid == self._spu_want})
         rows.append({"sep": True})
+        if (self.current or {}).get("kind") in ("stremio", "vod", "series"):
+            rows.append({"id": "fetch",
+                         "main": "Find subtitles online\u2026"})
         rows.append({"id": "settings", "main": "Subtitle settings\u2026"})
         self._open_ctl_panel(
             self.btn_cc, "SUBTITLES", rows, self._on_spu_row_picked)
@@ -5946,6 +6306,8 @@ class PlayerView(QtWidgets.QWidget):
         rid = row.get("id")
         if rid == "settings":
             self._open_sub_settings()
+        elif rid == "fetch":
+            self._manual_fetch_online_sub()
         else:
             self._select_spu(rid, row.get("name", "") or "")
 
@@ -6486,11 +6848,15 @@ class PlayerView(QtWidgets.QWidget):
         """
         if not self.config.profanity.get("enabled"):
             return
-        if kind == "stremio":
+        if kind == "stremio" or (
+                kind in ("vod", "series")
+                and (self.current or {}).get("_fetched_sub")):
             # the relay (embedded tracks) was already routed in
             # _effective_url; the handoff's EXTERNAL subtitle file is the
             # other half — most debrid/torrent files carry no text track
-            # at all, so without it the filter has nothing to read
+            # at all, so without it the filter has nothing to read. A
+            # VOD/series media whose captions were rescued by a FETCHED
+            # file re-feeds it here on re-open the same way.
             self._load_stremio_sub_cues()
             return
         if kind != "live" or not self._is_dvrable():
@@ -6506,8 +6872,9 @@ class PlayerView(QtWidgets.QWidget):
             self._start_cc_when_buffer(tries_left=75)
 
     def _load_stremio_sub_cues(self):
-        """Stremio handoff: feed the handed-off subtitle file's cues to the
-        filter. The file's timestamps sit on the video's own timeline
+        """Feed the media's EXTERNAL subtitle file's cues (a Stremio
+        handoff's --sub-file, or a fetched-online rescue on any kind) to
+        the filter. The file's timestamps sit on the video's own timeline
         (VLC's get_time axis) — pre-timed like a VOD track, so the same
         measured mute lead applies. Safe to re-run when the user toggles
         the filter mid-stream: identical windows merge. The parse itself

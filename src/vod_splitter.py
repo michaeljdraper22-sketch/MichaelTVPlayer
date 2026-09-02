@@ -483,7 +483,11 @@ class VodRelay(QtCore.QObject):
             req = urllib.request.Request(
                 self.url, headers={"User-Agent": self.ua,
                                    "Range": "bytes=0-11"})
-            with urllib.request.urlopen(req, timeout=20) as r:
+            # 10 s for a 12-byte ranged GET is already generous; this runs
+            # synchronously on the UI thread inside VodRelay.start, so a
+            # hanging (not fast-erroring) debrid URL used to freeze the
+            # open path for the old 20 s before playback even began
+            with urllib.request.urlopen(req, timeout=10) as r:
                 head = r.read(12)
                 cr = r.headers.get("Content-Range") or ""
                 if "/" in cr:

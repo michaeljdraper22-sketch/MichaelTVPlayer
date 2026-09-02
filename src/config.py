@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.5.17"
+APP_VERSION = "1.5.18"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -116,6 +116,12 @@ DEFAULTS = {
     "stremio_size_demote_gb": 25,
     "stremio_watch_downloads": True,   # auto-play Stremio's playlist.m3u
                                        # the moment it lands in Downloads
+    # When a stream's embedded subtitles can't be restyled (bitmap PGS-only,
+    # no text track, wrong language): silently fetch a matching TEXT
+    # subtitle online (keyless OpenSubtitles addon) and render it in the
+    # app's styled caption overlay. Covers Stremio handoffs + the IPTV
+    # VOD/series library; live TV is exempt.
+    "fetch_online_subs": True,
 }
 
 # valid stremio_resolution_pref values ("match" = same resolution as the
@@ -678,3 +684,11 @@ class Config:
     @stremio_watch_downloads.setter
     def stremio_watch_downloads(self, value: bool) -> None:
         self.data["stremio_watch_downloads"] = bool(value)
+
+    @property
+    def fetch_online_subs(self) -> bool:
+        return bool(self.data.get("fetch_online_subs", True))
+
+    @fetch_online_subs.setter
+    def fetch_online_subs(self, value: bool) -> None:
+        self.data["fetch_online_subs"] = bool(value)

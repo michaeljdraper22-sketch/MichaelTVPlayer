@@ -137,12 +137,16 @@ pv.current = {"kind": "stremio", "title": "Silo — S01E01",
 pv._stop_profanity()                   # play_media's teardown ran before this
 pv._on_media_for_profanity("stremio")
 wins = pv._filter_engine.windows
-check("clean cue produced no window", len(wins) == 1)
-if wins:
-    w = wins[0]
+check("every filtered word built a window (hell + shit)", len(wins) == 2)
+if len(wins) == 2:
+    w_hell, w_shit = wins
+    check("hell window inside cue 1, shifted by the VOD lead",
+          10.0 < w_hell[0] < 11.2 and 10.8 < w_hell[1] <= 12.0,
+          repr(w_hell))
     # 'shit' sits mid-cue; word share of (20,22) minus the 0.4 s VOD lead
-    check("window inside cue 2, shifted by the VOD lead",
-          19.0 < w[0] < 20.6 and 20.4 < w[1] <= 22.0, repr(w))
+    check("shit window inside cue 2, shifted by the VOD lead",
+          19.0 < w_shit[0] < 20.6 and 20.4 < w_shit[1] <= 22.0,
+          repr(w_shit))
 check("evaluation loop running", pv._filter_timer.isActive())
 stub.mute_calls.clear()
 stub.now_ms = int(wins[0][0] * 1000) + 200 if wins else 20500
@@ -158,13 +162,14 @@ pv._on_media_for_profanity("stremio")
 check("windows merged, not duplicated",
       len(pv._filter_engine.windows) == n_before)
 
-print("[6] guards — wrong kind / unreadable file never break playback")
+print("[6] guards — unreadable file / bare handoff never break playback")
 pv._filter_engine.clear()
 pv.current = {"kind": "vod", "title": "Movie", "url": "http://x/m.mp4",
               "fav_key": "vod:1", "sub_file": p_utf8}
 pv._load_stremio_sub_cues()
-check("non-stremio kind: external file ignored",
-      not pv._filter_engine.windows)
+check("vod kind: external file honored (fetched-subs generalization)",
+      len(pv._filter_engine.windows) == 2)
+pv._filter_engine.clear()
 pv.current = {"kind": "stremio", "title": "S", "url": "http://x/s",
               "fav_key": "stremio:t:1",
               "sub_file": os.path.join(tmpdir, "gone.srt")}
@@ -174,12 +179,14 @@ try:
           not pv._filter_engine.windows)
 except Exception as exc:
     check("missing sub file: no crash, no windows", False, repr(exc))
+pv._filter_engine.clear()
 pv.current = {"kind": "stremio", "title": "S", "url": "http://x/s",
               "fav_key": "stremio:t:2"}          # no sub_file at all
 pv._load_stremio_sub_cues()
 check("handoff without sub file: no-op", not pv._filter_engine.windows)
 
 print("[7] relay-embedded cues (no sub_file) still gate through the tick")
+pv._filter_engine.clear()
 pv._cap_relay_gen = pv._session        # direct call passes the stale guard
 pv._on_vod_cue(30.0, 32.0, "you fuckin kidding me")
 check("relay cue built a window", len(pv._filter_engine.windows) == 1)

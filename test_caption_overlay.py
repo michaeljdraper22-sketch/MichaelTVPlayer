@@ -741,41 +741,51 @@ class _RelayStub2:
         pass
 
 
-view._cap_fail = False
-view._vod_relay = _RelayStub2(
-    3, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
-        4: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""}},
-    {3: "S_TEXT/UTF8", 4: "S_HDMV/PGS"})
-view._select_spu(4, "English (United States) - [English]")
-check("plain-name VOD pick engages the overlay", view._cap_on)
-view._cap_vod_check()
-check("Arabic-only text track hands captions back to VLC",
-      view._cap_fail and not view._cap_on and fake.spu == 4)
+# These three legs pin the CLASSIC dead-end body (latch + VLC handoff),
+# which predates the online-subtitle fetch. With fetch_online_subs on
+# (the default) the same dead-ends arm a search instead of latching, so
+# run them with the fetch disabled — the same config-gate idiom section
+# [8] and probe_stremio_subfetch [12] use — keeping each leg's original
+# intent AND keeping this suite offline (no armed network job).
+view.config.data["fetch_online_subs"] = False
+try:
+    view._cap_fail = False
+    view._vod_relay = _RelayStub2(
+        3, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+            4: {"codec": "S_HDMV/PGS", "lang": "eng", "name": ""}},
+        {3: "S_TEXT/UTF8", 4: "S_HDMV/PGS"})
+    view._select_spu(4, "English (United States) - [English]")
+    check("plain-name VOD pick engages the overlay", view._cap_on)
+    view._cap_vod_check()
+    check("Arabic-only text track hands captions back to VLC",
+          view._cap_fail and not view._cap_on and fake.spu == 4)
 
-# a matching eng text track keeps the app overlay
-view._cap_fail = False
-view._vod_relay = _RelayStub2(
-    5, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
-        5: {"codec": "S_TEXT/UTF8", "lang": "eng", "name": ""}},
-    {3: "S_TEXT/UTF8", 5: "S_TEXT/UTF8"})
-view._select_spu(5, "English (United States) - [English]")
-check("re-engage with a matching text track", view._cap_on)
-view._cap_vod_check()
-check("eng text track keeps the app overlay",
-      not view._cap_fail and view._cap_on)
+    # a matching eng text track keeps the app overlay
+    view._cap_fail = False
+    view._vod_relay = _RelayStub2(
+        5, {3: {"codec": "S_TEXT/UTF8", "lang": "ar", "name": ""},
+            5: {"codec": "S_TEXT/UTF8", "lang": "eng", "name": ""}},
+        {3: "S_TEXT/UTF8", 5: "S_TEXT/UTF8"})
+    view._select_spu(5, "English (United States) - [English]")
+    check("re-engage with a matching text track", view._cap_on)
+    view._cap_vod_check()
+    check("eng text track keeps the app overlay",
+          not view._cap_fail and view._cap_on)
 
-# a tap that never produced ANY metadata (dead after a cache rebase)
-# must hand captions back to VLC once the retries run out — sitting
-# mute forever was the "no subtitles on movies" failure mode
-view._cap_fail = False
-view._cap_on = True
-view._cap_want = True
-view._spu_want = 5
-view._vod_relay = _RelayStub2(None, {}, {})
-view._cap_vod_tries = 0
-view._cap_vod_check()
-check("dead tap (no track metadata) hands captions back to VLC",
-      view._cap_fail and not view._cap_on and fake.spu == 5)
+    # a tap that never produced ANY metadata (dead after a cache rebase)
+    # must hand captions back to VLC once the retries run out — sitting
+    # mute forever was the "no subtitles on movies" failure mode
+    view._cap_fail = False
+    view._cap_on = True
+    view._cap_want = True
+    view._spu_want = 5
+    view._vod_relay = _RelayStub2(None, {}, {})
+    view._cap_vod_tries = 0
+    view._cap_vod_check()
+    check("dead tap (no track metadata) hands captions back to VLC",
+          view._cap_fail and not view._cap_on and fake.spu == 5)
+finally:
+    view.config.data["fetch_online_subs"] = True
 
 print("[5c] stale relay deliveries never touch the next movie's store")
 # VodRelay emits cue/failed from its worker threads over queued
@@ -964,9 +974,13 @@ view._cc_flush_pending()
 off6 = view._cc_off
 view._cap_cues.add(70.5 + off6, 72.0 + off6, "what the hell is this")
 shown6 = _show_at(71.0 + off6)             # inside the anchored window
-check("masked line rendered while the filter is on",
-      shown6 == [mask_text("what the hell is this", [("hell", "exact")])]
-      and "*" in shown6[0])
+check("substituted line rendered while the filter is on",
+      shown6 == ["what the censored is this"] and "*" not in shown6[0])
+view._filter_engine.subs_enabled = False   # substitution off -> stars
+check("masked line rendered when substitution is off",
+      _show_at(71.0 + off6)
+      == [mask_text("what the hell is this", [("hell", "exact")])]
+      and "*" in _show_at(71.0 + off6)[0])
 view._filter_engine.enabled = False
 check("unmasked once the filter is off",
       _show_at(70.5 + off6) == ["what the hell is this"])
@@ -1136,6 +1150,136 @@ check("pos_pct raise lifts the block above the bar", top < 948)
 ov.set_lines([])
 ov.set_bar_top(None)
 ov.set_preview("")
+
+print("[8] online-subtitle fetch: dead-end interception + store hygiene + rows")
+import time as _time                              # noqa: E402
+import src.stremio as _stremio                    # noqa: E402
+
+_sub_dir = tempfile.mkdtemp(prefix="mtp_cap_subfetch_")
+
+
+def _write_sub(name, body):
+    p = os.path.join(_sub_dir, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(body)
+    return p
+
+
+_SUB_A = _write_sub("a.srt",
+                    "1\n00:00:10,000 --> 00:00:12,000\nfile A line\n\n")
+_SUB_B = _write_sub("b.srt",
+                    "1\n00:00:10,000 --> 00:00:12,000\nfile B line\n\n")
+
+
+class _FR2:
+    def __init__(self, tracks, selected=None, metas=None):
+        self.parser_tracks = tracks
+        self.parser_selected = selected
+        self.parser_tracks_meta = metas or {}
+
+
+def _arm_dead_end(relay):
+    view.current = {"kind": "stremio", "title": "T", "url": "u",
+                    "fav_key": "stremio:t:1", "stremio_imdb": "tt1",
+                    "season": 1, "episode": 1}
+    view._vod_relay = relay
+    view._cap_want = True
+    view._cap_fail = False
+    view._cap_store_ext = False
+    view._stremio_sub_path = ""
+    view._stremio_sub_cues = []
+    view._cap_cues.clear()
+    view._spu_want = 0
+    view._spu_name = "English - [English]"
+    view._sub_fetch_pending = False
+    view._sub_fetching = False
+    view._sub_fetch_fail = None
+    view._set_cap_on(True)
+    view._cap_vod_check()
+
+
+_saved = (_stremio.search_online_subtitles,
+          _stremio.download_online_subtitle,
+          _stremio.resolve_vod_identity)
+try:
+    _stremio.search_online_subtitles = lambda *a, **k: [
+        {"id": "1", "url": "http://x/1.srt", "lang": "eng",
+         "name": "a.srt", "release": "", "hash_match": False}]
+
+    def _dl(url, dest):
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:10,000 --> 00:00:12,000\n"
+                    "fetched line\n\n")
+        return True
+
+    _stremio.download_online_subtitle = _dl
+
+    # the seam ON: bitmap-only dead-end is intercepted, not latched
+    _arm_dead_end(_FR2({1: "S_HDMV/PGS"}))
+    check("bitmap-only dead-end intercepted: failure NOT latched",
+          not view._cap_fail and view._sub_fetching)
+    _t0 = _time.time()
+    while _time.time() - _t0 < 10 and view._sub_fetching:
+        app.processEvents()
+        _time.sleep(0.02)
+    check("fetched subtitle engaged in the overlay",
+          view._cap_on and view._cap_store_ext and not view._cap_fail)
+    check("VLC's own spu off under the fetched overlay", fake.spu == -1)
+    fake.times["t"] = 11000
+    view._caption_tick()
+    check("fetched cues paint through the overlay",
+          view._cap_wid._lines == ["fetched line"],
+          )
+
+    # the seam OFF (config): today's classic handoff, verbatim
+    view.config.data["fetch_online_subs"] = False
+    _arm_dead_end(_FR2({1: "S_HDMV/PGS"}))
+    check("config off: classic handoff still latches",
+          view._cap_fail and not view._sub_fetching
+          and not view._cap_on)
+    view.config.data["fetch_online_subs"] = True
+finally:
+    (_stremio.search_online_subtitles, _stremio.download_online_subtitle,
+     _stremio.resolve_vod_identity) = _saved
+
+# second engage REPLACES the previous file's cues (no double render).
+# Hermetic: reset every piece of state the engage reads so nothing an
+# earlier section's armed fetch left behind can leak in (the store is
+# the suite-wide CueStore; text_at returns LINES — a list).
+view._stremio_sub_path = ""
+view._stremio_sub_cues = []
+view._sub_fetch_pending = False
+view._sub_fetching = False
+view.current = {"kind": "stremio", "title": "T2", "url": "u2",
+                "fav_key": "stremio:t:2", "sub_file": _SUB_A}
+view._cap_fail = False
+view._engage_stremio_external()
+check("first engage stores its cues",
+      len(view._cap_cues.cues) == 1)
+view.current["sub_file"] = _SUB_B        # a re-fetch landed a new file
+view._engage_stremio_external()
+check("second engage REPLACES the store (no double render)",
+      len(view._cap_cues.cues) == 1
+      and view._cap_cues.text_at(11.0) == ["file B line"])
+
+# menu-row presence: the online-fetch row follows the eligible kinds
+_rows = []
+_open = view._open_ctl_panel
+view._open_ctl_panel = lambda *a, **k: _rows.append(a[2])
+try:
+    for cur in ({"kind": "stremio", "fav_key": "s"},
+                {"kind": "vod", "fav_key": "v"},
+                {"kind": "series", "fav_key": "se"},
+                {"kind": "live", "fav_key": "l"}):
+        view.current = cur
+        view._subs_panel()
+finally:
+    view._open_ctl_panel = _open
+_ids = [[r.get("id") for r in rr] for rr in _rows]
+check("fetch row offered on stremio/vod/series",
+      all("fetch" in i for i in _ids[:3]))
+check("no fetch row on live TV", "fetch" not in _ids[3])
 
 print()
 print(f"{len(PASS)} passed, {len(FAIL)} failed")

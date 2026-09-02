@@ -51,6 +51,11 @@ def main():
     app = QtWidgets.QApplication(sys.argv)
     cfg = Config.load()
     view = PlayerView(cfg)
+    # The CC button is deliberately dormant until a stream starts; give the
+    # view a live media dict so the state legs below exercise track logic,
+    # not the dormant gate.
+    view.current = {"kind": "live", "title": "Probe", "url": "http://x/p",
+                    "fav_key": "live:probe"}
 
     print("[1] config + button wiring")
     check("'cc' is a known button key", "cc" in BUTTON_KEYS)

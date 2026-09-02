@@ -24,9 +24,12 @@ public plumbing Stremio itself uses —
     torrent, GET /{infoHash}/{fileIdx} plays it.
 """
 
+import concurrent.futures
 import logging
 import os
 import re
+import struct
+import tempfile
 import time
 
 import requests
@@ -34,6 +37,7 @@ import requests
 log = logging.getLogger("mtp.stremio")
 
 CINEMETA = "https://v3-cinemeta.strem.io"
+OPENSUBS_ADDON = "https://opensubtitles-v3.strem.io"
 DEFAULT_SERVER = "http://127.0.0.1:11470"
 USER_AGENT = "MichaelTVPlayer/1.0 (Stremio handoff)"
 
@@ -41,6 +45,15 @@ _session = requests.Session()
 _session.headers["User-Agent"] = USER_AGENT
 
 _meta_cache = {}          # imdb_id -> series meta (episode lists are big)
+
+# (imdb, season, episode) -> (monotonic, streams). Next/prev bounces,
+# reloads and re-lookaheads re-ask the SAME episode within minutes — a
+# short TTL serves those from memory instead of another addon round trip
+# (live-measured: one torrentio query is 2-4 s, and it sat directly on
+# the ⏮ click path). Empty results are never cached (an addon blip must
+# not pin "no streams" for 10 minutes).
+_streams_cache = {}
+_STREAMS_CACHE_TTL = 600.0
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +559,215 @@ def find_movie(name: str):
     return _find_catalog(search_movies, name)
 
 
+# ---------------------------------------------------------------------------
+# online subtitle fetch (keyless OpenSubtitles stremio addon)
+
+_OSHASH_CHUNK = 65536          # the moviehash reads 64 KB per end
+_SUB_MAX_BYTES = 2 << 20       # a text subtitle > 2 MB is not text
+_SUB_CANDIDATES = 6            # ranked candidates handed to the player
+
+
+def opensubs_hash(head_bytes: bytes, tail_bytes: bytes, total_size: int) -> int:
+    """OpenSubtitles 'moviehash' of a file from its first and last 64 KB:
+    total_size + the uint64-LE words of each chunk, mod 2^64. Pure math on
+    supplied bytes (offline-testable); the caller slices the chunks out of
+    whatever it has cached — for a file smaller than 64 KB the caller
+    passes the whole file twice, exactly like the reference tool."""
+    h = int(total_size or 0) & 0xFFFFFFFFFFFFFFFF
+    chunks = []
+    head = bytes(head_bytes or b"")
+    tail = bytes(tail_bytes or b"")
+    if tail:
+        chunks.append(tail[-_OSHASH_CHUNK:])
+    chunks.append(head[:_OSHASH_CHUNK])
+    for chunk in chunks:
+        words = len(chunk) // 8
+        if words:
+            h += sum(struct.unpack("<%dQ" % words, chunk[:words * 8]))
+            h &= 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+def search_online_subtitles(kind: str, imdb: str, season: int = 0,
+                            episode: int = 0, want_lang: str = "eng",
+                            file_hint: str = "", video_hash: str = "") -> list:
+    """Ranked TEXT-subtitle candidates from the keyless OpenSubtitles
+    stremio addon (same addon protocol as Cinemeta), best first, ≤ 6:
+    [{id, url, lang, name, release, hash_match}].
+
+    Series requests name the exact episode; entries whose OWN season/
+    episode fields disagree are dropped (measured live: an S08E02 file
+    listed under 1:1), and an SxxExx marker in the entry's file name must
+    not contradict the request either. Ranking: a hash match outranks
+    everything, then token overlap of the entry's file/release names with
+    the playing file's name (file_hint), then the addon's own stable
+    order. video_hash is best-effort — ranking survives the addon
+    ignoring the parameter."""
+    imdb = (imdb or "").strip()
+    if not imdb:
+        return []
+    movie = str(kind or "").startswith("movie") or kind == "vod"
+    if movie:
+        path = "movie/%s.json" % imdb
+    else:
+        path = "series/%s:%d:%d.json" % (
+            imdb, int(season or 0), int(episode or 0))
+    url = "%s/subtitles/%s" % (OPENSUBS_ADDON, path)
+    if video_hash:
+        url += "?videoHash=%s" % video_hash
+    subs = []
+    for attempt in (0, 1):
+        try:
+            resp = _session.get(url, timeout=20)
+            if resp.status_code != 200:
+                raise ValueError("http %d" % resp.status_code)
+            subs = ((resp.json() or {}).get("subtitles")) or []
+            break
+        except Exception as exc:  # noqa: BLE001 - addon blips are quiet
+            if not attempt:
+                time.sleep(1.0)
+                continue
+            log.info("stremio: opensubs %s failed: %r", path, exc)
+    want = (want_lang or "eng").strip().lower()
+    hint_words = {w for w in re.split(r"\W+", (file_hint or "").lower())
+                  if len(w) > 2}
+    ranked = []
+    for idx, s in enumerate(subs):
+        if not s or not s.get("url"):
+            continue
+        if str(s.get("lang") or "").strip().lower() != want:
+            continue
+        fname = str(s.get("subtitleFileName") or "")
+        if not movie:
+            want_se = (int(season or 0), int(episode or 0))
+            fname_se = parse_se(fname)
+            if fname_se is not None:
+                # the file name is ground truth: the listing's own S/E
+                # fields lie sometimes (live-measured: an S08E02 file
+                # listed under 1:1) — trust the marker over the fields
+                if fname_se != want_se:
+                    continue      # the FILE itself is another episode
+            else:
+                try:
+                    got = (int(s.get("season") or 0),
+                           int(s.get("episode") or 0))
+                except (TypeError, ValueError):
+                    continue
+                if got != want_se:
+                    continue      # wrong-episode listing, no marker to
+                                  # overrule it
+        entry_words = set(re.split(
+            r"\W+", ("%s %s" % (fname, s.get("movieReleaseName") or "")).lower()))
+        overlap = len(hint_words & entry_words)
+        hash_match = bool(video_hash) and str(
+            s.get("matchedByHash") or s.get("hash") or "").strip().lower() \
+            not in ("", "0", "false", "none")
+        ranked.append((1 if hash_match else 0, overlap, -idx, s))
+    ranked.sort(key=lambda t: (-t[0], -t[1], -t[2]))
+    out = []
+    for boost, overlap, _neg_idx, s in ranked[:_SUB_CANDIDATES]:
+        out.append({
+            "id": str(s.get("id") or ""),
+            "url": str(s.get("url") or ""),
+            "lang": str(s.get("lang") or ""),
+            "name": str(s.get("subtitleFileName")
+                        or s.get("movieReleaseName") or ""),
+            "release": str(s.get("movieReleaseName") or ""),
+            "hash_match": bool(boost),
+        })
+    return out
+
+
+def subtitle_cache_path(imdb: str, sub_id: str) -> str:
+    """Where a fetched subtitle lands: %TEMP%\\MichaelTVPlayer\\subs\\
+    {imdb}-{id}.srt — both parts sanitized (addon ids are opaque strings,
+    TEMP can sit anywhere)."""
+    def _safe(text, cap):
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", str(text or "x"))[:cap]
+    return os.path.join(tempfile.gettempdir(), "MichaelTVPlayer", "subs",
+                        "%s-%s.srt" % (_safe(imdb, 40), _safe(sub_id, 80)))
+
+
+def download_online_subtitle(url: str, dest_path: str) -> bool:
+    """Stream ONE fetched subtitle to dest_path. True when a non-empty
+    file landed; anything over _SUB_MAX_BYTES is a broken/HTML payload,
+    not text, and fails. One quiet retry, _catalog_search style."""
+    if not url:
+        return False
+    for attempt in (0, 1):
+        tmp = dest_path + ".part"
+        try:
+            d = os.path.dirname(dest_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            resp = _session.get(url, timeout=20, stream=True)
+            if resp.status_code != 200:
+                raise ValueError("http %d" % resp.status_code)
+            size = 0
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > _SUB_MAX_BYTES:
+                        raise ValueError("payload exceeds %d bytes"
+                                         % _SUB_MAX_BYTES)
+                    f.write(chunk)
+            if size <= 0:
+                raise ValueError("empty body")
+            os.replace(tmp, dest_path)
+            return True
+        except Exception as exc:  # noqa: BLE001 - addon blips are quiet
+            for junk in (tmp, dest_path):
+                try:
+                    os.remove(junk)
+                except OSError:
+                    pass
+            if not attempt:
+                time.sleep(1.0)
+                continue
+            log.info("stremio: subtitle download %r failed: %r",
+                     url[:80], exc)
+    return False
+
+
+def resolve_vod_identity(playable: dict):
+    """Identity for an IPTV VOD/series playable, for the online-subtitle
+    fetch: series playables already carry series_name/season/episode
+    (browsers._make_playable), VOD ones carry only a stream title. Returns
+    the same shape resolve_identity uses — {stremio_imdb, season, episode}
+    or {movie: True, stremio_imdb} — or None. Lazy: only a caption
+    dead-end ever calls it, so the catalog round-trips cost nothing on
+    the normal path."""
+    if not playable:
+        return None
+    kind = playable.get("kind")
+    if kind == "series":
+        name = clean_show_name(str(playable.get("series_name") or ""))
+        if not name:
+            return None
+        hit = find_series(name)
+        if not hit:
+            log.info("stremio: vod identity: no series for %r", name)
+            return None
+        try:
+            season = int(playable.get("season") or 0)
+            episode = int(playable.get("episode") or 0)
+        except (TypeError, ValueError):
+            return None
+        return {"stremio_imdb": hit[0], "series_name": hit[1],
+                "season": season, "episode": episode}
+    if kind == "vod":
+        title = str(playable.get("title") or "")
+        for query in _movie_queries(title):
+            cand = find_movie(query)
+            if cand:
+                return {"movie": True, "stremio_imdb": cand["id"]}
+        log.info("stremio: vod identity: no movie for %r", title[:60])
+        return None
+    return None
+
+
 def _ordered_episodes(meta: dict, season: int):
     """The meta's episodes as a sorted (season, episode) list (specials /
     season 0 are skipped unless that is where the user already is)."""
@@ -608,33 +830,62 @@ def _addon_bases(config) -> list:
     return out or ["https://torrentio.strem.fun"]
 
 
-def addon_streams(config, imdb_id: str, season: int, episode: int):
-    """Merged /stream/series/{imdb}:{s}:{e}.json results from every
-    configured addon (add-ons answer 204/empty when they have nothing).
+def _query_addon(base: str, url: str) -> list:
+    """One addon's stream list (each stream stamped with its base), or [].
     One quiet retry on connection blips — a single ReadTimeout was seen
     live leaving a "no usable stream" dead end at end-of-episode."""
-    streams = []
-    for base in _addon_bases(config):
-        url = "%s/stream/series/%s:%d:%d.json" % (base, imdb_id,
-                                                  season, episode)
-        for attempt in (1, 2):
-            try:
-                resp = _session.get(url, timeout=25)
-                if resp.status_code != 200:
-                    break
-                data = resp.json()
-                for s in (data or {}).get("streams") or []:
-                    if isinstance(s, dict):
-                        s = dict(s)
-                        s["_addon"] = base
-                        streams.append(s)
-                break
-            except requests.exceptions.HTTPError:
-                break          # the addon answered — don't retry those
-            except Exception as exc:  # noqa: BLE001
-                if attempt == 1:
-                    continue
-                log.info("stremio: addon %s query failed: %r", base, exc)
+    for attempt in (1, 2):
+        try:
+            resp = _session.get(url, timeout=25)
+            if resp.status_code != 200:
+                return []      # addons answer 204/4xx when they have nothing
+            data = resp.json()
+            out = []
+            for s in (data or {}).get("streams") or []:
+                if isinstance(s, dict):
+                    s = dict(s)
+                    s["_addon"] = base
+                    out.append(s)
+            return out
+        except requests.exceptions.HTTPError:
+            return []          # the addon answered — don't retry those
+        except Exception as exc:  # noqa: BLE001
+            if attempt == 1:
+                continue
+            log.info("stremio: addon %s query failed: %r", base, exc)
+            return []
+    return []
+
+
+def addon_streams(config, imdb_id: str, season: int, episode: int):
+    """Merged /stream/series/{imdb}:{s}:{e}.json results from every
+    configured addon, queried CONCURRENTLY (they used to run serially, so
+    one slow addon added its full latency — up to 25 s, doubled by the
+    retry — to every episode open) and cached per episode for a short TTL
+    (bounces and re-lookaheads re-ask the same episode)."""
+    key = (str(imdb_id or "").lower(), int(season), int(episode))
+    hit = _streams_cache.get(key)
+    if hit and time.monotonic() - hit[0] < _STREAMS_CACHE_TTL:
+        return hit[1]
+    bases = _addon_bases(config)
+    if len(bases) == 1:
+        streams = _query_addon(bases[0], "%s/stream/series/%s:%d:%d.json"
+                               % (bases[0], imdb_id, season, episode))
+    else:
+        with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, len(bases))) as pool:
+            futures = [
+                pool.submit(_query_addon, base,
+                            "%s/stream/series/%s:%d:%d.json"
+                            % (base, imdb_id, season, episode))
+                for base in bases]
+            streams = []
+            for f in futures:      # merge in addon-priority order
+                streams.extend(f.result())
+    if streams:
+        if len(_streams_cache) > 12:
+            _streams_cache.clear()   # bounded; episodes age out wholesale
+        _streams_cache[key] = (time.monotonic(), streams)
     return streams
 
 
