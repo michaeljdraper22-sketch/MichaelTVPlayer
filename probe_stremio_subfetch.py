@@ -30,6 +30,7 @@ MTP_SUBFETCH_SKIP_LIVE=1).
 import os
 import sys
 import tempfile
+import threading
 import time
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -46,6 +47,12 @@ app = QtWidgets.QApplication(sys.argv)
 cfg = Config(dict(DEFAULTS), None)
 pv = PlayerView(cfg)
 pv.resize(1280, 720)
+# the UI tick + cursor poll run against FakeVLC (None-return stubs): a
+# pump window >= their interval once qFatal'd the harness (the old [9]
+# note). The legs below sometimes need long pumps (drain/wait_delivered),
+# so stop both — no leg depends on either timer.
+pv.timer.stop()
+pv.cursor_timer.stop()
 fails = [0]
 
 
@@ -238,9 +245,11 @@ try:
 
     huge = [b"\x00" * 65536] * 33          # 2.1 MB > the 2 MB cap
     stremio._session = _Sess([_R(200, chunks=huge), _R(200, chunks=huge)])
-    check("over-cap payload -> False, nothing left behind",
+    check("over-cap payload -> False; the earlier GOOD file survives, "
+          "no .part litter",
           not stremio.download_online_subtitle("http://x/4", p_dest)
-          and not os.path.exists(p_dest)
+          and os.path.exists(p_dest)
+          and "hi" in (prof_mod.read_subtitle_text(p_dest) or "")
           and not os.path.exists(p_dest + ".part"))
 finally:
     stremio._session = saved_sess
@@ -398,6 +407,46 @@ def wait_job(timeout=10.0):
     return False
 
 
+# delivery spy: a SECOND connection on the same runner signal (the
+# view's own slot runs first — connection order). The FIXED callback
+# deliberately leaves flags untouched on a stale drop, so wait_job's
+# flag polling cannot see those deliveries; matching the delivered
+# result by content can.
+recv = []
+pv._subfetch_runner.finished.connect(recv.append)
+
+
+def drain(seconds=0.4):
+    """Deliver any still-queued results from earlier legs, then forget
+    them. A worker's emit can queue just after the previous leg's last
+    pump; a stray delivery into the next leg would otherwise confuse
+    the waits below (observed live: [9]'s result once landed in [9b])."""
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        app.processEvents()
+        time.sleep(0.02)
+    del recv[:]
+
+
+def _dest_of(r):
+    """The downloaded-file path inside a delivered result tuple (None
+    for failure-shaped results)."""
+    try:
+        val = r[1]
+        return val[2][0] if isinstance(val[2], tuple) else None
+    except (IndexError, TypeError):
+        return None
+
+
+def wait_delivered(pred, timeout=10.0):
+    """Pump until a fetch result matching pred has been DELIVERED to the
+    GUI thread (worker done + queued signal dispatched)."""
+    t0 = time.time()
+    while not any(pred(r) for r in recv) and time.time() - t0 < timeout:
+        app.processEvents()
+        time.sleep(0.02)
+    return any(pred(r) for r in recv)
+
 GOT_CUR = {"kind": "stremio", "title": "GoT — S01E01",
            "url": "http://x/s", "fav_key": "stremio:t:1",
            "stremio_imdb": "tt0944947", "season": 1, "episode": 1,
@@ -501,6 +550,35 @@ try:
 finally:
     restore_fetch()
 
+print("[6c] STALE identity failure — the current media's pending survives")
+try:
+    patch_fetch([{"id": "223", "url": "http://x/23.srt", "lang": "eng",
+                  "name": "b.srt", "release": "", "hash_match": False}])
+    cur = {"kind": "stremio", "title": "Stremio B", "url": "http://x/s4",
+           "fav_key": "stremio:t:4"}
+    reset_state(cur, FakeRelay(tracks={"1": "S_HDMV/PGS"}))
+    pv._cap_vod_check()
+    check("B pended on its dead-end", pv._sub_fetch_pending)
+    # OLD media A's identity lookup fails late. resolve_identity coming
+    # back empty-handed arrives as ("ok", (base, None)) — A's fav_key is
+    # stamped in the tuple, so the staleness gate CAN and must see it
+    pv._on_stremio_identity(("ok", ("stremio:t:99", None)))
+    check("stale failure did NOT resolve B's pending",
+          pv._sub_fetch_pending and not pv._cap_fail
+          and not pv._sub_fetching and not fetch_calls)
+    # B's OWN identity then arrives — the armed search must still fire
+    pv._on_stremio_identity(
+        ("ok", ("stremio:t:4", {"movie": True,
+                                "stremio_imdb": "tt0071315"})))
+    check("B's own identity kicked the search",
+          not pv._sub_fetch_pending and pv._sub_fetching
+          and len(fetch_calls) == 1)
+    check("waited for B's job", wait_job())
+    check("B engages after its own identity",
+          pv._cap_on and pv.current.get("sub_file"))
+finally:
+    restore_fetch()
+
 print("[7] vod + series — identity resolves INSIDE the job")
 try:
     got_series = {"stremio_imdb": "tt0944947",
@@ -587,20 +665,146 @@ try:
     patch_fetch([{"id": "444", "url": "http://x/4.srt", "lang": "eng",
                   "name": "x.srt", "release": "", "hash_match": False}])
     reset_state(dict(GOT_CUR), FakeRelay(tracks={"1": "S_HDMV/PGS"}))
+    drain()
     pv._cap_vod_check()
     check("slow job in flight", pv._sub_fetching)
-    # bump BEFORE any processEvents: the queued result can only be
-    # delivered through the event loop, so it arrives pre-staled (a long
-    # worker sleep here instead once crashed the harness: the extended
-    # pump window let the 400 ms UI tick run against FakeVLC's None
-    # returns and PyQt5 qFatal'd the process with nothing on stderr)
+    # the user moved on mid-search: play_media's exact reset (the :1735
+    # session bump + the :1792-94 field clears). The probe used to bump
+    # alone and rely on the OLD callback clearing _sub_fetching on a
+    # stale drop — the fixed callback must leave flags untouched
     pv._session += 1                      # the user moved on mid-search
-    check("waited out the slow job", wait_job())
+    pv._sub_fetch_pending = False
+    pv._sub_fetching = False
+    pv._sub_fetch_fail = None
+    check("stale result DELIVERED to the GUI thread",
+          wait_delivered(
+              lambda r: (_dest_of(r) or "").endswith("444.srt")))
     check("stale result dropped (no store, no engage, no cur writes)",
           not pv._cap_on and not pv._cap_fail
           and not pv.current.get("sub_file")
           and len(pv._cap_cues.cues) == 0)
     pv._session -= 1                      # leave the counter sane
+finally:
+    restore_fetch()
+
+print("[9b] two-kick race — media A's late result cannot pose as B's")
+try:
+    gate_a = threading.Event()
+    gate_b = threading.Event()
+
+    def _race_search(kind, imdb, season=0, episode=0, want_lang="eng",
+                     file_hint="", video_hash=""):
+        fetch_calls.append(dict(kind=kind, imdb=imdb, season=season,
+                                episode=episode, lang=want_lang,
+                                hint=file_hint, vhash=video_hash))
+        (gate_a if imdb == "ttA" else gate_b).wait(10.0)
+        return [{"id": "a1" if imdb == "ttA" else "b1",
+                 "url": "http://x/%s.srt" % imdb, "lang": "eng",
+                 "name": "%s.srt" % imdb, "release": "",
+                 "hash_match": False}]
+
+    def _race_dl(url, dest):
+        d = os.path.dirname(dest)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(dest, "w", encoding="utf-8") as f:
+            f.write("1\n00:00:10,000 --> 00:00:12,000\n%s line\n\n"
+                    % ("media A" if "ttA" in url else "media B"))
+        return True
+
+    saved_race = (stremio.search_online_subtitles,
+                  stremio.download_online_subtitle,
+                  stremio.resolve_vod_identity)
+    stremio.search_online_subtitles = _race_search
+    stremio.download_online_subtitle = _race_dl
+    stremio.resolve_vod_identity = lambda p: None
+
+    # media A kicks a GATED job (its worker parks inside the search)
+    reset_state({"kind": "stremio", "title": "A", "url": "http://x/a",
+                 "fav_key": "stremio:t:10", "stremio_imdb": "ttA",
+                 "season": 1, "episode": 1},
+                PGS_RELAY)
+    drain()
+    pv._cap_vod_check()
+    check("A's job kicked (in flight)", pv._sub_fetching)
+    t0 = time.time()                 # no processEvents: nothing to deliver
+    while len(fetch_calls) < 1 and time.time() - t0 < 5.0:
+        time.sleep(0.02)
+    check("A's worker parked in the gated search",
+          fetch_calls and fetch_calls[0]["imdb"] == "ttA")
+    check("A's dead-end armed its fail hook",
+          pv._sub_fetch_fail is not None)
+    # the user switches to media B: play_media's bump, then B's own kick
+    # (the old shared _sub_fetch_gen stamp was overwritten HERE — A's
+    # late result then sailed through the guard and engaged on B)
+    pv._session += 1
+    reset_state({"kind": "stremio", "title": "B", "url": "http://x/b",
+                 "fav_key": "stremio:t:11", "stremio_imdb": "ttB",
+                 "season": 2, "episode": 2},
+                PGS_RELAY)
+    pv._cap_vod_check()
+    t0 = time.time()
+    while not fetch_calls and time.time() - t0 < 5.0:
+        time.sleep(0.02)
+    check("B's own job in flight too (both workers parked)",
+          pv._sub_fetching and len(fetch_calls) == 1
+          and fetch_calls[0]["imdb"] == "ttB",
+          repr(fetch_calls))
+    # release A first: its late result arrives while B's job still runs
+    gate_a.set()
+    check("A's late result delivered",
+          wait_delivered(
+              lambda r: (_dest_of(r) or "").endswith("ttA-a1.srt")))
+    check("A did NOT engage on B (no sub_file/_fetched_sub, no cues, "
+          "overlay down)",
+          not pv.current.get("sub_file")
+          and not pv.current.get("_fetched_sub")
+          and len(pv._cap_cues.cues) == 0
+          and not pv._cap_on and not pv._cap_store_ext)
+    check("A did NOT clear B's armed fail hook",
+          pv._sub_fetch_fail is not None)
+    check("A did NOT latch B's classic dead-end", not pv._cap_fail)
+    check("A did NOT clobber B's _sub_fetching flag mid-flight",
+          pv._sub_fetching)
+    # release B: the CURRENT job engages fine
+    gate_b.set()
+    check("B's result delivered",
+          wait_delivered(
+              lambda r: (_dest_of(r) or "").endswith("ttB-b1.srt")))
+    check("B engages its own file",
+          pv._cap_on and pv._cap_store_ext
+          and pv.current.get("sub_file", "").endswith(
+              stremio.subtitle_cache_path("ttB", "b1").split(os.sep)[-1])
+          and pv._sub_fetch_fail is None)
+    stub.now_ms = 11000
+    pv._caption_tick()
+    check("overlay paints B's cues (A's file never parsed)",
+          pv._cap_wid._lines == ["media B line"],
+          repr(pv._cap_wid._lines))
+finally:
+    (stremio.search_online_subtitles, stremio.download_online_subtitle,
+     stremio.resolve_vod_identity) = saved_race
+
+print("[9c] captions turned OFF mid-search — no resurrect on delivery")
+try:
+    patch_fetch([{"id": "445", "url": "http://x/45.srt", "lang": "eng",
+                  "name": "y.srt", "release": "", "hash_match": False}])
+    reset_state(dict(GOT_CUR), FakeRelay(tracks={"1": "S_HDMV/PGS"}))
+    drain()
+    pv._cap_vod_check()
+    check("search in flight", pv._sub_fetching)
+    pv._cap_want = False                # the user hit CC Off mid-search
+    check("waited for delivery", wait_job())
+    check("captions stay OFF (no forced re-enable)",
+          not pv._cap_on and not pv._cap_store_ext)
+    check("no engage side effects (no cur writes, no cues)",
+          not pv.current.get("sub_file")
+          and not pv.current.get("_fetched_sub")
+          and len(pv._cap_cues.cues) == 0)
+    check("no fail-restore either (the user wants captions off)",
+          not pv._cap_fail)
+    check("pending/fetching state dropped",
+          not pv._sub_fetch_pending and not pv._sub_fetching)
 finally:
     restore_fetch()
 

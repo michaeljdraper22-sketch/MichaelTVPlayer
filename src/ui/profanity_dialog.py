@@ -12,7 +12,8 @@ the sync offset.
 from PyQt5 import QtCore, QtWidgets
 
 from ..config import PROFANITY_DEFAULTS
-from ..profanity import DEFAULT_SUBSTITUTION, DEFAULT_WORDS, LEVELS
+from ..profanity import (DEFAULT_SUBSTITUTION, DEFAULT_WORDS, LEVELS,
+                         _lower_stable)
 
 
 class ProfanityDialog(QtWidgets.QDialog):
@@ -112,7 +113,9 @@ class ProfanityDialog(QtWidgets.QDialog):
         self.ed_defsub.setMaximumWidth(160)
         self.ed_defsub.setToolTip(
             "Used for a filtered word that has no substitute of its own "
-            "(the Substitute column below).")
+            "(the Substitute column below).\n"
+            "Leave empty to mask words with asterisks (words without "
+            "their own substitute).")
         sub_row.addWidget(self.ed_defsub)
         sub_row.addStretch(1)
         lay.addLayout(sub_row)
@@ -180,7 +183,7 @@ class ProfanityDialog(QtWidgets.QDialog):
     def _add_word(self):
         text, ok = QtWidgets.QInputDialog.getText(
             self, "Add word", "Word to filter:", text="")
-        text = text.strip().lower()
+        text = _lower_stable(text.strip())
         if not ok or not text:
             return
         level, ok = QtWidgets.QInputDialog.getItem(
@@ -192,8 +195,10 @@ class ProfanityDialog(QtWidgets.QDialog):
             self, "Add word",
             f"Substitute for '{text}' (blank = default substitute):",
             text="")
-        if ok:
-            self._add_row(text, level, sub.strip())
+        # Cancel HERE means "no substitute of its own", not "drop the
+        # word": the word and level above were already confirmed, and a
+        # blank sub falls back to the default substitute at display time.
+        self._add_row(text, level, sub.strip() if ok else "")
 
     def _remove_selected(self):
         rows = sorted({i.row() for i in self.table.selectedIndexes()},
@@ -229,7 +234,7 @@ class ProfanityDialog(QtWidgets.QDialog):
             cb = self.table.cellWidget(r, 1)
             if it is None or cb is None:
                 continue
-            w = it.text().strip().lower()
+            w = _lower_stable(it.text().strip())
             if w and w not in seen:
                 seen.add(w)
                 sub = ""

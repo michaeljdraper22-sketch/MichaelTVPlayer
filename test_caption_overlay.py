@@ -985,6 +985,26 @@ view._filter_engine.enabled = False
 check("unmasked once the filter is off",
       _show_at(70.5 + off6) == ["what the hell is this"])
 
+# (code review 2026-09-02) clearing the dialog's "Default substitute:"
+# field is an EXPLICIT empty string — it must reach the engine as "" (the
+# documented asterisk-masking fallback in replace_text), not silently
+# become the absent-key default "censored"
+cfg.data["profanity"] = {"enabled": True,
+                         "substitute_subtitles": True,
+                         "default_substitution": "",
+                         "words": [["hell", "exact"]]}
+view._apply_profanity_config()
+check("cleared dialog field -> engine default_sub '' (not 'censored')",
+      view._filter_engine.default_sub == "")
+_masked = view._filter_engine.clean_line("what the hell is this")
+check("sub-less word MASKS (asterisks), never the word 'censored'",
+      _masked == "what the **** is this" and "censored" not in _masked)
+del cfg.data["profanity"]["default_substitution"]
+view._apply_profanity_config()
+check("ABSENT key keeps the engine default 'censored'",
+      view._filter_engine.default_sub == "censored")
+view._filter_engine.enabled = False
+
 # stage-3: the VOD filter path opens mute windows ~0.4 s early (movies
 # were measured to miss mutes by ~0.5 s) without touching caption times
 view._filter_engine.clear()

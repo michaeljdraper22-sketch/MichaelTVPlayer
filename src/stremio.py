@@ -30,6 +30,7 @@ import os
 import re
 import struct
 import tempfile
+import threading
 import time
 
 import requests
@@ -51,8 +52,11 @@ _meta_cache = {}          # imdb_id -> series meta (episode lists are big)
 # short TTL serves those from memory instead of another addon round trip
 # (live-measured: one torrentio query is 2-4 s, and it sat directly on
 # the ⏮ click path). Empty results are never cached (an addon blip must
-# not pin "no streams" for 10 minutes).
+# not pin "no streams" for 10 minutes). Keyed on the addon list too, so
+# editing the addon order invalidates picks; lock + FIFO eviction because
+# lookahead, prev-lookahead and the click path hit it from worker threads.
 _streams_cache = {}
+_streams_cache_lock = threading.Lock()
 _STREAMS_CACHE_TTL = 600.0
 
 
@@ -718,7 +722,10 @@ def download_online_subtitle(url: str, dest_path: str) -> bool:
             os.replace(tmp, dest_path)
             return True
         except Exception as exc:  # noqa: BLE001 - addon blips are quiet
-            for junk in (tmp, dest_path):
+            # only the .part is junk — a previously-good dest_path is the
+            # no-network re-engage path's cache and must survive a
+            # transient re-download failure
+            for junk in (tmp,):
                 try:
                     os.remove(junk)
                 except OSError:
@@ -864,10 +871,12 @@ def addon_streams(config, imdb_id: str, season: int, episode: int):
     retry — to every episode open) and cached per episode for a short TTL
     (bounces and re-lookaheads re-ask the same episode)."""
     key = (str(imdb_id or "").lower(), int(season), int(episode))
-    hit = _streams_cache.get(key)
-    if hit and time.monotonic() - hit[0] < _STREAMS_CACHE_TTL:
-        return hit[1]
     bases = _addon_bases(config)
+    full_key = key + (tuple(bases),)
+    with _streams_cache_lock:
+        hit = _streams_cache.get(full_key)
+        if hit and time.monotonic() - hit[0] < _STREAMS_CACHE_TTL:
+            return hit[1]
     if len(bases) == 1:
         streams = _query_addon(bases[0], "%s/stream/series/%s:%d:%d.json"
                                % (bases[0], imdb_id, season, episode))
@@ -883,9 +892,12 @@ def addon_streams(config, imdb_id: str, season: int, episode: int):
             for f in futures:      # merge in addon-priority order
                 streams.extend(f.result())
     if streams:
-        if len(_streams_cache) > 12:
-            _streams_cache.clear()   # bounded; episodes age out wholesale
-        _streams_cache[key] = (time.monotonic(), streams)
+        with _streams_cache_lock:
+            # bounded: evict oldest-inserted, never a wholesale wipe (a
+            # wipe could discard a neighbor the prefetch just warmed)
+            while len(_streams_cache) >= 12:
+                _streams_cache.popitem(last=False)
+            _streams_cache[full_key] = (time.monotonic(), streams)
     return streams
 
 

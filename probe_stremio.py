@@ -598,11 +598,18 @@ def leg_a():
     stremio.addon_streams(pref_cfg(addons=(A3,)), "ttY", 1, 1)
     check("an empty addon answer is never cached",
           len(calls) == 9, len(calls))
-    stale = stremio._streams_cache[("ttx", 1, 1)]
-    stremio._streams_cache[("ttx", 1, 1)] = (stale[0] - 601.0, stale[1])
+    stremio.addon_streams(pref_cfg(addons=(A1,)), "ttX", 1, 9)
+    check("an addon-list edit re-queries (cache key includes the addons)",
+          len(calls) == 10, len(calls))
+    # cache keys are (imdb, season, episode, addons-tuple) — find the
+    # ttX 1:1 entry by prefix, then age it past the TTL
+    skey = next(k for k in stremio._streams_cache
+                if k[:3] == ("ttx", 1, 1))
+    stale = stremio._streams_cache[skey]
+    stremio._streams_cache[skey] = (stale[0] - 601.0, stale[1])
     stremio.addon_streams(cfg3, "ttX", 1, 1)
     check("an expired cache entry re-queries the addons",
-          len(calls) == 12, len(calls))
+          len(calls) == 13, len(calls))
     stremio._session = saved_sess
     stremio._streams_cache.clear()
     stremio._streams_cache.update(saved_cache)

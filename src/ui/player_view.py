@@ -701,14 +701,17 @@ class PlayerView(QtWidgets.QWidget):
         #                   verbatim when the fetch fails, so failure
         #                   restores exactly today's behavior;
         # _sub_fetch_lang / _lang_name = ISO code + display word for the
-        #                   wanted language (the sticky pick's hint);
-        # _sub_fetch_gen = session generation the job belongs to.
+        #                   wanted language (the sticky pick's hint). The
+        #                   job's session generation is captured in the
+        #                   kick's closure and stamped into the result
+        #                   tuple — no shared field (a second kick used to
+        #                   overwrite the stamp and let the first kick's
+        #                   late result engage on the wrong media).
         self._sub_fetch_pending = False
         self._sub_fetching = False
         self._sub_fetch_lang = "eng"
         self._sub_fetch_lang_name = "English"
         self._sub_fetch_fail = None
-        self._sub_fetch_gen = -1
         self._cap_clock_s = 0.0       # caption timing clock (VLC display
         #                              # position; see _caption_clock_s)
         self._cap_raw_s = None        # last raw get_time() seen by the
@@ -1993,10 +1996,20 @@ class PlayerView(QtWidgets.QWidget):
                     log.warning("stremio identity lookup failed: %s", val)
                 except Exception:
                     pass
-            if self._sub_fetch_pending:
+            cur = self.current or {}
+            if self._sub_fetch_pending and (
+                    base is None or (cur.get("kind") == "stremio"
+                                     and cur.get("fav_key") == base)):
                 # a caption dead-end armed the online-subtitle fetch on the
                 # promise of an imdb id that will never arrive — finish it
-                # with today's classic handoff, quietly (no second banner)
+                # with today's classic handoff, quietly (no second banner).
+                # STALENESS-GATED (code review 2026-09-02) with the same
+                # fav_key guard the success branch below uses WHEN THE
+                # FAILING LOOKUP'S MEDIA IS KNOWN: OLD media A's late
+                # identity failure must not resolve NEW media B's armed
+                # pending (that latched B's classic dead-end and killed
+                # B's search). A base-less failure (the worker itself
+                # raised) cannot be staleness-checked and still resolves.
                 self._run_sub_fetch_fail()
             self.show_info("Could not identify this stream \u2014 "
                            "autoplay unavailable")
@@ -6065,7 +6078,11 @@ class PlayerView(QtWidgets.QWidget):
             return      # waiting on _on_stremio_identity
         self._sub_fetch_pending = False
         self._sub_fetching = True
-        self._sub_fetch_gen = self._session
+        gen = self._session    # THIS kick's generation, captured in the
+        #                        closure and stamped into the result tuple:
+        #                        a shared field would be overwritten by the
+        #                        next kick (media B) and let this job's late
+        #                        result pose as current on B
         kind = cur.get("kind")
         is_movie = kind == "vod" or bool(cur.get("movie"))
         lang = self._sub_fetch_lang or "eng"
@@ -6082,68 +6099,88 @@ class PlayerView(QtWidgets.QWidget):
 
         def _work():
             from .. import stremio
-            my_imdb, my_season, my_episode = imdb, season, episode
-            my_movie = is_movie
-            if not my_imdb:
-                # vod/series identity resolves HERE (lazy): catalog
-                # round-trips only ever happen for a caption dead-end
-                ident = stremio.resolve_vod_identity(cur_snap)
-                if not ident:
-                    return None
-                my_imdb = str(ident.get("stremio_imdb") or "")
-                if not my_imdb:
-                    return None
-                my_movie = bool(ident.get("movie"))
-                try:
-                    my_season = int(ident.get("season") or season or 0)
-                    my_episode = int(ident.get("episode") or episode or 0)
-                except (TypeError, ValueError):
-                    pass
-            # moviehash from the running relay's cached head/tail — the
-            # relay is up by construction on this path; resume sessions
-            # carry no head, and a missing hash only degrades ranking
-            vhash = ""
             try:
-                relay = self._vod_relay
-                if (relay is not None
-                        and getattr(relay, "total", 0) > 131072
-                        and len(getattr(relay, "_head", b"") or b"") >= 65536
-                        and len(getattr(relay, "_tail", b"") or b"") >= 65536):
-                    vhash = "%016x" % stremio.opensubs_hash(
-                        relay._head[:65536], relay._tail, relay.total)
-            except Exception:  # noqa: BLE001 - hash is best-effort
+                my_imdb, my_season, my_episode = imdb, season, episode
+                my_movie = is_movie
+                if not my_imdb:
+                    # vod/series identity resolves HERE (lazy): catalog
+                    # round-trips only ever happen for a caption dead-end
+                    ident = stremio.resolve_vod_identity(cur_snap)
+                    if not ident:
+                        return (gen, "ok", None)
+                    my_imdb = str(ident.get("stremio_imdb") or "")
+                    if not my_imdb:
+                        return (gen, "ok", None)
+                    my_movie = bool(ident.get("movie"))
+                    try:
+                        my_season = int(ident.get("season") or season or 0)
+                        my_episode = int(ident.get("episode") or episode or 0)
+                    except (TypeError, ValueError):
+                        pass
+                # moviehash from the running relay's cached head/tail — the
+                # relay is up by construction on this path; resume sessions
+                # carry no head, and a missing hash only degrades ranking
                 vhash = ""
-            cands = stremio.search_online_subtitles(
-                "movie" if my_movie else "series", my_imdb,
-                season=my_season, episode=my_episode,
-                want_lang=lang, file_hint=file_hint, video_hash=vhash)
-            for cand in cands[:3]:
-                dest = stremio.subtitle_cache_path(my_imdb, cand["id"])
-                if not stremio.download_online_subtitle(cand["url"], dest):
-                    continue
-                text = prof_mod.read_subtitle_text(dest)
-                cues = prof_mod.parse_subtitle_cues(text) if text else []
-                if cues:
-                    return dest, (cand.get("name") or cand.get("release")
-                                  or "subtitle")
-            return None
+                try:
+                    relay = self._vod_relay
+                    if (relay is not None
+                            and getattr(relay, "total", 0) > 131072
+                            and len(getattr(relay, "_head", b"") or b"") >= 65536
+                            and len(getattr(relay, "_tail", b"") or b"") >= 65536):
+                        vhash = "%016x" % stremio.opensubs_hash(
+                            relay._head[:65536], relay._tail, relay.total)
+                except Exception:  # noqa: BLE001 - hash is best-effort
+                    vhash = ""
+                cands = stremio.search_online_subtitles(
+                    "movie" if my_movie else "series", my_imdb,
+                    season=my_season, episode=my_episode,
+                    want_lang=lang, file_hint=file_hint, video_hash=vhash)
+                for cand in cands[:3]:
+                    dest = stremio.subtitle_cache_path(my_imdb, cand["id"])
+                    if not stremio.download_online_subtitle(cand["url"], dest):
+                        continue
+                    text = prof_mod.read_subtitle_text(dest)
+                    cues = prof_mod.parse_subtitle_cues(text) if text else []
+                    if cues:
+                        return (gen, "ok", (dest, (cand.get("name")
+                                                   or cand.get("release")
+                                                   or "subtitle")))
+                return (gen, "ok", None)
+            except Exception as exc:  # noqa: BLE001 - surfaced to the UI
+                return (gen, "err", str(exc))
 
         self._subfetch_runner.run(_work)
 
     def _on_subs_fetched(self, result):
         """The online-subtitle job came back (any of the three kinds).
-        Stale results (the session generation moved on) drop silently;
-        failure runs the arming dead-end's classic body verbatim; success
-        renders the fetched file in the styled overlay. The engage is
-        called DIRECTLY — _engage_caption_overlay's _cap_fail early-out
-        must be bypassed because the dead-end deliberately left the
-        failure unlatched while the search ran."""
-        self._sub_fetching = False
+        The worker STAMPS its kick's session generation into the result
+        tuple — only a result from the CURRENT generation may touch
+        flags or engage (the old shared-counter guard let a newer kick
+        overwrite the stamp, so media A's late result engaged on media
+        B, cleared B's fail hook and clobbered B's _sub_fetching flag).
+        Stale results drop silently, flags untouched; failure runs the
+        arming dead-end's classic body verbatim; success renders the
+        fetched file in the styled overlay. The engage is called
+        DIRECTLY — _engage_caption_overlay's _cap_fail early-out must be
+        bypassed because the dead-end deliberately left the failure
+        unlatched while the search ran."""
         ok, val = result
-        if self._closing or self._sub_fetch_gen != self._session:
-            return      # the user moved on — drop
+        if ok != "ok" or not (isinstance(val, tuple) and len(val) == 3):
+            return      # the worker died before stamping its generation
+        gen, ok, val = val
+        if self._closing or gen != self._session:
+            return      # the user moved on — drop, flags untouched
+        self._sub_fetching = False
         cur = self.current or {}
         if cur.get("kind") not in ("stremio", "vod", "series"):
+            return
+        if not self._cap_want:
+            # the user turned captions OFF while the multi-second search
+            # ran: engaging would force-re-enable them. Drop the
+            # pending/fetching state ONLY — no engage, no fail-restore.
+            # (The manual row re-sets _cap_want at its kick, so an
+            # explicit ask still engages.)
+            self._sub_fetch_pending = False
             return
         if ok != "ok" or not val:
             if ok != "ok":
@@ -6685,9 +6722,13 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_engine.whole_cue = bool(prof.get("whole_cue"))
         self._filter_engine.subs_enabled = bool(
             prof.get("substitute_subtitles", True))
+        # an explicit empty string means "no substitute word" — the engine
+        # masks with asterisks (replace_text's empty-default fallback).
+        # Only an ABSENT key (None) keeps the engine default "censored".
+        raw_sub = prof.get("default_substitution")
         self._filter_engine.default_sub = \
-            str(prof.get("default_substitution") or "").strip() \
-            or prof_mod.DEFAULT_SUBSTITUTION
+            prof_mod.DEFAULT_SUBSTITUTION if raw_sub is None \
+            else str(raw_sub).strip()
         self._filter_engine.enabled = bool(prof.get("enabled"))
 
     def apply_profanity_settings(self):

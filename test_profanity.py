@@ -529,6 +529,107 @@ def main():
     check("saved word list keeps the substitute column",
           cfg4.profanity["words"] == [list(w) for w in DEFAULT_WORDS])
 
+    print("[9d] review fixes — longest-wins overlaps, İ-safe lowering, "
+          "punctuated exact words, add-word cancel")
+
+    # FIX 1: a longer LATER overlapping match wins (leftmost-first used to
+    # keep the shorter one and leak the remainder unfiltered)
+    check("longer LATER overlap wins (xcunts repro)",
+          replace_text("xcunts", [("cun", "partial", "CUN"),
+                                  ("unts", "partial", "UNTS")])
+          == "xcUNTS")
+    check("overlap leaves no unfiltered remainder",
+          replace_text("xcunts", [("cun", "partial", "AAA"),
+                                  ("unts", "partial", "BBB")])
+          == "xcBBB")
+    check("longest wins among staggered overlaps (natural list)",
+          replace_text("goddamn", [("god", "partial", "gosh"),
+                                   ("odd", "partial", "odd"),
+                                   ("goddamn", "exact", "gosh dang")])
+          == "gosh dang")
+    check("'pissed off' still reads 'ticked off' (entry-order tiebreak)",
+          replace_text("pissed off", DEFAULT_WORDS) == "ticked off")
+
+    # FIX 2: lowering must not change length (Turkish 'İ' grows to two
+    # chars), or spans computed on the lowered copy mis-slice the original
+    check("Turkish 'İ' line no longer garbles the neighbor word",
+          replace_text("İstanbul hell", [("hell", "exact", "heck")])
+          == "İstanbul heck")
+    check("mute-path spans stay index-aligned on 'İ' text",
+          find_matches("İstanbul hell", [("hell", "exact")]) == [(9, 13)])
+    check("'İ' word-list word matches without corrupting neighbors",
+          replace_text("İDİOT stays", [("İDİOT", "exact", "silly")])
+          == "SILLY stays")
+    check("Cyrillic line substitutes cleanly (length-stable lower)",
+          replace_text("он сказал shit тихо", [("shit", "whole", "crap")])
+          == "он сказал crap тихо")
+
+    # FIX 3: exact-level words that themselves carry punctuation — \b
+    # guards could never fire around them; the lookarounds can
+    check("punctuated exact word matches (substitution path)",
+          match_spans_with_subs("what the (hell)",
+                                [("(hell)", "exact", "X")])
+          == [(9, 15, "X")])
+    check("punctuated exact word matches (mute path)",
+          find_matches("damn!", [("damn!", "exact")]) == [(0, 5)])
+    check("plain exact matching unchanged",
+          find_matches("hell", [("hell", "exact")]) == [(0, 4)])
+    check("exact still skips 'shells' and 'hellish'",
+          find_matches("shells hellish", [("hell", "exact")]) == [])
+
+    # FIX 4: Cancel at the SUBSTITUTE prompt keeps the word (blank sub);
+    # Cancel at the earlier prompts still discards. The prompt chain is
+    # modal, so it is driven offscreen: a timer answers each active dialog
+    # in turn ('ok' accepts, optionally typing text first; 'cancel'
+    # rejects).
+    def drive_add_word(d, script):
+        state = {"i": 0}
+
+        def step():
+            if state["i"] >= len(script):
+                return
+            w = QtWidgets.QApplication.activeModalWidget()
+            if w is None:
+                QtCore.QTimer.singleShot(20, step)
+                return
+            kind, val = script[state["i"]]
+            state["i"] += 1
+            if state["i"] < len(script):
+                QtCore.QTimer.singleShot(20, step)
+            if kind == "cancel":
+                w.reject()
+                return
+            if val is not None:
+                le = w.findChild(QtWidgets.QLineEdit)
+                if le is not None:
+                    le.setText(val)
+            w.accept()
+
+        QtCore.QTimer.singleShot(20, step)
+        d._add_word()
+
+    cfg5 = temp_config()
+    dlg5 = ProfanityDialog(cfg5, lambda: None)
+    n0 = dlg5.table.rowCount()
+    drive_add_word(dlg5, [("ok", "frig"), ("ok", None), ("cancel", None)])
+    r = dlg5.table.rowCount() - 1
+    check("cancel at the substitute prompt still adds the word",
+          dlg5.table.rowCount() == n0 + 1
+          and dlg5.table.item(r, 0).text() == "frig"
+          and dlg5.table.cellWidget(r, 1).currentText() == "exact"
+          and dlg5.table.item(r, 2).text() == "")
+    drive_add_word(dlg5, [("ok", "frack"), ("ok", None), ("ok", "frick")])
+    r = dlg5.table.rowCount() - 1
+    check("ok at the substitute prompt adds word + substitute",
+          dlg5.table.item(r, 0).text() == "frack"
+          and dlg5.table.item(r, 2).text() == "frick")
+    drive_add_word(dlg5, [("cancel", None)])
+    check("cancel at the WORD prompt still discards",
+          dlg5.table.rowCount() == n0 + 2)
+    drive_add_word(dlg5, [("ok", "frig"), ("cancel", None)])
+    check("cancel at the LEVEL prompt still discards",
+          dlg5.table.rowCount() == n0 + 2)
+
     print()
     if FAIL:
         print(f"FAILED {len(FAIL)}: {FAIL}")

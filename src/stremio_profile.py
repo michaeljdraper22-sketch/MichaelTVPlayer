@@ -3,7 +3,10 @@
 Stremio's desktop shell (v5) keeps its profile — every installed
 addon included — inside the WebView2 browser profile embedded in the
 install directory: <install>\\<shell>.WebView2\\EBChrome\\…\\Default\\
-Local Storage\\leveldb\\*.ldb. The addon collection is the localStorage
+Local Storage\\leveldb\\*.ldb — and, until leveldb flushes it there,
+the .log write-ahead log (that is where a JUST-INSTALLED addon first
+lives, so the WAL must be read just as carefully as the tables).
+The addon collection is the localStorage
 map key "profile" under the web.stremio.com origin, a JSON blob:
 
     {"auth": {...}, "addons": [{"manifest": {...},
@@ -26,7 +29,7 @@ import os
 import re
 import shutil
 import tempfile
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 log = logging.getLogger(__name__)
 
@@ -111,8 +114,14 @@ def snappy_decompress(src: bytes) -> bytes:
             pos += 4
         if not 0 < offset <= len(out):
             raise ValueError("snappy copy offset out of range")
-        for _ in range(n):                 # byte-by-byte: overlaps legal
-            out.append(out[-offset])
+        start = len(out) - offset
+        if offset >= n:                      # source window can't overlap
+            out += out[start:start + n]      # the copy: one bulk slice
+        else:                                # overlapping (RLE-style):
+            while n > 0:                     # the valid window grows as
+                take = min(n, len(out) - start)   # we append, so double
+                out += out[start:start + take]    # through it in slices
+                n -= take                    # (~log(n) appends, not n)
     if len(out) != length:
         raise ValueError("snappy length mismatch")
     return bytes(out)
@@ -199,11 +208,17 @@ def _table_entries(data: bytes):
 def _log_entries(data: bytes):
     """Yield (seq, type, user_key, value) from a leveldb write-ahead
     .log: 32 KiB blocks of [crc][len][type] records, payload = a
-    WriteBatch of user-level entries."""
+    WriteBatch of user-level entries. A record that doesn't fit its
+    block's remaining space is split by leveldb's writer into FIRST /
+    MIDDLE / LAST fragments that SPAN blocks (only a <7-byte trailer
+    ever pads a block out) — so the fragment accumulator must live
+    across the whole file, never per block: the profile blob is
+    routinely >100 KB, several blocks' worth of fragments."""
     out = []
+    fragment = b""                           # accumulates FIRST..LAST
     for base in range(0, len(data), 32768):
         buf = data[base:base + 32768]
-        pos, fragment = 0, b""
+        pos = 0
         while pos + 7 <= len(buf):
             length = int.from_bytes(buf[pos + 4:pos + 6], "little")
             rtype = buf[pos + 6]
@@ -211,21 +226,27 @@ def _log_entries(data: bytes):
             if rtype in (5, 6, 7, 8):        # recyclable record: extra
                 pos += 4                     # 4-byte log number
             if pos + length > len(buf):
-                break                        # torn tail block
+                fragment = b""               # torn record: nothing after
+                break                        # it can be trusted
             payload = buf[pos:pos + length]
             pos += length
             if rtype == 0 or length == 0:
                 continue                     # preallocated padding
             if rtype in (1, 5):              # full record
                 fragment = payload
-            elif rtype in (2, 6):            # first fragment
-                fragment = payload
+            elif rtype in (2, 6):            # first fragment — a FIRST
+                fragment = payload           # abandons any incomplete
+                continue                     # record before it
+            elif rtype in (3, 7):            # middle fragment (may sit
+                fragment += payload          # blocks away from the FIRST)
                 continue
-            elif rtype in (3, 7):            # middle fragment
+            elif rtype in (4, 8):            # last fragment: complete
                 fragment += payload
-                continue
-            else:                            # last fragment (4/8)
-                fragment += payload
+            else:                            # unknown record type: skip
+                fragment = b""               # it (do NOT treat it as a
+                continue                     # terminator) and reset, so a
+                                             # corrupt stream can't poison
+                                             # the next record
             if len(fragment) < 12:
                 fragment = b""
                 continue
@@ -358,7 +379,7 @@ def provider_from_url(url: str) -> str:
     The URL is matched case-sensitively where it must be (base64) and
     insensitively everywhere else."""
     url = str(url or "")
-    low = url.lower()
+    low = unquote(url).lower()    # URL-encoded tokens (torbox%3DK) count
     for token, label in _DEBRID_TOKENS:
         if re.search(r"%s=" % token, low):
             return label

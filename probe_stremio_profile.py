@@ -20,10 +20,16 @@ TEMP (the real Stremio directory is never written to):
       magic, snappy blocks, truncated/corrupt tables yield nothing;
   [3] WAL record walking — WriteBatch decode, deletions, padding/torn/
       garbage records, newest-seq-wins across .ldb + .log;
+  [3b] WAL FRAGMENTATION — records split by leveldb's log writer into
+      FIRST/MIDDLE/LAST fragments that SPAN 32 KiB blocks (the real
+      profile blob is >100 KB, several blocks' worth): big-record
+      round-trip, FIRST+LAST variant, FULL after fragments, a garbage-
+      interrupted fragment stream (accumulator resets, next record
+      still parses), unknown record types skipped;
   [4] the Chromium value flag-byte sniffing + transport-URL
       normalization;
-  [5] provider_from_url — TorBox/Premiumize/Real-Debrid path tokens and
-      base64 config segments, unknown -> "";
+  [5] provider_from_url — TorBox/Premiumize/Real-Debrid path tokens
+      (plain and URL-encoded) and base64 config segments, unknown -> "";
   [6] describe_addon labels + priority_sort's documented default order
       (Torrentio family, then Debridio; TorBox before Premiumize;
       unknowns last; stable);
@@ -132,6 +138,33 @@ def write_batch(seq, entries):
         if etype == 1:
             buf += varint(len(value)) + value
     return bytes(buf)
+
+
+def wal_add(buf, payload):
+    """Append one logical record to a WAL byte image exactly the way
+    leveldb's log_writer.cc does: a payload that doesn't fit the
+    current block's remaining space is split into FIRST + MIDDLE* +
+    LAST physical records that SPAN 32 KiB blocks (only a <7-byte
+    trailer is ever block padding). Mutates and returns buf — the
+    fragmentation-leg counterpart of the single-block wal_record."""
+    BLOCK, HDR = 32768, 7
+    pos, begin = 0, True
+    while True:
+        block_left = BLOCK - (len(buf) % BLOCK)
+        if block_left < HDR:            # not even a header fits:
+            buf += b"\x00" * block_left # leveldb pads and rolls over
+            continue
+        leftover = block_left - HDR
+        end = len(payload) if pos + leftover >= len(payload) \
+            else pos + leftover
+        rtype = (1 if begin else 4) if end == len(payload) \
+            else (2 if begin else 3)
+        chunk = payload[pos:end]
+        buf += struct.pack("<I", 0) + struct.pack("<H", len(chunk)) \
+            + bytes([rtype]) + chunk
+        pos, begin = end, False
+        if end == len(payload):
+            return buf
 
 
 # snappy EMIT side (the probe compresses; the module decompresses)
@@ -374,6 +407,69 @@ try:
           sp._profile_bytes(DELE) is None)
     check("empty leveldb dir -> None", sp._profile_bytes(EMPTY) is None)
 
+    print("[3b] WAL fragmentation — FIRST/MIDDLE/LAST spanning 32 KiB "
+          "blocks (the P1: the real profile record is >100 KB)")
+    FRAG = new_tmp("mtp_probe_sldb_frag_")
+    BIG = {"auth": {}, "addons": [addon(URL_TTB, "Torrentio")],
+           "pad": "x" * 50000}     # ~100 KB as UTF-16LE: FIRST + MIDDLE
+                                   # + MIDDLE + LAST over 4 blocks
+    MED = {"auth": {}, "addons": [addon(URL_TTB, "Torrentio")],
+           "pad": "y" * 20000}     # ~40 KB: FIRST + LAST over 2 blocks
+    img = bytearray()
+    wal_add(img, write_batch(700, [(1, ORIGIN_KEY, ls_value(BIG)),
+                                   (1, OTHER_KEY, b"2")]))
+    wal_add(img, write_batch(650, [(1, ORIGIN_KEY, ls_value(MED))]))
+    wal_add(img, write_batch(800, [(1, OTHER_KEY, b"after")]))  # FULL
+    with open(os.path.join(FRAG, "000003.log"), "wb") as f:
+        f.write(img)
+    rtypes = []                    # census the physical records the way
+    for b in range(0, len(img), 32768):   # the reader blocks them
+        blk, p = img[b:b + 32768], 0
+        while p + 7 <= len(blk):
+            ln = int.from_bytes(blk[p + 4:p + 6], "little")
+            rt = blk[p + 6]
+            p += 7
+            if rt in (5, 6, 7, 8):
+                p += 4
+            if p + ln > len(blk):
+                break
+            if rt == 0 or ln == 0:
+                continue
+            rtypes.append(rt)
+            p += ln
+    blocks_used = (len(img) + 32767) // 32768
+    check("physical layout: FIRST + MIDDLEs + LASTs, then a FULL after "
+          "them; the big record spans >= 3 blocks",
+          rtypes[0] == 2 and 3 in rtypes and rtypes.count(4) == 2
+          and rtypes[-1] == 1 and blocks_used >= 3,
+          "blocks=%d rtypes=%s" % (blocks_used, rtypes))
+    frag_entries = sp._log_entries(bytes(img))
+    check("fragmented records spanning blocks round-trip (seq + key)",
+          [(e[0], e[1], e[2]) for e in frag_entries]
+          == [(700, 1, ORIGIN_KEY), (701, 1, OTHER_KEY),
+              (650, 1, ORIGIN_KEY), (800, 1, OTHER_KEY)],
+          repr([(e[0], e[2]) for e in frag_entries]))
+    check("the ~100 KB profile VALUE survives fragmentation intact",
+          frag_entries[0][3] == ls_value(BIG),
+          "len=%d" % len(frag_entries[0][3]))
+    check("newest seq still wins inside one fragmented log (700 > 650)",
+          sp._profile_bytes(FRAG) == ls_value(BIG))
+    inter = bytearray()
+    wal_add(inter, write_batch(900, [(1, ORIGIN_KEY,
+                                      ls_value(OLD_PROFILE))]))
+    inter += wal_record(b"A" * 10, rtype=2)  # FIRST of a record that
+    inter += wal_record(b"B" * 12, rtype=3)  # never gets its LAST
+    inter += wal_record(b"junk9", rtype=9)   # unknown type: skipped,
+                                             # accumulator reset
+    wal_add(inter, write_batch(950, [(1, OTHER_KEY, b"ok")]))
+    got = sp._log_entries(bytes(inter))
+    check("garbage-interrupted fragment stream dropped; FULL records "
+          "on both sides still parse (old code 'completed' the stream "
+          "through the unknown-type branch and emitted junk)",
+          [(e[0], e[1], e[2]) for e in got]
+          == [(900, 1, ORIGIN_KEY), (950, 1, OTHER_KEY)],
+          repr([(e[0], e[2]) for e in got]))
+
     print("[4] _decode_profile + normalize_base — flag sniffing, URLs")
     check("flag 0 (UTF-16LE) decodes",
           sp._decode_profile(ls_value(OLD_PROFILE)) == OLD_PROFILE)
@@ -411,6 +507,14 @@ try:
           == "Premiumize")
     check("realdebrid= path token -> Real-Debrid",
           sp.provider_from_url(URL_TRD) == "Real-Debrid")
+    check("URL-encoded path token (torbox%3DKEY) -> TorBox",
+          sp.provider_from_url(
+              "https://torrentio.strem.fun/torbox%3DTBKEY77/manifest.json")
+          == "TorBox")
+    check("URL-encoded premiumize token -> Premiumize",
+          sp.provider_from_url(
+              "https://torrentio.strem.fun/premiumize%3DPMKEY/m")
+          == "Premiumize")
     check("base64 {provider:torbox} segment -> TorBox",
           sp.provider_from_url(
               "https://addon.debridio.com/%s/manifest.json"

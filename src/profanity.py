@@ -128,11 +128,20 @@ def _word_level(entry) -> tuple:
     return str(entry), "exact"
 
 
+def _lower_stable(s: str) -> str:
+    """Length-preserving ``lower()`` — a character whose lowering GROWS
+    (Turkish 'İ' -> 'i' + combining dot, 1 char -> 2) stays as-is. Match
+    spans are computed on the lowered copy but slice the ORIGINAL text,
+    so the two must stay index-aligned (Cyrillic etc. lower 1:1 and are
+    unaffected)."""
+    return "".join(ch.lower() if len(ch.lower()) == 1 else ch for ch in s)
+
+
 def find_matches(text: str, words) -> list:
     """[(char_start, char_end)] of every bad-word occurrence in ``text``.
 
-    exact    — standalone word only (\\b match); 'dog' hits 'the dog barked'
-               but not 'doghouse'
+    exact    — standalone word only (word-boundary match); 'dog' hits
+               'the dog barked' but not 'doghouse'
     partial  — the substring anywhere; masks just the substring ('***house')
     whole    — the substring anywhere; masks the whole containing word
                ('********')
@@ -141,14 +150,15 @@ def find_matches(text: str, words) -> list:
     a third element (the suggested substitute) — it is ignored here.
     """
     spans = []
-    low = text.lower()
+    low = _lower_stable(text)
     for entry in words or ():
         word, level = _word_level(entry)
-        word = word.strip().lower()
+        word = _lower_stable(word.strip())
         if not word or level not in LEVELS:
             continue
         if level == "exact":
-            for m in re.finditer(r"\b" + re.escape(word) + r"\b", low):
+            for m in re.finditer(r"(?<!\w)" + re.escape(word) + r"(?!\w)",
+                                 low):
                 spans.append((m.start(), m.end()))
         else:
             start = 0
@@ -320,19 +330,23 @@ def match_spans_with_subs(text: str, words, default_sub: str = "") -> list:
     """[(start, end, sub)] for every match — non-overlapping, longest wins.
 
     Overlaps arise naturally once substitutions are in play ("goddamn"
-    exact sits inside "god damnit"'s reach in hand-made lists): at equal
-    starts the longer match replaces the shorter, and anything reaching
-    into an already-kept span is dropped."""
+    exact sits inside "god damnit"'s reach in hand-made lists). Candidates
+    are resolved LONGEST-first regardless of position: ties go to the
+    earlier start, then to word-list order (so 'pissed' keeps beating
+    'piss' in the default list). Anything overlapping a longer kept match
+    is dropped, and the kept hits are re-sorted left-to-right so the
+    caller can render them in one pass."""
     hits = []
-    low = text.lower()
+    low = _lower_stable(text)
     for entry in words or ():
         word, level = _word_level(entry)
-        word = word.strip().lower()
+        word = _lower_stable(word.strip())
         if not word or level not in LEVELS:
             continue
         sub = _entry_sub(entry, default_sub)
         if level == "exact":
-            for m in re.finditer(r"\b" + re.escape(word) + r"\b", low):
+            for m in re.finditer(r"(?<!\w)" + re.escape(word) + r"(?!\w)",
+                                 low):
                 hits.append((m.start(), m.end(), sub))
         else:
             start = 0
@@ -351,14 +365,13 @@ def match_spans_with_subs(text: str, words, default_sub: str = "") -> list:
                         e += 1
                     hits.append((s, e, sub))
                 start = i + 1
-    hits.sort(key=lambda h: (h[0], -(h[1] - h[0])))
+    hits.sort(key=lambda h: (-(h[1] - h[0]), h[0]))
     kept = []
-    last_end = -1
     for s, e, sub in hits:
-        if s < last_end:
+        if any(s < ke and e > ks for ks, ke, _ in kept):
             continue      # overlaps a longer match kept earlier
         kept.append((s, e, sub))
-        last_end = e
+    kept.sort()           # back to left-to-right for rendering
     return kept
 
 
