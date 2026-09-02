@@ -163,6 +163,143 @@ def leg_a():
           calls == ["Bad Parse"], str(calls))
     stremio.search_series = saved_search
 
+    # ---- movie identity: a handoff URL with no S/E marker is a MOVIE.
+    # Every one used to dead-end at "could not identify this stream"
+    # (resolve_identity returned None; the banner never showed anything
+    # real). The names below are actual movie handoffs from the user's
+    # player log (2026-09-01/02).
+    qs = stremio._movie_queries(
+        "Chinatown.1974.2160p.BluRay.REMUX.For.LGTVs.DV.HDR.MULTI.DPD"
+        ".5.1.H265.MP4-BTM")
+    check("movie queries: head before the year first",
+          qs and qs[0] == "Chinatown", qs)
+    qs = stremio._movie_queries(
+        "[2ndfire]My_Neighbor_Totoro[DCP Theatrical Master][2160p]"
+        "[AV1][10bit][67695A2D].mkv")
+    check("movie queries: no year, tags stripped -> cleaned name",
+          qs == ["My Neighbor Totoro"], qs)
+    qs = stremio._movie_queries(
+        "The Incredibles (2004) x 1606 (2160p) HDR 5.1 x265 10bit "
+        "Phun Psyz.mkv")
+    check("movie queries: paren-wrapped year still heads",
+          qs and qs[0] == "The Incredibles", qs)
+    qs = stremio._movie_queries(
+        "Бешеные псы / Reservoir Dogs (Квентин Тарантино / "
+        "Quentin Tarantino 1992) UHD BDRemux 2160p")
+    check("movie queries: dual-language head keeps both titles",
+          qs and qs[0] == "Бешеные псы Reservoir Dogs Квентин Тарантино "
+          "Quentin Tarantino", qs)
+
+    saved_movies = stremio.search_movies
+    stremio.search_movies = lambda q: ([
+        {"id": "tt0071315", "name": "Chinatown", "year": "1974",
+         "poster": "http://p/chin.jpg"}]
+        if "chinatown" in q.lower() else [])
+    hit = stremio.find_movie("Chinatown REMUX For LGTVs")
+    check("find_movie returns id/name/year/poster",
+          hit and hit["id"] == "tt0071315" and hit["year"] == "1974"
+          and hit["poster"] == "http://p/chin.jpg", hit)
+    stremio.search_movies = lambda q: []
+    check("find_movie miss -> None",
+          stremio.find_movie("No Such Film") is None)
+    stremio.search_movies = saved_movies
+
+    # Cinemeta's search serves 504 HTML pages under load — one quiet
+    # retry (the shared core retried connection blips only)
+    class _R:
+        def __init__(self, code, body):
+            self.status_code, self._b = code, body
+
+        def json(self):
+            return self._b
+
+    class _Sess:
+        def __init__(self, script):
+            self.script, self.i = script, 0
+
+        def get(self, url, **kw):
+            r = self.script[min(self.i, len(self.script) - 1)]
+            self.i += 1
+            return _R(*r)
+
+    saved_sess = stremio._session
+    stremio._session = _Sess([
+        (504, None),
+        (200, {"metas": [{"id": "ttM", "name": "M", "type": "movie",
+                          "releaseInfo": "2001"}]})])
+    ms = stremio.search_movies("Any Movie")
+    check("movie search retries a Cinemeta 504",
+          ms and ms[0]["id"] == "ttM" and ms[0]["year"] == "2001", ms)
+    stremio._session = _Sess([(504, None), (504, None)])
+    check("movie search survives an all-504 run",
+          stremio.search_movies("Any Movie") == [])
+    stremio._session = saved_sess
+
+    # resolve_identity end-to-end on the real handoff URLs, network
+    # stubbed (content-disposition probe + catalog + metainfo)
+    saved = (stremio._content_disposition, stremio._torrent_metainfo,
+             stremio.search_movies, stremio.search_series,
+             stremio.series_meta)
+    stremio._content_disposition = lambda url: ""
+    stremio._torrent_metainfo = lambda h: None
+    stremio.search_movies = lambda q: ([
+        {"id": "tt0071315", "name": "Chinatown", "year": "1974",
+         "poster": "http://p/chin.jpg"}]
+        if "chinatown" in q.lower() else [])
+    ident = stremio.resolve_identity(
+        "https://addon.debridio.com/play/movie/premiumize/k/h/"
+        "b6b100699a8772bb760621a399c762b5ecc64927/"
+        "Chinatown.1974.2160p.BluRay.REMUX.For.LGTVs.DV.HDR.MULTI.DPD"
+        ".5.1.H265.MP4-BTM", None)
+    check("resolve_identity: movie URL -> movie identity",
+          ident and ident.get("movie") is True
+          and ident.get("stremio_imdb") == "tt0071315"
+          and ident.get("movie_name") == "Chinatown"
+          and ident.get("year") == "1974", ident)
+    stremio.search_movies = lambda q: []
+    ident = stremio.resolve_identity(
+        "https://torrentio.strem.fun/resolve/torbox/k/h/"
+        "8dba7609c2b7a585ad91aa0e2d0812840ebaf212/"
+        "%5B2ndfire%5DMy_Neighbor_Totoro%5BDCP%20Theatrical%20Master%5D"
+        ".mkv/0/%5B2ndfire%5DMy_Neighbor_Totoro%5BDCP%20Theatrical%20"
+        "Master%5D.mkv", None)
+    check("resolve_identity: catalog miss -> display-name partial",
+          ident and ident.get("movie") is True
+          and ident.get("display_name") == "My Neighbor Totoro"
+          and not ident.get("stremio_imdb"), ident)
+
+    class _DeadServer:
+        @staticmethod
+        def torrent_names(info_hash, file_idx):
+            return []
+
+    check("resolve_identity: no names at all -> None",
+          stremio.resolve_identity(
+              "http://127.0.0.1:11470/" + "8" * 40 + "/2",
+              _DeadServer()) is None)
+
+    stremio.search_series = lambda q: [{"id": "ttS", "name": "Silo"}]
+    stremio.series_meta = lambda imdb: {
+        "name": "Silo", "videos": [{"season": 3, "episode": 7,
+                                    "name": "The Hourglass"}]}
+    ident = stremio.resolve_identity(
+        "https://addon.debridio.com/play/series/premiumize/k/h/h/"
+        "Silo.S03E07.WEB-DL.2160p.DV.HDR10.mkv", None)
+    check("resolve_identity: S/E marker still resolves series",
+          ident and ident.get("stremio_imdb") == "ttS"
+          and ident.get("season") == 3 and ident.get("episode") == 7
+          and ident.get("episode_name") == "The Hourglass"
+          and not ident.get("movie"), ident)
+    (stremio._content_disposition, stremio._torrent_metainfo,
+     stremio.search_movies, stremio.search_series,
+     stremio.series_meta) = saved
+
+    check("adjacent playable: movie -> None (no next/prev episode)",
+          stremio.next_playable(None, {
+              "kind": "stremio", "url": "http://x/m", "movie": True,
+              "stremio_imdb": "tt0071315"}) is None)
+    # ---- end movie identity ----
+
     cleaned = stremio.clean_show_name(
         "Game.of.Thrones.S02E05.1080p.WEB-DL.x265-QTZ")
     check("clean show name", cleaned == "Game of Thrones", repr(cleaned))
@@ -501,6 +638,13 @@ def leg_b():
     hit1 = stremio.find_series("Silo")
     check("find_series single-word (live: the user's Silo case)",
           hit1 is not None, hit1)
+    hit = stremio.find_movie("Chinatown 1974")
+    check("find_movie (live: the user's Chinatown case)",
+          hit and hit["id"] == "tt0071315", hit and hit.get("name"))
+    hit = stremio.find_movie(stremio.clean_movie_name(
+        "Бешеные псы / Reservoir Dogs (1992) UHD BDRemux 2160p"))
+    check("find_movie dual-language release name (live)",
+          hit and hit["id"] == "tt0105236", hit and hit.get("name"))
 
     cfg = Config(dict(DEFAULTS), None)
     streams = stremio.addon_streams(cfg, "tt0944947", 1, 2)
@@ -775,7 +919,42 @@ if os.environ.get("MTP_PROBE_URL"):
            str((nxt or {}).get("title", ""))[:60])
     report("lookahead title has episode name", bool(nxt) and len(
         str(nxt.get("title", "")).split(" — ", 1)[-1].split(" ", 2)) >= 3,
-        str((nxt or {}).get("title", ""))[:60])
+        str(nxt.get("title", ""))[:60])
+# movie identity end-to-end (offline): a movie ident (no season) retitles
+# the banner "Name (Year)", keeps the episode buttons hidden, kicks no
+# lookahead, and a finished movie never rolls autoplay — all on a fresh
+# minimal current so no episode identity interferes
+_mfk = (win.player_view.current or {}).get("fav_key") or "stremio:x:0"
+win.player_view.current = {"kind": "stremio", "fav_key": _mfk,
+                           "url": "http://x/m", "title": "Stremio stream"}
+win.player_view._on_stremio_identity(("ok", (_mfk, {
+    "movie": True, "stremio_imdb": "tt0071315",
+    "movie_name": "Chinatown", "year": "1974",
+    "torrent_name": "Chinatown.1974", "file_name": "Chinatown.1974"})))
+_c = win.player_view.current or {}
+report("movie identity banner title 'Name (Year)'",
+       _c.get("title") == "Chinatown (1974)", str(_c.get("title")))
+report("movie flags the playable",
+       bool(_c.get("movie")) and _c.get("stremio_imdb") == "tt0071315")
+report("movie keeps episode buttons hidden",
+       _pv.btn_prev.isHidden() and _pv.btn_next.isHidden()
+       and _pv.btn_auto.isHidden())
+report("movie kicks no lookahead", _pv._look_busy != _mfk)
+win.player_view._on_stremio_identity(("ok", (_mfk, {
+    "movie": True, "display_name": "Some Unfindable Film"})))
+report("movie catalog miss -> cleaned display name",
+       (win.player_view.current or {}).get("title")
+       == "Some Unfindable Film",
+       str((win.player_view.current or {}).get("title")))
+_pv.btn_auto.setChecked(True)
+_pv._eof_next_done = False
+_pv._seeking = False
+_pv._live_paused = False
+_pv._win_sel = None
+_pv._downloading = False
+_pv._vid_s = 600.0
+win.player_view._maybe_autoplay_next(False, 600000, 599000)
+report("finished movie never rolls autoplay", not _pv._eof_next_done)
 win.close()
 '''
 

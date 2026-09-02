@@ -1911,17 +1911,32 @@ class PlayerView(QtWidgets.QWidget):
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran
         cur.update(ident)
-        title = "%s \u2014 S%02dE%02d" % (ident.get("series_name", "Series"),
-                                         int(ident.get("season") or 0),
-                                         int(ident.get("episode") or 0))
-        if ident.get("episode_name"):
-            title += " %s" % ident["episode_name"]
+        if ident.get("movie"):
+            # a movie: "Name (Year)" — no episode maths, no lookahead,
+            # no episode buttons (their visibility gate keys on season)
+            name = ident.get("movie_name") or ident.get("display_name") \
+                or ""
+            year = str(ident.get("year") or "").strip()
+            title = ("%s (%s)" % (name, year)) if (name and year) \
+                else (name or "Stremio stream")
+            try:
+                log.info("stremio: identified movie %r", title)
+            except Exception:
+                pass
+        else:
+            title = "%s \u2014 S%02dE%02d" % (
+                ident.get("series_name", "Series"),
+                int(ident.get("season") or 0),
+                int(ident.get("episode") or 0))
+            if ident.get("episode_name"):
+                title += " %s" % ident["episode_name"]
         cur["title"] = title
         self.show_info(title, sticky=True)
         # the episode buttons (prev/next/autoplay) are gated on the
         # identity's season/episode — surface them now that it's known
         self._update_control_state()
-        self._begin_stremio_lookahead()
+        if not ident.get("movie"):
+            self._begin_stremio_lookahead()
 
     # ---- stremio: prefetch the next episode while this one plays ----
 
@@ -1932,8 +1947,9 @@ class PlayerView(QtWidgets.QWidget):
         debrid resolve + torrent engine warm-up all happen up front,
         while the user is still watching)."""
         cur = self.current or {}
-        if cur.get("kind") != "stremio" or not cur.get("stremio_imdb"):
-            return
+        if cur.get("kind") != "stremio" or not cur.get("stremio_imdb") \
+                or cur.get("movie"):
+            return          # movies have no next episode to prefetch
         base = cur.get("fav_key")
         if self._look_busy == base:
             return
@@ -2378,6 +2394,11 @@ class PlayerView(QtWidgets.QWidget):
             return
         cur = self.current or {}
         if cur.get("kind") not in ("series", "catchup", "stremio"):
+            return
+        if cur.get("movie"):
+            # a Stremio movie has no next episode to roll into (the
+            # autoplay toggle can still be CHECKED from an earlier
+            # episode — hidden buttons keep their state)
             return
         if length_ms <= 0:
             return

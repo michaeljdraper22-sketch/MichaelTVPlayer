@@ -215,11 +215,13 @@ _MOVIE_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
 
 def clean_movie_name(text: str) -> str:
     """Reduce a MOVIE file/torrent name to something the movie catalog
-    search likes: clean_show_name plus bracketed release tags [..],
-    (annotated) paren groups and '/' separators — dual-language release
-    names like 'Бешеные псы / Reservoir Dogs (1992) UHD BDRemux' search
-    far better without them."""
-    name = re.sub(r"[\[\(\{][^\[\]\(\)\{\}]*[\]\)\}]", " ", text or "")
+    search likes: container extension, bracketed release tags [..],
+    (annotated) paren groups and '/' separators off, then the shared
+    release-name cleanup — dual-language names like 'Бешеные псы /
+    Reservoir Dogs (1992) UHD BDRemux' search far better without them."""
+    name = re.sub(r"\.(mkv|mp4|avi|ts|webm|m2ts|mov|strm)$",
+                  "", (text or "").strip(), flags=re.IGNORECASE)
+    name = re.sub(r"[\[\(\{][^\[\]\(\)\{\}]*[\]\)\}]", " ", name)
     name = clean_show_name(name)
     name = re.sub(r"[\[\]\(\)\{\}/]+", " ", name)
     return re.sub(r"\s+", " ", name).strip(" -–—")
