@@ -93,6 +93,19 @@ _TAP_RESTART_BACK_BYTES = 24 << 20
 # the rest is VLC's own re-buffer).
 VOD_SPLITTER_READY = True
 
+# Provider ride-through: a CDN that caps connection AGE (the 2026-09-01
+# Incredibles kills at ~600 s) or reaps idle ones (a long VLC pause —
+# the 2026-09-02 Paw Patrol freeze) cuts the ONE streaming body
+# mid-file. The serve loop reopens at the exact byte position so VLC
+# never sees a truncated body. Reopens after a body that DELIVERED are
+# unbounded (a 2 h movie on a 10-min age cap rides a dozen of them);
+# only failures are budgeted — an open error or a zero-byte reopen
+# burns one unit, any served byte refills the budget, and an exhausted
+# budget cuts the body with a WARN (a loud, reportable failure instead
+# of the silent freeze the pre-fix relay produced).
+_REOPEN_FAIL_BUDGET = 3
+_REOPEN_BACKOFF_S = 0.5
+
 
 def _snap_cluster(buf: bytes) -> int:
     """Offset of the first plausibly-real Cluster header in ``buf``:
@@ -135,6 +148,14 @@ class _ProviderStream:
                                 "Range": f"bytes={offset}-"})
         t0 = time.monotonic()
         self.resp = urllib.request.urlopen(req, timeout=30)
+        status = getattr(self.resp, "status", None)
+        if status is not None and status not in (200, 206):
+            # 403 (expired signed URL) / 5xx (provider down): fail the
+            # OPEN, not the body — the serve loop's bounded-retry path
+            # then decides between another attempt and cutting. A None
+            # status is a non-HTTP scheme (file://) — always accepted.
+            self.resp.close()
+            raise OSError(f"provider HTTP {status}")
         tlog("provider open @%d: %.3fs", offset, time.monotonic() - t0)
 
     def read(self, n: int) -> bytes:
@@ -1072,6 +1093,11 @@ class VodRelay(QtCore.QObject):
                 #                     # stream and reopened the provider
                 src = ""             # last source served from (trace only)
                 why = "range-end"
+                fails = 0            # consecutive provider failures that
+                #                     # served no bytes (open error or a
+                #                     # zero-byte body); any byte refills
+                served = False       # the current stream delivered bytes
+                reopens = 0
                 try:
                     while b is None or pos <= b:
                         if relay.cache_base <= pos \
@@ -1127,11 +1153,41 @@ class VodRelay(QtCore.QObject):
                             self.wfile.write(relay._tail[off:off + n])
                             pos += n
                             continue
-                        if st is not None and (st.dead
-                                               or st.gen != relay._gen):
-                            why = "stale" if st.gen != relay._gen \
-                                else "provider-eof"
-                            break
+                        if st is not None and st.gen != relay._gen:
+                            why = "stale"   # another handler owns the slot
+                            break           # now — our bytes come via the
+                                           # cache
+                        if st is not None and st.dead:
+                            # the provider cut the body mid-serve (CDN
+                            # connection-age cap, idle reap during a long
+                            # VLC pause) — or it ended naturally at the
+                            # file's end
+                            if relay.total and pos >= relay.total:
+                                why = "provider-eof"
+                                break
+                            if served:
+                                fails = 0   # a body that delivered is a
+                                            # healthy ride, not a failure
+                            else:
+                                fails += 1
+                            if fails >= _REOPEN_FAIL_BUDGET:
+                                why = "provider-dead"
+                                log.warning(
+                                    "vod splitter: provider dead at %d — "
+                                    "cutting after %d failed reopens",
+                                    pos, fails)
+                                break
+                            reopens += 1
+                            tot = (" of %d" % relay.total) \
+                                if relay.total else ""
+                            log.info(
+                                "vod splitter: provider body died at %d%s"
+                                " — reopening (%d)", pos, tot, reopens)
+                            st = None
+                            src = ""
+                            served = False
+                            time.sleep(_REOPEN_BACKOFF_S)
+                            continue
                         if st is None:
                             cur = relay._stream
                             if cur is not None and not cur.dead \
@@ -1144,16 +1200,26 @@ class VodRelay(QtCore.QObject):
                                 continue
                             st = relay._acquire(pos, owner=me)
                             if st is None:
-                                why = "provider-fail"
-                                break
+                                fails += 1
+                                if fails >= _REOPEN_FAIL_BUDGET \
+                                        or not relay._alive:
+                                    why = "provider-fail"
+                                    log.warning(
+                                        "vod splitter: provider open at %d "
+                                        "failed %dx — cutting", pos, fails)
+                                    break
+                                time.sleep(_REOPEN_BACKOFF_S)
+                                continue
+                            served = False
                             if src != "provider":
                                 tlog("serve @%d -> provider", pos)
                                 src = "provider"
                         data = st.read_some(_CHUNK if b is None
                                             else min(_CHUNK, b - pos + 1))
                         if not data:
-                            why = "provider-eof"
-                            break
+                            continue    # the dead-branch above decides:
+                                        # natural EOF, reopen, or cut
+                        served = True
                         self.wfile.write(data)
                         pos += len(data)
                 except Exception as exc:  # noqa: BLE001

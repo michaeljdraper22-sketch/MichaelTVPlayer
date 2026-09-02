@@ -101,7 +101,11 @@ class VLCPlayer:
             # return None and silently fall back to a no-args instance.
             "--ignore-config",
             "--no-video-title-show",
-            "--no-stats",
+            # input stats ON: the VOD stall watchdog reads cumulative
+            # demux bytes via libvlc_media_get_stats (with --no-stats the
+            # counters read zero and the starvation trigger can never
+            # fire); the cost is a few atomic adds per packet.
+            "--stats",
             f"--network-caching={nc}",
             f"--live-caching={nc}",
             "--file-caching=1000",
@@ -634,6 +638,26 @@ class VLCPlayer:
             except Exception:
                 pass
             return 0.0
+
+    def demuxed_bytes(self) -> int:
+        """Cumulative demuxed bytes for the current media (VLC input
+        stats). The VOD stall watchdog's starvation signal: a provider
+        cut leaves VLC 'playing' with its CLOCK still advancing while
+        nothing is demuxed — the frozen-clock test alone can't see it.
+        -1 when stats are unavailable (the caller treats that as no
+        signal, never as frozen). NB: this vlc.py binding's get_stats
+        takes a CALLER-ALLOCATED struct — calling it bare raises
+        TypeError."""
+        try:
+            m = self.player.get_media()
+            if m is None:
+                return -1
+            stats = vlc.MediaStats()
+            if not m.get_stats(stats):
+                return -1
+            return stats.demux_read_bytes or 0
+        except Exception:
+            return -1
 
     def seek_ms(self, delta_ms: int) -> int:
         """Relative seek. Returns the clamped target ms (the caller's

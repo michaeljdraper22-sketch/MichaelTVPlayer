@@ -669,6 +669,10 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_relay_gen = 0       # session the attached relay belongs
         self._vod_raw_wall = 0.0      # VOD stall watchdog: wall time raw last
         #                              # moved (series/movies, like catch-up)
+        self._vod_demux_wall = 0.0    # ... and wall time demux bytes last
+        #                              # grew (starvation — the clock can
+        #                              # keep ADVANCING on a cut body)
+        self._vod_demux_last = None   # last seen cumulative demux bytes
         self._vod_rescues = 0         # rescues this media (cap: 2)
         self._cap_relay_gen = 0       # session the attached relay belongs
         self._relay_start_offset = 0  # byte offset for the NEXT relay start
@@ -1370,30 +1374,57 @@ class PlayerView(QtWidgets.QWidget):
     _CU_END_MARGIN_S = 15.0  # this close to the program end, stopping is
     #                          # natural (recording ran out) — never rescue
 
-    # VOD (series/movies) stall watchdog — same disease as catch-up's
-    # (provider/relay connection dies mid-episode, VLC freezes on the last
-    # frame, pause/play do nothing and autoplay never fires because the
-    # player never reaches "ended"; seen live on 2026-08-29 autoplay of
-    # Adventure Time S3E19: log silent from 12:47 to the 18:58 close).
-    _VOD_FREEZE_S = 30.0     # raw frozen this long while playing = rescue
+    # VOD (series/movies/stremio) stall watchdog — same disease as
+    # catch-up's (provider/relay connection dies mid-episode, VLC freezes
+    # on the last frame, pause/play do nothing and autoplay never fires
+    # because the player never reaches "ended"; seen live on 2026-08-29
+    # autoplay of Adventure Time S3E19: log silent from 12:47 to the
+    # 18:58 close — and again on 2026-09-01/02 Stremio streams: The
+    # Incredibles froze mid-movie at ~9.5 min twice, and Paw Patrol
+    # S04E06 froze after a 13-min pause). kind=stremio was never in the
+    # gate, and the frozen-CLOCK test misses the starved shape a cut
+    # relay body produces: VLC stays 'playing' and the clock keeps
+    # ADVANCING while no frame decodes — so cumulative demux bytes are
+    # the second trigger.
+    _VOD_FREEZE_S = 30.0     # clock or demux frozen this long = rescue
     _VOD_MAX_RESCUES = 2     # then give up (logged at ERROR = auto-report)
 
-    def _vod_stall_watchdog(self, now, playing, raw_s, dur_s, raw_moved):
+    def _vod_stall_watchdog(self, now, playing, raw_s, dur_s, raw_moved,
+                            demux_b=-1):
         if (self._closing or self._live_paused or self._seeking
                 or not self.current
                 or self.current.get("kind") not in ("series", "movie",
-                                                    "vod")):
+                                                    "vod", "stremio")):
             self._vod_raw_wall = now
+            self._vod_demux_wall = now
             return
+        demux_known = demux_b is not None and demux_b > 0
+        demux_moved = False
+        if demux_known:
+            if self._vod_demux_last is not None \
+                    and demux_b > self._vod_demux_last:
+                demux_moved = True
+                self._vod_demux_wall = now
+            self._vod_demux_last = demux_b
+        else:
+            self._vod_demux_wall = now   # no stats this tick — can't judge
         if raw_moved:
             self._vod_raw_wall = now
-            return
         if not playing or self._vid_s >= dur_s - self._CU_END_MARGIN_S:
             self._vod_raw_wall = now   # near-end/natural stop isn't a stall
+            self._vod_demux_wall = now
             return
-        if now - self._vod_raw_wall < self._VOD_FREEZE_S:
+        if self._vod_raw_wall <= 0.0:
+            self._vod_raw_wall = now   # never armed (pre-play_media tick)
+        if self._vod_demux_wall <= 0.0:
+            self._vod_demux_wall = now
+        clock_frozen = now - self._vod_raw_wall >= self._VOD_FREEZE_S
+        starved = (demux_known and not demux_moved
+                   and now - self._vod_demux_wall >= self._VOD_FREEZE_S)
+        if not (clock_frozen or starved):
             return
         self._vod_raw_wall = now
+        self._vod_demux_wall = now
         cur = dict(self.current)
         pos_s = max(0.0, self._vid_s)
         from .. import feedback
@@ -1404,8 +1435,10 @@ class PlayerView(QtWidgets.QWidget):
                       cur.get("title"))
             return
         self._vod_rescues += 1
-        log.error("VOD stall rescue %d: clock frozen at %.0fs — reopening "
-                  "'%s'", self._vod_rescues, pos_s, cur.get("title"))
+        log.error("VOD stall rescue %d: %s at %.0fs — reopening "
+                  "'%s'", self._vod_rescues,
+                  "demux starved" if starved and not clock_frozen
+                  else "clock frozen", pos_s, cur.get("title"))
         feedback.crumb("VOD stall rescue at %.0fs: %r"
                        % (pos_s, cur.get("title")))
         # cap the resume position a little before the freeze point so the
@@ -1798,6 +1831,8 @@ class PlayerView(QtWidgets.QWidget):
         if (self.current or {}).get("url") != playable.get("url"):
             self._vod_rescues = 0     # same-media rescue reopens keep the cap
         self._vod_raw_wall = now_s()
+        self._vod_demux_wall = now_s()
+        self._vod_demux_last = None
         self._last_raw = None
         self._raw_change_wall = 0.0
         self._video_wh = (0, 0)   # next media's size is unknown until the
@@ -4635,9 +4670,15 @@ class PlayerView(QtWidgets.QWidget):
             if self._is_catchup():
                 self._catchup_watchdog(now, playing, raw_s,
                                        length / 1000.0, raw_moved)
-            elif self.current.get("kind") in ("series", "movie", "vod"):
+            elif self.current.get("kind") in ("series", "movie", "vod",
+                                              "stremio"):
+                try:
+                    demux = self.vlc.demuxed_bytes()
+                except Exception:      # stub players / binding gaps —
+                    demux = -1         # starvation falls back to raw-only
                 self._vod_stall_watchdog(now, playing, raw_s,
-                                         length / 1000.0, raw_moved)
+                                         length / 1000.0, raw_moved,
+                                         demux)
             self._maybe_autoplay_next(playing, length, raw)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None
@@ -5532,8 +5573,7 @@ class PlayerView(QtWidgets.QWidget):
                             > _CC_WATCH_COOLDOWN_S):
                         self._cc_watchdog_fire(now)
             if lines and self._filter_engine.enabled:
-                words = self._filter_engine.words
-                lines = [prof_mod.mask_text(ln, words) for ln in lines]
+                lines = [self._filter_engine.clean_line(ln) for ln in lines]
             self._cap_wid.set_lines(lines)
         except Exception as exc:  # noqa: BLE001
             # keep the 100 ms caption timer alive whatever happens, but
@@ -6281,6 +6321,11 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_engine.sync_s = int(prof.get("sync_ms", 0)) / 1000.0
         self._filter_engine.lead_s = int(prof.get("lead_ms", 1500)) / 1000.0
         self._filter_engine.whole_cue = bool(prof.get("whole_cue"))
+        self._filter_engine.subs_enabled = bool(
+            prof.get("substitute_subtitles", True))
+        self._filter_engine.default_sub = \
+            str(prof.get("default_substitution") or "").strip() \
+            or prof_mod.DEFAULT_SUBSTITUTION
         self._filter_engine.enabled = bool(prof.get("enabled"))
 
     def apply_profanity_settings(self):

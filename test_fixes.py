@@ -389,6 +389,95 @@ def main():
     view.dvr = None
     view._mode = "live"
 
+    print("[16] VOD stall watchdog: stremio covered + demux starvation")
+    # The 2026-09-01/02 freeze shapes: kind=stremio was excluded from
+    # the watchdog, and the starved shape (relay body cut — VLC stays
+    # 'playing' with its CLOCK still advancing while nothing is demuxed)
+    # is invisible to the frozen-clock test alone.
+    rescues = []
+
+    class WatchVlc:
+        def demuxed_bytes(self):
+            return getattr(self, "demux", -1)
+
+    view.vlc, real_vlc = WatchVlc(), view.vlc
+    view.current = {"kind": "stremio", "title": "Paw Patrol S04E06",
+                    "url": "http://x/v.mkv"}
+    view.play_media = lambda cur, start_at=0.0: rescues.append(
+        (cur.get("kind"), round(start_at, 1)))
+    wd = view._vod_stall_watchdog
+    T0 = 10_000.0
+    DUR = 600.0
+    view._vod_raw_wall = view._vod_demux_wall = T0   # [15]'s ticks left
+    view._vod_demux_last = None                      # real-clock walls
+
+    def arm(now, playing, raw_s, raw_moved, demux):
+        wd(now, playing, raw_s, DUR, raw_moved, demux)
+
+    # healthy flow: clock + demux both moving — must never arm
+    view._vid_s = 100.0
+    view._vod_rescues = 0
+    arm(T0, True, 100.0, True, 5_000_000)
+    arm(T0 + 120.0, True, 220.0, True, 9_000_000)
+    check("healthy stremio: no rescue after 2 min", not rescues)
+    # the Paw Patrol shape: clock ADVANCING, demux frozen 30s+
+    arm(T0 + 121.0, True, 221.0, True, 9_000_000)
+    arm(T0 + 152.0, True, 252.0, True, 9_000_000)
+    check("starved stremio (clock advancing, demux frozen) rescues "
+          "at pos-3: %s" % rescues,
+          bool(rescues) and rescues[-1] == ("stremio", 97.0))
+    # paused: an extended pause must never fire (user paused, stream idle)
+    del rescues[:]
+    view._vod_rescues = 0
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_demux_last = None
+    arm(T0, False, 100.0, False, 4_000_000)
+    arm(T0 + 3600.0, False, 100.0, False, 4_000_000)
+    arm(T0 + 7200.0, True, 100.5, True, 4_500_000)  # resumed + demuxing
+    check("paused/resumed stream: no rescue while healthy", not rescues)
+    # stats unavailable (-1): falls back to raw-only, never false-fires
+    del rescues[:]
+    view._vod_rescues = 0
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_demux_last = None
+    arm(T0, True, 100.0, True, -1)
+    arm(T0 + 60.0, True, 160.0, True, -1)
+    check("no stats + healthy clock: no rescue", not rescues)
+    # clock-frozen shape still rescued (the v1.4.8 Adventure Time case)
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_rescues = 0
+    arm(T0 + 1.0, True, 100.0, False, 4_000_000)
+    arm(T0 + 32.0, True, 100.0, False, 4_000_000)
+    check("frozen clock still rescues", len(rescues) == 1)
+    # near-end guard: stopping 5s before the end is natural
+    del rescues[:]
+    view._vod_rescues = 0
+    view._vid_s = DUR - 5.0
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_demux_last = None
+    arm(T0 + 1.0, True, DUR - 5.0, False, 4_000_000)
+    arm(T0 + 60.0, True, DUR - 5.0, False, 4_000_000)
+    check("near-end stop: no rescue", not rescues)
+    # cap: two rescues per media, then it gives up (no third call)
+    del rescues[:]
+    view._vid_s = 100.0
+    view._vod_rescues = 2
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_demux_last = None
+    arm(T0 + 1.0, True, 100.0, False, 4_000_000)
+    arm(T0 + 32.0, True, 100.0, False, 4_000_000)
+    check("rescue cap holds (2 per media)", not rescues)
+    # live TV stays outside the VOD watchdog
+    view.current = {"kind": "live", "title": "ch", "url": "u"}
+    view._vod_rescues = 0
+    view._vod_raw_wall = view._vod_demux_wall = T0
+    view._vod_demux_last = None
+    arm(T0 + 1.0, True, 100.0, False, 4_000_000)
+    arm(T0 + 60.0, True, 100.0, False, 4_000_000)
+    check("live TV: no VOD rescue", not rescues)
+    view.current = None
+    view.vlc = real_vlc
+
     view.stop()
     app.processEvents()
     print()

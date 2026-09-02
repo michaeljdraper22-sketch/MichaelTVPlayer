@@ -1103,6 +1103,143 @@ def main():
     check("mp4 ladder: all labeled non-English -> NO selection",
           m2._selected is None)
 
+    print("[10] provider death ride-through: transparent reopen + "
+          "bounded failure")
+    # The 2026-09-01/02 freeze class: the CDN kills the ONE long-lived
+    # streaming body mid-file (age cap / idle reap after a pause). The
+    # serve loop must reopen at the exact byte position so the client
+    # never sees a truncated body — and when the provider refuses to
+    # come back, fail LOUD and bounded instead of silently cutting.
+    import http.client as _hc
+    import logging as _logging
+
+    class _FlakyHandler(_ProviderHandler):
+        def do_GET(self):
+            srv = self.server
+            srv.gets += 1
+            blob = srv.blob
+            rng = self.headers.get("Range") or ""
+            a, b = 0, len(blob) - 1
+            if rng.startswith("bytes="):
+                spec = rng[len("bytes="):]
+                a_s, _, b_s = spec.partition("-")
+                if a_s:
+                    a = int(a_s)
+                if b_s:
+                    b = int(b_s)
+            length = b - a + 1
+            if srv.refuse:
+                srv.refusals += 1
+                self.send_response(503)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if (not srv.killed and srv.kill_after
+                    and a == 0 and length > srv.kill_after):
+                srv.killed = True
+                self.send_response(206)
+                self.send_header("Accept-Ranges", "bytes")
+                self.send_header("Content-Type", srv.ctype)
+                self.send_header("Content-Range",
+                                 f"bytes {a}-{b}/{len(blob)}")
+                self.send_header("Content-Length", str(length))
+                self.end_headers()
+                self.wfile.write(blob[a:a + srv.kill_after])
+                return          # mid-body close (the CDN age kill)
+            _ProviderHandler.do_GET(self)
+
+    class _FlakyProvider(ThreadingHTTPServer):
+        daemon_threads = True
+
+        def __init__(self, blob, ctype):
+            super().__init__(("127.0.0.1", 0), _FlakyHandler)
+            self.blob = blob
+            self.ctype = ctype
+            self.hits = 0            # _ProviderHandler.do_GET tallies it
+            self.kill_after = None
+            self.killed = False
+            self.refuse = False
+            self.gets = 0
+            self.refusals = 0
+
+    big = open(TAIL_MKV, "rb").read()          # ~4.7 MB MKV
+    logs = []
+    rec = _logging.getLogger("mtp")
+
+    class _Rec(_logging.Handler):
+        def emit(self, r):
+            logs.append(r.getMessage())
+
+    rec.addHandler(_Rec())
+    rec.setLevel(_logging.INFO)
+
+    # (a) one mid-body kill: the client receives the WHOLE file
+    prov_f = _FlakyProvider(big, "video/x-matroska")
+    prov_f.kill_after = 2_000_000
+    threading.Thread(target=prov_f.serve_forever, daemon=True).start()
+    relay_f = VodRelay()
+    local_f = relay_f.start(
+        f"http://127.0.0.1:{prov_f.server_address[1]}/big.mkv",
+        "MichaelTVPlayer/1.0")
+    check("flaky: relay started", local_f.startswith("http://127.0.0.1:"))
+    # wait out the async startup (head fetch + tail prefetch + acquire)
+    deadline = time.time() + 15
+    while time.time() < deadline and relay_f.cache_size == 0:
+        time.sleep(0.1)
+    with urllib.request.urlopen(local_f, timeout=60) as r:
+        body = r.read()
+    check("flaky: client received the WHOLE file through the kill "
+          f"({len(body)} of {len(big)} bytes)",
+          body == big)
+    check("flaky: provider actually killed the body once",
+          prov_f.killed and prov_f.gets >= 3)
+    check("flaky: reopen marked in the relay log",
+          any("reopen" in l.lower() for l in logs))
+    check("flaky: no premature cut in the log",
+          not any("cutting" in l.lower() for l in logs))
+    relay_f.stop()
+
+    # (b) kill, then the provider refuses for good: bounded retries,
+    # WARN, and the body is cut (the client sees a short body, not a
+    # silent freeze)
+    logs.clear()
+    prov_g = _FlakyProvider(big, "video/x-matroska")
+    prov_g.kill_after = 2_000_000
+    threading.Thread(target=prov_g.serve_forever, daemon=True).start()
+
+    class _RefuseAfterKill(_FlakyHandler):
+        def do_GET(self):
+            if self.server.killed and not self.server.refuse:
+                self.server.refuse = True
+            _FlakyHandler.do_GET(self)
+
+    prov_g.RequestHandlerClass = _RefuseAfterKill
+    relay_g = VodRelay()
+    local_g = relay_g.start(
+        f"http://127.0.0.1:{prov_g.server_address[1]}/big.mkv",
+        "MichaelTVPlayer/1.0")
+    deadline = time.time() + 15
+    while time.time() < deadline and relay_g.cache_size == 0:
+        time.sleep(0.1)
+    short = None
+    try:
+        with urllib.request.urlopen(local_g, timeout=60) as r:
+            short = r.read()
+    except (_hc.IncompleteRead, ConnectionError) as exc:
+        short = getattr(exc, "partial", b"")
+    check("refusing provider: body cut short (loud failure, "
+          f"{len(short or b'')} of {len(big)} bytes)",
+          short is not None and len(short) < len(big))
+    check("refusing provider: cut WARNed in the log",
+          any("cutting" in l.lower() for l in logs))
+    check("refusing provider: refusals bounded (3)",
+          prov_g.refusals == 3)
+    check("refusing provider: provider GETs bounded",
+          prov_g.gets <= 8)
+    relay_g.stop()
+    rec.handlers = [h for h in rec.handlers
+                    if not isinstance(h, _Rec)]
+
     print()
     if FAIL:
         print(f"FAILED {len(FAIL)}: {FAIL}")
