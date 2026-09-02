@@ -210,6 +210,39 @@ def clean_show_name(text: str) -> str:
     return re.sub(r"\s+", " ", name).strip(" -–—()[]{}.")
 
 
+_MOVIE_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+
+def clean_movie_name(text: str) -> str:
+    """Reduce a MOVIE file/torrent name to something the movie catalog
+    search likes: clean_show_name plus bracketed release tags [..],
+    (annotated) paren groups and '/' separators — dual-language release
+    names like 'Бешеные псы / Reservoir Dogs (1992) UHD BDRemux' search
+    far better without them."""
+    name = re.sub(r"[\[\(\{][^\[\]\(\)\{\}]*[\]\)\}]", " ", text or "")
+    name = clean_show_name(name)
+    name = re.sub(r"[\[\]\(\)\{\}/]+", " ", name)
+    return re.sub(r"\s+", " ", name).strip(" -–—")
+
+
+def _movie_queries(text: str) -> list:
+    """Searchable queries for a movie release name, best first: the head
+    before the release year (movie titles almost always sit left of it —
+    'Chinatown.1974.2160p.BluRay…' -> 'Chinatown'), then the fully
+    cleaned name ('[2ndfire]My_Neighbor_Totoro…' carries no year at
+    all)."""
+    queries = []
+    m = _MOVIE_YEAR_RE.search(text or "")
+    if m:
+        head = clean_movie_name(text[:m.start()])
+        if head:
+            queries.append(head)
+    full = clean_movie_name(text)
+    if full and full not in queries:
+        queries.append(full)
+    return queries
+
+
 def _scan_for_names(obj):
     """Collect string values under name-ish keys anywhere in a JSON blob
     (the streaming server's stats shape is not contractual)."""
@@ -419,44 +452,69 @@ def series_meta(imdb_id: str):
     return meta
 
 
-def search_series(name: str):
-    """Catalog search -> list of {id, name} (best first). One quiet
-    retry on a blip — Cinemeta occasionally reads slow."""
+def _catalog_search(catalog: str, name: str):
+    """Shared Cinemeta top/search (catalog = 'series' | 'movie') -> raw
+    metas list. One quiet retry on ANY hiccup — connection blips AND the
+    504 HTML error pages the search endpoint serves under load (seen
+    live on plain one-word queries, so a single-shot read gave up on
+    healthy names)."""
     if not name:
         return []
+    metas = []
     for attempt in (0, 1):
         try:
             resp = _session.get(
-                "%s/catalog/series/top/search=%s.json" % (CINEMETA,
-                                                          name[:60]),
+                "%s/catalog/%s/top/search=%s.json" % (CINEMETA, catalog,
+                                                      name[:60]),
                 timeout=20)
+            if resp.status_code != 200:
+                raise ValueError("http %d" % resp.status_code)
             metas = ((resp.json() or {}).get("metas")) or []
             break
-        except requests.RequestException as exc:
+        except Exception as exc:  # noqa: BLE001
             if not attempt:
                 time.sleep(1.0)
                 continue
-            log.warning("stremio: cinemeta search %r failed: %r", name, exc)
-            return []
-        except Exception as exc:  # noqa: BLE001
-            log.warning("stremio: cinemeta search %r failed: %r", name, exc)
-            return []
+            log.info("stremio: cinemeta %s search %r failed: %r",
+                     catalog, name, exc)
+    return metas
+
+
+def search_series(name: str):
+    """Catalog search -> list of {id, name} (best first)."""
     out = []
-    for m in metas:
+    for m in _catalog_search("series", name):
         if m.get("type") in (None, "series") and m.get("id") and \
                 m.get("name"):
             out.append({"id": str(m["id"]), "name": str(m["name"])})
     return out
 
 
-def find_series(name: str):
-    """Best (imdb_id, canonical_name) for a show name, or None. Results
-    must share a word with the query so a bad parse can't match a
-    completely unrelated show; release-group/site prefix spam (which the
-    cleaner can't know about) is handled by re-searching with leading
-    words progressively dropped. Single-word names get their one query
-    too (range floor of 1 — "Silo" silently never searched, which left
-    the episode buttons/autoplay dead on one-word-titled shows)."""
+def search_movies(name: str):
+    """Movie catalog search -> list of {id, name, year, poster} (best
+    first) — releaseInfo carries the year ('1992')."""
+    out = []
+    for m in _catalog_search("movie", name):
+        if m.get("type") in (None, "movie") and m.get("id") and \
+                m.get("name"):
+            ym = re.match(r"(?:19|20)\d{2}",
+                          str(m.get("releaseInfo") or m.get("year") or ""))
+            out.append({
+                "id": str(m["id"]), "name": str(m["name"]),
+                "year": ym.group(0) if ym else "",
+                "poster": str(m.get("poster") or ""),
+            })
+    return out
+
+
+def _find_catalog(search, name: str):
+    """Best word-overlapping catalog candidate for a release name, or
+    None. Results must share a word with the query so a bad parse can't
+    match a completely unrelated title; release-group/site prefix spam
+    (which the cleaner can't know about) is handled by re-searching with
+    leading words progressively dropped. Single-word names get their one
+    query too (range floor of 1 — "Silo" silently never searched, which
+    left the episode buttons/autoplay dead on one-word-titled shows)."""
     if not name:
         return None
     words = [w for w in re.split(r"\W+", name) if len(w) > 2]
@@ -465,12 +523,25 @@ def find_series(name: str):
         if not query:
             break
         wanted = {w for w in re.split(r"\W+", query.lower()) if len(w) > 2}
-        for cand in search_series(query):
-            cand_words = {w for w in re.split(r"\W+", cand["name"].lower())
-                          if len(w) > 2}
+        for cand in search(query):
+            cand_words = {w for w in re.split(r"\W+", str(
+                cand.get("name", "")).lower()) if len(w) > 2}
             if cand_words & wanted:
-                return cand["id"], cand["name"]
+                return cand
     return None
+
+
+def find_series(name: str):
+    """Best (imdb_id, canonical_name) for a show name, or None (matching
+    rules in _find_catalog)."""
+    hit = _find_catalog(search_series, name)
+    return (hit["id"], hit["name"]) if hit else None
+
+
+def find_movie(name: str):
+    """Best {id, name, year, poster} for a movie name, or None (matching
+    rules in _find_catalog)."""
+    return _find_catalog(search_movies, name)
 
 
 def _ordered_episodes(meta: dict, season: int):
@@ -594,16 +665,46 @@ def _stream_parts(stream: dict):
     return res, seeds, size_gb
 
 
-def best_stream(config, streams: list):
+def _cur_resolution(cur: dict) -> int:
+    """Resolution of the stream being watched, parsed from its file /
+    torrent name; 0 when neither carries a marker ("match" mode then
+    falls back to the 1080 default)."""
+    for key in ("file_name", "torrent_name"):
+        text = str((cur or {}).get(key) or "")
+        m = _RES_RE.search(text)
+        if m:
+            return int(m.group(1))
+        if _RES_ALIAS_RE.search(text):
+            return 2160
+    return 0
+
+
+def best_stream(config, streams: list, cur: dict = None):
     """Pick the stream to autoplay: playable sources only (a direct url,
-    or infoHash+fileIdx for the local server), preferred resolution
-    first, then seeders, with oversized rups demoted."""
+    or infoHash+fileIdx for the local server). Ranking, best first:
+    resolution preference (match current / auto 4K-first fall-down / a
+    fixed pick), then sane size (over stremio_size_demote_gb demoted,
+    never excluded), then addon priority (the stremio_addons order — the
+    same release on two addons goes to the preferred one), then
+    resolution and finally seeders as quiet tie-breaks — debrid cache
+    makes seed counts nearly meaningless, so they never override a
+    resolution choice."""
     if not streams:
         return None
-    try:
-        prefer = int(config.data.get("stremio_prefer_resolution", 1080))
-    except (TypeError, ValueError):
-        prefer = 1080
+    mode = config.stremio_resolution_pref
+    if mode == "match":
+        prefer, auto = _cur_resolution(cur) or 1080, False
+    elif mode == "auto":
+        prefer, auto = 0, True
+    else:
+        try:
+            prefer = int(mode)
+        except ValueError:
+            prefer = 1080
+        auto = False
+    size_max = config.stremio_size_demote_gb
+    addon_rank = {base: pos for pos, base
+                  in enumerate(_addon_bases(config))}
 
     def usable(s):
         if s.get("url"):
@@ -612,13 +713,17 @@ def best_stream(config, streams: list):
 
     def score(s):
         res, seeds, size_gb = _stream_parts(s)
-        # bucket 0 = exact preferred resolution, 1 = below it, 2 = above,
-        # 3 = unknown; then sane size, then seeders; resolution only as a
-        # tie-break (tuple sorts ascending, best first)
-        res_fit = 0 if res == prefer else (1 if 0 < res < prefer
-                                           else 2 if res else 3)
-        size_pen = 1 if size_gb > 25 else 0
-        return (res_fit, size_pen, -min(seeds, 500), -res)
+        # bucket 0 = the preferred resolution (auto mode: any known one),
+        # 1 = below the fixed target, 2 = above it, 3 = unknown; then
+        # sane size, then the preferred addon (unknown addons last)
+        if auto:
+            res_fit = 0 if res else 3
+        else:
+            res_fit = 0 if res == prefer else (1 if 0 < res < prefer
+                                               else 2 if res else 3)
+        size_pen = 1 if 0 < size_max < size_gb else 0
+        rank = addon_rank.get(s.get("_addon"), len(addon_rank))
+        return (res_fit, size_pen, rank, -res, -min(seeds, 500))
 
     ranked = sorted([s for s in streams if usable(s)], key=score)
     return ranked[0] if ranked else None
@@ -627,12 +732,42 @@ def best_stream(config, streams: list):
 # ---------------------------------------------------------------------------
 # identity + playables
 
+def _movie_identity(file_name: str, torrent_name: str):
+    """Identity for a handed-off MOVIE (no season/episode marker in
+    either name): the movie-catalog hit when the name resolves — with
+    imdb id, canonical name, year and poster for the now-playing banner
+    and the recents list — else a display-name-only partial so the
+    banner at least shows a cleaned title. (The "could not identify"
+    dead end was also a lie here: autoplay never applies to movies.)
+    None only when there is no usable name at all."""
+    raw = file_name or torrent_name
+    for query in _movie_queries(raw):
+        cand = find_movie(query)
+        if cand:
+            return {
+                "movie": True,
+                "stremio_imdb": cand["id"],
+                "movie_name": cand["name"],
+                "year": cand.get("year") or "",
+                "icon": cand.get("poster") or "",
+                "torrent_name": torrent_name,
+                "file_name": file_name,
+            }
+    cleaned = clean_movie_name(raw)
+    # a bare hash/number tail must not become the shown title
+    if cleaned and re.search(r"[A-Za-z]{4,}", cleaned):
+        return {"movie": True, "display_name": cleaned,
+                "torrent_name": torrent_name, "file_name": file_name}
+    return None
+
+
 def resolve_identity(url: str, server: StreamingServer):
     """Figure out what a handed-off URL is playing:
-    {series_imdb, series_name, season, episode, torrent_name, file_name}
-    or None. Torrent name <- streaming server stats <- public .torrent
-    cache; season/episode <- the episode file name, else the torrent name;
-    the show <- a Cinemeta search on the cleaned name."""
+    {stremio_imdb, series_name, season, episode, torrent_name, file_name}
+    for an episode, {movie: True, …} for a movie, or None. Torrent name <-
+    streaming server stats <- public .torrent cache; season/episode <- the
+    episode file name, else the torrent name; the show/movie <- a Cinemeta
+    search on the cleaned name."""
     parsed = parse_server_url(url)
     file_name, torrent_name = "", ""
     if parsed:
@@ -669,9 +804,16 @@ def resolve_identity(url: str, server: StreamingServer):
 
     se = parse_se(file_name) or parse_se(torrent_name)
     if not se:
-        log.info("stremio: no season/episode marker in %r / %r",
-                 file_name[:60], torrent_name[:60])
-        return None
+        # no marker anywhere: a MOVIE (the Stremio handoff's movie links
+        # look exactly like episode links minus the marker — every movie
+        # identity used to die here, leaving the banner at "could not
+        # identify"). Resolve it against the movie catalog instead.
+        ident = _movie_identity(file_name, torrent_name)
+        if not ident:
+            log.info("stremio: no season/episode marker and no usable "
+                     "movie name in %r / %r",
+                     file_name[:60], torrent_name[:60])
+        return ident
     hit = find_series(clean_show_name(file_name or torrent_name))
     if not hit:
         log.info("stremio: catalog search found no show for %r",
@@ -782,6 +924,8 @@ def prev_playable(config, cur: dict):
 
 
 def _adjacent_playable(config, cur: dict, step: int):
+    if cur.get("movie"):
+        return None      # an identified movie has no adjacent episode
     server = StreamingServer(
         (config.data.get("stremio_server") if config else None) or "")
 
@@ -808,7 +952,7 @@ def _adjacent_playable(config, cur: dict, step: int):
     s, e = nxt
 
     streams = addon_streams(config, imdb, s, e)
-    stream = best_stream(config, streams)
+    stream = best_stream(config, streams, cur)
     if not stream:
         log.info("stremio: no usable stream for %s S%02dE%02d "
                  "(%d candidates)", imdb, s, e, len(streams))

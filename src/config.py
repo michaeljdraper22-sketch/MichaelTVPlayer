@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "1.5.14"
+APP_VERSION = "1.5.15"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -35,17 +35,22 @@ SUBTITLE_DEFAULTS = {
     "prefer_bar": True,       # windowed letterbox: park subs in the black bar
 }
 
-# Profanity filter. Off by default (opt-in). Words are stored as a flat
-# [word, level] list so removals of defaults persist; level is one of
-# exact / partial / whole (see src.profanity).
+# Profanity filter. Defaults ported from the user's Advanced Profanity
+# Filter (Chrome) settings: filter ON, and subtitles show each word's
+# SUGGESTED SUBSTITUTE ("fuck" -> "freak") instead of asterisks. Words are
+# stored as a flat [word, level] or [word, level, substitute] list so
+# removals of defaults persist; level is one of exact / partial / whole
+# (see src.profanity).
 PROFANITY_DEFAULTS = {
-    "enabled": False,
-    "words": [],                # [] = the curated DEFAULT_WORDS list
+    "enabled": True,
+    "words": [],                # [] = the DEFAULT_WORDS list (APF port)
     "pad_before_ms": 120,       # mute starts N ms before the word
     "pad_after_ms": 250,        # mute ends N ms after the word
     "sync_ms": 0,               # + mute later, − mute earlier (track drift)
     "lead_ms": 1500,            # captions lag speech: mute EARLIER by this
     "whole_cue": False,         # True = mute the whole line, not just the word
+    "substitute_subtitles": True,   # subtitles show the substitute, not ***
+    "default_substitution": "censored",  # for words without their own sub
 }
 
 DEFAULTS = {
@@ -99,15 +104,24 @@ DEFAULTS = {
     "telemetry_last_sent": 0.0,    # epoch of the last uploaded report
     "telemetry_repo": "",          # "" = diagnostics.REPO
     # Stremio handoff (Settings > Stremio handoff…): addon URLs queried
-    # for next-episode streams (Torrentio-shaped /stream/series/… API),
-    # the local Stremio streaming server that turns torrents into HTTP,
-    # and the resolution preferred when picking a stream.
+    # for next-episode streams (Torrentio-shaped /stream/series/… API) —
+    # in priority order, the first line breaks ties — the local Stremio
+    # streaming server that turns torrents into HTTP, and how autoplay
+    # ranks streams: resolution preference (match current / auto
+    # fall-down / a fixed pick) and the size above which a stream is
+    # demoted, not excluded (0 = never demote).
     "stremio_addons": ["https://torrentio.strem.fun"],
     "stremio_server": "http://127.0.0.1:11470",
-    "stremio_prefer_resolution": 1080,
+    "stremio_resolution_pref": "1080",
+    "stremio_size_demote_gb": 25,
     "stremio_watch_downloads": True,   # auto-play Stremio's playlist.m3u
                                        # the moment it lands in Downloads
 }
+
+# valid stremio_resolution_pref values ("match" = same resolution as the
+# stream being watched, "auto" = 4K-first fall-down, rest = fixed target)
+_STREMIO_RES_PREFS = ("match", "auto", "2160", "1440", "1080", "720",
+                      "480")
 
 BUTTON_KEYS = (
     "back60", "back10", "play", "fwd10", "begin", "live", "rec",
@@ -133,13 +147,15 @@ class Config:
     def load(cls) -> "Config":
         path = _data_dir() / "settings.json"
         data = dict(DEFAULTS)
+        loaded = {}
         if path.exists():
             try:
                 loaded = json.loads(path.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    data.update(loaded)
+                if not isinstance(loaded, dict):
+                    loaded = {}
             except Exception:
-                pass
+                loaded = {}
+            data.update(loaded)
         # one-time migration: the old default size 0 (VLC "auto") became a
         # concrete number, so the setting starts somewhere tunable — 0/Auto
         # can still be chosen explicitly afterwards (marker stops this from
@@ -167,6 +183,41 @@ class Config:
             if isinstance(lt, int) and lt >= 3:
                 data["last_tab"] = lt + 1
             data["_catchup_tab_migrated"] = True
+        # one-time migration: autoplay stream picking grew from a single
+        # preferred-resolution int into full preferences (match current /
+        # auto fall-down / a fixed pick). 2160 and the legacy 0 both meant
+        # "no fixed target", so they land on auto; the stale old key left
+        # in settings.json is ignored from here on.
+        if not data.get("_stremio_res_migrated"):
+            if "stremio_resolution_pref" not in loaded \
+                    and "stremio_prefer_resolution" in loaded:
+                try:
+                    old = int(data["stremio_prefer_resolution"])
+                except (TypeError, ValueError):
+                    old = 1080
+                if old in (0, 2160):
+                    old = "auto"
+                pref = str(old)
+                data["stremio_resolution_pref"] = \
+                    pref if pref in _STREMIO_RES_PREFS else "1080"
+            data["_stremio_res_migrated"] = True
+        # one-time migration: the word list was ported from the user's
+        # Advanced Profanity Filter (Chrome) settings — 41 words, each with
+        # its suggested substitute, and subtitles now default to showing
+        # the substitute ("freak in the heck") instead of asterisks. The
+        # stored list is REPLACED (the user asked for the APF list to be
+        # THE word list); mute timing they tuned (pads, lead, sync) and
+        # the on/off state are kept.
+        if not data.get("_apf_words_migrated"):
+            from .profanity import DEFAULT_SUBSTITUTION, DEFAULT_WORDS
+            prof = data.get("profanity")
+            if not isinstance(prof, dict):
+                prof = {}
+            prof["words"] = [list(w) for w in DEFAULT_WORDS]
+            prof.setdefault("substitute_subtitles", True)
+            prof.setdefault("default_substitution", DEFAULT_SUBSTITUTION)
+            data["profanity"] = prof
+            data["_apf_words_migrated"] = True
         return cls(data, path)
 
     def save(self) -> None:
@@ -428,17 +479,21 @@ class Config:
         stored = self.data.get("profanity") or {}
         merged = dict(PROFANITY_DEFAULTS)
         for key in ("enabled", "pad_before_ms", "pad_after_ms", "sync_ms",
-                    "lead_ms", "whole_cue"):
+                    "lead_ms", "whole_cue", "substitute_subtitles",
+                    "default_substitution"):
             if key in stored:
                 merged[key] = stored[key]
         words = stored.get("words")
         if isinstance(words, list) and words:
             clean = []
             for w in words:
-                if isinstance(w, (list, tuple)) and len(w) == 2 \
+                if isinstance(w, (list, tuple)) and 2 <= len(w) <= 3 \
                         and str(w[0]).strip() \
                         and w[1] in ("exact", "partial", "whole"):
-                    clean.append([str(w[0]).strip().lower(), w[1]])
+                    item = [str(w[0]).strip().lower(), w[1]]
+                    if len(w) == 3:
+                        item.append(str(w[2] or ""))
+                    clean.append(item)
             merged["words"] = clean
         return merged
 
@@ -456,14 +511,23 @@ class Config:
         clean["lead_ms"] = max(0, min(10000,
                                       int(v.get("lead_ms", 1500))))
         clean["whole_cue"] = bool(v.get("whole_cue", False))
+        clean["substitute_subtitles"] = bool(
+            v.get("substitute_subtitles",
+                  PROFANITY_DEFAULTS["substitute_subtitles"]))
+        clean["default_substitution"] = \
+            str(v.get("default_substitution",
+                      PROFANITY_DEFAULTS["default_substitution"]) or "").strip()
         words = v.get("words")
         clean["words"] = []
         if isinstance(words, list):
             for w in words:
-                if isinstance(w, (list, tuple)) and len(w) == 2 \
+                if isinstance(w, (list, tuple)) and 2 <= len(w) <= 3 \
                         and str(w[0]).strip() \
                         and w[1] in ("exact", "partial", "whole"):
-                    clean["words"].append([str(w[0]).strip().lower(), w[1]])
+                    item = [str(w[0]).strip().lower(), w[1]]
+                    if len(w) == 3:
+                        item.append(str(w[2] or ""))
+                    clean["words"].append(item)
         self.data["profanity"] = clean
 
 
@@ -581,21 +645,31 @@ class Config:
             else DEFAULTS["stremio_server"]
 
     @property
-    def stremio_prefer_resolution(self) -> int:
-        try:
-            val = int(self.data.get("stremio_prefer_resolution", 1080))
-        except (TypeError, ValueError):
-            val = 1080
-        return val if val in (0, 480, 720, 1080, 1440, 2160) else 1080
+    def stremio_resolution_pref(self) -> str:
+        val = str(self.data.get("stremio_resolution_pref", "") or "").strip()
+        return val if val in _STREMIO_RES_PREFS else "1080"
 
-    @stremio_prefer_resolution.setter
-    def stremio_prefer_resolution(self, value: int) -> None:
+    @stremio_resolution_pref.setter
+    def stremio_resolution_pref(self, value: str) -> None:
+        val = str(value or "").strip()
+        self.data["stremio_resolution_pref"] = \
+            val if val in _STREMIO_RES_PREFS else "1080"
+
+    @property
+    def stremio_size_demote_gb(self) -> int:
+        try:
+            val = int(self.data.get("stremio_size_demote_gb", 25))
+        except (TypeError, ValueError):
+            val = 25
+        return max(0, min(500, val))
+
+    @stremio_size_demote_gb.setter
+    def stremio_size_demote_gb(self, value: int) -> None:
         try:
             val = int(value)
         except (TypeError, ValueError):
-            val = 1080
-        self.data["stremio_prefer_resolution"] = \
-            val if val in (0, 480, 720, 1080, 1440, 2160) else 1080
+            val = 25
+        self.data["stremio_size_demote_gb"] = max(0, min(500, val))
 
     @property
     def stremio_watch_downloads(self) -> bool:

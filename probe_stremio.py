@@ -195,6 +195,116 @@ def leg_a():
           best and best["infoHash"] == "b" * 40,
           best and best["title"][:20])
 
+    # autoplay stream preferences (Settings > Stremio handoff…):
+    # scoring order is resolution fit, size demotion, addon priority
+    # (the stremio_addons line order), then resolution and seeders as
+    # quiet tie-breaks — seeds used to sit ABOVE the resolution
+    # tie-break, so a 1000-seed 720p beat a 100-seed 1080p
+    A1, A2 = "https://addon-one.example", "https://addon-two.example"
+
+    def pref_cfg(res="1080", size=25, addons=(A1, A2)):
+        d = dict(DEFAULTS)
+        d["stremio_resolution_pref"] = res
+        d["stremio_size_demote_gb"] = size
+        d["stremio_addons"] = list(addons)
+        return Config(d, None)
+
+    def fs(name, title, addon):
+        return {"name": name, "title": title, "infoHash": name[0] * 40,
+                "fileIdx": 0, "_addon": addon}
+
+    s_a1 = fs("addon1-1080", "S01E01 1080p \U0001F464 5 \U0001F4BE 8.0 GB",
+              A1)
+    s_a2 = fs("addon2-1080",
+              "S01E01 1080p \U0001F464 300 \U0001F4BE 8.0 GB", A2)
+    best = stremio.best_stream(pref_cfg(), [s_a1, s_a2])
+    check("prefs: addon list order breaks ties",
+          best and best["name"] == "addon1-1080", best and best["name"])
+    best = stremio.best_stream(pref_cfg(addons=(A2, A1)), [s_a1, s_a2])
+    check("prefs: swapped addon order, other addon wins",
+          best and best["name"] == "addon2-1080")
+
+    lo_p1 = fs("addon1-720", "S01E01 720p \U0001F464 900 \U0001F4BE 3.0 GB",
+               A1)
+    hi_p2 = fs("addon2-1080",
+               "S01E01 1080p \U0001F464 3 \U0001F4BE 8.0 GB", A2)
+    best = stremio.best_stream(pref_cfg(), [lo_p1, hi_p2])
+    check("prefs: resolution beats provider priority",
+          best and best["name"] == "addon2-1080")
+
+    fat1 = fs("addon1-fat", "S01E01 1080p \U0001F464 900 \U0001F4BE 40 GB",
+              A1)
+    lean2 = fs("addon2-lean", "S01E01 1080p \U0001F464 3 \U0001F4BE 8 GB",
+               A2)
+    best = stremio.best_stream(pref_cfg(), [fat1, lean2])
+    check("prefs: size demotion beats provider priority",
+          best and best["name"] == "addon2-lean")
+    best = stremio.best_stream(pref_cfg(size=0), [fat1, lean2])
+    check("prefs: 'Never demote' keeps the preferred addon's 40 GB rip",
+          best and best["name"] == "addon1-fat")
+    best = stremio.best_stream(pref_cfg(size=50), [fat1, lean2])
+    check("prefs: 50 GB threshold keeps the 40 GB rip",
+          best and best["name"] == "addon1-fat")
+
+    p720 = fs("720-horde", "S01E01 720p \U0001F464 1000 \U0001F4BE 3 GB",
+              A1)
+    p1080 = fs("1080-thin", "S01E01 1080p \U0001F464 100 \U0001F4BE 8 GB",
+               A1)
+    best = stremio.best_stream(pref_cfg(res="auto", addons=(A1,)),
+                               [p720, p1080])
+    check("prefs: auto — 1080p beats a 1000-seed 720p (the old 'Best "
+          "available' let seeds outrank resolution)",
+          best and best["name"] == "1080-thin")
+    p4k = fs("2160-rare", "S01E01 2160p \U0001F464 2 \U0001F4BE 20 GB", A1)
+    best = stremio.best_stream(pref_cfg(res="auto", addons=(A1,)),
+                               [p720, p1080, p4k])
+    check("prefs: auto takes 4K when present",
+          best and best["name"] == "2160-rare")
+    best = stremio.best_stream(
+        pref_cfg(res="auto", addons=(A1,)),
+        [fs("4k-fatty", "S01E01 2160p \U0001F464 2 \U0001F4BE 60 GB", A1),
+         p1080])
+    check("prefs: auto + demote — a 60 GB 4K loses to an 8 GB 1080p",
+          best and best["name"] == "1080-thin")
+    best = stremio.best_stream(
+        pref_cfg(res="auto", addons=(A1,)),
+        [p1080, fs("markless", "S01E01 \U0001F464 5000 \U0001F4BE 8 GB",
+                   A1)])
+    check("prefs: auto ranks unknown resolution last",
+          best and best["name"] == "1080-thin")
+
+    match = pref_cfg(res="match", addons=(A1,))
+    best = stremio.best_stream(
+        match, [p720, p1080, p4k],
+        {"file_name": "Show.S01E02.2160p.WEB-DL.mkv", "torrent_name": ""})
+    check("prefs: match follows the current stream's 2160p",
+          best and best["name"] == "2160-rare")
+    best = stremio.best_stream(
+        match, [p720, p1080],
+        {"file_name": "Show.S01E02.720p.WEB-DL.mkv"})
+    check("prefs: match follows the current stream's 720p",
+          best and best["name"] == "720-horde")
+    best = stremio.best_stream(match, [p720, p1080],
+                               {"file_name": "episode.mkv"})
+    check("prefs: match falls back to 1080p when unparsable",
+          best and best["name"] == "1080-thin")
+    best = stremio.best_stream(
+        match, [p720, p1080, p4k],
+        {"torrent_name": "Show 4K HDR Complete"})
+    check("prefs: match reads the 4K alias from the torrent name",
+          best and best["name"] == "2160-rare")
+
+    n1 = fs("thin-1080", "S01E01 1080p \U0001F464 5 \U0001F4BE 8 GB", A1)
+    n2 = fs("fat-seeds", "S01E01 1080p \U0001F464 300 \U0001F4BE 8 GB", A1)
+    best = stremio.best_stream(pref_cfg(), [n1, n2])
+    check("prefs: seeders remain the final nudge among equals",
+          best and best["name"] == "fat-seeds")
+    off = fs("off-addon", "S01E01 1080p \U0001F464 500 \U0001F4BE 8 GB",
+             "https://elsewhere.example")
+    best = stremio.best_stream(pref_cfg(), [n2, off])
+    check("prefs: streams from unlisted addons rank last",
+          best and best["name"] == "fat-seeds")
+
     # end-of-media detection: state "ended" OR the tracked-position
     # fallback (VLC resets raw to 0 / stalls the state when a
     # network-relayed VOD finishes — the black-screen-at-credits bug)
@@ -290,6 +400,81 @@ def leg_a():
           nxt and nxt.get("title", ""))
     stremio.series_meta, stremio.addon_streams, stremio.StreamingServer \
         = saved
+
+    # settings migration: stremio_prefer_resolution (int) ->
+    # stremio_resolution_pref ("match"/"auto"/fixed pick); 2160 and the
+    # legacy 0 both meant "no fixed target", so they land on auto
+    import json
+    from pathlib import Path
+    mig = tempfile.mkdtemp(prefix="mtp_probe_mig_")
+    old_appdata = os.environ.get("APPDATA")
+    os.environ["APPDATA"] = mig
+    try:
+        cfgdir = Path(mig) / "MichaelTVPlayer"
+        cfgdir.mkdir(parents=True, exist_ok=True)
+        sfile = cfgdir / "settings.json"
+
+        def load_with(payload):
+            sfile.write_text(json.dumps(payload), encoding="utf-8")
+            return Config.load()
+
+        c = load_with({"stremio_prefer_resolution": 2160})
+        check("migration: 2160 -> auto",
+              c.stremio_resolution_pref == "auto",
+              c.stremio_resolution_pref)
+        c = load_with({"stremio_prefer_resolution": 720})
+        check("migration: 720 -> fixed 720",
+              c.stremio_resolution_pref == "720",
+              c.stremio_resolution_pref)
+        c = load_with({})
+        check("migration: fresh config defaults to 1080",
+              c.stremio_resolution_pref == "1080",
+              c.stremio_resolution_pref)
+        c = load_with({"stremio_prefer_resolution": 999})
+        check("migration: garbage value -> 1080",
+              c.stremio_resolution_pref == "1080",
+              c.stremio_resolution_pref)
+        c = load_with({"stremio_prefer_resolution": 0})
+        check("migration: legacy 0 -> auto",
+              c.stremio_resolution_pref == "auto",
+              c.stremio_resolution_pref)
+        c = load_with({"stremio_prefer_resolution": 1080,
+                       "stremio_resolution_pref": "match"})
+        check("migration: explicit new key never overridden",
+              c.stremio_resolution_pref == "match",
+              c.stremio_resolution_pref)
+    finally:
+        if old_appdata is not None:
+            os.environ["APPDATA"] = old_appdata
+
+    # prefs dialog round-trip: combos <-> config <-> disk (offscreen;
+    # no parent, so the live-watcher hook inside accept() is skipped)
+    from src.ui.stremio_dialog import StremioDialog
+    dpath = Path(tempfile.mkdtemp(prefix="mtp_probe_dlg_")) / "settings.json"
+    dcfg = Config(dict(DEFAULTS), dpath)
+    dlg = StremioDialog(dcfg, None)
+    check("dialog: resolution combo starts at the config's 1080p",
+          dlg.res_combo.currentData() == "1080",
+          dlg.res_combo.currentData())
+    check("dialog: size combo starts at the config's 25 GB",
+          dlg.size_combo.currentData() == 25,
+          dlg.size_combo.currentData())
+    dlg.res_combo.setCurrentIndex(dlg.res_combo.findData("match"))
+    dlg.size_combo.setCurrentIndex(dlg.size_combo.findData(50))
+    dlg.addons_edit.setPlainText(A2 + "\n" + A1)
+    dlg.accept()
+    check("dialog: accept persists match mode",
+          dcfg.stremio_resolution_pref == "match",
+          dcfg.stremio_resolution_pref)
+    check("dialog: accept persists the 50 GB demote threshold",
+          dcfg.stremio_size_demote_gb == 50, dcfg.stremio_size_demote_gb)
+    check("dialog: accept persists the addon priority order",
+          dcfg.stremio_addons == [A2, A1], dcfg.stremio_addons)
+    disk = json.loads(dpath.read_text(encoding="utf-8"))
+    check("dialog: preferences land on disk",
+          disk.get("stremio_resolution_pref") == "match"
+          and disk.get("stremio_size_demote_gb") == 50
+          and disk.get("stremio_addons") == [A2, A1])
 
 
 # ------------------------------------------------------------- [B] catalog

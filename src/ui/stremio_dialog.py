@@ -99,10 +99,12 @@ class StremioDialog(QtWidgets.QDialog):
         # ---- next-episode sources ------------------------------------
         lay.addWidget(QtWidgets.QLabel(
             "Stream addons for autoplay-next — paste each addon\u2019s "
-            "manifest URL from Stremio\u2019s Addons page (one per line). "
-            "Your configured Torrentio / Debridio instances carry their "
-            "debrid keys in the URL, so next episodes come back as "
-            "direct debrid links:"))
+            "manifest URL from Stremio\u2019s Addons page, one per line, "
+            "in priority order (line 1 is the preferred provider; the "
+            "rest are fallbacks and only serve ties your preferred "
+            "addons can\u2019t). Your configured Torrentio / Debridio "
+            "instances carry their debrid keys in the URL, so next "
+            "episodes come back as direct debrid links:"))
         self.addons_edit = QtWidgets.QPlainTextEdit()
         self.addons_edit.setPlaceholderText(
             "https://torrentio.strem.fun/manifest/\u2039your-config\u203a"
@@ -115,15 +117,34 @@ class StremioDialog(QtWidgets.QDialog):
         res_row = QtWidgets.QHBoxLayout()
         res_row.addWidget(QtWidgets.QLabel("Preferred resolution:"))
         self.res_combo = QtWidgets.QComboBox()
-        for label, val in (("Best available (2160p)", 2160),
-                           ("1440p", 1440), ("1080p", 1080),
-                           ("720p", 720), ("480p", 480)):
+        for label, val in (("Match current stream", "match"),
+                           ("Best available (4K \u2192 1080p \u2192 \u2026)",
+                            "auto"),
+                           ("2160p", "2160"), ("1440p", "1440"),
+                           ("1080p", "1080"), ("720p", "720"),
+                           ("480p", "480")):
             self.res_combo.addItem(label, val)
-        idx = self.res_combo.findData(config.stremio_prefer_resolution)
-        self.res_combo.setCurrentIndex(idx if idx >= 0 else 2)
+        idx = self.res_combo.findData(config.stremio_resolution_pref)
+        self.res_combo.setCurrentIndex(idx if idx >= 0 else 4)
         res_row.addWidget(self.res_combo)
         res_row.addStretch(1)
         lay.addLayout(res_row)
+
+        size_row = QtWidgets.QHBoxLayout()
+        size_row.addWidget(QtWidgets.QLabel("Demote streams larger than:"))
+        self.size_combo = QtWidgets.QComboBox()
+        for label, val in (("Never", 0), ("10 GB", 10), ("25 GB", 25),
+                           ("50 GB", 50), ("100 GB", 100)):
+            self.size_combo.addItem(label, val)
+        cur = config.stremio_size_demote_gb
+        idx = self.size_combo.findData(cur)
+        if idx < 0:                       # a hand-edited value: keep it
+            self.size_combo.addItem("%d GB" % cur, cur)
+            idx = self.size_combo.count() - 1
+        self.size_combo.setCurrentIndex(idx)
+        size_row.addWidget(self.size_combo)
+        size_row.addStretch(1)
+        lay.addLayout(size_row)
 
         srv_row = QtWidgets.QHBoxLayout()
         srv_row.addWidget(QtWidgets.QLabel(
@@ -260,8 +281,10 @@ class StremioDialog(QtWidgets.QDialog):
                   self.addons_edit.toPlainText().splitlines()
                   if line.strip()]
         self.config.stremio_addons = addons
-        self.config.stremio_prefer_resolution = \
-            self.res_combo.currentData() or 1080
+        self.config.stremio_resolution_pref = \
+            self.res_combo.currentData() or "1080"
+        self.config.stremio_size_demote_gb = \
+            self.size_combo.currentData() or 0
         self.config.stremio_server = self.srv_edit.text()
         self.config.stremio_watch_downloads = \
             self.watch_chk.isChecked()
