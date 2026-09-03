@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
-"""DVR buffer: record a live stream with VLC so you can rewind reliably.
+"""DVR recorder: the single provider connection for live TV.
 
-Uses a **headless libvlc player** (no window) to save the stream to a temp
-``buffer.ts`` file. The main player then plays either the live URL (normal) or
-that local file (rewind). Because the file is a regular local file, VLC can seek
-in it freely \u2014 rewind is just ``set_time``. ``stop()`` deletes the file.
+Uses a **headless libvlc player** (no window) to write the stream to a temp
+``buffer.ts`` file. The main player watches that local file a few seconds
+behind the write frontier (chase mode, see player_view._engage_chase);
+because it is a regular local file, VLC can seek in it freely — rewind is
+just ``set_time``. ``stop()`` deletes the file.
 """
 
 import logging
@@ -24,12 +25,10 @@ class VlcRecorder:
         self.network_caching = max(0, min(50000, int(network_caching)))
         self.file_path = None
         self.rec_path = None
-        self.start_time = None
         self._instance = None
         self._player = None
         self._media = None   # keep the python-vlc Media wrapper alive (GC bug)
         self._dir = None
-        self.keep_file = False   # kept for API compatibility
         self._size_check_t = 0.0
         self._last_size = 0
         self._shared_instance = instance
@@ -58,11 +57,9 @@ class VlcRecorder:
         if buffer_path:
             self.file_path = buffer_path
             self._dir = os.path.dirname(buffer_path) or None
-            self.keep_file = False
         else:
             self._dir = tempfile.mkdtemp(prefix="mtp_dvr_")
             self.file_path = os.path.join(self._dir, "buffer.ts")
-            self.keep_file = False
         self.rec_path = output_path or None
         try:
             log.info("dvr.start buffer=%s reuse=%s shared_vlc=%s rec=%s",
@@ -70,7 +67,6 @@ class VlcRecorder:
                      self._shared_instance is not None, self.rec_path)
         except Exception:
             pass
-        self.start_time = time.time()
         self._size_check_t = 0.0
         self._last_size = 0
 
@@ -141,11 +137,6 @@ class VlcRecorder:
             self._last_size = new_size
         return self.file_path if self._last_size > 50000 else None
 
-    def elapsed_seconds(self) -> float:
-        if not self.start_time:
-            return 0.0
-        return time.time() - self.start_time
-
     def stop(self, delete: bool = True):
         """Stop recording. ``delete=False`` keeps the buffer file (used when the
         recorder is about to be restarted onto the same buffer).
@@ -181,11 +172,10 @@ class VlcRecorder:
             self._player = None
         self._media = None
         self._instance = None
-        self.start_time = None
         # 4) delete the temp dir only now — VLC may still hold the file open
         #    for a moment after stop() on Windows, so retry 3x / 0.5 s apart
         #    and simply log a final failure instead of raising.
-        if delete and self._dir and os.path.isdir(self._dir) and not self.keep_file:
+        if delete and self._dir and os.path.isdir(self._dir):
             d = self._dir
             for attempt in (1, 2, 3):
                 try:

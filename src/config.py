@@ -65,7 +65,6 @@ DEFAULTS = {
     # panels that don't care and want a faster startup. Applies after a
     # restart (Settings > Provider connection speed).
     "api_concurrency": 2,
-    "theme": "dark",
     "enabled_countries": [],      # selected country/group tokens (Live TV)
     "countries_configured": False,
     "vod_enabled_countries": [],  # Movies country/group filter
@@ -82,7 +81,6 @@ DEFAULTS = {
     "recents": [],                # list of "playable" dicts (most-recent first)
     "custom_channels": [],        # user-defined stream URLs
     "last_channel": None,
-    "auto_play_last": False,
     "window_geometry": None,      # [x, y, w, h]
     "window_state": None,         # "normal" | "maximized" | "fullscreen"
     "splitter_sizes": [460, 880],
@@ -339,14 +337,6 @@ class Config:
     @api_concurrency.setter
     def api_concurrency(self, value: int) -> None:
         self.data["api_concurrency"] = max(1, min(16, int(value)))
-
-    @property
-    def theme(self) -> str:
-        return self.data.get("theme", "dark")
-
-    @theme.setter
-    def theme(self, value: str) -> None:
-        self.data["theme"] = value
 
     @property
     def enabled_countries(self) -> list:

@@ -949,9 +949,7 @@ class CustomTab(PlayableListWidget):
         super().__init__(config, lambda: config.custom_channels, can_remove=True, parent=parent)
 
     def _remove(self, playable):
-        chans = self.config.data.setdefault("custom_channels", [])
-        chans[:] = [c for c in chans if c.get("fav_key") != playable.get("fav_key")]
-        self.config.save()
+        self.config.remove_custom_channel(playable.get("fav_key"))
         self.refresh()
 
     def add_channel_dialog(self, parent=None):
