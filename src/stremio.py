@@ -183,6 +183,26 @@ def parse_server_url(url: str):
     return m.group("hash").lower(), int(m.group("idx") or 0)
 
 
+def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
+    """Cheap liveness check for a handed-off debrid link: a 1-byte range
+    GET that must produce ANY 2xx within ``timeout_s`` (redirects
+    followed, body never read — headers only). True = the link serves;
+    False = the 502 / hang / refused shapes that leave VLC dead on
+    arrival. The caller treats False as "switch to the local-server
+    torrent now" instead of waiting out the 10 s guard (live-measured
+    2026-09-02/03: every debrid handoff on record was one of these
+    shapes, paying the full 10 s or worse)."""
+    try:
+        resp = _session.get(url, timeout=timeout_s, stream=True,
+                            headers={"Range": "bytes=0-0"})
+        try:
+            return 200 <= resp.status_code < 300
+        finally:
+            resp.close()
+    except requests.RequestException:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # naming / season-episode parsing
 

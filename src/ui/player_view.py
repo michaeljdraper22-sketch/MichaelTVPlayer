@@ -807,6 +807,10 @@ class PlayerView(QtWidgets.QWidget):
         # debrid link itself refuses to start
         self._fb_runner = AsyncRunner()
         self._fb_runner.finished.connect(self._on_stremio_fallback)
+        # fast dead-debrid detector (see _kick_stremio_probe): a 1-byte
+        # range GET raced against VLC's own open of the same URL
+        self._probe_runner = AsyncRunner()
+        self._probe_runner.finished.connect(self._on_stremio_probe)
         # online-subtitle search+download (caption dead-end rescue) — its
         # own runner: _stremio_runner's finished is wired to identity, and
         # the fetch must never queue behind (or clobber) an identity lookup
@@ -1935,6 +1939,7 @@ class PlayerView(QtWidgets.QWidget):
                     self._stremio_fallback_done = False
                     self._stremio_guard_t0 = now_s()
                     self._stremio_guard.start()
+                    self._kick_stremio_probe(url)
             except Exception:  # noqa: BLE001
                 pass
         # Subtitle choice is sticky by language across channels: _enforce_spu (via the
@@ -2136,6 +2141,52 @@ class PlayerView(QtWidgets.QWidget):
 
     # ---- stremio: debrid-stall fallback (local-server torrent) ----
 
+    def _kick_stremio_probe(self, url):
+        """Race a 1-byte range GET against VLC's own open of the same
+        debrid link. VLC's failure mode here is silent — a dead torbox
+        resolve link parks it in 'ended' (the 10 s guard eventually
+        catches that) or in 'opening' forever (the guard used to miss
+        that shape entirely; live-seen 2026-09-02 16:01, 55 s dead screen
+        until a manual reload). The probe sees the 502/hang directly and
+        switches after ~1-3 s; a healthy link answers fast and changes
+        nothing (the guard stays armed as the backstop)."""
+        base = (self.current or {}).get("fav_key")
+        t0 = now_s()
+
+        def _work():
+            from .. import stremio
+            return base, stremio.probe_debrid(url, timeout_s=3.0), \
+                now_s() - t0
+        self._probe_runner.run(_work)
+
+    def _on_stremio_probe(self, result):
+        ok, val = result
+        if ok != "ok" or self._closing:
+            return
+        base, alive, took_s = val if isinstance(val, tuple) \
+            else (None, True, 0.0)
+        cur = self.current or {}
+        if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
+            return          # the user moved on while the probe ran
+        if alive or self._stremio_fallback_done:
+            return          # link healthy — the 10 s guard stays the backstop
+        # The probe saw no bytes, but a fast debrid start can still beat
+        # it home: only switch when VLC shows no real playback either
+        # (same alive rule the guard uses).
+        try:
+            state = self.vlc.state_name() or ""
+            if state in ("playing", "paused") or self._vid_s > 5.0:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            log.info("stremio: debrid probe dead after %.1fs — falling "
+                     "back to the local-server torrent early", took_s)
+        except Exception:
+            pass
+        self._stremio_guard.stop()
+        self._begin_stremio_fallback()
+
     def _stremio_guard_tick(self):
         """Every 2 s after a debrid handoff opens: if VLC still hasn't
         started after ~10 s the debrid link is dead (live-seen: transient
@@ -2148,17 +2199,17 @@ class PlayerView(QtWidgets.QWidget):
             self._stremio_guard.stop()
             return
         try:
+            # alive needs REAL playback: state playing/paused, or the
+            # tracked video clock advanced. is_playing() used to sit in
+            # this test too, but it also reads True while VLC is merely
+            # OPENING a dead link (live-seen 2026-09-02 16:01: the guard
+            # disarmed itself on the first tick and the hung open ran
+            # 55 s until a manual reload). A stream that played >5 s and
+            # then stalled/ended is alive by this rule too — restarting
+            # it from zero is the end-of-media / stall paths' territory,
+            # never this guard's.
             state = self.vlc.state_name() or ""
-            alive = self.vlc.is_playing() or state in ("playing", "paused")
-            if not alive and state in ("ended", "stopped", "error"):
-                # A link that DIED can wear these states too: a dead-on-
-                # arrival debrid URL (live-seen 2026-09-02 16:01: torrentio
-                # resolve 502s) puts VLC straight into "ended" having played
-                # nothing — counting that as alive disarmed this guard and
-                # the fallback never fired (55 s dead screen, manual reload).
-                # Only a state reached AFTER real playback counts as alive;
-                # the end-of-media / stall paths own that territory.
-                alive = self._vid_s > 5.0
+            alive = state in ("playing", "paused") or self._vid_s > 5.0
         except Exception:  # noqa: BLE001
             alive = False
         if alive:
