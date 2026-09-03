@@ -258,7 +258,8 @@ class VLCPlayer:
                 record_path: str = None,
                 append: bool = False, timeshift: bool = None,
                 start_wait_s: float = 20.0,
-                sub_file: str = None) -> None:
+                sub_file: str = None,
+                network_caching_ms: int = 0) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
@@ -291,6 +292,24 @@ class VLCPlayer:
             self.media.add_option(f"http-user-agent={USER_AGENT}")
         except Exception:
             pass
+        if network_caching_ms > 0:
+            try:
+                # Per-media read-ahead depth, overriding the instance-wide
+                # --network-caching for this one input (the same mechanism
+                # as per-entry :network-caching in .m3u playlists). VOD
+                # gets a deep buffer so a CDN dip is absorbed invisibly;
+                # live TV keeps the instance value — its distance from the
+                # live edge must not grow. This is a fill-behind target,
+                # not a gate: playback starts on the first decoded frames
+                # while the cache fills during playback.
+                self.media.add_option(
+                    f":network-caching={int(network_caching_ms)}")
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    log.warning("play_at: add network-caching failed: %r",
+                                exc)
+                except Exception:
+                    pass
         if start_seconds > 0:
             try:
                 self.media.add_option(f":start-time={float(start_seconds):.3f}")
@@ -402,20 +421,10 @@ class VLCPlayer:
 
     def play(self, url: str, timeshift: bool = None,
              start_seconds: float = 0.0, start_wait_s: float = 20.0,
-             sub_file: str = None) -> None:
+             sub_file: str = None, network_caching_ms: int = 0) -> None:
         self.play_at(url, start_seconds, timeshift=timeshift,
-                     start_wait_s=start_wait_s, sub_file=sub_file)
-
-    def play_and_record(self, url: str, path: str, append: bool = False) -> None:
-        """Backwards-compatible wrapper around play_at()."""
-        self.play_at(url, 0.0, record_path=path, append=append)
-
-    def play_outputs(self, url: str, record_path: str = None,
-                     append: bool = False) -> None:
-        """Watch ``url`` on the display while forking extra outputs from the
-        SAME single connection (kept for API compatibility — everything
-        funnels into play_at now)."""
-        self.play_at(url, 0.0, record_path=record_path, append=append)
+                     start_wait_s=start_wait_s, sub_file=sub_file,
+                     network_caching_ms=network_caching_ms)
 
     def stop(self) -> None:
         """Stop playback. Never raises, never deadlocks the UI thread.
@@ -660,6 +669,24 @@ class VLCPlayer:
         except Exception:
             return -1
 
+    def displayed_pictures(self) -> int:
+        """Cumulative displayed video pictures for the current media
+        (VLC input stats; -1 when unavailable — the caller treats that
+        as no signal, never as frozen). The VOD watchdog's third
+        signal: a starved-but-trickling input keeps VLC 'playing' with
+        its CLOCK and demux counters creeping while the video output
+        holds the last picture — 'video stuck, time bar rolling'."""
+        try:
+            m = self.player.get_media()
+            if m is None:
+                return -1
+            stats = vlc.MediaStats()
+            if not m.get_stats(stats):
+                return -1
+            return stats.displayed_pictures
+        except Exception:
+            return -1
+
     def seek_ms(self, delta_ms: int) -> int:
         """Relative seek. Returns the clamped target ms (the caller's
         position tracker rebases on it — VLC's own clock only catches up
@@ -723,12 +750,6 @@ class VLCPlayer:
             return self.player.audio_get_volume()
         except Exception:
             return self._volume
-
-    def toggle_mute(self) -> None:
-        """Absolute toggle off the DESIRED state — never off what VLC
-        happens to report mid-swap (a polled flip during a player swap
-        desynced the two and re-muted behind the user's back)."""
-        self.set_mute(not self._mute)
 
     def set_mute(self, on: bool) -> None:
         self._mute = bool(on)

@@ -851,7 +851,8 @@ def main():
             self.pos_calls.append(frac)
             self._t = int(frac * 1800000)
 
-        def play(self, url, timeshift=None, start_seconds=0.0):
+        def play(self, url, timeshift=None, start_seconds=0.0,
+                 network_caching_ms=0):
             self.plays.append(url)
 
         def is_playing(self):

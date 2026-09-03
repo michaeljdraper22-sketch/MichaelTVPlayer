@@ -191,7 +191,7 @@ class _ProviderStream:
                  at, len(data), dt)
         self.offset += len(data)
         if self.appendable:
-            self.relay.append_cache(data)
+            self.relay.append_cache(self, data)
         return data
 
     def close(self):
@@ -441,9 +441,11 @@ class VodRelay(QtCore.QObject):
             self._server = None
         self._kill_ffmpeg()
         with self._lock:
-            if self._stream is not None:
-                self._stream.close()
-                self._stream = None
+            st = self._stream
+            if st is not None:
+                with self._cache_lock:
+                    self._stream = None
+                st.close()
         if self._cache is not None:
             try:
                 self._cache.close()
@@ -565,6 +567,12 @@ class VodRelay(QtCore.QObject):
             if st is not None:
                 tlog("acquire @%d: replace (old @%d dead=%s owned=%s)",
                      offset, st.offset, st.dead, st.owner is not None)
+                # detach the slot BEFORE closing: an in-flight read on the
+                # old stream must find the identity check in append_cache
+                # failing, or its bytes would land in the rebased window
+                # (lock order _lock -> _cache_lock, as everywhere)
+                with self._cache_lock:
+                    self._stream = None
                 st.close()
             if st is None or st.offset != offset:
                 self._rebase(offset)
@@ -599,7 +607,8 @@ class VodRelay(QtCore.QObject):
                 return None
             if st is not None:
                 st.owner = owner
-            self._stream = st
+            with self._cache_lock:
+                self._stream = st
             return st
 
     def _rebase(self, offset: int):
@@ -643,11 +652,24 @@ class VodRelay(QtCore.QObject):
             if st.owner == owner:
                 st.owner = None
 
-    def append_cache(self, data: bytes):
-        if self._cache is None:
+    def append_cache(self, st, data: bytes):
+        """Append one provider read into the cache window — but only if
+        ``st`` still owns the provider slot. A sibling handler's
+        _acquire can close+replace the stream (and _rebase the window)
+        while this read was in flight; appending those bytes into the
+        NEW window would store them at the wrong file offset (a
+        byte-shifted cache — every later cache hit serves garbage to
+        VLC's demuxer). _acquire clears the slot under this SAME lock
+        before closing/rebasing, so the identity check and the write
+        are one atomic step: the append either lands in the old window
+        (which the rebase then truncates away) or it doesn't land at
+        all."""
+        if self._cache is None or not data:
             return
         try:
             with self._cache_lock:
+                if self._stream is not st:
+                    return
                 self._cache.seek(0, os.SEEK_END)
                 self._cache.write(data)
                 self._cache.flush()

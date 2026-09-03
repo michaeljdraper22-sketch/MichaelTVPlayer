@@ -165,6 +165,14 @@ _CC_ANCHOR_ALPHA = 0.50
 _CC_SYNC_TOL_S = 2.0        # |raw delta - rate x wall delta| accepted as a nudge
 _CC_STALL_FREEZE_S = 6.0    # raw frozen this long while "playing" = underrun stall
 _CC_REBASE_S = 4.0          # anchor correction beyond this snaps (no EWMA crawl)
+# VOD read-ahead depth for series/movies/Stremio playback (2026-09-03
+# Elite Force diagnosis: a 4K HEVC episode needs ~35 Mbps and the CDN
+# episodically collapses to a ~300 KB/s trickle — VLC's 1.5 s default
+# cache drained instantly, garbling/freezing the picture). 15 s of
+# read-ahead absorbs short dips invisibly; the stall watchdog's new
+# video-starvation trigger reloads past the sustained ones. Never below
+# the user's global network_caching setting when they raise it.
+_VOD_READAHEAD_MS = 15000
 # WP3 robust anchor-snap: a large gap alone is NOT snap evidence — the
 # 2026-08-21 corpus showed most >4 s snaps were single-batch noise spikes
 # round-tripping within 20 s (35-50 per session), each slamming the whole
@@ -684,6 +692,10 @@ class PlayerView(QtWidgets.QWidget):
         #                              # grew (starvation — the clock can
         #                              # keep ADVANCING on a cut body)
         self._vod_demux_last = None   # last seen cumulative demux bytes
+        self._vod_pic_win_t = 0.0     # picture-rate window: wall time it
+        #                              # opened (video-starvation trigger)
+        self._vod_pic_win_b = None    # ... and displayed-pictures count at
+        #                              # the window open (None = no signal)
         self._vod_rescues = 0         # rescues this media (cap: 2)
         self._cap_relay_gen = 0       # session the attached relay belongs
         self._relay_start_offset = 0  # byte offset for the NEXT relay start
@@ -1469,16 +1481,24 @@ class PlayerView(QtWidgets.QWidget):
     # ADVANCING while no frame decodes — so cumulative demux bytes are
     # the second trigger.
     _VOD_FREEZE_S = 30.0     # clock or demux frozen this long = rescue
+    _VOD_PIC_WIN_S = 15.0    # displayed-pictures rate window (see below)
+    _VOD_PIC_MIN_FPS = 8.0   # below this average display rate = starved
+    #                          # (content is 23.9-30 fps; a third of the
+    #                          # slowest is unreachably low for healthy
+    #                          # playback, and 0 fps — the stuck picture —
+    #                          # hits it immediately once the window closes)
     _VOD_MAX_RESCUES = 2     # then give up (logged at ERROR = auto-report)
 
     def _vod_stall_watchdog(self, now, playing, raw_s, dur_s, raw_moved,
-                            demux_b=-1):
+                            demux_b=-1, pics=-1):
         if (self._closing or self._live_paused or self._seeking
                 or not self.current
                 or self.current.get("kind") not in ("series", "movie",
                                                     "vod", "stremio")):
             self._vod_raw_wall = now
             self._vod_demux_wall = now
+            self._vod_pic_win_t = now
+            self._vod_pic_win_b = None
             return
         demux_known = demux_b is not None and demux_b > 0
         demux_moved = False
@@ -1490,11 +1510,38 @@ class PlayerView(QtWidgets.QWidget):
             self._vod_demux_last = demux_b
         else:
             self._vod_demux_wall = now   # no stats this tick — can't judge
+        # Video-starvation trigger: the trickle shape the frozen-clock and
+        # frozen-demux tests are blind to — VLC stays 'playing', its clock
+        # keeps rolling and demux bytes keep creeping (audio survives a
+        # trickle; 2026-09-03 Elite Force: provider cut every ~260 KB yet
+        # ~300 KB/s kept both counters alive) while the vout holds the
+        # last picture. Measured as the average DISPLAYED-PICTURE rate over
+        # a 15 s window, so a VBR container's quiet scenes can't false-fire
+        # (display rate is time-based, not byte-based).
+        pic_known = pics is not None and pics >= 0
+        video_starved = False
+        if pic_known:
+            if self._vod_pic_win_b is not None \
+                    and now - self._vod_pic_win_t >= self._VOD_PIC_WIN_S:
+                # window just closed — measure it BEFORE reopening it
+                fps = (pics - self._vod_pic_win_b) \
+                    / (now - self._vod_pic_win_t)
+                if fps < self._VOD_PIC_MIN_FPS:
+                    video_starved = True
+            if self._vod_pic_win_b is None \
+                    or now - self._vod_pic_win_t >= self._VOD_PIC_WIN_S:
+                self._vod_pic_win_t = now
+                self._vod_pic_win_b = pics
+        else:
+            self._vod_pic_win_t = now   # no stats this tick — can't judge
+            self._vod_pic_win_b = None
         if raw_moved:
             self._vod_raw_wall = now
         if not playing or self._vid_s >= dur_s - self._CU_END_MARGIN_S:
             self._vod_raw_wall = now   # near-end/natural stop isn't a stall
             self._vod_demux_wall = now
+            self._vod_pic_win_t = now
+            self._vod_pic_win_b = None
             return
         if self._vod_raw_wall <= 0.0:
             self._vod_raw_wall = now   # never armed (pre-play_media tick)
@@ -1503,10 +1550,12 @@ class PlayerView(QtWidgets.QWidget):
         clock_frozen = now - self._vod_raw_wall >= self._VOD_FREEZE_S
         starved = (demux_known and not demux_moved
                    and now - self._vod_demux_wall >= self._VOD_FREEZE_S)
-        if not (clock_frozen or starved):
+        if not (clock_frozen or starved or video_starved):
             return
         self._vod_raw_wall = now
         self._vod_demux_wall = now
+        self._vod_pic_win_t = now
+        self._vod_pic_win_b = None
         cur = dict(self.current)
         pos_s = max(0.0, self._vid_s)
         from .. import feedback
@@ -1517,10 +1566,11 @@ class PlayerView(QtWidgets.QWidget):
                       cur.get("title"))
             return
         self._vod_rescues += 1
+        why = ("video starved" if video_starved
+               else "demux starved" if starved and not clock_frozen
+               else "clock frozen")
         log.error("VOD stall rescue %d: %s at %.0fs — reopening "
-                  "'%s'", self._vod_rescues,
-                  "demux starved" if starved and not clock_frozen
-                  else "clock frozen", pos_s, cur.get("title"))
+                  "'%s'", self._vod_rescues, why, pos_s, cur.get("title"))
         feedback.crumb("VOD stall rescue at %.0fs: %r"
                        % (pos_s, cur.get("title")))
         # cap the resume position a little before the freeze point so the
@@ -1569,6 +1619,7 @@ class PlayerView(QtWidgets.QWidget):
             # of the two families — see XtreamClient.timeshift_url).
             # Flip legacy/modern and replay from scratch via the relay.
             try:
+                self.client.flip_timeshift_form()
                 dur_min = max(1, math.ceil(
                     (cur.get("utc_end", 0) - cur.get("utc_start", 0))
                     / 60.0)) or 60
@@ -1920,6 +1971,8 @@ class PlayerView(QtWidgets.QWidget):
         self._vod_raw_wall = now_s()
         self._vod_demux_wall = now_s()
         self._vod_demux_last = None
+        self._vod_pic_win_t = now_s()
+        self._vod_pic_win_b = None
         self._last_raw = None
         self._raw_change_wall = 0.0
         self._video_wh = (0, 0)   # next media's size is unknown until the
@@ -1954,10 +2007,21 @@ class PlayerView(QtWidgets.QWidget):
             # (head prefetched separately; VLC's own seek then drives the
             # main provider stream — see VodRelay.start).
             self._relay_start_offset = 1 if start_at > 3.0 else 0
+            # VOD read-ahead: a per-media network-caching of 15 s (never
+            # less than the user's global setting) makes VLC pull that much
+            # of the file ahead of playback — a CDN dip is absorbed without
+            # a single frozen frame, and when the splitter relay is in the
+            # path its cache window rides the same pulls (the read-ahead is
+            # disk-buffered for free). Fill-behind, not a gate: the first
+            # frames play while the buffer builds. Live TV keeps the
+            # instance value (distance to the live edge must not grow).
+            nc = max(_VOD_READAHEAD_MS,
+                     int(getattr(self.config, "network_caching", 0) or 0))
             self.vlc.play(self._effective_url(url, kind),
                           timeshift=False, start_seconds=start_at,
                           start_wait_s=60.0 if kind == "stremio" else 20.0,
-                          sub_file=playable.get("sub_file") or None)
+                          sub_file=playable.get("sub_file") or None,
+                          network_caching_ms=nc)
         self._poke_audio()
         self._poke_rate()
         self._wake()
@@ -2873,9 +2937,6 @@ class PlayerView(QtWidgets.QWidget):
 
     def toggle_pause(self):
         self._toggle_pause()
-
-    def seek_relative(self, ms):
-        self._seek_ms(ms)
 
     def _frontier_s(self) -> float:
         """Seconds of CONFIRMED content currently in the chase buffer.
@@ -5079,9 +5140,13 @@ class PlayerView(QtWidgets.QWidget):
                     demux = self.vlc.demuxed_bytes()
                 except Exception:      # stub players / binding gaps —
                     demux = -1         # starvation falls back to raw-only
+                try:
+                    pics = self.vlc.displayed_pictures()
+                except Exception:      # same stub/binding gaps
+                    pics = -1
                 self._vod_stall_watchdog(now, playing, raw_s,
                                          length / 1000.0, raw_moved,
-                                         demux)
+                                         demux, pics)
             self._maybe_autoplay_next(playing, length, raw)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None

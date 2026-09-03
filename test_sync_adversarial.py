@@ -414,7 +414,8 @@ class FakeVLC:
     def apply_scale(self, w, h):
         pass
 
-    def play(self, url, timeshift=False, start_seconds=0.0):
+    def play(self, url, timeshift=False, start_seconds=0.0,
+             network_caching_ms=0):
         pass
 
 
