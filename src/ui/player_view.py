@@ -1304,12 +1304,30 @@ class PlayerView(QtWidgets.QWidget):
             self.ctl.move(g.left() + (g.width() - w) // 2,
                           g.bottom() - h - 10)
             self.ctl.raise_()
-        # DVR start-up pill: centered on the video
+        # DVR start-up pill: centered on the video — except download
+        # progress, which anchors just above the download button it came
+        # from (the VOD/Stremio button, or the gold window button on
+        # catch-up) so a running download never parks in the middle of
+        # the picture. The bar's geometry survives its auto-hide, so the
+        # pill keeps that spot while the controls sleep.
         if self._dvr_status.isVisible():
             ss = self._dvr_status.sizeHint()
             self._dvr_status.resize(ss)
-            self._dvr_status.move(g.left() + (g.width() - ss.width()) // 2,
-                                  g.top() + (g.height() - ss.height()) // 2)
+            if self._dvr_status.text().startswith("Download"):
+                btn = self.btn_win if self._is_catchup() else self.btn_dl
+                if btn.isHidden():     # compact bar dropped the button
+                    bx = self.ctl.x() + self.ctl.width() // 2
+                else:
+                    bx = btn.mapTo(self.overlay,
+                                   btn.rect().center()).x()
+                self._dvr_status.move(
+                    g.left() + max(0, min(g.width() - ss.width(),
+                                          bx - g.left() - ss.width() // 2)),
+                    max(g.top(), self.ctl.y() - ss.height() - 6))
+            else:
+                self._dvr_status.move(
+                    g.left() + (g.width() - ss.width()) // 2,
+                    g.top() + (g.height() - ss.height()) // 2)
             self._dvr_status.raise_()
         # caption overlay: anchored to the DISPLAYED picture — the rect the
         # video paints in, letterboxed under fit / full surface under crop
