@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 from PyQt5.QtTest import QTest  # noqa: E402
 
-from src.config import BUTTON_KEYS, Config  # noqa: E402
+from src.config import Config  # noqa: E402
 from src.ui.player_view import PlayerView, _SPEEDS  # noqa: E402
 
 PASS = []
@@ -59,10 +59,7 @@ def main():
     cfg = Config.load()
     view = PlayerView(cfg)
 
-    print("[1] config + button wiring")
-    check("'audio' is a known button key", "audio" in BUTTON_KEYS)
-    check("'audio' defaults to visible",
-          cfg.control_buttons.get("audio") is True)
+    print("[1] button wiring")
     check("btn_audio lives in the control row",
           view.btn_audio.parent() is view.ctl_row)
     check("btn_audio sits next to btn_cc (before btn_scale)",
@@ -301,14 +298,17 @@ def main():
           == ["Auto", "English"])
     view._ctl_panel.close_panel()
 
-    print("[10] settings visibility honours 'audio'")
-    cfg.data["control_buttons"] = dict(cfg.control_buttons, audio=False)
-    view._apply_button_visibility()
-    check("btn_audio hidden when turned off in settings",
-          not view.btn_audio.isVisible() and view.btn_audio.isHidden())
-    cfg.data["control_buttons"] = dict(cfg.control_buttons, audio=True)
-    view._apply_button_visibility()
-    check("btn_audio shown again", not view.btn_audio.isHidden())
+    print("[10] narrow-window compaction hides the seek buttons")
+    view._in_fit_ctl = True   # hold the ladder still, as _fit_ctl itself does
+    try:
+        view._apply_compact(5)
+        check("btn_back10 hidden at compaction level 5",
+              view.btn_back10.isHidden())
+        view._apply_compact(0)
+        check("btn_back10 back at compaction level 0",
+              not view.btn_back10.isHidden())
+    finally:
+        view._in_fit_ctl = False
 
     print("[11] _tick drives the enforcement (VLC re-selected behind us)")
     fake.tracks = [(1, "Spanish"), (2, "English")]

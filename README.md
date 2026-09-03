@@ -135,7 +135,6 @@ through a single VLC connection.
     on it to jump straight to that point** (hold to fine-tune); the handle
     swells when the cursor is over it. Timestamps are tracked locally and
     tick smoothly even when the stream's own timestamps misbehave.
-  - Every button can be switched on/off in **Settings ▸ Playback controls…**
 - **Live TV always runs in DVR chase mode** — every channel is recorded to
   a short-term buffer that you watch a few seconds behind live (default 5 s,
   Settings ▸ Live delay). A small "Buffering…" pill covers the couple of
@@ -194,7 +193,7 @@ through a single VLC connection.
   **Live TV, Movies and Series**: tick the countries/regions you want;
   saved automatically (survives restarts) and applied to both the category
   list and the full "All" view.
-- **Adjustable network cache** — Playback ▸ Network cache size (0–50,000 ms)
+- **Adjustable network cache** — Settings ▸ Network cache size (0–50,000 ms)
 - **Enter** plays the selected item; **mouse wheel** over the video = volume
 
 ## Requirements

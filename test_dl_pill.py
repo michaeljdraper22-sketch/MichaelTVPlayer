@@ -40,7 +40,6 @@ CATCHUP = {"kind": "catchup", "title": "Yestercast", "url": "http://x/c.ts",
 def main():
     app = QtWidgets.QApplication(sys.argv)
     cfg = Config.load()
-    cfg.data["control_buttons"] = dict(cfg.control_buttons)  # timebar True
     view = PlayerView(cfg)
     view.resize(1280, 720)
     view.show()
@@ -163,9 +162,7 @@ def main():
           abs(pill().top() - y_no_caps) <= 2)
 
     print("[8] sibling window prompts route to the same anchor")
-    for text in ("Enable the time bar (Settings \u25b8 Playback controls) "
-                 "to pick a download window",
-                 "Stream length unknown yet \u2014 try again in a moment",
+    for text in ("Stream length unknown yet \u2014 try again in a moment",
                  "Window download unavailable for this stream"):
         view._set_dvr_status(text)
         app.processEvents()

@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5 import QtWidgets  # noqa: E402
 
-from src.config import BUTTON_KEYS, Config  # noqa: E402
+from src.config import Config  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
 
 PASS = []
@@ -57,9 +57,7 @@ def main():
     view.current = {"kind": "live", "title": "Probe", "url": "http://x/p",
                     "fav_key": "live:probe"}
 
-    print("[1] config + button wiring")
-    check("'cc' is a known button key", "cc" in BUTTON_KEYS)
-    check("'cc' defaults to visible", cfg.control_buttons.get("cc") is True)
+    print("[1] button wiring")
     check("btn_cc lives in the control row",
           view.btn_cc.parent() is view.ctl_row)
     check("btn_cc sits between sep2 and btn_scale",
@@ -144,14 +142,17 @@ def main():
     check("current track is checked", checked == ["Spanish"])
     view._ctl_panel.close_panel()
 
-    print("[9] settings visibility honours 'cc'")
-    cfg.data["control_buttons"] = dict(cfg.control_buttons, cc=False)
-    view._apply_button_visibility()
-    check("btn_cc hidden when turned off in settings",
-          not view.btn_cc.isVisible() and view.btn_cc.isHidden())
-    cfg.data["control_buttons"] = dict(cfg.control_buttons, cc=True)
-    view._apply_button_visibility()
-    check("btn_cc shown again", not view.btn_cc.isHidden())
+    print("[9] narrow-window compaction hides the seek buttons")
+    view._in_fit_ctl = True   # hold the ladder still, as _fit_ctl itself does
+    try:
+        view._apply_compact(5)
+        check("btn_back10 hidden at compaction level 5",
+              view.btn_back10.isHidden())
+        view._apply_compact(0)
+        check("btn_back10 back at compaction level 0",
+              not view.btn_back10.isHidden())
+    finally:
+        view._in_fit_ctl = False
 
     print("[10] _tick drives the enforcement (live mode)")
     fake.tracks = [(1, "English")]

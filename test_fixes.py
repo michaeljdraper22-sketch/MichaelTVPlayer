@@ -28,7 +28,6 @@ def check(name, cond):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     cfg = Config.load()
-    cfg.data["control_buttons"] = dict(cfg.control_buttons)  # timebar True
     view = PlayerView(cfg)
     view.resize(1280, 720)
     view.show()

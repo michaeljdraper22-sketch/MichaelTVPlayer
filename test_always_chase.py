@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from PyQt5 import QtCore, QtWidgets  # noqa: E402
 
-from src.config import Config, BUTTON_KEYS  # noqa: E402
+from src.config import Config  # noqa: E402
 from src.ui import player_view as pv_mod  # noqa: E402
 from src.ui.player_view import PlayerView  # noqa: E402
 
@@ -80,7 +80,6 @@ with tempfile.TemporaryDirectory() as td:
 
 check("safety margin is 5 s (caption cushion after jump-to-live)",
       pv_mod._CHASE_SAFETY_S == 5.0)
-check("no 'dvr' key in control buttons", "dvr" not in BUTTON_KEYS)
 
 print("[2] play_media(live) auto-engages the chase pipeline")
 REC = []
@@ -353,8 +352,6 @@ pv_mod._CHASE_RETRY_DELAYS = orig_delays
 
 print("[4] the DVR button is gone")
 check("no btn_dvr on the view", not hasattr(view, "btn_dvr"))
-check("no 'dvr' entry in the control-button set",
-      "dvr" not in cfg.control_buttons)
 
 print("[5] jump-to-live keeps the caption cushion")
 view._mode = "chase"

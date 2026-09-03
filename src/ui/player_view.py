@@ -415,7 +415,7 @@ _WIN_GAP_MS = 1000          # smallest selectable window (1 s)
 # just above the download/window button (see _layout_overlays) instead of
 # the video center, and auto-clear a few seconds after they go quiet
 # (see _hide_dl_pill).  Prefix-matched against the pill's text.
-_DL_PILL_PREFIXES = ("Download", "Enable the time bar", "Stream length",
+_DL_PILL_PREFIXES = ("Download", "Stream length",
                      "Window download")
 
 
@@ -4339,13 +4339,6 @@ class PlayerView(QtWidgets.QWidget):
             self._win_engage()
 
     def _win_engage(self):
-        if not self.config.control_buttons.get("timebar", True):
-            # the time bar setting is off — there is nothing to mark
-            self._set_dvr_status(
-                "Enable the time bar (Settings \u25b8 Playback controls) "
-                "to pick a download window")
-            QtCore.QTimer.singleShot(4000, self._hide_dl_pill)
-            return
         self._set_scrub_visible(True)
         if self.slider.maximum() <= 0:
             self._set_dvr_status("Stream length unknown yet \u2014 try again "
@@ -5187,7 +5180,7 @@ class PlayerView(QtWidgets.QWidget):
             self.time_right.setText(rt)
 
     def _set_scrub_visible(self, on: bool):
-        vis = bool(on) and self.config.control_buttons.get("timebar", True)
+        vis = bool(on)
         # isHidden() (not isVisible()) — the parent overlay may itself be
         # hidden, and that must not fool us into skipping the change.
         if self.scrub_row.isHidden() == vis:
@@ -5266,12 +5259,12 @@ class PlayerView(QtWidgets.QWidget):
         self._refresh_spu_button()
         self._refresh_audio_button()
 
-    # ---- per-button visibility (Settings ▸ Playback controls…) ----
+    # ---- per-button visibility (fixed set; kind rules + narrow-window
+    # compaction decide what shows) ----
     def apply_button_visibility(self):
         self._apply_button_visibility()
 
     def _apply_button_visibility(self):
-        vis = self.config.control_buttons
         compact = self._compact_hidden
         vod = self._is_vod()
         catchup = self._is_catchup()
@@ -5294,7 +5287,7 @@ class PlayerView(QtWidgets.QWidget):
         stremio_ep = kind == "stremio" and bool(
             (self.current or {}).get("season"))
         for key, w in widgets.items():
-            on = bool(vis.get(key, True)) and key not in compact
+            on = key not in compact
             if key == "rec":
                 # One slot, deliberately swapped by content kind — NOT just
                 # cosmetics. REC on VOD would restart playback through VLC's
@@ -5338,7 +5331,7 @@ class PlayerView(QtWidgets.QWidget):
                 w.setVisible(on)
 
         def any_of(*keys):
-            return any(vis.get(k, True) and k not in compact for k in keys)
+            return any(k not in compact for k in keys)
 
         # separators vanish when the row gets tight (see _apply_compact)
         seps_on = self._compact_level < 2

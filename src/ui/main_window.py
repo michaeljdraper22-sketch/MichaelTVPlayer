@@ -334,26 +334,7 @@ class MainWindow(QtWidgets.QMainWindow):
         act_countries.triggered.connect(self.open_countries)
         countries_menu.addAction(act_countries)
 
-        play_menu = menu_bar.addMenu("&Playback")
-        act_live = QtWidgets.QAction("Jump to Live", self)
-        act_live.triggered.connect(self.player_view._jump_live)
-        act_pause = QtWidgets.QAction("Pause / Resume", self)
-        act_pause.triggered.connect(self.player_view.toggle_pause)
-        act_stop = QtWidgets.QAction("Stop", self)
-        act_stop.triggered.connect(self.player_view.stop)
-        act_next = QtWidgets.QAction("Play next (N)", self)
-        act_next.triggered.connect(self.player_view._play_next_clicked)
-        act_prev = QtWidgets.QAction("Play previous (P)", self)
-        act_prev.triggered.connect(self.player_view._play_prev_clicked)
-        play_menu.addAction(act_pause)
-        play_menu.addAction(act_live)
-        play_menu.addAction(act_next)
-        play_menu.addAction(act_prev)
-        play_menu.addAction(act_stop)
-
         settings_menu = menu_bar.addMenu("&Settings")
-        act_buttons = QtWidgets.QAction("Playback controls…", self)
-        act_buttons.triggered.connect(self.edit_control_buttons)
         act_pf = QtWidgets.QAction("Profanity filter…", self)
         act_pf.triggered.connect(self.edit_profanity)
         act_folder = QtWidgets.QAction("Recording folder…", self)
@@ -368,7 +349,6 @@ class MainWindow(QtWidgets.QMainWindow):
         act_apiconc.triggered.connect(self.edit_api_concurrency)
         act_stremio = QtWidgets.QAction("Stremio handoff\u2026", self)
         act_stremio.triggered.connect(self.edit_stremio)
-        settings_menu.addAction(act_buttons)
         settings_menu.addAction(act_pf)
         settings_menu.addAction(act_stremio)
         settings_menu.addSeparator()
@@ -821,53 +801,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config.download_folder = folder
             self.config.save()
 
-    def edit_control_buttons(self):
-        """Choose which playback-control buttons appear on the video."""
-        names = [
-            ("back60", "Rewind 60 s"), ("back10", "Rewind 10 s"),
-            ("play", "Play / Pause"), ("fwd10", "Forward 10 s"),
-            ("begin", "Jump to beginning"),
-            ("live", "LIVE (jump to live edge)"),
-            ("rec", "Record / Download"),
-            ("cc", "Subtitles"),
-            ("audio", "Audio tracks"),
-            ("scale", "Video scaling"), ("speed", "Playback speed"),
-            ("autoplay", "Autoplay next episode"),
-            ("playnext", "Play next"),
-            ("playprev", "Play previous"),
-            ("mute", "Mute"), ("volume", "Volume slider"),
-            ("timebar", "Time bar (live rewind)"),
-        ]
-        current = self.config.control_buttons
-        dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Playback controls")
-        dlg.resize(360, 300)
-        lay = QtWidgets.QVBoxLayout(dlg)
-        lay.addWidget(QtWidgets.QLabel(
-            "Tick the buttons to show on the video overlay:"))
-        grid = QtWidgets.QGridLayout()
-        grid.setHorizontalSpacing(24)
-        boxes = {}
-        for i, (key, label) in enumerate(names):
-            cb = QtWidgets.QCheckBox(label)
-            cb.setChecked(bool(current.get(key, True)))
-            boxes[key] = cb
-            grid.addWidget(cb, i // 2, i % 2)
-        wrap = QtWidgets.QWidget()
-        wrap.setLayout(grid)
-        lay.addWidget(wrap)
-        bb = QtWidgets.QDialogButtonBox(
-            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
-        bb.accepted.connect(dlg.accept)
-        bb.rejected.connect(dlg.reject)
-        lay.addWidget(bb)
-        if dlg.exec_() == QtWidgets.QDialog.Accepted:
-            self.config.control_buttons = {
-                key: cb.isChecked() for key, cb in boxes.items()
-            }
-            self.config.save()
-            self.player_view.apply_button_visibility()
-
     def edit_profanity(self):
         """Settings ▸ Profanity filter… — word list, levels, timing."""
         from .profanity_dialog import ProfanityDialog
@@ -1212,7 +1145,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "  choose the folder once in Settings -> Recording folder. Works\n"
             "  through the same single connection; recordings are kept\n"
             "  on disk.\n\n"
-            "Settings menu: recording folder, live TV buffer length, live\n"
+            "Settings menu: recording folder, download folder, live\n"
             "delay and network cache size.\n\n"
             "The window can be made very small and snapped to halves/corners (Windows\n"
             "Snap) so you can tile it next to another player.\n\n"

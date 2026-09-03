@@ -85,15 +85,10 @@ DEFAULTS = {
     "window_state": None,         # "normal" | "maximized" | "fullscreen"
     "splitter_sizes": [460, 880],
     "last_tab": 0,
-    # Which playback-control buttons are shown on the video overlay
-    # (Settings ▸ Playback controls…).
-    "control_buttons": {
-        "back60": True, "back10": True, "play": True, "fwd10": True,
-        "begin": True, "live": True, "rec": True,
-        "cc": True, "audio": True, "scale": True, "speed": True,
-        "mute": True, "volume": True, "timebar": True,
-        "autoplay": True, "playnext": True,
-    },
+    # Which playback-control buttons are shown on the video overlay is no
+    # longer configurable — the on-video set is fixed (the old Settings ▸
+    # Playback controls… dialog was removed; a stale "control_buttons" key
+    # in an existing settings.json is ignored).
     "autoplay_next": True,          # the autoplay toggle's state (series/catch-up)
     "scale_mode": "fit",          # "fit" | "stretch" | "crop"
     "subtitle_appearance": dict(SUBTITLE_DEFAULTS),
@@ -130,12 +125,6 @@ DEFAULTS = {
 # stream being watched, "auto" = 4K-first fall-down, rest = fixed target)
 _STREMIO_RES_PREFS = ("match", "auto", "2160", "1440", "1080", "720",
                       "480")
-
-BUTTON_KEYS = (
-    "back60", "back10", "play", "fwd10", "begin", "live", "rec",
-    "cc", "audio", "scale", "speed", "mute", "volume", "timebar",
-    "autoplay", "playnext",
-)
 
 
 def _data_dir() -> Path:
@@ -419,23 +408,6 @@ class Config:
     @last_tab.setter
     def last_tab(self, value: int) -> None:
         self.data["last_tab"] = int(value)
-
-    @property
-    def control_buttons(self) -> dict:
-        stored = self.data.get("control_buttons") or {}
-        merged = dict(DEFAULTS["control_buttons"])
-        for key in BUTTON_KEYS:
-            if key in stored:
-                merged[key] = bool(stored[key])
-        return merged
-
-    @control_buttons.setter
-    def control_buttons(self, value) -> None:
-        clean = dict(DEFAULTS["control_buttons"])
-        for key in BUTTON_KEYS:
-            if key in (value or {}):
-                clean[key] = bool(value[key])
-        self.data["control_buttons"] = clean
 
     @property
     def autoplay_next(self) -> bool:
