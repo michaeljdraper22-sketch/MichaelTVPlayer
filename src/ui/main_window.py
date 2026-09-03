@@ -418,6 +418,16 @@ class MainWindow(QtWidgets.QMainWindow):
             # Direct activation of an archive channel: open its program picker
             self.catchup_tab._open_picker(playable)
             return
+        if playable.get("kind") == "stremio" and not self._channels_hidden:
+            # A Stremio stream takes over the window (handoff, favorites,
+            # recents — every path lands here), so fold the channel list
+            # away exactly like Ctrl+L does: splitter sizes are saved first
+            # so showing it again restores them, and the floating chevron
+            # on the video's left edge brings it back. Already hidden means
+            # the user hid it themselves — keep THEIR saved sizes.
+            self._splitter_saved = self.splitter.sizes()
+            self._channels_hidden = True
+            self._apply_channels()
         # remember where this was launched from so the live-TV ⏭/⏮ walk
         # THAT list (a favorites-launched channel steps through favorites)
         self._live_nav_source = nav_source
