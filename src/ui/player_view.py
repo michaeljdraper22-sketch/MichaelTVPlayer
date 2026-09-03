@@ -784,6 +784,14 @@ class PlayerView(QtWidgets.QWidget):
         self._next_runner.finished.connect(self._on_next_fetched)
         self._prev_runner = AsyncRunner()
         self._prev_runner.finished.connect(self._on_prev_fetched)
+        # lookup coalescing: the base (fav_key) whose next/prev lookup is
+        # currently in flight — a spam of clicks (or autoplay racing a
+        # click) fans out into concurrent network resolve chains without
+        # this (see _kick_next_lookup)
+        self._next_busy_base = ""
+        self._prev_busy_base = ""
+        # rate-limit wall for the _tick trap's exception logging
+        self._tick_err_wall = 0.0
         # Stremio handoff identity lookups (torrent name -> episode ->
         # show) — separate so a slow catalog search can't touch the others
         self._stremio_runner = AsyncRunner()
@@ -1178,7 +1186,7 @@ class PlayerView(QtWidgets.QWidget):
         self._ghost_fix_timer.timeout.connect(self._recompose_video_surface)
         self.timer = QtCore.QTimer(self)
         self.timer.setInterval(400)
-        self.timer.timeout.connect(self._tick)
+        self.timer.timeout.connect(self._tick_guarded)
         self.timer.start()
         # debounced volume persistence (wheel/click changes save shortly
         # after the last change instead of only on slider release)
@@ -2275,45 +2283,129 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_auto.setToolTip("Autoplay next episode — ON"
                                  if on else "Autoplay next episode — OFF")
 
+    def _pn_log(self, msg, *args):
+        """Log helper for the play-next/prev machinery — never raises
+        (the codebase rule: logging must not break playback). The 2026-09-03
+        ~07:00 incident (play-next spammed on an ended Stremio episode:
+        not ONE log line, no switch, nothing) was undiagnosable precisely
+        because every bail on this path was silent."""
+        try:
+            log.info(msg, *args)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _pn_fail(self, what):
+        """A play-next/prev slot blew up. In the WINDOWED exe a raise
+        inside a clicked slot has no stderr to land on — it just
+        vanishes, and the button "silently does nothing" (the failure
+        shape _open_ctl_panel was already hardened against). Land it in
+        player.log and tell the user."""
+        try:
+            log.exception("playnext: %s handler failed", what)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.show_info("Could not switch \u2014 details in player.log")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _kick_next_lookup(self, base, cur):
+        """Spawn the next-item lookup for ``base`` — ONE in flight per
+        base. Spamming the button coalesces into a single network chain
+        instead of N concurrent addon/debrid resolves."""
+        if base and self._next_busy_base == base:
+            self._pn_log("playnext: lookup for %r already running \u2014 "
+                         "click coalesced", base)
+            return
+        self._next_busy_base = base or ""
+        self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+
+    def _kick_prev_lookup(self, base, cur):
+        """The ⏮ twin of _kick_next_lookup."""
+        if base and self._prev_busy_base == base:
+            self._pn_log("playprev: lookup for %r already running \u2014 "
+                         "click coalesced", base)
+            return
+        self._prev_busy_base = base or ""
+        self._prev_runner.run(lambda: (base, self._fetch_prev(cur)))
+
     def _play_next_clicked(self):
+        try:
+            self._play_next_core()
+        except Exception:  # noqa: BLE001
+            self._pn_fail("play-next")
+
+    def _play_next_core(self):
         cur = self.current
         if self._closing or not cur:
+            self._pn_log("playnext: click dropped \u2014 closing=%s "
+                         "current=%s", bool(self._closing),
+                         "none" if cur is None else cur.get("kind"))
             return
-        if cur.get("kind") == "live":
+        kind = cur.get("kind")
+        if kind == "live":
             self.request_next_channel.emit()
             return
-        if cur.get("kind") == "stremio":
-            self.show_info("Finding next\u2026")
+        if kind == "stremio":
             base = cur.get("fav_key")
-            self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+            self._pn_log("playnext: click \u2014 stremio base=%r", base)
+            # the banner is cosmetic and trapped separately: a broken
+            # overlay must never kill the switch (the runner is what
+            # plays the next episode, not the banner)
+            try:
+                self.show_info("Finding next\u2026")
+            except Exception:  # noqa: BLE001
+                pass
+            self._kick_next_lookup(base, cur)
             return
-        if cur.get("kind") not in ("series", "catchup") or not self.client:
+        if kind not in ("series", "catchup") or not self.client:
+            self._pn_log("playnext: click dropped \u2014 kind=%r", kind)
             return
-        if cur.get("kind") == "series" and cur.get("series_id") is None:
+        if kind == "series" and cur.get("series_id") is None:
             self.show_info("No episode list for this item")
             return
-        self.show_info("Finding next\u2026")
         base = cur.get("fav_key")
-        self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+        self._pn_log("playnext: click \u2014 %s base=%r", kind, base)
+        try:
+            self.show_info("Finding next\u2026")
+        except Exception:  # noqa: BLE001
+            pass
+        self._kick_next_lookup(base, cur)
 
     def _play_prev_clicked(self):
         """The ⏮ twin of play-next: previous channel (live TV — the channel
         ABOVE the current one in the Live list), previous episode (series /
         Stremio) or earlier recorded program (catch-up)."""
+        try:
+            self._play_prev_core()
+        except Exception:  # noqa: BLE001
+            self._pn_fail("play-prev")
+
+    def _play_prev_core(self):
         cur = self.current
         if self._closing or not cur:
+            self._pn_log("playprev: click dropped \u2014 closing=%s "
+                         "current=%s", bool(self._closing),
+                         "none" if cur is None else cur.get("kind"))
             return
         if cur.get("kind") == "live":
             self.request_prev_channel.emit()
             return
         if cur.get("kind") not in ("series", "catchup", "stremio"):
+            self._pn_log("playprev: click dropped \u2014 kind=%r",
+                         cur.get("kind"))
             return
         if cur.get("kind") == "series" and cur.get("series_id") is None:
             self.show_info("No episode list for this item")
             return
-        self.show_info("Finding previous\u2026")
         base = cur.get("fav_key")
-        self._prev_runner.run(lambda: (base, self._fetch_prev(cur)))
+        self._pn_log("playprev: click \u2014 %s base=%r", cur.get("kind"),
+                     base)
+        try:
+            self.show_info("Finding previous\u2026")
+        except Exception:  # noqa: BLE001
+            pass
+        self._kick_prev_lookup(base, cur)
 
     @staticmethod
     def _nn(v):
@@ -2524,59 +2616,85 @@ class PlayerView(QtWidgets.QWidget):
         }
 
     def _on_next_fetched(self, result):
-        ok, val = result
-        if self._closing or ok != "ok":
-            if not self._closing:
-                try:
-                    log.warning("next-episode lookup failed: %s", val)
-                except Exception:
-                    pass
-                self.show_info("Could not look up the next item")
-            return
-        base, nxt = val
-        cur = self.current or {}
-        if cur.get("fav_key") != base:
-            return          # the user moved on while the lookup ran
-        if not nxt:
-            self.show_info(
-                "No more episodes in this series"
-                if cur.get("kind") == "series"
-                else "No stream found for the next episode"
-                if cur.get("kind") == "stremio"
-                else "No later programs in the archive")
-            return
-        self._start_next(nxt)
+        self._next_busy_base = ""
+        try:
+            ok, val = result
+            if self._closing or ok != "ok":
+                if not self._closing:
+                    try:
+                        log.warning("next-episode lookup failed: %s", val)
+                    except Exception:
+                        pass
+                    self.show_info("Could not look up the next item")
+                return
+            base, nxt = val
+            cur = self.current or {}
+            if cur.get("fav_key") != base:
+                # the user moved on while the lookup ran — this used to be
+                # a perfectly silent drop, one of the reasons a dead spam
+                # of clicks left no trace at all (2026-09-03)
+                self._pn_log("playnext: result stale-dropped \u2014 "
+                             "base=%r cur=%r", base, cur.get("fav_key"))
+                return
+            if not nxt:
+                self._pn_log("playnext: nothing found after %r", base)
+                self.show_info(
+                    "No more episodes in this series"
+                    if cur.get("kind") == "series"
+                    else "No stream found for the next episode"
+                    if cur.get("kind") == "stremio"
+                    else "No later programs in the archive")
+                return
+            self._pn_log("playnext: switching %r -> %r", base,
+                         nxt.get("fav_key") or nxt.get("title", ""))
+            self._start_next(nxt)
+        except Exception:  # noqa: BLE001
+            self._pn_fail("next-result")
 
     def _on_prev_fetched(self, result):
-        ok, val = result
-        if self._closing or ok != "ok":
-            if not self._closing:
-                try:
-                    log.warning("prev-episode lookup failed: %s", val)
-                except Exception:
-                    pass
-                self.show_info("Could not look up the previous item")
-            return
-        base, prv = val
-        cur = self.current or {}
-        if cur.get("fav_key") != base:
-            return          # the user moved on while the lookup ran
-        if not prv:
-            self.show_info(
-                "No earlier episodes in this series"
-                if cur.get("kind") == "series"
-                else "No stream found for the previous episode"
-                if cur.get("kind") == "stremio"
-                else "No earlier programs in the archive")
-            return
-        self._start_next(prv)
+        self._prev_busy_base = ""
+        try:
+            ok, val = result
+            if self._closing or ok != "ok":
+                if not self._closing:
+                    try:
+                        log.warning("prev-episode lookup failed: %s", val)
+                    except Exception:
+                        pass
+                    self.show_info("Could not look up the previous item")
+                return
+            base, prv = val
+            cur = self.current or {}
+            if cur.get("fav_key") != base:
+                self._pn_log("playprev: result stale-dropped \u2014 "
+                             "base=%r cur=%r", base, cur.get("fav_key"))
+                return
+            if not prv:
+                self._pn_log("playprev: nothing found before %r", base)
+                self.show_info(
+                    "No earlier episodes in this series"
+                    if cur.get("kind") == "series"
+                    else "No stream found for the previous episode"
+                    if cur.get("kind") == "stremio"
+                    else "No earlier programs in the archive")
+                return
+            self._pn_log("playprev: switching %r -> %r", base,
+                         prv.get("fav_key") or prv.get("title", ""))
+            self._start_next(prv)
+        except Exception:  # noqa: BLE001
+            self._pn_fail("prev-result")
 
     def _start_next(self, nxt):
         """Switch playback to the next item through the same bookkeeping
         MainWindow.play() does (recents + last_channel)."""
-        self.config.add_recent(nxt)
-        self.config.data["last_channel"] = nxt
-        self.config.save()
+        try:
+            self.config.add_recent(nxt)
+            self.config.data["last_channel"] = nxt
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            # bookkeeping is secondary — the switch itself must still run
+            self._pn_log("playnext: recents/last_channel save failed "
+                         "for %r", nxt.get("title", ""))
         self.play_media(nxt)
         # the neighbor prefetches (lookahead + prevlook) are kicked from
         # play_media itself now — here they only fired for switches, never
@@ -2619,13 +2737,19 @@ class PlayerView(QtWidgets.QWidget):
             # autoplay toggle can still be CHECKED from an earlier
             # episode — hidden buttons keep their state)
             return
-        if length_ms <= 0:
-            return
         state = ""
         try:
             state = self.vlc.state_name() or ""
         except Exception:  # noqa: BLE001
             pass
+        if length_ms <= 0 and state != "ended":
+            # no clock to reason with — EXCEPT a clean VLC "ended", which
+            # proves the finish on its own. VLC drops get_length() the
+            # moment a network VOD relay ends; vetoing on the dead clock
+            # used to starve autoplay exactly then (live-seen 2026-09-03:
+            # LIVE jumped an episode to its end and the roll-into-next
+            # never fired, not even the eof-note log line)
+            return
         if not self._media_finished(playing, length_ms, raw_ms,
                                     self._vid_s, state):
             return
@@ -2654,7 +2778,10 @@ class PlayerView(QtWidgets.QWidget):
         else:
             self.show_info("Up next\u2026")
         base = cur.get("fav_key")
-        self._next_runner.run(lambda: (base, self._fetch_next(cur)))
+        self._pn_log("playnext: autoplay fired \u2014 base=%r state=%s "
+                     "len=%dms vid=%.1fs", base, state or "?", length_ms,
+                     self._vid_s)
+        self._kick_next_lookup(base, cur)
 
     # ---- controls ----
     def _on_surface_clicked(self):
@@ -4600,6 +4727,24 @@ class PlayerView(QtWidgets.QWidget):
             # isVisible() guard was exactly how those ghosts survived.
             self.overlay.repaint()
 
+    def _tick_guarded(self):
+        # Top-level trap: the WINDOWED exe has no stderr — an uncaught
+        # raise in the tick (dead overlay widget, wedged VLC call) used
+        # to die invisibly on every iteration, which is how end-of-media
+        # autoplay could silently stop firing with zero log lines
+        # (2026-09-03). Rate-limited so a hard break costs at most one
+        # line per 10 s. (Named separately from _tick so source-level
+        # regression checks on the tick body keep working.)
+        try:
+            self._tick()
+        except Exception:  # noqa: BLE001
+            try:
+                if now_s() - self._tick_err_wall > 10.0:
+                    self._tick_err_wall = now_s()
+                    log.exception("tick: iteration failed (rate-limited)")
+            except Exception:  # noqa: BLE001
+                pass
+
     def _tick(self):
         # Teardown guard: once stop() has run, no timer may touch VLC —
         # the player instance may already be released.
@@ -4854,7 +4999,18 @@ class PlayerView(QtWidgets.QWidget):
             self._maybe_autoplay_next(playing, length, raw)
         else:
             self._last_raw = raw / 1000.0 if raw >= 0 else None
-            self._vid_s = 0.0
+            if (self.current or {}).get("kind") in ("series", "catchup",
+                                                    "stremio"):
+                # An ended network file can read length 0 for a tick
+                # (get_length drops before the sticky fallback lands).
+                # Keep polling for the finish here — and do NOT zero the
+                # tracked clock: _media_finished's vid_s fallback is what
+                # recognizes the ended shape, and wiping it (the old
+                # else-branch) erased that signal (2026-09-03: autoplay
+                # never fired after LIVE jumped an episode to its end).
+                self._maybe_autoplay_next(playing, length, raw)
+            else:
+                self._vid_s = 0.0
 
 
 
