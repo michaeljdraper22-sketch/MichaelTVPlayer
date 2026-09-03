@@ -53,28 +53,28 @@ class StubClient:
     def __init__(self):
         self.item_calls = []   # (kind, cat_id) per fetch_items
 
-    def live_categories(self):
+    def live_categories(self, refresh=False):
         return [{"category_id": 1, "category_name": "FIFA"},
                 {"category_id": 2, "category_name": "News"}]
 
-    def vod_categories(self):
+    def vod_categories(self, refresh=False):
         return [{"category_id": 1, "category_name": "FIFA Movies"},
                 {"category_id": 2, "category_name": "Action"}]
 
-    def series_categories(self):
+    def series_categories(self, refresh=False):
         return [{"category_id": 1, "category_name": "FIFA Series"},
                 {"category_id": 2, "category_name": "Drama"}]
 
-    def live_streams(self, cat_id):
+    def live_streams(self, cat_id, refresh=False):
         self.item_calls.append(("live", cat_id))
         return [{"name": "Live Chan", "stream_id": 11}]
 
-    def vod_streams(self, cat_id, timeout=None):
+    def vod_streams(self, cat_id, timeout=None, refresh=False):
         self.item_calls.append(("vod", cat_id))
         return [{"name": "A Movie", "stream_id": 22,
                  "container_extension": "mp4"}]
 
-    def series(self, cat_id, timeout=None):
+    def series(self, cat_id, timeout=None, refresh=False):
         self.item_calls.append(("series", cat_id))
         return [{"name": "A Series", "series_id": 33}]
 
