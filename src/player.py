@@ -188,7 +188,7 @@ class VLCPlayer:
             feedback.stat("vlc_errors")
             url = getattr(self, "_current_url", "")
             log.error("VLC playback error event (state=%s url=%s)",
-                      self.state_name(), url)
+                      self.state_name(), feedback.redact_url(url))
         except Exception:
             pass
 
@@ -381,12 +381,13 @@ class VLCPlayer:
             feedback.stat("plays_never_started")
             log.error("playback never started within %.0fs (state=%s "
                       "url=%s) — probing stream", wait_s,
-                      self.state_name(), url)
+                      self.state_name(), feedback.redact_url(url))
 
             def _probe():
                 try:
                     res = feedback.probe_url(url)
-                    log.error("stream probe: %s — url=%s", res, url)
+                    log.error("stream probe: %s — url=%s", res,
+                              feedback.redact_url(url))
                 except Exception:
                     pass
             threading.Thread(target=_probe, name="mtp-probe",

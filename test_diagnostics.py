@@ -31,7 +31,13 @@ def test_scrub():
         "userinfo http://alice:secret@cdn.example.com/live.ts\n"
         "path C:\\Users\\micha\\AppData\\Local\\Temp\\mtp_dvr_x\\buffer.ts\n"
         "plain user=nope token=abc123 key=kv u=zzz p=ww\n"
-        "cpu=90 queue=1 keepme=plain")
+        "cpu=90 queue=1 keepme=plain\n"
+        # the issue-#3 leak, verbatim shape: stream URLs carry the
+        # credentials IN THE PATH (probe + never-started log lines)
+        "probe: HTTP 403 — url=http://26D7N4FV.cdngold8k.com/live/"
+        "26D7N4FV/85093768/96054.ts\n"
+        "movie url=http://host.net/movie/myuser/mypass123/456.mkv\r\n"
+        "timeshift http://h/timeshift/q4z/u9/1234.ts?utc=1")
     check("username redacted", "username=REDACTED" in s)
     check("password redacted", "password=REDACTED" in s)
     check("token redacted", "token=REDACTED" in s)
@@ -42,6 +48,15 @@ def test_scrub():
     check("windows profile path redacted",
           "Users\\USER\\" in s and "micha" not in s)
     check("host kept (provider diagnostics)", "host:8080" in s)
+    # path-style stream credentials (the issue #3 leak)
+    check("path creds redacted (live)", "85093768" not in s
+          and "live/REDACTED/REDACTED/96054.ts" in s)
+    check("path creds redacted (movie)",
+          "mypass123" not in s
+          and "movie/REDACTED/REDACTED/456.mkv" in s)
+    check("path creds redacted (timeshift)",
+          "timeshift/REDACTED/REDACTED/1234.ts" in s)
+    check("stream id kept (diagnostics)", "96054.ts" in s)
 
 
 def test_report():

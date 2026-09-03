@@ -17,6 +17,7 @@ No credentials are ever stored here; probe helpers return statuses only.
 
 import logging
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -38,6 +39,27 @@ _dirty_prev_session = False
 # probing; never rendered into any report)
 _server_host = ""
 _server_scheme = "http"
+
+
+# ---- credential redaction at LOG time -------------------------------------
+# Xtream stream URLs carry the account credentials IN THE PATH:
+# http://host/live/USERNAME/PASSWORD/12345.ts.  The diagnostics scrubber
+# only covered query-style and user:pass@ URLs, so these leaked verbatim
+# into a PUBLIC bug report (GitHub issue #3, 2026-09-02).  redact_url
+# runs at LOG time — the local player.log never stores the password
+# either — and diagnostics.scrub re-applies the same pattern on upload
+# as a backstop for URLs logged anywhere else.
+_STREAM_PATH_CRED_RE = re.compile(
+    r"(?i)((?:live|movie|series|timeshift)/)[^/&?#\s]+/[^/&?#\s]+/")
+
+
+def redact_url(text) -> str:
+    """Mask path-style credentials in stream URLs; never raises."""
+    try:
+        return _STREAM_PATH_CRED_RE.sub(r"\1REDACTED/REDACTED/",
+                                        str(text or ""))
+    except Exception:  # noqa: BLE001
+        return str(text or "")
 
 
 # ---- generic recorders ----------------------------------------------------

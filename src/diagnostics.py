@@ -74,11 +74,18 @@ _QUERY_CRED_RE = re.compile(
     r"[^&\s'\"<>]+")
 _URL_USERINFO_RE = re.compile(r"(?i)https?://[^\s/:@]+:[^\s/@]+@")
 _WIN_USER_RE = re.compile(r"(?i)([a-z]:\\+users\\+)[^\\\s\"']+")
+# Xtream stream URLs carry credentials IN THE PATH (host/live/USER/PASS/
+# id.ts); the two patterns above never touched them, and the probe log
+# lines leaked a real account into PUBLIC issue #3 (2026-09-02). Same
+# fix as feedback.redact_url, applied here as the upload-side backstop.
+_PATH_CRED_RE = re.compile(
+    r"(?i)((?:live|movie|series|timeshift)/)[^/&?#\s]+/[^/&?#\s]+/")
 
 
 def scrub(text: str) -> str:
     """Redact credentials from ``text`` (see module docstring)."""
     try:
+        text = _PATH_CRED_RE.sub(r"\1REDACTED/REDACTED/", text)
         text = _QUERY_CRED_RE.sub(r"\1REDACTED", text)
         text = _URL_USERINFO_RE.sub("https://REDACTED@", text)
         text = _WIN_USER_RE.sub(r"\1USER\\", text)
