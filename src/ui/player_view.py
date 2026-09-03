@@ -403,6 +403,13 @@ _WIN_GOLD = QtGui.QColor(245, 197, 24, 255)
 _WIN_GOLD_HEX = "#f5c518"
 _WIN_GAP_MS = 1000          # smallest selectable window (1 s)
 
+# ovStatus pill texts that belong to the download feature: these anchor
+# just above the download/window button (see _layout_overlays) instead of
+# the video center, and auto-clear a few seconds after they go quiet
+# (see _hide_dl_pill).  Prefix-matched against the pill's text.
+_DL_PILL_PREFIXES = ("Download", "Enable the time bar", "Stream length",
+                     "Window download")
+
 
 class WinMarker(QtWidgets.QWidget):
     """One gold < / > catch-up download-window handle on the scrubber.
@@ -1305,25 +1312,35 @@ class PlayerView(QtWidgets.QWidget):
                           g.bottom() - h - 10)
             self.ctl.raise_()
         # DVR start-up pill: centered on the video — except download
-        # progress, which anchors just above the download button it came
-        # from (the VOD/Stremio button, or the gold window button on
-        # catch-up) so a running download never parks in the middle of
-        # the picture. The bar's geometry survives its auto-hide, so the
-        # pill keeps that spot while the controls sleep.
+        # pills (see _DL_PILL_PREFIXES), which anchor just above the
+        # button that triggered them (the VOD/Stremio button, or the gold
+        # window button on catch-up) so a running download never parks in
+        # the middle of the picture. The bar's geometry survives its
+        # auto-hide, so the pill keeps that spot while the controls sleep;
+        # when captions are showing, it lifts clear of the caption block.
         if self._dvr_status.isVisible():
             ss = self._dvr_status.sizeHint()
             self._dvr_status.resize(ss)
-            if self._dvr_status.text().startswith("Download"):
+            if self._dvr_status.text().startswith(_DL_PILL_PREFIXES):
                 btn = self.btn_win if self._is_catchup() else self.btn_dl
-                if btn.isHidden():     # compact bar dropped the button
+                if btn.isHidden():
+                    # no download button in the current bar (channel kind
+                    # changed mid-download, the rec slot's setting is off,
+                    # pre-stream) — park over the bar's center instead
                     bx = self.ctl.x() + self.ctl.width() // 2
                 else:
                     bx = btn.mapTo(self.overlay,
                                    btn.rect().center()).x()
+                # vertical anchor: the 6 px gap above the control bar,
+                # raised above the caption text block when one is showing
+                by = self.ctl.y() - 6
+                blk = self._cap_wid.text_block()
+                if blk is not None:
+                    by = min(by, self._cap_wid.y() + blk[0] - 6)
                 self._dvr_status.move(
                     g.left() + max(0, min(g.width() - ss.width(),
                                           bx - g.left() - ss.width() // 2)),
-                    max(g.top(), self.ctl.y() - ss.height() - 6))
+                    max(g.top(), by - ss.height()))
             else:
                 self._dvr_status.move(
                     g.left() + (g.width() - ss.width()) // 2,
@@ -4247,7 +4264,7 @@ class PlayerView(QtWidgets.QWidget):
     def _hide_dl_pill(self):
         if (not self._downloading and self._dvr_status.isVisible()
                 and self._dvr_status.text().startswith(
-                    ("Download", "Enable", "Stream length"))):
+                    _DL_PILL_PREFIXES)):
             self._set_dvr_status(None)
 
     # ---- catch-up download window (gold < > markers on the scrubber) ----

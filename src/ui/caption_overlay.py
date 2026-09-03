@@ -205,6 +205,9 @@ class CaptionOverlay(QtWidgets.QWidget):
         self._bar_top = None     # px from the widget top where the bottom
         #                          letterbox bar starts — None parks the
         #                          text over the picture (historic mode)
+        self._last_block = None  # (y, block_h) of the last painted text
+        #                          block, widget px — lets overlay siblings
+        #                          (the download pill) keep clear of it
         self.hide()
 
     # ---- data ----
@@ -246,8 +249,18 @@ class CaptionOverlay(QtWidgets.QWidget):
             self._bar_top = px
             self.update()
 
+    def text_block(self):
+        """(top, height) of the painted caption text block, widget px, or
+        None when nothing is currently shown. Mirrors paintEvent's own
+        geometry (wrap + insets + bar parking), so siblings can stay clear
+        of the actual text instead of guessing."""
+        if not self.isVisible() or not (self._lines or self._preview):
+            return None
+        return self._last_block
+
     # ---- painting ----
     def paintEvent(self, _event):
+        self._last_block = None    # stale until this paint finishes
         lines = self._lines or ([self._preview] if self._preview else [])
         if not lines or self.height() < 40 or self.width() < 80:
             return
@@ -295,6 +308,7 @@ class CaptionOverlay(QtWidgets.QWidget):
             y = h - bottom - block_h
         if y < int(h * 0.02):
             y = int(h * 0.02)
+        self._last_block = (y, block_h)
 
         # colors
         text = self._color(ap.get("text_color"), "#FFFFFF", 255)

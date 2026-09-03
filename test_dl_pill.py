@@ -3,7 +3,11 @@
 download button (VOD/Stremio button, or the gold window button on
 catch-up) instead of parking in the middle of the picture. Every other
 DVR-status pill stays centered, the anchor survives the controls going
-to sleep, and a pill wider than the window clamps inside the video.
+to sleep, the pill lifts clear of a showing caption block, sibling
+window-download prompts (Enable the time bar / Stream length unknown /
+Window download unavailable) route to the same anchor, the bar-center
+fallback covers a mid-download channel switch, and a pill wider than
+the window clamps inside the video.
 
 Run:  .venv\\Scripts\\python.exe test_dl_pill.py   (sets QT_QPA_PLATFORM itself)
 """
@@ -127,6 +131,71 @@ def main():
     w = view.surface.geometry().width()
     check(f"clamped pill stays inside ({p.left()}..{p.right()} of {w})",
           p.left() >= 0 and p.right() <= w)
+
+    print("[7] showing captions lift the pill clear of the text block")
+    view.resize(1280, 720)
+    view._update_control_state()
+    app.processEvents()
+    view._set_dvr_status("Downloading\u2026 12 / 34 MB")
+    app.processEvents()
+    y_no_caps = pill().top()          # anchor without captions
+    view._cap_wid.set_lines(["Lowered the shields, sir."])
+    view._cap_wid.repaint()           # synchronous paint -> cached block
+    app.processEvents()
+    view._set_dvr_status("Downloading\u2026 13 / 34 MB")
+    app.processEvents()
+    p = pill()
+    blk = view._cap_wid.text_block()
+    check("caption block is painted + cached", blk is not None)
+    if blk is not None:
+        cap_top = view._cap_wid.y() + blk[0]
+        check(f"pill bottom clears the caption block "
+              f"(pill bottom={p.bottom()} cap top={cap_top})",
+              p.bottom() <= cap_top - 4)
+        check(f"pill rode UP with the captions ({y_no_caps} -> {p.top()})",
+              p.top() < y_no_caps)
+    view._cap_wid.set_lines([])       # cue gap: anchor falls back
+    view._cap_wid.repaint()
+    app.processEvents()
+    view._set_dvr_status("Downloading\u2026 14 / 34 MB")
+    app.processEvents()
+    check("no caption showing -> back to the bar-gap anchor",
+          abs(pill().top() - y_no_caps) <= 2)
+
+    print("[8] sibling window prompts route to the same anchor")
+    for text in ("Enable the time bar (Settings \u25b8 Playback controls) "
+                 "to pick a download window",
+                 "Stream length unknown yet \u2014 try again in a moment",
+                 "Window download unavailable for this stream"):
+        view._set_dvr_status(text)
+        app.processEvents()
+        p = pill()
+        check(f"prompt anchored above the bar: {text[:22]}\u2026",
+              abs(p.bottom() - (view.ctl.y() - 6)) <= 2)
+
+    print("[9] 'Window download unavailable' now auto-hides")
+    view._downloading = False
+    view._hide_dl_pill()
+    check("pill cleared by _hide_dl_pill",
+          not view._dvr_status.isVisible())
+
+    print("[10] mid-download switch to live: bar-center fallback")
+    view.current = {"kind": "live", "title": "Live", "url": "http://x/1.ts",
+                    "fav_key": "live:1"}
+    view._mode = "chase"
+    view._update_control_state()
+    view.hide_timer.stop()
+    app.processEvents()
+    check("live hides the download button", view.btn_dl.isHidden())
+    view._set_dvr_status("Downloading\u2026 15 / 34 MB")
+    app.processEvents()
+    p = pill()
+    check(f"pill parked over the bar's center "
+          f"(pill cx={p.center().x()} bar cx="
+          f"{view.ctl.x() + view.ctl.width() // 2})",
+          abs(p.center().x() - (view.ctl.x() + view.ctl.width() // 2)) <= 2)
+    check("pill still above the bar, not mid-screen",
+          abs(p.bottom() - (view.ctl.y() - 6)) <= 2)
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
