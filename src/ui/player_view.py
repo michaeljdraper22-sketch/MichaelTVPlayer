@@ -647,6 +647,10 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1           # DESIRED subtitle track id (-1 = off)
         self._spu_name = ""           # its name — re-matched after media opens
         self._spu_ui = None           # (enabled, on, name) last painted on btn_cc
+        self._sub_dlg_mute = False    # subtitle settings dialog open: VLC's
+        #                             # own spu muted so its rendering and
+        #                             # the dialog preview don't double-paint
+        #                             # (see _open_sub_settings / _enforce_spu)
         # audio tracks (mirror of the spu stack). _audio_name empty = AUTO
         # mode: no user pick — English is preferred by default; a non-empty
         # name is the CURRENT program's pick, re-matched on player swaps
@@ -4671,9 +4675,35 @@ class PlayerView(QtWidgets.QWidget):
                 self._btn_panel, self._btn_ovfs, self._btn_reload,
                 self._btn_showpanel, self.info_overlay, self._dvr_status,
                 self._cap_wid)):
+            # NOTE: this decides at the INSTANT the controls sleep.  When
+            # that lands in a gap between cues the whole window goes away —
+            # every later cue then re-opens it via _ensure_cap_window
+            # (showing the caption child alone paints nothing while its
+            # parent top-level is hidden).
             self.overlay.hide()   # nothing left to show over the video
         # captions may sit lower now that the control bar is gone
         self._layout_overlays()
+
+    def _ensure_cap_window(self):
+        """A caption cue arrived while the overlay window slept away:
+        bring the window back — CONTROLS STAY ASLEEP.  _sleep() above
+        hides the whole window when nothing is on it, which it decides at
+        the instant the controls sleep; landing in a gap between cues
+        used to strand every later cue in a hidden window (showing the
+        child never shows its parent top-level) — captions then only
+        appeared while the cursor kept the controls on screen."""
+        if self._closing or self.overlay.isVisible():
+            return
+        if self._overlay_suppressed:
+            return   # never raise the overlay over another app's windows
+        try:
+            win = self.window()
+            if win is not None and win.isMinimized():
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        self._layout_overlays()   # re-glue: the cursor poll only corrects
+        self.overlay.show()       # drift while the window is visible
 
     def _cursor_on_controls(self) -> bool:
         for w in (self.ctl, self._btn_panel, self._btn_ovfs,
@@ -5368,6 +5398,21 @@ class PlayerView(QtWidgets.QWidget):
         the sticky choice is kept so a fallback re-selects it instantly."""
         if self._closing:
             return
+        if self._sub_dlg_mute:
+            # Subtitle settings dialog open: the app-rendered PREVIEW is
+            # the only sample that belongs on the video.  VLC's own spu
+            # (VLC-rendered bitmap track, or an unparseable handoff file
+            # VLC kept) paints in its OWN auto-sized style right through
+            # the dialog — the "two sample subtitles, one huge one
+            # normal" report.  Keep it off for the dialog's lifetime; the
+            # next enforce tick after close restores the sticky choice.
+            try:
+                if self.vlc.active_spu() != -1:
+                    self.vlc.set_spu(-1)
+            except Exception:  # noqa: BLE001
+                pass
+            self._refresh_spu_button()
+            return
         try:
             if self._cap_on:
                 if self.vlc.active_spu() != -1:
@@ -5912,6 +5957,8 @@ class PlayerView(QtWidgets.QWidget):
             if lines and self._filter_engine.enabled:
                 lines = [self._filter_engine.clean_line(ln) for ln in lines]
             self._cap_wid.set_lines(lines)
+            if lines:
+                self._ensure_cap_window()
         except Exception as exc:  # noqa: BLE001
             # keep the 100 ms caption timer alive whatever happens, but
             # never swallow errors SILENTLY: log each DISTINCT error once
@@ -6566,6 +6613,15 @@ class PlayerView(QtWidgets.QWidget):
             self.overlay.show()
             self._layout_overlays()
         self._cap_wid.set_preview("Subtitle preview")
+        # mute VLC's own renderer for the dialog's lifetime: its sample
+        # (auto-sized, style-deaf — see _enforce_spu) painted right
+        # through the dialog on top of the preview — the reported
+        # "one HUGE, one normal" pair of samples
+        self._sub_dlg_mute = True
+        try:
+            self.vlc.set_spu(-1)
+        except Exception:  # noqa: BLE001
+            pass
         dlg = SubtitleDialog(self.config, self._apply_sub_delay,
                              apply_live=self._apply_sub_style_live,
                              parent=self.window())
@@ -6585,6 +6641,9 @@ class PlayerView(QtWidgets.QWidget):
                         .removeNativeEventFilter(closer)
                 except Exception:  # noqa: BLE001
                     pass
+            # dialog over: VLC's sticky track is re-selected by the next
+            # _enforce_spu tick (timers run through the modal loop)
+            self._sub_dlg_mute = False
         self._cap_wid.set_preview("")
         if subtitle_instance_args(self.config.subtitle_appearance) != before:
             if self._cap_on:
