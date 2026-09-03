@@ -844,7 +844,7 @@ class PlayerView(QtWidgets.QWidget):
         self._eof_note_done = False   # one end-of-media log per media
         self._last_vod_len_ms = 0     # sticky VOD length through EOF
         self.vlc = VLCPlayer(
-            timeshift=config.timeshift, volume=config.volume,
+            volume=config.volume,
             network_caching=config.network_caching,
             sub_args=subtitle_instance_args(config.subtitle_appearance),
             spu_delay_ms=int(config.subtitle_appearance.get("delay_ms", 0)
@@ -1648,8 +1648,8 @@ class PlayerView(QtWidgets.QWidget):
         vlc.Instance in the process, which deadlocks on Windows (see the note
         in dvr.py). Instance-level options such as network-caching cannot be
         changed after creation, so they are logged and take effect on the next
-        app restart; runtime-changeable settings (timeshift flag, volume) are
-        applied immediately.
+        app restart; runtime-changeable settings (volume) are applied
+        immediately.
         """
         current = self.current
         try:
@@ -1659,7 +1659,6 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            self.vlc.timeshift = self.config.timeshift
             self.vlc.set_volume(self.config.volume)
         except Exception as exc:  # noqa: BLE001
             try:
@@ -3904,8 +3903,7 @@ class PlayerView(QtWidgets.QWidget):
         if self.dvr:
             self.dvr.stop(delete=False)
             self.dvr = None
-        self.dvr = VlcRecorder(self.config.dvr_max_minutes,
-                               self.config.network_caching,
+        self.dvr = VlcRecorder(network_caching=self.config.network_caching,
                                instance=self.vlc.instance)
         rec_path = self._rec_path if record else None
         if buf and os.path.exists(buf):
@@ -6760,7 +6758,6 @@ class PlayerView(QtWidgets.QWidget):
         old = self.vlc
         try:
             self.vlc = VLCPlayer(
-                timeshift=self.config.timeshift,
                 volume=self.config.volume,
                 network_caching=self.config.network_caching,
                 sub_args=self._sub_args_built,

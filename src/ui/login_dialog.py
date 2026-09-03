@@ -22,16 +22,10 @@ class LoginDialog(QtWidgets.QDialog):
         self.pass_edit = QtWidgets.QLineEdit(config.password)
         self.pass_edit.setEchoMode(QtWidgets.QLineEdit.Password)
 
-        self.timeshift_chk = QtWidgets.QCheckBox(
-            "Enable Timeshift (pause / rewind live TV)"
-        )
-        self.timeshift_chk.setChecked(config.timeshift)
-
         form = QtWidgets.QFormLayout()
         form.addRow("Server URL:", self.server_edit)
         form.addRow("Username:", self.user_edit)
         form.addRow("Password:", self.pass_edit)
-        form.addRow("", self.timeshift_chk)
 
         self.test_btn = QtWidgets.QPushButton("Test Connection")
         self.test_btn.clicked.connect(self._test)
@@ -105,6 +99,5 @@ class LoginDialog(QtWidgets.QDialog):
         self.config.data["server_url"] = server
         self.config.data["username"] = user
         self.config.data["password"] = pw
-        self.config.data["timeshift"] = self.timeshift_chk.isChecked()
         self.config.save()
         self.accept()

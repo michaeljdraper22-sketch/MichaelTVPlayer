@@ -178,8 +178,6 @@ def collect_system_info(config) -> dict:
         "settings": {
             "network_caching": config.network_caching,
             "chase_delay": config.chase_delay,
-            "dvr_max_minutes": config.dvr_max_minutes,
-            "timeshift": config.timeshift,
         },
     }
     return info

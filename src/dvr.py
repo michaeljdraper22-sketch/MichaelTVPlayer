@@ -19,9 +19,8 @@ log = logging.getLogger("mtp")
 
 
 class VlcRecorder:
-    def __init__(self, max_minutes: int = 30, network_caching: int = 1500,
+    def __init__(self, network_caching: int = 1500,
                  instance=None):
-        self.max_minutes = max(1, int(max_minutes))
         self.network_caching = max(0, min(50000, int(network_caching)))
         self.file_path = None
         self.rec_path = None

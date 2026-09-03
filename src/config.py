@@ -58,7 +58,6 @@ DEFAULTS = {
     "username": "",
     "password": "",
     "volume": 100,
-    "timeshift": True,
     "network_caching": 1500,      # ms, 0..50000
     # Parallel provider API list-loads (1..16). 2 survives aggressive
     # per-second rate limiters (the startup burst used to fire ~11 calls
@@ -73,7 +72,6 @@ DEFAULTS = {
     "vod_countries_configured": False,
     "series_enabled_countries": [],   # Series country/group filter
     "series_countries_configured": False,
-    "dvr_max_minutes": 30,        # rolling DVR buffer window
     "record_folder": "",          # where permanent recordings are saved
     "download_folder": "",        # where catch-up window / VOD downloads go
     # Seconds behind live the always-on DVR chase keeps live TV. 5 is the
@@ -266,14 +264,6 @@ class Config:
     @volume.setter
     def volume(self, value: int) -> None:
         self.data["volume"] = int(value)
-
-    @property
-    def timeshift(self) -> bool:
-        return bool(self.data.get("timeshift", True))
-
-    @timeshift.setter
-    def timeshift(self, value: bool) -> None:
-        self.data["timeshift"] = bool(value)
 
     # ---- collections ----
     @property
@@ -549,14 +539,6 @@ class Config:
                     clean["words"].append(item)
         self.data["profanity"] = clean
 
-
-    @property
-    def dvr_max_minutes(self) -> int:
-        return int(self.data.get("dvr_max_minutes", 30))
-
-    @dvr_max_minutes.setter
-    def dvr_max_minutes(self, value: int) -> None:
-        self.data["dvr_max_minutes"] = max(1, int(value))
 
     @property
     def record_folder(self) -> str:

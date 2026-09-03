@@ -360,8 +360,6 @@ class MainWindow(QtWidgets.QMainWindow):
         act_folder.triggered.connect(self.choose_record_folder)
         act_dlfolder = QtWidgets.QAction("Download folder…", self)
         act_dlfolder.triggered.connect(self.choose_download_folder)
-        act_dvr_window = QtWidgets.QAction("DVR buffer length…", self)
-        act_dvr_window.triggered.connect(self.edit_dvr_window)
         act_delay = QtWidgets.QAction("Live delay (behind live)\u2026", self)
         act_delay.triggered.connect(self.edit_chase_delay)
         act_cache = QtWidgets.QAction("Network cache size\u2026", self)
@@ -376,7 +374,6 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu.addSeparator()
         settings_menu.addAction(act_folder)
         settings_menu.addAction(act_dlfolder)
-        settings_menu.addAction(act_dvr_window)
         settings_menu.addAction(act_delay)
         settings_menu.addAction(act_cache)
         settings_menu.addAction(act_apiconc)
@@ -798,22 +795,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.splitter.setSizes(self._splitter_saved)
             except Exception:  # noqa: BLE001
                 pass
-
-    def edit_dvr_window(self):
-        value, ok = QtWidgets.QInputDialog.getInt(
-            self, "Live TV buffer length",
-            "How many minutes of live TV to keep available for rewind.\n"
-            "More = more disk use while watching (deleted when you switch "
-            "channels).",
-            value=self.config.dvr_max_minutes, min=1, max=240, step=5,
-        )
-        if ok:
-            self.config.dvr_max_minutes = value
-            self.config.save()
-            # restart the recorder for the new window if it's running
-            if self.player_view.dvr and self.player_view.dvr.running:
-                self.player_view._restart_recorder(
-                    record=self.player_view.btn_rec.isChecked())
 
     def open_countries(self):
         """Open the country / region filter (filters the Live TV list)."""
