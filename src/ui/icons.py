@@ -311,18 +311,33 @@ def fullscreen():
 
 
 def refresh():
-    """Reload stream: an almost-full circle with an arrowhead at its
-    top-right opening — the universal refresh glyph."""
+    """Reload stream: an open ring with a solid arrowhead at its top-right
+    opening pointing clockwise into the gap — the universal refresh glyph
+    (Material-style). Built like the seek glyphs' arc-plus-arrowhead: the
+    old two-line barb arrow collapsed into a nub at the corner buttons'
+    18 px and the ring sat off-center (11,11) on the canvas."""
     def draw(p, c):
         p.setBrush(QtCore.Qt.NoBrush)
         _pen(p, c, 2.2)
-        # circle centered (11,11) r=6.8, open on the right between 30°
-        # (top-right) and 330° (bottom-right); the sweep runs the long way
-        p.drawArc(QtCore.QRectF(4.2, 4.2, 13.6, 13.6), 30 * 16, 300 * 16)
-        # arrowhead at the 30° start, pointing along the counter-clockwise
-        # travel (up-left) — two barbs swept back from the tip
-        _polyline(p, c, [(19.8, 9.3), (16.9, 7.6)], 2.2)
-        _polyline(p, c, [(16.9, 11.0), (16.9, 7.6)], 2.2)
+        # ring centered (12,12), wide-open at the right like Material's
+        # refresh: the sweep runs COUNTERCLOCKWISE from 55° around to 335°,
+        # leaving an ~80° gap between 335° and 55°
+        r = 7.2
+        p.drawArc(QtCore.QRectF(12 - r, 12 - r, 2 * r, 2 * r),
+                  55 * 16, 280 * 16)
+        # solid arrowhead at the 55° arc end, pointing along the clockwise
+        # travel (down-right, into the gap) — tip ahead of the arc end,
+        # barbs swept back across it, exactly like _seek_glyph
+        th = radians(55.0)
+        ex, ey = 12 + r * cos(th), 12 - r * sin(th)
+        tx, ty = sin(th), cos(th)                # CW travel direction there
+        nx, ny = cos(th), -sin(th)               # outward normal
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF([
+            _F(ex + tx * 4.4, ey + ty * 4.4),    # tip, along the travel
+            _F(ex + nx * 3.0, ey + ny * 3.0),
+            _F(ex - nx * 3.0, ey - ny * 3.0)]))
     return _icon("refresh", draw)
 
 
