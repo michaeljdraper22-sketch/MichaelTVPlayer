@@ -4,14 +4,22 @@
 Report 2026-09-03 (Stremio handoff, latest Adventure Time episode):
 captions only showed while the on-video control buttons were on screen and
 vanished with them.  Root cause: _sleep() hides the WHOLE overlay window
-when nothing is on it — decided at the instant the controls sleep.  A
-sleep that lands in a gap between cues (no cue active right then) hides
-the window, and every later cue painted into it invisibly: showing the
-caption child never shows its parent top-level.  _ensure_cap_window now
-re-opens the window when a cue arrives, controls staying asleep.
+when nothing is on it — decided at the instant the controls sleep — so a
+sleep landing in a gap between cues stranded every later cue in a hidden
+window (showing the caption child never shows its parent top-level).
 
-Part 2: while the Subtitle settings dialog previews on the video, VLC's
-own spu renderer must be muted — an unparseable handoff file (or a bitmap
+Cut 2 (same day, after a LIVE series session via the vod relay still lost
+captions on every control sleep despite the cue-rescue re-show): while
+_cap_on (the overlay is the ACTIVE caption renderer) _sleep() now never
+hides the window at all — it is transparent, click-through and paints
+nothing between cues, so keeping it up costs nothing and makes the
+stranding class structurally impossible.  _ensure_cap_window stays as the
+rescue for the other hiders (minimized-restore leftover, suppression
+aftermath).  VLC-rendered mode (overlay disengaged) keeps the classic
+hide.
+
+Also: while the Subtitle settings dialog previews on the video, VLC's own
+spu renderer must be muted — an unparseable handoff file (or a bitmap
 track) VLC kept rendering painted its auto-sized sample right through the
 dialog on top of the app-styled preview ("two samples, one HUGE one
 normal").
@@ -109,8 +117,9 @@ def make_view():
     return view, fake
 
 
-print("[1] fullscreen sleep landing in a cue GAP strands the window — "
-      "and the next cue brings it back, controls staying asleep")
+print("[1] fullscreen sleep landing in a cue GAP: the window now STAYS "
+      "while the caption renderer is active — stranding is structurally "
+      "impossible, controls still sleep")
 view, fake = make_view()
 view.set_fullscreen_mode(True)           # immersive: corner buttons sleep too
 view._wake()                             # controls up
@@ -119,36 +128,51 @@ check("controls awake after wake",
 fake.times["t"] = 20000                  # 20 s: cue (10-12) NOT active — gap
 view._caption_tick()
 view._sleep()                            # 4 s idle, gap at the instant
-check("the bug state: sleep in a gap hid the whole overlay window",
-      view.overlay.isHidden())
+check("gap sleep keeps the overlay window (renderer active)",
+      view.overlay.isVisible())
+check("controls asleep", view.ctl.isHidden() and view._btn_panel.isHidden()
+      and view._btn_ovfs.isHidden() and view._btn_reload.isHidden())
 fake.times["t"] = 11000                  # 11 s: cue active again
 view._caption_tick()
-check("cue re-opens the overlay window", view.overlay.isVisible())
-check("cue actually painted", view._cap_wid._lines == ["hello there"])
-check("controls stayed asleep (no wake from captions)",
-      view.ctl.isHidden() and view._btn_panel.isHidden()
-      and view._btn_ovfs.isHidden() and view._btn_reload.isHidden())
+check("cue painted with the controls asleep",
+      view._cap_wid._lines == ["hello there"])
+check("window still up (never stranded)", view.overlay.isVisible())
 
-print("[2] sleep while a cue IS active keeps the window (historic behavior)")
+print("[2] a window hidden by the OTHER hiders (minimized-restore "
+      "leftover, suppression aftermath) is rescued by the next cue")
+view.overlay.hide()                      # simulate a non-_sleep hider
 fake.times["t"] = 11000
-view._sleep()
-check("active cue keeps the overlay window", view.overlay.isVisible())
-check("caption still painted", view._cap_wid._lines == ["hello there"])
+view._caption_tick()
+check("cue re-opens the overlay window", view.overlay.isVisible())
+check("controls stayed asleep (no wake from captions)",
+      view.ctl.isHidden())
+fake.times["t"] = 20000
+view._caption_tick()                     # gap: cue's window ends first
+view.overlay.hide()
+check("window hidden again at a gap", view.overlay.isHidden())
 
 print("[3] suppression wins: never raise the overlay over another app's "
       "windows just for captions")
 view._overlay_suppressed = True
-fake.times["t"] = 20000
-view._caption_tick()                     # gap: the cue's window ENDS first,
-view._sleep()                            # then the idle sleep hides it
-check("window hidden again at a gap", view.overlay.isHidden())
 fake.times["t"] = 11000
 view._caption_tick()
 check("suppressed: the cue does NOT re-show the window",
       view.overlay.isHidden())
 view._overlay_suppressed = False
 
-print("[4] windowed mode: the corner buttons never sleep, so the window "
+print("[4] VLC-rendered subtitles (overlay disengaged): the classic "
+      "window hide at a sleep is preserved")
+view4, fake4 = make_view()
+view4._set_cap_on(False)                 # VLC owns rendering
+fake4.times["t"] = 20000
+view4._caption_tick()                    # tick no-ops (renderer off)
+view4.set_fullscreen_mode(True)
+view4._wake()
+view4._sleep()
+check("disengaged: sleep hides the window as before",
+      view4.overlay.isHidden())
+
+print("[5] windowed mode: the corner buttons never sleep, so the window "
       "never goes away — captions ride through unchanged")
 view2, fake2 = make_view()
 view2._wake()
@@ -163,7 +187,7 @@ view2._caption_tick()
 check("windowed: caption painted through the sleep",
       view2._cap_wid._lines == ["hello there"])
 
-print("[5] Subtitle settings dialog: VLC's own spu muted while the "
+print("[6] Subtitle settings dialog: VLC's own spu muted while the "
       "preview is on the video, sticky choice restored after close")
 view3, fake3 = make_view()
 fake3.tracks = [(4, "Track 1"), (7, "English")]

@@ -4709,13 +4709,30 @@ class PlayerView(QtWidgets.QWidget):
         if not any(w.isVisible() for w in (
                 self._btn_panel, self._btn_ovfs, self._btn_reload,
                 self._btn_showpanel, self.info_overlay, self._dvr_status,
-                self._cap_wid)):
-            # NOTE: this decides at the INSTANT the controls sleep.  When
-            # that lands in a gap between cues the whole window goes away —
-            # every later cue then re-opens it via _ensure_cap_window
-            # (showing the caption child alone paints nothing while its
-            # parent top-level is hidden).
+                self._cap_wid)) and not self._cap_on:
             self.overlay.hide()   # nothing left to show over the video
+        elif not any(w.isVisible() for w in (
+                self._btn_panel, self._btn_ovfs, self._btn_reload,
+                self._btn_showpanel, self.info_overlay,
+                self._dvr_status)) and self._cap_on:
+            # While the caption overlay is the ACTIVE renderer the window
+            # stays up, full stop.  The first cut of the vanish fix only
+            # re-opened it when the next cue arrived (_ensure_cap_window)
+            # — correct in offscreen tests, yet a live 2026-09-03 series
+            # session (relay MKV, SDH-English pick) still lost captions
+            # with every control sleep, so some native show/hide
+            # subtlety of the layered window defeats the re-show.  A
+            # transparent, click-through, idle-painting-nothing window
+            # costs nothing to keep — never hiding it makes the whole
+            # stranding class impossible rather than hard to hit.  This
+            # line is the tripwire: it marks every sleep that KEEPS the
+            # window for captions (a hidden window below this state
+            # would be the invariant broken).
+            try:
+                log.info("captions: controls slept in a cue gap — "
+                         "overlay window kept (renderer active)")
+            except Exception:  # noqa: BLE001
+                pass
         # captions may sit lower now that the control bar is gone
         self._layout_overlays()
 
@@ -4739,6 +4756,12 @@ class PlayerView(QtWidgets.QWidget):
             pass
         self._layout_overlays()   # re-glue: the cursor poll only corrects
         self.overlay.show()       # drift while the window is visible
+        self.overlay.raise_()     # back above the video HWND's z-order
+        try:
+            log.info("captions: re-opened the overlay window for a cue "
+                     "(controls asleep)")
+        except Exception:  # noqa: BLE001
+            pass
 
     def _cursor_on_controls(self) -> bool:
         for w in (self.ctl, self._btn_panel, self._btn_ovfs,
