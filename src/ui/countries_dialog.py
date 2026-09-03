@@ -18,11 +18,12 @@ class _CountryPane(QtWidgets.QWidget):
 
     changed = QtCore.pyqtSignal()
 
-    def __init__(self, config, client, fetch, prefix, parent=None):
+    def __init__(self, config, client, fetch_name, prefix, parent=None):
         super().__init__(parent)
         self.config = config
         self.client = client
-        self._fetch = fetch
+        self._fetch_name = fetch_name   # client attr, resolved at fetch time
+                                         # so a swapped client is honoured
         self._prefix = prefix            # config key prefix ("" | "vod_" | …)
         self._country_cats = []
 
@@ -34,7 +35,7 @@ class _CountryPane(QtWidgets.QWidget):
         b_reload = QtWidgets.QPushButton("⟳ Reload")
         b_all.clicked.connect(lambda: self._set_all(True))
         b_none.clicked.connect(lambda: self._set_all(False))
-        b_reload.clicked.connect(self._load)
+        b_reload.clicked.connect(lambda: self._load(force=True))
         btn_row.addWidget(b_all)
         btn_row.addWidget(b_none)
         btn_row.addStretch(1)
@@ -69,10 +70,11 @@ class _CountryPane(QtWidgets.QWidget):
         self.config.save()
 
     # ---- loading ----
-    def _load(self):
+    def _load(self, force=False):
         self.status.setText("Loading categories…")
         self._clear_layout(self.check_layout)
-        self.runner.run(self._fetch)
+        fn = getattr(self.client, self._fetch_name)
+        self.runner.run(fn, refresh=bool(force))
 
     def _on_loaded(self, result):
         ok, val = result
@@ -150,12 +152,12 @@ class CountriesDialog(QtWidgets.QDialog):
 
         self.tabs = QtWidgets.QTabWidget()
         panes = (
-            ("Live TV", client.live_categories, ""),
-            ("Movies", client.vod_categories, "vod_"),
-            ("Series", client.series_categories, "series_"),
+            ("Live TV", "live_categories", ""),
+            ("Movies", "vod_categories", "vod_"),
+            ("Series", "series_categories", "series_"),
         )
-        for label, fetch, prefix in panes:
-            pane = _CountryPane(config, client, fetch, prefix)
+        for label, fetch_name, prefix in panes:
+            pane = _CountryPane(config, client, fetch_name, prefix)
             pane.changed.connect(self.changed.emit)
             self.tabs.addTab(pane, label)
         layout.addWidget(self.tabs, 1)
@@ -164,7 +166,16 @@ class CountriesDialog(QtWidgets.QDialog):
         close_btn.clicked.connect(self.hide)
         layout.addWidget(close_btn, 0, QtCore.Qt.AlignRight)
 
-    def _load(self):
+    def set_client(self, client):
+        """Adopt a rebuilt client (File ▸ Account saved): panes resolve
+        their fetch callable at call time, so this is all it takes."""
+        self.client = client
+        for i in range(self.tabs.count()):
+            pane = self.tabs.widget(i)
+            if isinstance(pane, _CountryPane):
+                pane.client = client
+
+    def _load(self, force=False):
         """Reload every pane (used by File ▸ Reload all lists)."""
         for i in range(self.tabs.count()):
-            self.tabs.widget(i)._load()
+            self.tabs.widget(i)._load(force=force)

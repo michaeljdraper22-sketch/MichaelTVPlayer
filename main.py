@@ -90,7 +90,7 @@ def cleanup_stale_temp_files(root: str = None) -> None:
     try:
         root = root or tempfile.gettempdir()
         for prefix in ("mtp_dvr_", "mtp_cap_", "mtp_split_",
-                       "MichaelTV-update-"):
+                       "MichaelTV-update-", "MichaelTV-swap-"):
             for path in glob.glob(os.path.join(root, prefix + "*")):
                 try:
                     if os.path.isdir(path):

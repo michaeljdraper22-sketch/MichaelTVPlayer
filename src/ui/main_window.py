@@ -136,7 +136,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setMinimumSize(470, 320)
 
         self.client = XtreamClient(
-            config.normalized_server(), config.username, config.password
+            config.normalized_server(), config.username, config.password,
+            max_concurrent=config.api_concurrency,
         )
 
         central = QtWidgets.QWidget()
@@ -365,6 +366,8 @@ class MainWindow(QtWidgets.QMainWindow):
         act_delay.triggered.connect(self.edit_chase_delay)
         act_cache = QtWidgets.QAction("Network cache size\u2026", self)
         act_cache.triggered.connect(self.edit_cache)
+        act_apiconc = QtWidgets.QAction("Provider connection speed\u2026", self)
+        act_apiconc.triggered.connect(self.edit_api_concurrency)
         act_stremio = QtWidgets.QAction("Stremio handoff\u2026", self)
         act_stremio.triggered.connect(self.edit_stremio)
         settings_menu.addAction(act_buttons)
@@ -376,6 +379,7 @@ class MainWindow(QtWidgets.QMainWindow):
         settings_menu.addAction(act_dvr_window)
         settings_menu.addAction(act_delay)
         settings_menu.addAction(act_cache)
+        settings_menu.addAction(act_apiconc)
         settings_menu.addSeparator()
         act_diag = QtWidgets.QAction("Help improve MichaelTV\u2026", self)
         act_diag.triggered.connect(self.edit_telemetry)
@@ -629,7 +633,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self, "MichaelTV — Update",
                 f"Could not check for updates:\n{val}")
             return
-        ver, notes, asset_url = val
+        ver, notes, asset_url, sha_url = val
         if not updater.is_newer(ver):
             QtWidgets.QMessageBox.information(
                 self, "MichaelTV — Update",
@@ -646,9 +650,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "MichaelTV — Update available", body)
         if btn != QtWidgets.QMessageBox.Yes:
             return
-        self._download_update(asset_url, ver)
+        self._download_update(asset_url, sha_url, ver)
 
-    def _download_update(self, asset_url, ver):
+    def _download_update(self, asset_url, sha_url, ver):
         prog = QtWidgets.QProgressDialog(
             f"Downloading MichaelTV {ver}\u2026", None, 0, 0, self)
         prog.setWindowTitle("MichaelTV — Update")
@@ -662,7 +666,14 @@ class MainWindow(QtWidgets.QMainWindow):
         def work():
             dest = os.path.join(tempfile.gettempdir(),
                                 f"MichaelTV-{ver}.zip")
-            return (ver, updater.download(asset_url, dest))
+            updater.download(asset_url, dest)
+            # integrity check, but strictly verify-when-present: releases
+            # without a .sha256 asset update exactly as before
+            if sha_url:
+                sha_path = dest + ".sha256"
+                updater.download(sha_url, sha_path)
+                updater.verify_sha256(dest, sha_path)
+            return (ver, dest)
 
         self._upd_dl_runner = AsyncRunner()
         self._upd_dl_runner.finished.connect(
@@ -707,19 +718,34 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def open_account(self):
         if LoginDialog.configure(self.config, self).exec_() == QtWidgets.QDialog.Accepted:
+            # NB: self.config here — a bare ``config`` in this method was a
+            # latent NameError (the __init__ parameter is not in scope) that
+            # crashed the app the moment the Account dialog was saved.
             self.client = XtreamClient(
-                self.config.normalized_server(), self.config.username, self.config.password
+                self.config.normalized_server(), self.config.username,
+                self.config.password,
+                max_concurrent=self.config.api_concurrency,
             )
             self.player_view.set_client(self.client)
+            # the tabs / countries dialog captured the OLD client at
+            # construction — without this they kept querying the previous
+            # account's credentials after an account change
+            self.countries_dialog.set_client(self.client)
+            for tab in (self.live_tab, self.vod_tab, self.series_tab,
+                        self.catchup_tab):
+                tab.client = self.client
             self.reload_all()
             self._acc_runner.run(self.client.authenticate)
 
     def reload_all(self):
+        """F5 / File ▸ Reload all lists / post-account-save: every list is
+        re-downloaded for real (refresh=True bypasses the client's
+        short-lived cache), deduped into one request per list."""
         self.fav_tab.refresh()
-        self.countries_dialog._load()
+        self.countries_dialog._load(force=True)
         for tab in (self.live_tab, self.vod_tab, self.series_tab,
                     self.catchup_tab):
-            tab._reload_categories()
+            tab._reload_categories(force=True)
 
     def add_custom(self):
         self.custom_tab.add_channel_dialog(self)
@@ -1002,6 +1028,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config.network_caching = value
             self.config.save()
             self.player_view.rebuild()
+
+    def edit_api_concurrency(self):
+        value, ok = QtWidgets.QInputDialog.getInt(
+            self, "Provider connection speed",
+            "How many channel/movie/series list downloads may run in\n"
+            "parallel when the app loads or reloads a library.\n\n"
+            "2 (default) is polite and survives providers that rate-limit\n"
+            "burst requests; higher loads faster on providers that allow\n"
+            "it.\nRange: 1 – 16.\n\nApplies after restarting MichaelTV.",
+            value=self.config.api_concurrency, min=1, max=16, step=1,
+        )
+        if ok:
+            self.config.api_concurrency = value
+            self.config.save()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():

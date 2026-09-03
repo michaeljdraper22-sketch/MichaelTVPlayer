@@ -66,10 +66,10 @@ class BaseBrowser(QtWidgets.QWidget):
         self._reload_categories()
 
     # ---- to be overridden ----
-    def fetch_categories(self):
+    def fetch_categories(self, refresh=False):
         return []
 
-    def fetch_items(self, cat_id):
+    def fetch_items(self, cat_id, refresh=False):
         return []
 
     def item_display(self, it):
@@ -130,10 +130,14 @@ class BaseBrowser(QtWidgets.QWidget):
         self.status.setStyleSheet("color:#9aa0a6;")
         layout.addWidget(self.status)
 
-    def _reload_categories(self):
+    def _reload_categories(self, force=False):
         self.status.setText("Loading categories…")
         self._mode = "cats"
-        self.runner.run(self.fetch_categories)
+        # an explicit reload (F5 / menu / account re-save) also refreshes
+        # the items fetch it triggers; a plain category click afterwards
+        # is happy to use the short-lived client cache instead
+        self._force_refresh = bool(force)
+        self.runner.run(self.fetch_categories, refresh=bool(force))
 
     def _on_category(self, _idx):
         if self.cat_combo.count() == 0:
@@ -156,7 +160,9 @@ class BaseBrowser(QtWidgets.QWidget):
             self.status.setText("Loading…")
         self._mode = "items"
         cat_arg = None if key in (None, "all") else key
-        self.runner.run(self.fetch_items, cat_arg)
+        refresh = getattr(self, "_force_refresh", False)
+        self._force_refresh = False
+        self.runner.run(self.fetch_items, cat_arg, refresh=refresh)
 
     def _on_loaded(self, result):
         ok, val = result
@@ -296,12 +302,12 @@ class LiveBrowser(BaseBrowser):
     # legacy config keys: enabled_countries / countries_configured
     country_prefix = ""
 
-    def fetch_categories(self):
-        return self.client.live_categories()
+    def fetch_categories(self, refresh=False):
+        return self.client.live_categories(refresh=refresh)
 
-    def fetch_items(self, cat_id):
+    def fetch_items(self, cat_id, refresh=False):
         # item-level country filtering happens in _show_items (base class)
-        return self.client.live_streams(cat_id)
+        return self.client.live_streams(cat_id, refresh=refresh)
 
     def item_display(self, it):
         return it.get("name", "")
@@ -328,13 +334,13 @@ class VodBrowser(BaseBrowser):
     big_library = True
     country_prefix = "vod_"
 
-    def fetch_categories(self):
-        return self.client.vod_categories()
+    def fetch_categories(self, refresh=False):
+        return self.client.vod_categories(refresh=refresh)
 
-    def fetch_items(self, cat_id):
+    def fetch_items(self, cat_id, refresh=False):
         # The "All" fetch downloads the whole library: give it a long rope.
         return self.client.vod_streams(
-            cat_id, timeout=None if cat_id else 90)
+            cat_id, timeout=None if cat_id else 90, refresh=refresh)
 
     def item_display(self, it):
         return it.get("name", "")
@@ -361,13 +367,13 @@ class SeriesBrowser(BaseBrowser):
     big_library = True
     country_prefix = "series_"
 
-    def fetch_categories(self):
-        return self.client.series_categories()
+    def fetch_categories(self, refresh=False):
+        return self.client.series_categories(refresh=refresh)
 
-    def fetch_items(self, cat_id):
+    def fetch_items(self, cat_id, refresh=False):
         # "All" downloads the whole catalogue: give it a long rope.
         return self.client.series(
-            cat_id, timeout=None if cat_id else 90)
+            cat_id, timeout=None if cat_id else 90, refresh=refresh)
 
     def item_display(self, it):
         return it.get("name", "")
@@ -602,13 +608,13 @@ class CatchupBrowser(BaseBrowser):
     # channels, 0 visible with a 4K/8K/US Live filter).
     country_prefix = None
 
-    def fetch_categories(self):
-        return self.client.live_categories()
+    def fetch_categories(self, refresh=False):
+        return self.client.live_categories(refresh=refresh)
 
-    def fetch_items(self, cat_id):
+    def fetch_items(self, cat_id, refresh=False):
         # only archive-capable channels have anything to catch up on
-        return [c for c in (self.client.live_streams(cat_id) or [])
-                if str(c.get("tv_archive")) == "1"]
+        return [c for c in (self.client.live_streams(cat_id, refresh=refresh)
+                            or []) if str(c.get("tv_archive")) == "1"]
 
     def item_display(self, it):
         dur = it.get("tv_archive_duration")

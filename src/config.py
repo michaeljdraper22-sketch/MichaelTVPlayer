@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -60,6 +60,12 @@ DEFAULTS = {
     "volume": 100,
     "timeshift": True,
     "network_caching": 1500,      # ms, 0..50000
+    # Parallel provider API list-loads (1..16). 2 survives aggressive
+    # per-second rate limiters (the startup burst used to fire ~11 calls
+    # at once and got 429'd into empty channel lists); raise it for
+    # panels that don't care and want a faster startup. Applies after a
+    # restart (Settings > Provider connection speed).
+    "api_concurrency": 2,
     "theme": "dark",
     "enabled_countries": [],      # selected country/group tokens (Live TV)
     "countries_configured": False,
@@ -249,12 +255,8 @@ class Config:
         return bool(self.server_url and self.username and self.password)
 
     def normalized_server(self) -> str:
-        s = self.server_url.strip()
-        if not s:
-            return ""
-        if not s.startswith(("http://", "https://")):
-            s = "http://" + s
-        return s.rstrip("/")
+        from .xtream import normalize_server_url
+        return normalize_server_url(self.server_url)
 
     # ---- player prefs ----
     @property
@@ -336,6 +338,17 @@ class Config:
     @network_caching.setter
     def network_caching(self, value: int) -> None:
         self.data["network_caching"] = max(0, min(50000, int(value)))
+
+    @property
+    def api_concurrency(self) -> int:
+        try:
+            return max(1, min(16, int(self.data.get("api_concurrency", 2))))
+        except (TypeError, ValueError):
+            return 2
+
+    @api_concurrency.setter
+    def api_concurrency(self, value: int) -> None:
+        self.data["api_concurrency"] = max(1, min(16, int(value)))
 
     @property
     def theme(self) -> str:

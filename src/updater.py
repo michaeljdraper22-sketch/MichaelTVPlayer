@@ -46,7 +46,10 @@ def is_newer(remote, local=APP_VERSION):
 
 
 def fetch_latest(timeout=15):
-    """Return (version, notes, asset_url) for the latest GitHub release.
+    """Return (version, notes, asset_url, sha256_url) for the latest
+    GitHub release.  sha256_url is None when the release carries no
+    checksum asset (all releases before it existed) — verification is
+    strictly verify-when-present and never blocks an update.
 
     Raises on any network/parse problem — the caller shows a plain message.
     """
@@ -66,10 +69,42 @@ def fetch_latest(timeout=15):
             if (a.get("name") or "").lower().endswith(".zip"):
                 asset_url = a.get("browser_download_url")
                 break
+    sha256_url = None
+    for a in data.get("assets") or []:
+        if (a.get("name") or "").lower().endswith(".sha256"):
+            sha256_url = a.get("browser_download_url")
+            break
     if not tag or not asset_url:
         raise RuntimeError("release has no MichaelTV zip asset")
     notes = (data.get("body") or "").strip()
-    return tag, notes, asset_url
+    return tag, notes, asset_url, sha256_url
+
+
+def verify_sha256(zip_path, sha_path):
+    """Check the downloaded zip against the LOCAL .sha256 file the caller
+    already downloaded (it is a plain path, NOT a URL — the original
+    draft urlopen'd it and crashed on "unknown url type: c" the moment
+    a release actually shipped a checksum).  Raises RuntimeError on
+    mismatch or an unreadable checksum; returns True on a match.  A
+    250 MB download with no integrity check accepts any truncated or
+    hijacked transfer as an update (issue #4 hardening)."""
+    import hashlib
+    expected = ""
+    with open(sha_path, "r", encoding="utf-8", errors="replace") as f:
+        tokens = f.read().strip().lower().split()
+        expected = tokens[0] if tokens else ""
+    if len(expected) < 32:
+        raise RuntimeError("checksum file is unreadable or empty")
+    h = hashlib.sha256()
+    with open(zip_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    got = h.hexdigest()
+    if got != expected:
+        raise RuntimeError(
+            f"download failed its integrity check "
+            f"(sha256 {got[:12]}…, expected {expected[:12]}…)")
+    return True
 
 
 def download(asset_url, dest, progress=None, chunk=1 << 16):
@@ -105,6 +140,17 @@ def stage_update(zip_path):
     app's exit is guaranteed by the caller's threading.Timer hard-exit;
     the unconditional ``taskkill`` only matters if even that failed.
     Every step appends to %TEMP%\\MichaelTV-swap.log for diagnosability.
+
+    The helper is written OUTSIDE the payload (issue #4 bug 3a/3b): when
+    it lived in staging, ``robocopy /MIR`` copied _swap.bat into the
+    install dir on every update, and the trailing ``rd /s /q`` of the
+    staging folder deleted the still-executing bat's directory, so its
+    last log line ("swap done") never ran and the log could not tell a
+    finished swap from a half-done one.  It now self-deletes via
+    ``del "%~f0"``.  The file is written with newline="" so the literal
+    \\r\\n in the lines is not translated a second time to \\r\\r\\n
+    (issue #4 bug 3c — cmd tolerated it, but the stray \\r leaked into
+    the swap log).
     """
     staging = os.path.join(
         tempfile.gettempdir(), f"MichaelTV-update-{os.getpid()}")
@@ -129,11 +175,20 @@ def stage_update(zip_path):
         # an arbitrary folder
         raise RuntimeError("install folder not detected "
                            "(no MichaelTV.exe beside the running app)")
-    helper = os.path.join(staging, "_swap.bat")
+    # refuse to "update" a disposable extraction: running straight out of
+    # a temp folder (e.g. the 7-Zip preview) would mirror the new version
+    # into a folder disk cleanup later deletes (issue #4 hardening)
+    _tmp = os.path.normcase(os.path.abspath(tempfile.gettempdir()))
+    _inst = os.path.normcase(os.path.abspath(install_dir))
+    if _inst == _tmp or _inst.startswith(_tmp + os.sep):
+        raise RuntimeError("MichaelTV is running from a temporary folder — "
+                           "extract or install it properly before updating")
+    helper = os.path.join(
+        tempfile.gettempdir(), f"MichaelTV-swap-{os.getpid()}.bat")
     pid = os.getpid()
     logf = os.path.join(tempfile.gettempdir(), "MichaelTV-swap.log")
     rc = ("/MIR /R:2 /W:2 /NFL /NDL /NJH /NJS /NP >nul")
-    with open(helper, "w") as f:
+    with open(helper, "w", newline="") as f:
         f.write(
             "@echo off\r\n"
             f"echo [{time.strftime('%Y-%m-%d %H:%M:%S')}] swap start"
@@ -143,16 +198,33 @@ def stage_update(zip_path):
             # if the app still wedged mid-shutdown, take it down; rc 128
             # (no such process) is the normal, already-exited case
             f"taskkill /F /PID {pid} >nul 2>&1\r\n"
-            f"echo [..] copying payload >> \"{logf}\"\r\n"
+            # every step is stamped at EXECUTION time ([%date% %time%]
+            # expand inside cmd): a stuck update is diagnosable from the
+            # log alone — how long the copy took, whether the AV-hold
+            # retry saved it, where things stopped (field lesson of the
+            # v1.4.1 bricked update, which had no log at all)
+            f"echo [%date% %time%] copying payload >> \"{logf}\"\r\n"
             f"robocopy \"{payload}\" \"{install_dir}\" {rc}\r\n"
+            # rc >= 8 is a robocopy FAILURE (1-7 are success variants);
+            # logged loudly but the swap continues — with the old exe
+            # still in place, starting it leaves a working app and the
+            # next update can retry, whereas skipping the start would
+            # strand the user with nothing running after the app exited
+            f"if errorlevel 8 echo [%date% %time%]!! robocopy FAILED"
+            f" rc=%errorlevel% >> \"{logf}\"\r\n"
             # one retry a beat later: AV suites can briefly hold the
             # fresh exe after writing it
             "ping -n 4 127.0.0.1 >nul\r\n"
             f"robocopy \"{payload}\" \"{install_dir}\" {rc}\r\n"
-            f"echo [..] starting new version >> \"{logf}\"\r\n"
+            f"if errorlevel 8 echo [%date% %time%]!! robocopy FAILED"
+            f" rc=%errorlevel% >> \"{logf}\"\r\n"
+            f"echo [%date% %time%] starting new version >> \"{logf}\"\r\n"
             f"start \"\" \"{install_dir}\\MichaelTV.exe\"\r\n"
             f"rd /s /q \"{staging}\"\r\n"
-            f"echo [..] swap done >> \"{logf}\"\r\n"
+            f"echo [%date% %time%] swap done >> \"{logf}\"\r\n"
+            # the helper lives in %TEMP%, not staging — deleting its own
+            # folder is no longer a concern; this last line now RUNS
+            f"del \"%~f0\"\r\n"
         )
     return helper, staging
 

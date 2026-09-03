@@ -2,7 +2,7 @@
 
 from PyQt5 import QtWidgets
 
-from ..xtream import XtreamClient
+from ..xtream import XtreamClient, normalize_server_url
 from .worker import AsyncRunner
 
 
@@ -63,10 +63,10 @@ class LoginDialog(QtWidgets.QDialog):
         return LoginDialog(config, parent)
 
     def _client_creds(self):
-        server = self.server_edit.text().strip()
-        if server and not server.startswith(("http://", "https://")):
-            server = "http://" + server
-        server = server.rstrip("/")
+        # normalize_server_url: pastes from chat/email can carry newlines
+        # and signature dashes — one such paste reached DNS as
+        # "host%0a%0a%0a-----" (GitHub issue #5)
+        server = normalize_server_url(self.server_edit.text())
         return server, self.user_edit.text().strip(), self.pass_edit.text()
 
     def _test(self):

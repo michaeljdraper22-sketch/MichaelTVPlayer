@@ -55,6 +55,15 @@ if exist "dist\MichaelTV-%VER%.zip" (
     echo Release package: dist\MichaelTV-%VER%.zip
 )
 
+rem ---- checksum asset: the in-app updater (v2.0.1+) verifies the zip
+rem      against it when present; older releases have none and update as
+rem      before (verification is strictly verify-when-present) ----
+powershell -NoProfile -Command ^
+  "(Get-FileHash -Algorithm SHA256 \"dist\MichaelTV-%VER%.zip\").Hash.ToLower() + '  MichaelTV-%VER%.zip' | Set-Content \"dist\MichaelTV-%VER%.zip.sha256\" -Encoding ascii"
+if exist "dist\MichaelTV-%VER%.zip.sha256" (
+    echo Checksum:        dist\MichaelTV-%VER%.zip.sha256
+)
+
 echo.
 echo Done. Double-click:  dist\MichaelTV.exe
 echo Runs fully isolated on dist\vlc\ — the installed VLC is not used.

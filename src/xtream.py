@@ -3,6 +3,7 @@
 import base64
 import binascii
 import hashlib
+import json
 import logging
 import math
 import threading
@@ -64,6 +65,56 @@ class XtreamError(Exception):
     pass
 
 
+def _http_error_message(resp) -> str:
+    """Final (post-retry) HTTP failure as a plain-language message.
+
+    The body is surfaced because this provider's 403 outage replies
+    {"error":"Authentication failed"} — indistinguishable from bad
+    credentials without it (issue #5) — and the hints say what a 403/429
+    from an IPTV panel almost always is (field diagnosis of the "dead"
+    line on GitHub issue #3: a provider-side block/outage, not an app
+    bug — the old bare "Server returned HTTP 403" sent the user chasing
+    a phantom app regression)."""
+    status = getattr(resp, "status_code", 0)
+    hint = ""
+    if status == 403:
+        hint = (" — the provider is refusing this connection (rate "
+                "limit, outage or block); retry in a few minutes")
+    elif status == 429:
+        hint = (" — the provider is rate-limiting; wait a minute, then "
+                "reload the lists")
+    elif 500 <= status < 600:
+        hint = " — provider server error; retry shortly"
+    body = ""
+    try:
+        body = (resp.text or "").strip()[:120]
+        try:
+            parsed = json.loads(body)
+            if isinstance(parsed, dict):
+                body = str(parsed.get("error") or body)
+        except ValueError:
+            pass
+    except Exception:  # noqa: BLE001
+        pass
+    detail = f" [{body}]" if body else ""
+    return f"Server returned HTTP {status}{hint}{detail}"
+
+
+def normalize_server_url(s: str) -> str:
+    """Clean a pasted panel URL.  Pastes from chat/email carry trailing
+    newlines and signature dashes — one such paste reached DNS as
+    ``host%0a%0a%0a-----`` (field log, GitHub issue #5).  Keep the first
+    line, strip paste artifacts, ensure a scheme, drop trailing slashes."""
+    s = (s or "").strip()
+    if not s:
+        return ""
+    s = s.splitlines()[0].strip()
+    s = s.rstrip("/- \t")
+    if s and not s.startswith(("http://", "https://")):
+        s = "http://" + s
+    return s.rstrip("/")
+
+
 def decode_epg_text(s: str) -> str:
     """Xtream EPG titles/descriptions arrive base64-encoded on most panels
     (verified on this account: get_simple_data_table titles decode to plain
@@ -83,13 +134,41 @@ def decode_epg_text(s: str) -> str:
 
 
 class XtreamClient:
-    def __init__(self, server: str, username: str, password: str, timeout: int = 20):
+    # Provider flakiness schedule (GitHub issue #5, field-verified on
+    # cdngold8k): the panel rate-limits on per-second CONCURRENCY (7 truly
+    # parallel calls -> 1-2 x 429; sequential always 200) and has hard
+    # outage windows where EVERY request 403s "Authentication failed" for
+    # minutes even with valid credentials.  429/5xx/network errors back
+    # off up to 4 retries; 403 gets 2 quick retries (it is usually a
+    # transient backend flap, not bad credentials — but a definitive
+    # 200-body auth rejection still fails immediately, no retries).
+    _BULK_BACKOFF = (0.8, 1.5, 2.5, 4.0, 6.0)
+    _FAST_BACKOFF = (0.8, 1.5)     # interactive calls: quick retries only
+    _RETRY_403 = 2
+    # Short TTL for list payloads: the Countries dialog and tab switches
+    # used to re-download the same megabytes within seconds.
+    _CACHE_TTL = 120.0
+
+    def __init__(self, server: str, username: str, password: str,
+                 timeout: int = 20, max_concurrent: int = 2):
         if not server:
             raise XtreamError("No server URL configured")
         self.base = server.rstrip("/")
         self.username = username
         self.password = password
         self.timeout = timeout
+        # Bulk list loads (categories / whole-library streams) share this
+        # gate so the startup burst cannot trip per-second rate limiters.
+        # Interactive one-shot calls (EPG on click, vod/series info, auth)
+        # stay OUTSIDE it — a 45 MB movie-list download must never stall
+        # them.  Configurable (Settings > Provider connection speed,
+        # default 2, 1..16) because tolerance varies per provider.
+        self._gate = threading.BoundedSemaphore(
+            max(1, min(16, int(max_concurrent or 2))))
+        self._cache = {}            # key -> (expires_epoch, data)
+        self._cache_lock = threading.Lock()
+        self._dedupe = {}           # key -> in-flight {"done","data","error"}
+        self._dedupe_lock = threading.Lock()
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "MichaelTVPlayer/1.0"})
         try:
@@ -102,7 +181,7 @@ class XtreamClient:
             pass
 
     # ---- low level ----
-    def _api(self, action=None, timeout=None, _retries=1, **extra):
+    def _api(self, action=None, timeout=None, bulk=False, **extra):
         params = {"username": self.username, "password": self.password}
         if action:
             params["action"] = action
@@ -110,24 +189,57 @@ class XtreamClient:
             if v is not None:
                 params[k] = v
         url = f"{self.base}/player_api.php"
-        try:
-            resp = self.session.get(url, params=params,
-                                    timeout=timeout or self.timeout)
-        except requests.RequestException as exc:
-            if _retries > 0:
-                # transient network blip — one quiet retry before declaring
-                # the panel unreachable (auto-reported either way on fail)
+        backoff = self._BULK_BACKOFF if bulk else self._FAST_BACKOFF
+        resp = None
+        for attempt in range(len(backoff) + 1):
+            exc = None
+            try:
+                if bulk:
+                    # a slot is held ONLY for the HTTP exchange — never
+                    # while backing off (a 429'd call must not block the
+                    # others) and never while parsing a multi-MB body
+                    with self._gate:
+                        resp = self.session.get(
+                            url, params=params,
+                            timeout=timeout or self.timeout)
+                else:
+                    resp = self.session.get(
+                        url, params=params, timeout=timeout or self.timeout)
+            except requests.RequestException as e:
+                exc = e
+            if exc is None:
+                if resp.status_code == 200:
+                    break
+                retryable = (resp.status_code == 429
+                             or 500 <= resp.status_code < 600
+                             or (resp.status_code == 403
+                                 and attempt < self._RETRY_403))
+                if retryable and attempt < len(backoff):
+                    _record_error(action, "HTTP %d (retrying)"
+                                  % resp.status_code)
+                    delay = backoff[attempt]
+                    try:    # honour the panel's own ask when it has one
+                        delay = max(delay, float(
+                            resp.headers.get("Retry-After")))
+                    except (TypeError, ValueError):
+                        pass
+                    time.sleep(delay)
+                    continue
+                _record_error(action, "HTTP %d" % resp.status_code)
+                log.error("xtream %s: server returned HTTP %d",
+                          action or "auth", resp.status_code)
+                raise XtreamError(_http_error_message(resp))
+            # connection-level failure — ONE quiet retry. The long ladder
+            # is for rate-limited/5xx ANSWERS, not dead hosts: a typo'd
+            # server URL (or the login "Test Connection" against one)
+            # must fail fast, not hang through ~15 s of backoff.
+            if attempt == 0:
                 time.sleep(1.0)
-                return self._api(action, timeout, _retries - 1, **extra)
+                continue
             _record_error(action, "connection: %r" % (exc,))
             log.error("xtream %s: connection failed: %r",
                       action or "auth", exc)
             raise XtreamError(f"Connection failed: {exc}") from exc
-        if resp.status_code != 200:
-            _record_error(action, "HTTP %d" % resp.status_code)
-            log.error("xtream %s: server returned HTTP %d",
-                      action or "auth", resp.status_code)
-            raise XtreamError(f"Server returned HTTP {resp.status_code}")
         try:
             self._record_panel_hints(resp)
             data = resp.json()
@@ -152,6 +264,53 @@ class XtreamClient:
             raise XtreamError(f"Panel error: {msg}")
         _record_action(action or "auth", data)
         return data
+
+    # ---- bulk loads: TTL cache + in-flight dedupe (issue #5) ----
+    # Startup wants the same lists from several widgets at once — the Live
+    # tab, the Catch-Up tab and the Countries dialog each fetch
+    # get_live_categories, and Live + Catch-Up each downloaded the whole
+    # 7 MB get_live_streams (~11 parallel calls, ~150 MB in 7 s).  One
+    # flight per key plus a short cache turns the burst into one download.
+    # Every caller gets its own shallow copy so nobody's in-place sorting
+    # or filtering leaks into anyone else's list.
+    def _bulk(self, key, fetch, refresh=False):
+        if not refresh:
+            with self._cache_lock:
+                hit = self._cache.get(key)
+                if hit and hit[0] > time.time():
+                    data = hit[1]
+                    return list(data) if isinstance(data, list) else data
+            with self._dedupe_lock:
+                flight = self._dedupe.get(key)
+                is_leader = flight is None
+                if is_leader:
+                    flight = {"done": threading.Event(), "data": None,
+                              "error": None}
+                    self._dedupe[key] = flight
+            if not is_leader:
+                flight["done"].wait()
+                if flight["error"] is not None:
+                    raise flight["error"]
+                data = flight["data"]
+                return list(data) if isinstance(data, list) else data
+        else:
+            flight = {"done": threading.Event(), "data": None, "error": None}
+            is_leader = True
+        try:
+            data = fetch()
+            flight["data"] = data      # followers read this after wait()
+        except BaseException as exc:
+            flight["error"] = exc
+            raise
+        finally:
+            if is_leader:
+                flight["done"].set()
+                with self._dedupe_lock:
+                    if self._dedupe.get(key) is flight:
+                        del self._dedupe[key]
+        with self._cache_lock:
+            self._cache[key] = (time.time() + self._CACHE_TTL, data)
+        return list(data) if isinstance(data, list) else data
 
     def _record_panel_hints(self, resp) -> None:
         """Fingerprint the panel once (server header etc.) for diagnostics —
@@ -193,22 +352,38 @@ class XtreamClient:
         )
 
     # ---- live ----
-    def live_categories(self):
-        return self._api("get_live_categories") or []
+    def live_categories(self, refresh=False):
+        return self._bulk(
+            ("live_categories",),
+            lambda: self._api("get_live_categories", bulk=True),
+            refresh) or []
 
-    def live_streams(self, category_id=None):
-        return self._api("get_live_streams", category_id=category_id) or []
+    def live_streams(self, category_id=None, refresh=False):
+        return self._bulk(
+            ("live_streams", category_id),
+            lambda: self._api("get_live_streams", category_id=category_id,
+                              bulk=True),
+            refresh) or []
 
     # ---- vod (movies) ----
-    def vod_categories(self):
-        return self._api("get_vod_categories") or []
+    def vod_categories(self, refresh=False):
+        return self._bulk(
+            ("vod_categories",),
+            lambda: self._api("get_vod_categories", bulk=True),
+            refresh) or []
 
-    def vod_streams(self, category_id=None, timeout=None):
+    def vod_streams(self, category_id=None, timeout=None, refresh=False):
+        return self._bulk(
+            ("vod_streams", category_id),
+            lambda: self._vod_fetch(category_id, timeout),
+            refresh) or []
+
+    def _vod_fetch(self, category_id, timeout):
         # No category = the provider's ENTIRE movie library, which can be a
         # multi-MB JSON that takes far longer than the default timeout.
         try:
             data = self._api("get_vod_streams", category_id=category_id,
-                             timeout=timeout) or []
+                             timeout=timeout, bulk=True) or []
         except XtreamError as exc:
             _record_error("get_vod_streams", "falling back to m3u (%s)"
                           % exc)
@@ -225,14 +400,23 @@ class XtreamClient:
         return self._api("get_vod_info", vod_id=vod_id) or {}
 
     # ---- series ----
-    def series_categories(self):
-        return self._api("get_series_categories") or []
+    def series_categories(self, refresh=False):
+        return self._bulk(
+            ("series_categories",),
+            lambda: self._api("get_series_categories", bulk=True),
+            refresh) or []
 
-    def series(self, category_id=None, timeout=None):
+    def series(self, category_id=None, timeout=None, refresh=False):
+        return self._bulk(
+            ("series", category_id),
+            lambda: self._series_fetch(category_id, timeout),
+            refresh) or []
+
+    def _series_fetch(self, category_id, timeout):
         # Same as VOD: the full series list can be huge.
         try:
             data = self._api("get_series", category_id=category_id,
-                             timeout=timeout) or []
+                             timeout=timeout, bulk=True) or []
         except XtreamError as exc:
             _record_error("get_series", "falling back to m3u (%s)" % exc)
             data = []
