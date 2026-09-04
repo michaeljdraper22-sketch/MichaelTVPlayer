@@ -18,7 +18,11 @@
     'Real Time with Bill Maher' above 'Adventure Time'; the old first-
     ANY-shared-word rule matched Maher off the single word 'Time',
     retitled the stream and killed every episode button + autoplay)
-    can't reproduce regardless of search ordering.
+    can't reproduce regardless of search ordering. Plus the 2026-09-04
+    cleaner regression: junk tokens strip as WHOLE tokens only, so 'DV'
+    can no longer eat the middle of 'Adventure' ('A enture Time' was a
+    query no title could match, so every Adventure Time lookup honestly
+    missed — prev/next/autoplay dead all day).
 [5] wiring: play_media kicks the probe with the guard.
 
 Run:  .venv\\Scripts\\python.exe test_stremio_speed.py   (sets QT_QPA_PLATFORM itself)
@@ -243,6 +247,41 @@ def main():
         "The Terminator 1984")
     check("movie matcher picks the right title word-set",
           movie_hit and movie_hit["id"] == "tt0086")
+
+    # ---- the 2026-09-04 field regression: _JUNK_RES's codec alternation
+    # had no word boundaries, so the 'DV' token ate the middle of
+    # 'Adventure' — clean_show_name turned every Adventure Time release
+    # into the query 'A enture Time', a string no catalog title can ever
+    # word-match, and the strict scorer (correctly) refused everything:
+    # identity, prev/next and autoplay logged 'nothing found' all day
+    # (player.log 2026-09-04 12:42-13:06, 5 misses in a row)
+    release = ("Adventure.Time.S03E24.Ghost.Princess.1080p.HMAX.WEBRip."
+               "DD.2.0.H.265.-EDGE2020.mkv")
+    cleaned = stremio.clean_show_name(release)
+    check("cleaner keeps 'Adventure' whole (DV strips as a token only)",
+          cleaned == "Adventure Time")
+    cleaned = stremio.clean_show_name(
+        "Marvels.Multiverse.of.Madness.2022.1080p.WEBRip.x265.mkv")
+    check("cleaner keeps 'Multiverse' whole (MULTI strips as a token only)",
+          "Multiverse" in cleaned.split())
+    cleaned = stremio.clean_movie_name(
+        "Everything.Everywhere.All.At.Once.2022.2160p.BluRay.MULTI.DV."
+        "HEVC.mkv")
+    check("movie cleaner still strips whole MULTI/DV tokens",
+          cleaned == "Everything Everywhere All At Once 2022")
+    seen = []
+
+    def recording_search(q):
+        seen.append(q)
+        return list(metas)
+
+    # resolve_identity's exact call shape: clean first, then match
+    hit = stremio._find_catalog(recording_search,
+                                stremio.clean_show_name(release))
+    check("incident release name resolves to Adventure Time",
+          bool(hit) and hit["id"] == "tt1305826")
+    check("searched query carries the whole word 'Adventure'",
+          any("adventure" in q.lower().split() for q in seen))
 
     print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)

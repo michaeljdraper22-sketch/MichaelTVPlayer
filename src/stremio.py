@@ -228,10 +228,16 @@ def parse_se(text: str):
 _JUNK_RES = [
     re.compile(r"\bS\d{1,2}\s*E\d{1,3}\b.*$", re.IGNORECASE),
     re.compile(r"\b\d{1,2}x\d{2,3}\b.*$", re.IGNORECASE),
-    re.compile(r"(2160p|1080p?|720p|480p|WEB[-.]?DL|WEBRip|BluRay|Blu-Ray|"
-               r"HDTV|HDTVRip|HDR10?|DV|DTS|AAC2?\.?0?|AC3|5\.1|7\.1|"
-               r"x264|h\.?265|x265|HEVC|AVC|10bit|8bit|REPACK|PROPER|"
-               r"MULTI|VFI|Complete|Season\s*\d+)", re.IGNORECASE),
+    # whole tokens only: an unbounded alternation ate 'DV' out of the
+    # middle of 'Adventure' (-> 'A enture Time', a query no catalog title
+    # can ever word-match) and 'MULTI' out of 'Multiverse' — the strict
+    # _find_catalog scorer then honestly missed the RIGHT show, killing
+    # identity, prev/next and autoplay on those titles (live-seen
+    # 2026-09-04, every Adventure Time lookup 'nothing found')
+    re.compile(r"\b(?:2160p|1080p?|720p|480p|WEB[-.]?DL|WEBRip|BluRay|"
+               r"Blu-Ray|HDTV|HDTVRip|HDR10?|DV|DTS|AAC2?\.?0?|AC3|5\.1|"
+               r"7\.1|x264|h\.?265|x265|HEVC|AVC|10bit|8bit|REPACK|"
+               r"PROPER|MULTI|VFI|Complete|Season\s*\d+)\b", re.IGNORECASE),
     re.compile(r"\b(www|com|net|org)\b", re.IGNORECASE),
     re.compile(r"[\.\-_]+(?=[\.\-_]|$)"),
 ]
