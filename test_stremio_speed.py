@@ -13,6 +13,13 @@
 [3] _on_stremio_probe: a dead probe switches to the local-server torrent
     immediately; an alive probe, a stale fav_key, an already-done
     fallback, or a VLC that already started all leave it alone.
+[4] stremio._find_catalog: candidates are scored by word overlap with a
+    60% floor — the 2026-09-03 20:57 incident (Cinemeta's search ranked
+    'Real Time with Bill Maher' above 'Adventure Time'; the old first-
+    ANY-shared-word rule matched Maher off the single word 'Time',
+    retitled the stream and killed every episode button + autoplay)
+    can't reproduce regardless of search ordering.
+[5] wiring: play_media kicks the probe with the guard.
 
 Run:  .venv\\Scripts\\python.exe test_stremio_speed.py   (sets QT_QPA_PLATFORM itself)
 """
@@ -184,7 +191,60 @@ def main():
     fired, _ = probe_case(False, done=True)
     check("fallback already spent -> no second try", len(fired) == 0)
 
-    print("[4] wiring: play_media kicks the probe with the guard")
+    print("[4] _find_catalog: best-overlap with a 60% word floor")
+    metas = [
+        {"id": "tt0350448", "name": "Real Time with Bill Maher"},
+        {"id": "tt15248880", "name": "Adventure Time: Fionna & Cake"},
+        {"id": "tt1305826", "name": "Adventure Time"},
+    ]
+
+    def search(results):
+        return lambda q: list(results)
+
+    # the incident shape exactly: Maher ranked FIRST, sharing 'Time'
+    hit = stremio._find_catalog(search(metas), "Adventure Time")
+    check("Maher-first ordering still matches Adventure Time",
+          hit and hit["id"] == "tt1305826")
+    # the wrong hit must not win even when the true title is ABSENT
+    hit = stremio._find_catalog(
+        search([metas[0], {"id": "tt0496", "name": "Tim Allen"}]),
+        "Adventure Time")
+    check("single shared word can never match (honest miss)",
+          hit is None)
+    # the incident's other file-name form: year left in the cleaned name
+    hit = stremio._find_catalog(search(metas), "Adventure Time 2008")
+    check("year-bearing query still matches Adventure Time",
+          hit and hit["id"] == "tt1305826")
+    # a one-word show must still hit (the old 'Silo' dead end)
+    hit = stremio._find_catalog(
+        search([{"id": "tt1212", "name": "Silo"},
+                {"id": "tt3434", "name": "Silicon Valley"}]), "Silo")
+    check("single-word name still matches", hit and hit["id"] == "tt1212")
+    # canonical titles may drop a query word: 2 of 3 words is enough
+    hit = stremio._find_catalog(
+        search([{"id": "tt7142", "name": "Star Trek: The Next Generation"},
+                {"id": "tt7143", "name": "Star Trek: Deep Space Nine"}]),
+        "Star Trek TNG")
+    check("partial canonical title (2 of 3 words) still matches",
+          hit and hit["id"] == "tt7142")
+    # the true match beats a same-overlap imposter by search order
+    hit = stremio._find_catalog(
+        search([{"id": "tt1", "name": "Time Bandits"},
+                {"id": "tt2", "name": "Adventure Time"}]),
+        "Adventure Time")
+    check("full-overlap candidate beats partial regardless of order",
+          hit and hit["id"] == "tt2")
+    # movies flow through the same matcher
+    movie_hit = stremio._find_catalog(
+        search([{"id": "tt0001", "name": "The Time Machine",
+                 "releaseInfo": "2002"},
+                {"id": "tt0086", "name": "The Terminator",
+                 "releaseInfo": "1984"}]),
+        "The Terminator 1984")
+    check("movie matcher picks the right title word-set",
+          movie_hit and movie_hit["id"] == "tt0086")
+
+    print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)
     check("play_media arm block kicks the probe",
           "self._kick_stremio_probe(url)" in src_pm)

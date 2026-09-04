@@ -17,8 +17,11 @@ Forensics from that session (player.log + settings.json):
 This suite pins the fixes: the whole click chain is trapped + logged
 (no silent bails anywhere), a broken banner can't kill the switch,
 lookups coalesce under spam, autoplay fires on a clean "ended" even
-when get_length() reads 0, and the tick's non-vod branch no longer
-zeroes the tracked position out from under end-of-media detection.
+when get_length() reads 0 — but ONLY once the media actually played
+(a dead debrid open parks a fresh handoff in "ended" within seconds;
+autoplay fired 3 s after the click, live-seen 2026-09-03 20:57) —
+and the tick's non-vod branch no longer zeroes the tracked position
+out from under end-of-media detection.
 
 Run:  .venv\\Scripts\\python.exe test_playnext_spam.py   (sets QT_QPA_PLATFORM itself)
 """
@@ -182,11 +185,29 @@ def main():
     view.vlc.state_name = lambda: "ended"
     view.vlc.is_playing = lambda: False
     view._vid_s = 0.0                     # even the tracked clock is gone
+    view._played_once = True              # the episode DID play before ending
     view._maybe_autoplay_next(False, 0, 0)   # playing, length_ms, raw_ms
     check("autoplay fired on clean 'ended' despite length 0",
           wait_for(lambda: played == ["stremio:tt1305826:5:43"]))
     check("autoplay fire was logged",
           any("autoplay fired" in r for r in cap.rows))
+    view.stop()
+
+    print("[5b] dead open: 'ended' without ever playing must NOT autoplay")
+    view, played = make_view("stremio:tt1305826:5:42")
+    view.btn_auto.setChecked(True)
+    view.vlc.state_name = lambda: "ended"  # dead debrid link: open -> ended
+    view.vlc.is_playing = lambda: False
+    view._vid_s = 0.0
+    view._played_once = False              # no tick ever saw playing/paused
+    cap.rows.clear()
+    view._maybe_autoplay_next(False, 0, 0)
+    app.processEvents()
+    time.sleep(0.1)                        # give a misfire room to land
+    app.processEvents()
+    check("autoplay did not fire on the dead open", not played)
+    check("no 'media finished' note for the dead open",
+          not any("media finished" in r for r in cap.rows))
     view.stop()
 
     print("[6] tick's non-vod branch keeps polling series/stremio ends")
@@ -197,6 +218,7 @@ def main():
     view.vlc.get_length = lambda: 0       # get_length dropped on the relay
     view.vlc.get_time = lambda: 0
     view._vid_s = 0.0
+    view._played_once = True              # watched before the relay died
     view._last_vod_len_ms = 0             # sticky length never landed
     view._eof_note_done = False
     view._eof_next_done = False

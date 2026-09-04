@@ -630,6 +630,10 @@ class PlayerView(QtWidgets.QWidget):
                                        # buffer/content (VLC timestamps can be
                                        # garbage broadcast PTS on these
                                        # streams — see _tick)
+        self._played_once = False     # this media ever reached VLC
+                                       # playing/paused (a dead debrid open
+                                       # parks in 'ended' without playing —
+                                       # see _maybe_autoplay_next)
         self._last_raw = None         # previous raw VLC time (chase/VOD tracker)
         self._raw_change_wall = 0.0   # wall time raw last CHANGED (wedge
         #                              # detector: frozen-while-playing)
@@ -1962,6 +1966,7 @@ class PlayerView(QtWidgets.QWidget):
         self._dvr_status.hide()
         self._scrub_on = False
         self._vid_s = 0.0
+        self._played_once = False  # a fresh media hasn't played a frame yet
         self._eof_next_done = False   # re-arm autoplay-next for this media
         self._eof_note_done = False
         self._last_vod_len_ms = 0
@@ -2852,6 +2857,16 @@ class PlayerView(QtWidgets.QWidget):
             # LIVE jumped an episode to its end and the roll-into-next
             # never fired, not even the eof-note log line)
             return
+        if state == "ended" and not self._played_once:
+            # ...but an "ended" on a media that never PLAYED is a dead
+            # open, not a finish: a stalled debrid resolve parks a fresh
+            # handoff in "ended" within seconds (live-seen 2026-09-03
+            # 20:57: autoplay fired 3 s after the click and raced the
+            # debrid→local-torrent fallback for the same media). That
+            # failure belongs to the fallback/guard machinery — rolling
+            # into the NEXT episode here would eat the one the user just
+            # clicked.
+            return
         if not self._media_finished(playing, length_ms, raw_ms,
                                     self._vid_s, state):
             return
@@ -3706,6 +3721,9 @@ class PlayerView(QtWidgets.QWidget):
         # position so the scrubber lands on the end immediately; with
         # autoplay off end-of-media then simply holds there (the video
         # stays at the end until the user does something else).
+        self._played_once = True   # a deliberate jump to the end counts as
+        #                          # played: autoplay may roll from it even
+        #                          # if no tick saw 'playing' first
         self.vlc.jump_to_live()
         length = self.vlc.get_length()
         if length > 0:
@@ -4892,6 +4910,15 @@ class PlayerView(QtWidgets.QWidget):
             return
         self._poll_video_size()
         playing = self.vlc.is_playing()
+        # Latch REAL playback for this media (state, not is_playing —
+        # that also reads True while VLC is merely opening a dead link).
+        # Autoplay's dead-open veto below keys on it.
+        if not self._played_once:
+            try:
+                if self.vlc.state_name() in ("playing", "paused"):
+                    self._played_once = True
+            except Exception:  # noqa: BLE001
+                pass
         # Only swap the icon when the state actually flipped: setIcon on a
         # translucent top-level overlay schedules a full recomposition of
         # the layered window, and doing that every tick mid-stream-switch

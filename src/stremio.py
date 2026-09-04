@@ -548,12 +548,21 @@ def search_movies(name: str):
 
 def _find_catalog(search, name: str):
     """Best word-overlapping catalog candidate for a release name, or
-    None. Results must share a word with the query so a bad parse can't
-    match a completely unrelated title; release-group/site prefix spam
-    (which the cleaner can't know about) is handled by re-searching with
-    leading words progressively dropped. Single-word names get their one
-    query too (range floor of 1 — "Silo" silently never searched, which
-    left the episode buttons/autoplay dead on one-word-titled shows)."""
+    None. Every candidate is SCORED by how many of the query's
+    significant words its title carries (search order breaks ties), and
+    a hit must cover most of the query — ceil of 60% of the words. The
+    old first-candidate-with-ANY-shared-word rule matched 'Real Time
+    with Bill Maher' to an 'Adventure Time' release outright the night
+    Cinemeta's search ranked Maher first (they share the word 'Time';
+    live-seen 2026-09-03 20:57 — the wrong show's meta then left every
+    episode button and autoplay dead and retitled the stream). A word
+    floor keeps a near-miss candidate from ever winning while still
+    tolerating canonical titles that drop or re-spell a query word.
+    Release-group/site prefix spam (which the cleaner can't know about)
+    is handled by re-searching with leading words progressively dropped.
+    Single-word names get their one query too (range floor of 1 —
+    "Silo" silently never searched, which left the episode buttons/
+    autoplay dead on one-word-titled shows)."""
     if not name:
         return None
     words = [w for w in re.split(r"\W+", name) if len(w) > 2]
@@ -562,11 +571,22 @@ def _find_catalog(search, name: str):
         if not query:
             break
         wanted = {w for w in re.split(r"\W+", query.lower()) if len(w) > 2}
+        # ceil(60%): 1 word -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3
+        need = max(1, (len(wanted) * 3 + 4) // 5)
+        best, best_score = None, (0, False)
         for cand in search(query):
             cand_words = {w for w in re.split(r"\W+", str(
                 cand.get("name", "")).lower()) if len(w) > 2}
-            if cand_words & wanted:
-                return cand
+            overlap = len(cand_words & wanted)
+            # a TIGHT candidate (every word of its title is in the
+            # query) is the exact title best — 'Adventure Time' must
+            # outrank the equal-overlap spinoff 'Adventure Time:
+            # Fionna & Cake' when the release name carries a year
+            tight = cand_words <= wanted
+            if (overlap, tight) > best_score:
+                best, best_score = cand, (overlap, tight)
+        if best_score[0] >= need:
+            return best
     return None
 
 
