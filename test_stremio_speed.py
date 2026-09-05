@@ -21,8 +21,18 @@
     can't reproduce regardless of search ordering. Plus the 2026-09-04
     cleaner regression: junk tokens strip as WHOLE tokens only, so 'DV'
     can no longer eat the middle of 'Adventure' ('A enture Time' was a
-    query no title could match, so every Adventure Time lookup honestly
+    query no title could word-match, so every Adventure Time lookup honestly
     missed — prev/next/autoplay dead all day).
+[4b] 2026-09-05 11:11: server-URL identity must honor the URL's
+    file_idx. A debrid-stall fallback on a 278-file 'Complete Series'
+    pack (real order: S10E13 first, S01E01 last) let the stats name-scan
+    grab files[0]'s marker — the playing S03E22 got retitled as the
+    series finale S10E13, ⏮ targeted S10E12 Gumbaldia and next/autoplay
+    died. torrent_names now surfaces stats files[file_idx] as the played
+    name; a markerless played file resolves as a movie from its OWN
+    name; the stats-less path prefers the idx-scoped .torrent cache
+    over the flattened global scan; _torrent_metainfo picks
+    files[file_idx] over largest-file.
 [5] wiring: play_media kicks the probe with the guard.
 
 Run:  .venv\\Scripts\\python.exe test_stremio_speed.py   (sets QT_QPA_PLATFORM itself)
@@ -282,6 +292,157 @@ def main():
           bool(hit) and hit["id"] == "tt1305826")
     check("searched query carries the whole word 'Adventure'",
           any("adventure" in q.lower().split() for q in seen))
+
+    print("[4b] 2026-09-05 11:11: server-stats names must honor "
+          "file_idx")
+    # The incident: a debrid stall fell back to the local-server URL
+    # /03727f0b.../73 of a 278-file 'Complete Series S01-S10' TiZU pack.
+    # The pack's files[] order is bizarre (S10E13 at index 0, S01E01 at
+    # 277 — the offsets confirm it is the torrent's real order), and the
+    # stats scan took the FIRST S/E-marked name it walked past: S10E13.
+    # The playing S03E22 got retitled as the series finale, ⏮ resolved
+    # to S10E12 Gumbaldia and next/autoplay died (the finale has no
+    # next). The next-episode click survived only because the correct
+    # S03E23 lookahead had been prefetched BEFORE the bad identity
+    # stomped cur (player.log 11:11:40-42, 11:23:16).
+    PACK = ("Adventure.Time.2010.S01-S10.Complete.Series.1080p.BluRay."
+            "EAC3.AV1-TiZU")
+    F_S10E13 = "Adventure.Time.S10E13.1080p.BluRay.EAC3.AV1-TiZU.mkv"
+    F_S03E22 = "Adventure.Time.S03E22.1080p.BluRay.EAC3.AV1-TiZU.mkv"
+    F_MOVIE = ("Everything.Everywhere.All.At.Once.2022.1080p.BluRay."
+               "MULTI.DV.HEVC.mkv")
+    OTHER_TORRENT_FILE = ("Adventure Time (2008) - S08E19 - Jelly Beans "
+                          "Have Power (1080p BluRay x265 ImE).mkv")
+
+    def pack_files(played_name):
+        files = [{"path": "p\\Season 10\\" + F_S10E13, "name": F_S10E13,
+                  "length": 866189846, "offset": 0}]
+        for i in range(1, 73):
+            files.append({"path": "p\\Season 1\\f%d.mkv" % i,
+                          "name": "filler.%d.mkv" % i, "length": 10 ** 6,
+                          "offset": 10 ** 6 * i})
+        files.append({"path": "p\\Season 3\\" + played_name,
+                      "name": played_name, "length": 215183704,
+                      "offset": 20273191820})
+        return files
+
+    class FakePackServer(stremio.StreamingServer):
+        def __init__(self, played_name, with_stats=True):
+            super().__init__("")
+            self.played_name = played_name
+            self.with_stats = with_stats
+
+        def stats(self, info_hash, file_idx):
+            if not self.with_stats:
+                return None
+            return {"infoHash": info_hash, "name": PACK,
+                    "files": pack_files(self.played_name)}
+
+        def _global_stats(self):
+            return {"activeTorrents": [
+                {"infoHash": "other", "name": OTHER_TORRENT_FILE,
+                 "files": [{"name": OTHER_TORRENT_FILE}]}]}
+
+    saved = (stremio.find_series, stremio.find_movie,
+             stremio.series_meta, stremio._torrent_metainfo)
+    try:
+        stremio.find_series = \
+            lambda name: (("tt1305826", "Adventure Time")
+                          if "adventure" in name.lower() else None)
+        stremio.find_movie = lambda q: (
+            {"id": "tt6652842", "name": "Everything Everywhere All at Once",
+             "year": "2022", "poster": ""}
+            if "everything everywhere" in q.lower() else None)
+        stremio.series_meta = lambda imdb: {"name": "Adventure Time",
+                                            "videos": [
+            {"season": 3, "episode": 22, "name": "Paper Pete"},
+            {"season": 3, "episode": 21, "name": "Marceline's Closet"},
+        ]}
+        stremio._torrent_metainfo = lambda h, file_idx=-1: None
+
+        srv_url = ("http://127.0.0.1:11470/"
+                   "03727f0bdebfd938dc6d56986ae7dc45429416dd/73")
+
+        # the incident verbatim: identity of server URL file 73
+        ident = stremio.resolve_identity(
+            srv_url, FakePackServer(F_S03E22))
+        check("pack URL /73 resolves to S03E22, not files[0] S10E13",
+              ident and ident.get("season") == 3
+              and ident.get("episode") == 22
+              and ident.get("stremio_imdb") == "tt1305826")
+        check("identity file_name is the played file's name",
+              ident and ident.get("file_name") == F_S03E22)
+
+        # torrent_names exposes the played file first
+        played, names = FakePackServer(F_S03E22).torrent_names(
+            "03727f0bdebfd938dc6d56986ae7dc45429416dd", 73)
+        check("torrent_names returns files[73] as the played name",
+              played == F_S03E22 and names[0] == F_S03E22)
+
+        # a MOVIE file inside the pack: no marker on the played file —
+        # the movie path must use its own name, never a sibling episode
+        ident = stremio.resolve_identity(
+            srv_url, FakePackServer(F_MOVIE))
+        check("markerless pack file resolves as the right movie",
+              ident and ident.get("movie") is True
+              and ident.get("stremio_imdb") == "tt6652842"
+              and ident.get("file_name") == F_MOVIE)
+
+        # no per-torrent stats: the idx-scoped .torrent cache must beat
+        # the flattened global scan (whose marker-bearing names belong
+        # to OTHER torrents — the S08E19 junk above)
+        stremio._torrent_metainfo = \
+            lambda h, file_idx=-1: (PACK, F_S03E22)
+        ident = stremio.resolve_identity(
+            srv_url, FakePackServer(F_S03E22, with_stats=False))
+        check("stats-less server URL prefers idx-picked metainfo over "
+              "global-scan junk",
+              ident and ident.get("season") == 3
+              and ident.get("episode") == 22)
+
+        # _torrent_metainfo itself: files[file_idx] beats largest-file
+        def benc(obj):
+            if isinstance(obj, dict):
+                return b"d" + b"".join(
+                    benc(k) + benc(v) for k, v in obj.items()) + b"e"
+            if isinstance(obj, list):
+                return b"l" + b"".join(benc(v) for v in obj) + b"e"
+            if isinstance(obj, int):
+                return b"i%de" % obj
+            return b"%d:%s" % (len(obj), obj)
+
+        torrent_blob = benc({b"info": {
+            b"name": b"at-pack",
+            b"files": [
+                {b"length": 900, b"path": [b"Season 10",
+                                            b"S10E13.mkv"]},
+                {b"length": 100, b"path": [b"Season 3",
+                                           b"S03E22.mkv"]},
+            ]}})
+
+        class FakeResp:
+            status_code = 200
+            content = torrent_blob
+
+        saved_sess = stremio._session
+        try:
+            stremio._torrent_metainfo = saved[3]   # the real one
+            stremio._session = type("S", (), {
+                "get": staticmethod(lambda url, **kw: FakeResp())})()
+            tname, fname = stremio._torrent_metainfo("a" * 40, 1)
+            check("metainfo picks the entry AT file_idx",
+                  fname == "S03E22.mkv")
+            _, fname = stremio._torrent_metainfo("a" * 40)
+            check("metainfo keeps largest-file default without an idx",
+                  fname == "S10E13.mkv")
+            _, fname = stremio._torrent_metainfo("a" * 40, 99)
+            check("metainfo falls back to largest on a bad idx",
+                  fname == "S10E13.mkv")
+        finally:
+            stremio._session = saved_sess
+    finally:
+        (stremio.find_series, stremio.find_movie,
+         stremio.series_meta, stremio._torrent_metainfo) = saved
 
     print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)

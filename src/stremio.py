@@ -337,10 +337,14 @@ def _bdecode(data: bytes):
     return val
 
 
-def _torrent_metainfo(info_hash: str):
+def _torrent_metainfo(info_hash: str, file_idx: int = -1):
     """Fetch a .torrent from a public magnet cache and return
-    (torrent_name, largest_file_name) — the identity fallback when the
-    streaming server cannot tell us the torrent's name."""
+    (torrent_name, file_name) — the identity fallback when the streaming
+    server cannot tell us the torrent's name. file_name is the entry AT
+    file_idx when the index is valid (the .torrent's files[] list is
+    ordered exactly like the server's play URLs — an idx-blind pick on
+    an episode pack returns some other episode's name), else the largest
+    file (the single-file/movie-pack default)."""
     try:
         resp = _session.get(
             "https://itorrents.org/torrent/%s.torrent" % info_hash,
@@ -350,8 +354,16 @@ def _torrent_metainfo(info_hash: str):
         meta = _bdecode(resp.content)
         info = meta.get(b"info") or {}
         tname = (info.get(b"name") or b"").decode("utf-8", "replace")
+        files = info.get(b"files") or []
+        pick = ""
+        if 0 <= file_idx < len(files):
+            try:
+                path = files[file_idx].get(b"path") or []
+                pick = path[-1].decode("utf-8", "replace") if path else ""
+            except Exception:  # noqa: BLE001
+                pick = ""
         best_len, best_name = -1, ""
-        for f in info.get(b"files") or []:
+        for f in files:
             try:
                 length = int(f.get(b"length") or 0)
                 path = f.get(b"path") or []
@@ -360,7 +372,7 @@ def _torrent_metainfo(info_hash: str):
                 continue
             if length > best_len and fname:
                 best_len, best_name = length, fname
-        return tname, best_name
+        return tname, pick or best_name
     except Exception as exc:  # noqa: BLE001
         log.info("stremio: metainfo lookup for %s failed: %r",
                  info_hash[:12], exc)
@@ -427,17 +439,39 @@ class StreamingServer:
         return None
 
     def torrent_names(self, info_hash: str, file_idx: int):
-        """Name candidates for a torrent the server is (or was) serving."""
+        """(played-file name, other name candidates) for a torrent the
+        server is (or was) serving. The per-torrent stats carry a files[]
+        array indexed exactly like the play URL's file idx — that entry
+        names the file actually being played. The generic scan (whole
+        stats blob + global stats) walks EVERY file of EVERY torrent in
+        JSON order, so for multi-episode packs its first S/E-marked name
+        is essentially a random sibling (live-seen 2026-09-05: a 278-file
+        S01-S10 pack ordered S10E13-first made the playing S03E22
+        resolve as the series finale — wrong banner title, wrong ⏮
+        target, dead autoplay). Callers must prefer the played-file name.
+        The played name also leads the candidate list (deduped)."""
+        played = ""
+        per = self.stats(info_hash, file_idx)
+        if per:
+            files = per.get("files")
+            if isinstance(files, list) and 0 <= file_idx < len(files) \
+                    and isinstance(files[file_idx], dict):
+                name = str(files[file_idx].get("name") or "").strip()
+                if not name:
+                    path = str(files[file_idx].get("path") or "").strip()
+                    name = path.replace("\\", "/").rstrip("/") \
+                        .rsplit("/", 1)[-1]
+                played = name
         names = []
-        for data in (self.stats(info_hash, file_idx), self._global_stats()):
+        for data in (per, self._global_stats()):
             if data:
                 names.extend(_scan_for_names(data))
         seen, out = set(), []
-        for n in names:
-            if n not in seen:
+        for n in ([played] if played else []) + names:
+            if n and n not in seen:
                 seen.add(n)
                 out.append(n)
-        return out
+        return played, out
 
     def _global_stats(self):
         try:
@@ -1083,17 +1117,35 @@ def resolve_identity(url: str, server: StreamingServer):
     file_name, torrent_name = "", ""
     if parsed:
         info_hash, file_idx = parsed
-        for name in server.torrent_names(info_hash, file_idx):
-            if not file_name and parse_se(name):
-                file_name = name
-            elif not torrent_name:
-                torrent_name = name
-            if file_name:
-                break
-        if not torrent_name and not file_name:
-            mi = _torrent_metainfo(info_hash)
-            if mi:
+        played, names = server.torrent_names(info_hash, file_idx)
+        if played:
+            # the stats' files[] entry for THIS url's file idx — the
+            # only scanned name that belongs to the file being played
+            file_name = played
+            if not parse_se(played):
+                # no episode marker on the played file itself: a marker
+                # found on some sibling in the pack scan would be a
+                # wrong-series hijack — pair the file with the torrent
+                # name and let the movie path try it instead
+                torrent_name = next(
+                    (n for n in names if n != played), "")
+        else:
+            # no idx-addressable name from the server: prefer the
+            # public .torrent cache — it is scoped to THIS hash and can
+            # pick the entry at file_idx. The flattened scan below walks
+            # every file of every torrent the server knows, so its
+            # first S/E-marked name is usually some OTHER file's
+            mi = _torrent_metainfo(info_hash, file_idx)
+            if mi and (mi[1] or mi[0]):
                 torrent_name, file_name = mi
+            else:
+                for name in names:
+                    if not file_name and parse_se(name):
+                        file_name = name
+                    elif not torrent_name:
+                        torrent_name = name
+                    if file_name:
+                        break
     else:
         # direct addon/debrid URL (Torbox / Premiumize / addon host): the
         # file name often rides in the path...

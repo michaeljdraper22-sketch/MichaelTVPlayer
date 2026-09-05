@@ -241,7 +241,7 @@ def leg_a():
              stremio.search_movies, stremio.search_series,
              stremio.series_meta)
     stremio._content_disposition = lambda url: ""
-    stremio._torrent_metainfo = lambda h: None
+    stremio._torrent_metainfo = lambda h, file_idx=-1: None
     stremio.search_movies = lambda q: ([
         {"id": "tt0071315", "name": "Chinatown", "year": "1974",
          "poster": "http://p/chin.jpg"}]
