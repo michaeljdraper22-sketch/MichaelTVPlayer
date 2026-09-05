@@ -2,11 +2,18 @@
 """Regression test for the update swap helper (the v1.4 -> v1.4.1 bricker).
 
 The helper batch must contain NO PIPES and NO ``timeout``: inside a
-DETACHED cmd a ``tasklist | find`` pipeline never returns and ``timeout``
-fails with rc 125 (both verified empirically on 2026-08-28) — the old
-wait loop hung on them forever, so the payload was never copied and the
-app never restarted. This test checks the generated script statically
+DETACHED cmd a ``tasklist | find`` pipeline never returns and
+``timeout`` fails with rc 125 (both verified empirically on 2026-08-28) —
+the old helper hung forever on them, so the payload was never copied and
+the app never restarted. This test checks the generated script statically
 AND runs the real swap flow end-to-end against a scratch install folder.
+
+The download stage rides along (the 2026-09-04 2.0 -> 2.1 failure on the
+brother's machine: "never stopped loading the update" — a bare spinner
+over a one-shot 240 MB fetch): real progress ticks, a mid-body death
+resumes via a byte-exact Range request, cancel stops promptly and leaves
+no partial, and a server that ignores the Range fails loudly instead of
+corrupting the file with restarted bytes.
 
 Run:  .venv\\Scripts\\python.exe test_updater_helper.py   (~20 s)
 """
@@ -14,6 +21,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 
@@ -159,6 +167,138 @@ def main():
           logtxt.count("] ") >= 3 and "[..]" not in logtxt)
     if app.poll() is None:
         app.kill()
+
+    print("[3] the download stage: progress, cut-body resume, cancel, "
+          "resume refusal")
+    dl_root = os.path.join(root, "dl")
+    os.makedirs(dl_root, exist_ok=True)
+
+    import http.server
+    import socketserver
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"   # one connection per request
+        payload = b""
+        cut_at = 0            # first response writes only this many bytes
+        refuse_resume = False  # answer a Range request with a full 200
+        trickle = 0           # beat size for the cancel test (0 = off)
+        ranges = []           # every Range header received
+
+        def log_message(self, *a):     # keep the test output clean
+            pass
+
+        def do_GET(self):
+            rng = self.headers.get("Range")
+            _Handler.ranges.append(rng)
+            body = _Handler.payload
+            if rng:
+                if _Handler.refuse_resume:
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                start = int(rng.split("=", 1)[1].split("-", 1)[0])
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes %d-%d/%d" % (
+                    start, len(body) - 1, len(body)))
+                self.send_header("Content-Length", str(len(body) - start))
+                self.end_headers()
+                self.wfile.write(body[start:])
+                return
+            self.send_response(200)
+            # on a cut the length LIES (full size) — the client must
+            # notice the short body at EOF and resume, exactly the shape
+            # of a connection dying mid-transfer
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            if _Handler.trickle:
+                i = 0
+                try:
+                    while i < len(body):
+                        self.wfile.write(body[i:i + _Handler.trickle])
+                        self.wfile.flush()
+                        i += _Handler.trickle
+                        time.sleep(0.02)
+                except Exception:  # noqa: BLE001 — client hung up
+                    pass
+                return
+            n = _Handler.cut_at if _Handler.cut_at else len(body)
+            self.wfile.write(body[:n])
+
+    def _start_server():
+        srv = socketserver.TCPServer(("127.0.0.1", 0), _Handler)
+        srv.daemon_threads = True
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        return srv, "http://127.0.0.1:%d/" % srv.server_address[1]
+
+    payload = bytes(range(256)) * 20            # 5120 deterministic bytes
+
+    # (a) plain download: byte-exact, progress monotonically to the total
+    _Handler.payload, _Handler.cut_at, _Handler.ranges = payload, 0, []
+    _srv, url = _start_server()
+    ticks = []
+    dest = os.path.join(dl_root, "full.zip")
+    updater.download(url, dest, progress=lambda d, t: ticks.append((d, t)),
+                     chunk=64)
+    check("plain download is byte-exact", open(dest, "rb").read() == payload)
+    check("progress reached the exact total",
+          ticks and ticks[-1] == (len(payload), len(payload)))
+    check("progress is monotonic",
+          all(ticks[i][0] < ticks[i + 1][0] for i in range(len(ticks) - 1)))
+    check("no .part left behind", not os.path.exists(dest + ".part"))
+
+    # (b) body cut at 2000 of 5120: resumes via Range from the cut
+    _Handler.payload, _Handler.cut_at, _Handler.ranges = \
+        payload, 2000, []
+    _srv2, url2 = _start_server()
+    ticks = []
+    dest = os.path.join(dl_root, "resumed.zip")
+    updater.download(url2, dest, progress=lambda d, t: ticks.append((d, t)),
+                     chunk=64)
+    check("cut-body download completes byte-exact",
+          open(dest, "rb").read() == payload)
+    check("resume sent a byte-exact Range from the cut",
+          "bytes=2000-" in [r or "" for r in _Handler.ranges])
+    check("progress kept its totals across the resume",
+          ticks and ticks[-1] == (len(payload), len(payload)))
+
+    # (c) cancel mid-trickle: stops promptly, no dest, no .part
+    _Handler.payload, _Handler.cut_at, _Handler.trickle, _Handler.ranges = \
+        payload, 0, 4, []
+    _srv3, url3 = _start_server()
+    dest = os.path.join(dl_root, "cancelled.zip")
+    cancel = threading.Event()
+    threading.Timer(0.4, cancel.set).start()
+    t0 = time.monotonic()
+    try:
+        updater.download(url3, dest, chunk=4, cancel=cancel)
+        check("cancel raised UpdateCancelled", False)
+    except updater.UpdateCancelled:
+        check("cancel raised UpdateCancelled", True)
+        check("cancel stopped promptly (< 3 s)",
+              time.monotonic() - t0 < 3.0)
+    check("cancelled download left no dest", not os.path.exists(dest))
+    check("cancelled download left no .part",
+          not os.path.exists(dest + ".part"))
+
+    # (d) server ignores the Range (200 + full body): loud failure, and
+    # no truncated zip can be mistaken for a good one
+    _Handler.payload, _Handler.cut_at = payload, 1500
+    _Handler.trickle = 0            # (c) left it on — a trickle would
+    _Handler.refuse_resume, _Handler.ranges = True, []
+    _srv4, url4 = _start_server()
+    dest = os.path.join(dl_root, "refused.zip")
+    try:
+        updater.download(url4, dest, chunk=64)
+        check("resume-refused raised", False)
+    except RuntimeError as exc:
+        check("resume-refused raised", True)
+        check("resume-refused names the problem",
+              "ignored the resume request" in str(exc))
+    check("refused download left no dest/part",
+          not os.path.exists(dest)
+          and not os.path.exists(dest + ".part"))
 
     import shutil
     shutil.rmtree(install_root, ignore_errors=True)

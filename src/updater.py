@@ -107,23 +107,90 @@ def verify_sha256(zip_path, sha_path):
     return True
 
 
-def download(asset_url, dest, progress=None, chunk=1 << 16):
-    """Stream the release zip to ``dest``; progress(done, total, -1 while
-    the size is unknown)."""
-    req = urllib.request.Request(
-        asset_url, headers={"User-Agent": "MichaelTVPlayer-updater"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
-        total = int(r.headers.get("Content-Length") or 0)
-        done = 0
+class UpdateCancelled(Exception):
+    """The user cancelled the update download (raised by download())."""
+
+
+def _drop(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def download(asset_url, dest, progress=None, chunk=1 << 16,
+             cancel=None, max_resume=6):
+    """Stream the release zip to ``dest``; progress(done, total) fires per
+    chunk (total is 0 while the size is unknown).
+
+    The release zip is ~240 MB and the link is not always kind to it
+    (2026-09-04, the brother's machine: the 2.0 -> 2.1 attempt "never
+    stopped loading the update" — a bare spinner over a one-shot fetch
+    that dies on the first hiccup and would restart from byte 0). The
+    download is therefore resumable and cancellable, the same contract
+    as worker.FileDownloader:
+
+    - ``cancel`` is a threading.Event; the read loop checks it every
+      chunk and raises UpdateCancelled promptly (the .part is removed).
+    - a connection that dies or stalls mid-body is re-dialed with a
+      byte-exact Range header; a server answering 200 instead of 206
+      fails loudly rather than let restarted bytes corrupt the file.
+      ``max_resume`` consecutive attempts delivering zero bytes give up
+      with the byte counts in the message.
+    - the body lands in ``dest + ".part"`` and is moved into place only
+      when complete, so an interrupted update never leaves a truncated
+      zip that a later run could mistake for a good one.
+    """
+    part = dest + ".part"
+    done = 0
+    total = 0
+    stalls = 0
+    try:
         while True:
-            b = r.read(chunk)
-            if not b:
-                break
-            f.write(b)
-            done += len(b)
-            if progress:
-                progress(done, total)
-    return dest
+            if cancel is not None and cancel.is_set():
+                raise UpdateCancelled("update download cancelled")
+            before = done
+            headers = {"User-Agent": "MichaelTVPlayer-updater"}
+            if done:
+                headers["Range"] = f"bytes={done}-"
+            req = urllib.request.Request(asset_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=60) as r, \
+                    open(part, "ab" if done else "wb") as f:
+                if done and r.status != 206:
+                    raise RuntimeError(
+                        "update server ignored the resume request "
+                        f"(got HTTP {r.status})")
+                if not done:
+                    total = int(r.headers.get("Content-Length") or 0)
+                while True:
+                    if cancel is not None and cancel.is_set():
+                        raise UpdateCancelled("update download cancelled")
+                    try:
+                        b = r.read(chunk)
+                    except Exception:  # noqa: BLE001 — died mid-body
+                        break        # same treatment as an early EOF: resume
+                    if not b:
+                        break
+                    f.write(b)
+                    done += len(b)
+                    if progress:
+                        progress(done, total)
+            if not total or done >= total:
+                break                # complete (or an unlengthened stream)
+            stalls = stalls + 1 if done == before else 0
+            if stalls > max_resume:
+                raise RuntimeError(
+                    f"update connection kept dying — got "
+                    f"{done // 1048576} of {total // 1048576} MB after "
+                    f"{stalls} dead tries")
+            time.sleep(min(3.0, 0.75 * (1 + stalls)))
+        os.replace(part, dest)
+        return dest
+    except BaseException:
+        # runs AFTER the with-blocks above closed the .part handle — a
+        # delete inside them just PermissionErrors silently on Windows
+        _drop(part)
+        raise
 
 
 def stage_update(zip_path):

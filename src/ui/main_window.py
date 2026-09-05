@@ -641,19 +641,43 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _download_update(self, asset_url, sha_url, ver):
         prog = QtWidgets.QProgressDialog(
-            f"Downloading MichaelTV {ver}\u2026", None, 0, 0, self)
+            f"Downloading MichaelTV {ver}\u2026", "Cancel", 0, 0, self)
         prog.setWindowTitle("MichaelTV — Update")
         prog.setWindowModality(QtCore.Qt.WindowModal)
         prog.setMinimumDuration(0)
+        # autoReset would treat reaching maximum as "done" and close the
+        # dialog while the checksum + staging still run; the cancel path
+        # must also survive setValue calls from late progress ticks
+        prog.setAutoReset(False)
+        prog.setAutoClose(False)
         prog.show()
         QtWidgets.QApplication.processEvents()
 
         import tempfile
+        import threading
+
+        cancel = threading.Event()
+        prog.canceled.connect(cancel.set)
+
+        # progress ticks cross from the worker thread — a signal bridge
+        # delivers them queued to the GUI thread (widgets must never be
+        # touched from the download thread)
+        class _ProgBridge(QtCore.QObject):
+            tick = QtCore.pyqtSignal(int, int)
+
+        bridge = _ProgBridge()
+        bridge.tick.connect(lambda d, t: self._upd_progress(prog, ver, d, t))
+        # hold references for the download's lifetime: a garbage-collected
+        # bridge would silently drop the connection mid-flight
+        self._upd_dl_bridge = bridge
+        self._upd_dl_cancel = cancel
 
         def work():
             dest = os.path.join(tempfile.gettempdir(),
                                 f"MichaelTV-{ver}.zip")
-            updater.download(asset_url, dest)
+            updater.download(asset_url, dest,
+                             progress=lambda d, t: bridge.tick.emit(d, t),
+                             cancel=cancel)
             # integrity check, but strictly verify-when-present: releases
             # without a .sha256 asset update exactly as before
             if sha_url:
@@ -667,15 +691,36 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda res: self._on_update_downloaded(res, prog))
         self._upd_dl_runner.run(work)
 
+    @staticmethod
+    def _upd_progress(prog, ver, done, total):
+        """Paint real byte counts on the update dialog (GUI thread, via
+        the signal bridge).  The ~240 MB zip over a slow link used to be
+        an anonymous spinner — indistinguishable from a hang ("it never
+        stopped loading the update", the 2026-09-04 2.0 -> 2.1 report)."""
+        try:
+            if total:
+                prog.setMaximum(total)
+                prog.setValue(min(done, total))
+                prog.setLabelText(
+                    f"Downloading MichaelTV {ver}\u2026  "
+                    f"{done // 1048576} / {total // 1048576} MB")
+            else:
+                prog.setLabelText(
+                    f"Downloading MichaelTV {ver}\u2026  "
+                    f"{done // 1048576} MB")
+        except RuntimeError:
+            pass    # dialog already gone (window closed mid-download)
+
     def _on_update_downloaded(self, result, prog):
         prog.close()
         ok, val = result
         if ok != "ok":
             logging.getLogger("mtp").error(
                 "update download failed: %s", val)
-            QtWidgets.QMessageBox.warning(
-                self, "MichaelTV — Update",
-                f"The download failed:\n{val}")
+            if str(val) != "update download cancelled":
+                QtWidgets.QMessageBox.warning(
+                    self, "MichaelTV — Update",
+                    f"The download failed:\n{val}")
             return
         try:
             ver, zip_path = val
