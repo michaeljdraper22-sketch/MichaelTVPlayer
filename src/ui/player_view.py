@@ -858,6 +858,7 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_guard_t0 = 0.0
         self._eof_next_done = False   # one autoplay shot per media
         self._eof_note_done = False   # one end-of-media log per media
+        self._eof_hold_noted = False  # one held-autoplay reason per media
         self._last_vod_len_ms = 0     # sticky VOD length through EOF
         self.vlc = VLCPlayer(
             volume=config.volume,
@@ -1969,6 +1970,7 @@ class PlayerView(QtWidgets.QWidget):
         self._played_once = False  # a fresh media hasn't played a frame yet
         self._eof_next_done = False   # re-arm autoplay-next for this media
         self._eof_note_done = False
+        self._eof_hold_noted = False
         self._last_vod_len_ms = 0
         self._cu_rescues = 0         # re-arm catch-up rescue/form-flip
         if (self.current or {}).get("url") != playable.get("url"):
@@ -2884,8 +2886,31 @@ class PlayerView(QtWidgets.QWidget):
                 pass
         if not self.btn_auto.isChecked():
             return
+        if state == "ended" and self._live_paused:
+            # An ENDED media cannot be paused — the latch is a toggle
+            # counter, not state read back from VLC, and one Space/click
+            # over the ending credits (a pause landing inside the read-
+            # ahead tail slips to "ended" as the buffered end drains; a
+            # click on the just-ended screen flips it too) leaves it
+            # stale on a media that provably played out. Nothing else
+            # clears it for an ended media — the held-flag gate below
+            # wedged autoplay on it FOREVER, silently (2026-09-05 13:12:
+            # the "media finished" note logged, autoplay never fired,
+            # the next episode never started).
+            self._live_paused = False
+            self._pn_log("playnext: stale pause latch cleared at "
+                         "end-of-media")
         if self._seeking or self._live_paused or self._win_sel \
                 or self._downloading:
+            if not self._eof_hold_noted:
+                # every hold names itself ONCE per media — a silent hold
+                # is undiagnosable from the log (the 2026-09-05 wedge
+                # produced exactly one line: the finish note)
+                self._eof_hold_noted = True
+                self._pn_log("playnext: autoplay held — seeking=%s "
+                             "live_paused=%s win_sel=%s downloading=%s",
+                             bool(self._seeking), bool(self._live_paused),
+                             bool(self._win_sel), bool(self._downloading))
             return
         self._eof_next_done = True
         look = self._stremio_lookahead

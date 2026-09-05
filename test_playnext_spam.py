@@ -23,6 +23,14 @@ autoplay fired 3 s after the click, live-seen 2026-09-03 20:57) —
 and the tick's non-vod branch no longer zeroes the tracked position
 out from under end-of-media detection.
 
+The 2026-09-05 13:12 IPTV incident rides along: an ENDED series
+episode with a stale pause latch (one Space/click over the ending
+credits) logged its finish note and then silently held autoplay
+FOREVER — an ended media cannot be paused, so the latch is provably
+stale and is cleared at the fire gate, while a REAL paused-at-credits
+hold (state='paused') still holds; every hold now names itself in the
+log exactly once.
+
 Run:  .venv\\Scripts\\python.exe test_playnext_spam.py   (sets QT_QPA_PLATFORM itself)
 """
 import logging
@@ -208,6 +216,99 @@ def main():
     check("autoplay did not fire on the dead open", not played)
     check("no 'media finished' note for the dead open",
           not any("media finished" in r for r in cap.rows))
+    view.stop()
+
+    def iptv_cur():
+        return {"kind": "series",
+                "title": "EN - Adventure Time - S04E16 - Burning Low",
+                "url": "http://cf.534842.xyz/series/726352471c/"
+                       "d809266e91/1985728.mkv",
+                "fav_key": "episode:1985728", "series_id": 3456,
+                "season": 4, "episode": 16}
+
+    def iptv_next():
+        return dict(iptv_cur(), fav_key="episode:1985730", season=4,
+                    episode=17,
+                    title="EN - Adventure Time - S04E17 - Breezy")
+
+    print("[5c] the 2026-09-05 13:12 incident: stale pause latch on an "
+          "ENDED series episode must not wedge autoplay")
+    view, played = make_view(None)
+    view.current = iptv_cur()
+    view._update_control_state()
+    view.btn_auto.setChecked(True)
+    view.vlc.state_name = lambda: "ended"     # played out — cannot be paused
+    view.vlc.is_playing = lambda: False
+    view._vid_s = 705.0                       # the incident's exact numbers
+    view._played_once = True                  # the episode really watched
+    view._live_paused = True                  # the wedge: one Space/click
+                                              # over the ending credits
+    view._fetch_next = lambda cur: iptv_next()
+    cap.rows.clear()
+    view._maybe_autoplay_next(False, 705322, 705000)
+    check("autoplay fired despite the stale pause latch",
+          wait_for(lambda: played == ["episode:1985730"]))
+    check("the stale latch was cleared", view._live_paused is False)
+    check("the clear named itself in the log",
+          any("stale pause latch cleared" in r for r in cap.rows))
+    check("the 'media finished' note still logged",
+          any("media finished" in r for r in cap.rows))
+    view.stop()
+
+    print("[5d] a REAL pause at the credits (state='paused') still holds "
+          "autoplay — and the hold names itself once")
+    view, played = make_view(None)
+    view.current = iptv_cur()
+    view._update_control_state()
+    view.btn_auto.setChecked(True)
+    view.vlc.state_name = lambda: "paused"    # VLC genuinely paused
+    view.vlc.is_playing = lambda: False
+    view._vid_s = 705.0
+    view._played_once = True
+    view._live_paused = True                  # and the latch agrees
+    view._fetch_next = lambda cur: iptv_next()
+    cap.rows.clear()
+    view._maybe_autoplay_next(False, 705322, 705000)
+    app.processEvents()
+    time.sleep(0.1)                           # give a misfire room to land
+    app.processEvents()
+    check("autoplay held on the real pause", not played)
+    check("the pause latch survived (VLC is still paused)",
+          view._live_paused is True)
+    held_rows = [r for r in cap.rows if "autoplay held" in r]
+    check("the hold logged exactly once with live_paused=True",
+          len(held_rows) == 1 and "live_paused=True" in held_rows[0])
+    view._maybe_autoplay_next(False, 705322, 705000)   # tick retry: still
+    app.processEvents()                                # one line, no spam
+    check("the hold log is one-shot across ticks",
+          len([r for r in cap.rows if "autoplay held" in r]) == 1)
+    view.stop()
+
+    print("[5e] a transient hold releases: after the drag ends autoplay "
+          "still fires on a later tick")
+    view, played = make_view(None)
+    view.current = iptv_cur()
+    view._update_control_state()
+    view.btn_auto.setChecked(True)
+    view.vlc.state_name = lambda: "ended"
+    view.vlc.is_playing = lambda: False
+    view._vid_s = 705.0
+    view._played_once = True
+    view._seeking = True                      # a drag mid-fire gets held
+    view._fetch_next = lambda cur: iptv_next()
+    cap.rows.clear()
+    view._maybe_autoplay_next(False, 705322, 705000)
+    app.processEvents()
+    time.sleep(0.05)
+    app.processEvents()
+    check("held while the drag is live", not played)
+    check("the hold named seeking",
+          any("autoplay held" in r and "seeking=True" in r
+              for r in cap.rows))
+    view._seeking = False                     # sliderReleased landed
+    view._maybe_autoplay_next(False, 705322, 705000)
+    check("fired on the very next tick after the release",
+          wait_for(lambda: played == ["episode:1985730"]))
     view.stop()
 
     print("[6] tick's non-vod branch keeps polling series/stremio ends")
