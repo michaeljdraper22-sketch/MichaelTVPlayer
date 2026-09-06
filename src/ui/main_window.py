@@ -243,13 +243,18 @@ class MainWindow(QtWidgets.QMainWindow):
             pass
 
     def _exit_fullscreen_only(self):
-        """Esc: leave fullscreen, never re-enter it (F is the toggle).
-        A live download-window selection is cancelled first — Esc is its
+        """Esc: leave whatever immersive mode is active — fullscreen first,
+        then zen — never re-enter either (F/H are the toggles).  A live
+        download-window selection is cancelled first — Esc is its
         dedicated escape hatch."""
         if self.player_view._win_cancel_if_active():
             return
-        if getattr(self.player_view, "_fullscreen", False):
+        if getattr(self.player_view, "_fullscreen", False) \
+                or self.isFullScreen():
             self.toggle_fullscreen()
+            return
+        if getattr(self, "_zen", False):
+            self.toggle_zen()
 
     def _on_countries_changed(self):
         """A country filter changed: reload every browser it can affect."""
@@ -275,8 +280,20 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=lambda: self.player_view.seek_or_nudge(-60000, 60))
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Right"), self,
                             activated=lambda: self.player_view.seek_or_nudge(60000, 60))
+        # H / F / Ctrl+L MUST be QShortcuts on the window, never shortcuts
+        # on the View menu's actions: an action shortcut dies the moment
+        # its menu bar is hidden, and immersive modes hide the menu bar —
+        # H could ENTER zen but never LEAVE it, F could enter fullscreen
+        # but never leave it (live-seen 2026-09-05: "several clicks to get
+        # back into it").  For years F was double-bound (QShortcut here +
+        # the menu action), which made it AMBIGUOUS in windowed mode and
+        # dead there too — Qt fires neither on an ambiguous match.
+        QtWidgets.QShortcut(QtGui.QKeySequence("H"), self,
+                            activated=self.toggle_zen)
         QtWidgets.QShortcut(QtGui.QKeySequence("F"), self,
                             activated=self.toggle_fullscreen)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+L"), self,
+                            activated=self.toggle_channels)
         QtWidgets.QShortcut(QtGui.QKeySequence("Escape"), self,
                             activated=self._exit_fullscreen_only)
         QtWidgets.QShortcut(QtGui.QKeySequence("F5"), self,
@@ -315,14 +332,16 @@ class MainWindow(QtWidgets.QMainWindow):
         chan_menu.addAction(act_add)
 
         view_menu = menu_bar.addMenu("&View")
-        self.act_panel = QtWidgets.QAction("Hide controls (Zen mode)", self)
-        self.act_panel.setShortcut("H")
+        # no setShortcut on these — the keys live on window-level
+        # QShortcuts (see _setup_shortcuts); the "\t" suffix keeps the
+        # key hint visible in the menu without binding a shortcut that
+        # dies whenever the menu bar is hidden
+        self.act_panel = QtWidgets.QAction(
+            "Hide controls (Zen mode)\tH", self)
         self.act_panel.triggered.connect(self.toggle_zen)
-        self.act_chan = QtWidgets.QAction("Hide channel list", self)
-        self.act_chan.setShortcut("Ctrl+L")
+        self.act_chan = QtWidgets.QAction("Hide channel list\tCtrl+L", self)
         self.act_chan.triggered.connect(self.toggle_channels)
-        act_fs = QtWidgets.QAction("Fullscreen", self)
-        act_fs.setShortcut("F")
+        act_fs = QtWidgets.QAction("Fullscreen\tF", self)
         act_fs.triggered.connect(self.toggle_fullscreen)
         view_menu.addAction(self.act_panel)
         view_menu.addAction(self.act_chan)
@@ -791,16 +810,65 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         self._zen = not getattr(self, "_zen", False)
         on = self._zen
-        self.act_panel.setText("Show controls" if on else "Hide controls (Zen mode)")
+        try:
+            log.info("chrome: zen %s", "on" if on else "off")
+        except Exception:
+            pass
+        self.act_panel.setText("Show controls\tH" if on
+                               else "Hide controls (Zen mode)\tH")
         self.menuBar().setVisible(not on)
         self._apply_channels()
         self.player_view.set_zen(on)
+
+    def reassert_immersive(self):
+        """A stream switch must never disturb an immersive session.
+
+        Episode next/prev/autoplay (and the Stremio fallback / reload /
+        handoff paths — every one of them funnels through
+        PlayerView.play_media) swaps the media while the user sits in zen
+        or fullscreen.  The swap destroys and rebuilds the native video
+        HWND; whatever that churn did to the window chrome, this puts the
+        zen / channel-list state back to exactly what the user chose and
+        hands keyboard focus to the player (a churned video window
+        swallows Space/H/N/P until the next click lands on a Qt widget —
+        the live-seen 2026-09-05 19:46 "left zen mode, several clicks to
+        get back in" shape).  Drift that gets healed is LOGGED — that one
+        line is the fingerprint if chrome ever pops back uninvited again."""
+        try:
+            zen = bool(getattr(self, "_zen", False))
+            want_tabs = (not zen) and not self._channels_hidden
+            healed = []
+            if self.tabs.isVisibleTo(self) != want_tabs:
+                self._apply_channels()
+                healed.append("channel tabs")
+            if zen and self.menuBar().isVisibleTo(self):
+                self.menuBar().setVisible(False)
+                healed.append("menu bar")
+            # Space / H / N / P work right away, no click needed first
+            self.player_view.setFocus(QtCore.Qt.OtherFocusReason)
+            if healed:
+                try:
+                    log.info("chrome: immersive drift healed after a "
+                             "stream switch — %s (zen=%s)",
+                             ", ".join(healed), zen)
+                except Exception:
+                    pass
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("reassert_immersive failed: %r", exc)
+            except Exception:
+                pass
 
     def toggle_channels(self):
         """Hide/show the channel list panel (corner button / Ctrl+L)."""
         if not self._channels_hidden:
             self._splitter_saved = self.splitter.sizes()
         self._channels_hidden = not self._channels_hidden
+        try:
+            log.info("chrome: channel list %s",
+                     "hidden" if self._channels_hidden else "shown")
+        except Exception:
+            pass
         self._apply_channels()
 
     def _apply_channels(self):
@@ -810,8 +878,8 @@ class MainWindow(QtWidgets.QMainWindow):
         hidden = self._channels_hidden
         self.tabs.setVisible(not hidden and not zen)
         self.player_view.set_panel_hidden(hidden and not zen)
-        self.act_chan.setText("Show channel list" if hidden
-                              else "Hide channel list")
+        self.act_chan.setText("Show channel list\tCtrl+L" if hidden
+                              else "Hide channel list\tCtrl+L")
         self.btn_hide_channels.setToolTip(
             "Show channel list (Ctrl+L)" if hidden
             else "Hide channel list (Ctrl+L)")
@@ -1013,6 +1081,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.config.save()
 
     def toggle_fullscreen(self):
+        try:
+            log.info("chrome: fullscreen %s",
+                     "off" if self.isFullScreen() else "on")
+        except Exception:
+            pass
         if self.isFullScreen():
             self.player_view.set_fullscreen_mode(False)
             if not getattr(self, "_zen", False):

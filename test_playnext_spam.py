@@ -31,6 +31,16 @@ stale and is cleared at the fire gate, while a REAL paused-at-credits
 hold (state='paused') still holds; every hold now names itself in the
 log exactly once.
 
+The 2026-09-05 19:46 zen incident gets its own section at MainWindow
+level ([9]): a next-episode click in zen mode left the immersive
+session and took "several clicks" to get back.  The switch chain keeps
+the zen flags (pinned), play_media now re-asserts the immersive chrome
++ player focus after every media swap (healing knocked-loose chrome,
+logged), and the immersive keys H / F / Ctrl+L moved from menu-action
+shortcuts (dead while the menu bar is hidden — zen/fullscreen hide it;
+F was additionally double-bound = ambiguous) to window-level
+QShortcuts; Esc now exits zen as the help text always claimed.
+
 Run:  .venv\\Scripts\\python.exe test_playnext_spam.py   (sets QT_QPA_PLATFORM itself)
 """
 import logging
@@ -41,7 +51,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt5 import QtWidgets  # noqa: E402
+from PyQt5 import QtCore, QtGui, QtWidgets  # noqa: E402
 
 from src import stremio  # noqa: E402
 from src.config import Config  # noqa: E402
@@ -350,6 +360,127 @@ def main():
           any("tick: iteration failed" in r for r in cap.rows))
     view._poll_video_size = lambda: None
     view.stop()
+
+    # ---- the 2026-09-05 19:46 zen incident (MainWindow level) ----
+    # "clicked the next episode on a zen-mode half-screen show: the next
+    # episode loaded but it left zen mode and required several clicks to
+    # get back into it."  Every switch path (next click / prev click /
+    # autoplay) funnels through _start_next -> play_media, and play_media
+    # now re-asserts the immersive chrome + keyboard focus after the
+    # media swap.  The "several clicks" half was the keyboard: H/F/Ctrl+L
+    # were menu-action shortcuts, and an action shortcut is DEAD while
+    # its menu bar is hidden — zen hides the menu bar, so H could enter
+    # zen but never leave it (same for F inside fullscreen); F was even
+    # double-bound (QShortcut + action) = ambiguous = dead in windowed
+    # mode too.  Those keys now live on window-level QShortcuts.
+    print("[9] the 19:46 zen incident: switches never leave the "
+          "immersive session, and the immersive keys actually work")
+    from src.ui.main_window import MainWindow
+    mcfg = Config({"server_url": "http://127.0.0.1", "username": "u",
+                   "password": "p"}, None)
+    win = MainWindow(mcfg)
+    win.resize(1340, 820)
+    win.show()
+    app.processEvents()
+    view = win.player_view
+    view._closing = False
+
+    def mk_ep(num):
+        return {"kind": "series",
+                "title": "EN - Mickey Mouse Clubhouse - S03E%02d" % num,
+                "url": "http://127.0.0.1:9/series/x/%d.mp4" % num,
+                "fav_key": "episode:2719%02d" % num, "series_id": 123,
+                "season": 3, "episode": num}
+
+    # start E07 the way the episode dialog does, then go zen
+    win.play(mk_ep(7))
+    wait_for(lambda: (view.current or {}).get("episode") == 7)
+    win.toggle_zen()
+    app.processEvents()
+    check("zen engaged: tabs + menu hidden",
+          not win.tabs.isVisibleTo(win)
+          and not win.menuBar().isVisibleTo(win))
+
+    # next click — the exact incident gesture
+    view._fetch_next = lambda cur: mk_ep(8)
+    view.clearFocus()                      # the churned video HWND shape
+    view._play_next_clicked()
+    check("next click switched the episode",
+          wait_for(lambda: (view.current or {}).get("episode") == 8))
+    check("zen chrome survived the next click",
+          getattr(win, "_zen", False)
+          and not win.tabs.isVisibleTo(win)
+          and not win.menuBar().isVisibleTo(win))
+    check("keyboard focus returned to the player",
+          app.focusWidget() is view)
+
+    # prev click rides the same chain
+    view._fetch_prev = lambda cur: mk_ep(6)
+    view._play_prev_clicked()
+    check("prev click switched back and kept zen",
+          wait_for(lambda: (view.current or {}).get("episode") == 6)
+          and not win.tabs.isVisibleTo(win))
+
+    # autoplay: chrome knocked loose mid-zen (the media swap's window
+    # churn) is healed by the switch itself
+    view.vlc.state_name = lambda: "ended"   # played out
+    view.vlc.is_playing = lambda: False
+    view._vid_s = 705.0
+    view._played_once = True
+    view.btn_auto.setChecked(True)
+    view._fetch_next = lambda cur: mk_ep(7)
+    win.tabs.setVisible(True)               # the knock
+    win.menuBar().setVisible(True)
+    cap.rows.clear()
+    view._maybe_autoplay_next(False, 705322, 705000)
+    check("autoplay fired through the real chain",
+          wait_for(lambda: (view.current or {}).get("episode") == 7))
+    check("knocked-loose chrome was healed (tabs+menu hidden again)",
+          not win.tabs.isVisibleTo(win)
+          and not win.menuBar().isVisibleTo(win))
+    check("the heal named itself in the log",
+          any("immersive drift healed" in r for r in cap.rows))
+
+    def press(key):
+        QtWidgets.QApplication.sendEvent(
+            win, QtGui.QKeyEvent(QtCore.QEvent.KeyPress, key,
+                                 QtCore.Qt.NoModifier))
+        app.processEvents()
+
+    # H must exit zen even though zen hides the menu bar (an action
+    # shortcut is DEAD while its menu is hidden — the several-clicks
+    # half of the incident; assert the menu really was hidden at press)
+    menu_was_hidden = not win.menuBar().isVisibleTo(win)
+    press(QtCore.Qt.Key_H)
+    check("H exited zen while the menu bar was hidden",
+          menu_was_hidden
+          and getattr(win, "_zen", False) is False
+          and win.tabs.isVisibleTo(win))
+    check("the zen transition was logged",
+          any("chrome: zen off" in r for r in cap.rows))
+    press(QtCore.Qt.Key_H)                 # back in for the Esc check
+    check("H re-entered zen", getattr(win, "_zen", False) is True)
+    press(QtCore.Qt.Key_Escape)
+    check("Esc exits zen", getattr(win, "_zen", False) is False)
+
+    # F pressed with the menu bar VISIBLE: the old double binding
+    # (QShortcut + menu action) was ambiguous there and fired neither.
+    # The second press runs inside fullscreen, where the menu bar is
+    # hidden — pinning the hidden-menu side as well.
+    if getattr(win, "_zen", False):
+        win.toggle_zen()
+    win.menuBar().setVisible(True)
+    app.processEvents()
+    press(QtCore.Qt.Key_F)
+    check("F entered fullscreen (menu visible: no ambiguity)",
+          win.isFullScreen())
+    press(QtCore.Qt.Key_F)
+    check("F left fullscreen (menu hidden inside fullscreen)",
+          not win.isFullScreen())
+
+    view.stop()
+    win.close()
+    app.processEvents()
 
     logging.getLogger("mtp").removeHandler(cap)
     print()

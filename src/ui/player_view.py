@@ -2032,6 +2032,20 @@ class PlayerView(QtWidgets.QWidget):
         self._poke_audio()
         self._poke_rate()
         self._wake()
+        # An immersive session (zen / fullscreen) must survive the switch:
+        # the media swap tears down and rebuilds the native video window,
+        # and whatever that churn did to the window chrome / keyboard
+        # focus, the user's zen + channel-list state is re-asserted right
+        # here — next/prev/autoplay, the Stremio dead-link fallback, the
+        # reload button and external handoffs ALL pass through this spot
+        # (live-seen 2026-09-05 19:46: a next-episode click left zen and
+        # took several clicks to get back).
+        try:
+            _win = self.window()
+            if hasattr(_win, "reassert_immersive"):
+                _win.reassert_immersive()
+        except Exception:  # noqa: BLE001
+            pass
         if kind == "stremio":
             # figure out what this handed-off stream is (show / season /
             # episode) in the background — that is what makes autoplay-

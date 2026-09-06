@@ -94,7 +94,8 @@ def main():
     check("media actually started", len(win.player_view.played) == 1)
     check("splitter sizes saved before hiding",
           list(win._splitter_saved) == before_sizes)
-    check("menu action now reads Show", win.act_chan.text() == "Show channel list")
+    check("menu action now reads Show",
+          win.act_chan.text() == "Show channel list\tCtrl+L")
 
     print("[2] toggle_channels brings it back with the saved sizes")
     MainWindow.toggle_channels(win)
@@ -102,7 +103,7 @@ def main():
     check("panel flag cleared", win._channels_hidden is False)
     check("tabs widget shown again", win.tabs.isHidden() is False)
     check("menu action reads Hide again",
-          win.act_chan.text() == "Hide channel list")
+          win.act_chan.text() == "Hide channel list\tCtrl+L")
     check("splitter widths restored", list(win.splitter.sizes()) == before_sizes)
 
     print("[3] Live-channel play leaves the panel alone")
