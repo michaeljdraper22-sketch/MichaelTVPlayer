@@ -33,6 +33,16 @@
     name; the stats-less path prefers the idx-scoped .torrent cache
     over the flattened global scan; _torrent_metainfo picks
     files[file_idx] over largest-file.
+[4c] 2026-09-07 13:01: the streams cache is an OrderedDict. The v1.5.20
+    review gave the 12-entry streams cache FIFO eviction via
+    dict.popitem(last=False) — but _streams_cache was a PLAIN dict,
+    whose popitem() takes no arguments, so the first lookup that needed
+    to evict (Bluey binge, cache full at 12) died with
+    TypeError('dict.popitem() takes no keyword arguments') BEFORE the
+    insert, leaving the cache pinned at 12 and every later new-episode
+    lookup dying the same way: autoplay reported 'nothing found' from
+    then on. The cache must evict oldest-inserted and keep serving.
+
 [5] wiring: play_media kicks the probe with the guard.
 
 Run:  .venv\\Scripts\\python.exe test_stremio_speed.py   (sets QT_QPA_PLATFORM itself)
@@ -443,6 +453,65 @@ def main():
     finally:
         (stremio.find_series, stremio.find_movie,
          stremio.series_meta, stremio._torrent_metainfo) = saved
+
+    print("[4c] 2026-09-07 13:01: streams cache evicts without dying "
+          "at the 12-entry boundary")
+    saved_qa = stremio._query_addon
+    saved_ab = stremio._addon_bases
+    try:
+        stremio._streams_cache.clear()   # the PRODUCTION object — the
+        # plain-dict bug lives in its type, so it must not be rebound
+        bases = ("http://addon.fake",)
+        stremio._addon_bases = lambda cfg: bases
+        queries = []
+
+        def fake_qa(base, url):
+            queries.append(url)
+            ep = int(url.rsplit(":", 1)[1].split(".")[0])
+            return [{"title": "S01E%02d" % ep, "url": "http://x/%d" % ep}]
+
+        stremio._query_addon = fake_qa
+        cfg = Config({}, None)
+
+        def key(ep):
+            return ("tt7678620", 1, ep, bases)
+
+        # the binge state at 13:01 exactly: 12 episodes already queried
+        # (current + lookahead + prevlook over five watched episodes)
+        for ep in range(1, 13):
+            stremio._streams_cache[key(ep)] = (time.monotonic(), [])
+        try:
+            streams = stremio.addon_streams(cfg, "tt7678620", 1, 13)
+            check("the 13th lookup does NOT die on popitem",
+                  streams == [{"title": "S01E13", "url": "http://x/13"}])
+        except Exception as exc:   # noqa: BLE001
+            check("the 13th lookup does NOT die on popitem "
+                  "(%r)" % exc, False)
+            streams = None
+        c = stremio._streams_cache
+        check("cache stays bounded at 12", len(c) == 12)
+        check("oldest-inserted entry (ep1) was the eviction victim",
+              key(1) not in c and key(2) in c)
+        check("the new episode is cached", key(13) in c)
+        # the wedge made EVERY later lookup die the same way; one more
+        # must succeed too
+        try:
+            streams = stremio.addon_streams(cfg, "tt7678620", 1, 14)
+            check("the 14th lookup works as well",
+                  streams == [{"title": "S01E14", "url": "http://x/14"}])
+        except Exception as exc:   # noqa: BLE001
+            check("the 14th lookup works as well (%r)" % exc, False)
+        n = len(queries)
+        try:
+            stremio.addon_streams(cfg, "tt7678620", 1, 14)
+        except Exception:      # noqa: BLE001 — pre-fix: pops again, dies
+            pass
+        check("a re-ask is served from the cache, not the addon",
+              len(queries) == n)
+    finally:
+        stremio._streams_cache.clear()
+        stremio._query_addon = saved_qa
+        stremio._addon_bases = saved_ab
 
     print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)

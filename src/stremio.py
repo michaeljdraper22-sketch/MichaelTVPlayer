@@ -32,6 +32,7 @@ import struct
 import tempfile
 import threading
 import time
+from collections import OrderedDict
 
 import requests
 
@@ -55,7 +56,10 @@ _meta_cache = {}          # imdb_id -> series meta (episode lists are big)
 # not pin "no streams" for 10 minutes). Keyed on the addon list too, so
 # editing the addon order invalidates picks; lock + FIFO eviction because
 # lookahead, prev-lookahead and the click path hit it from worker threads.
-_streams_cache = {}
+# OrderedDict: FIFO eviction via popitem(last=False) — a plain dict's
+# popitem() takes no arguments, and the 2026-09-07 13:01 Bluey binge
+# proved every lookup past the 12-entry boundary died on exactly that.
+_streams_cache = OrderedDict()
 _streams_cache_lock = threading.Lock()
 _STREAMS_CACHE_TTL = 600.0
 
