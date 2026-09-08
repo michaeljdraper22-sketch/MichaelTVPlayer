@@ -247,13 +247,26 @@ _JUNK_RES = [
 ]
 
 
-def clean_show_name(text: str) -> str:
+def clean_show_name(text: str, strip_year: bool = False) -> str:
     """Reduce a torrent/file name to something a catalog search likes:
-    strip the episode marker + quality/codec noise, separators to spaces."""
+    strip the episode marker + quality/codec noise, separators to spaces.
+
+    ``strip_year`` is for RELEASE heads (resolve_identity's series
+    path): Sonarr/Plex names park the year LEFT of the episode marker —
+    'Bluey (2018) - S01E50 - …' cuts to 'Bluey (2018) - ', the
+    end-strip peels the ')' but leaves the year as a query word, no
+    series title ever carries it, and the 60% word floor then failed
+    EVERY lookup (live-seen 2026-09-08: catalog searched 'Bluey
+    (2018', nothing found — identity, autoplay and the next-click all
+    dead on the same name). Off by default: the movie cleaner's full
+    query legitimately ends in the year, and canonical series names
+    ('Space: 1999') must keep their title years."""
     name = text or ""
     for rx in _JUNK_RES:
         name = rx.sub(" ", name)
     name = re.sub(r"[\.\-_]+", " ", name)
+    if strip_year:
+        name = re.sub(r"\s*[\[\(]?\b(?:19|20)\d{2}\b[\]\)]?", " ", name)
     return re.sub(r"\s+", " ", name).strip(" -–—()[]{}.")
 
 
@@ -1181,10 +1194,14 @@ def resolve_identity(url: str, server: StreamingServer):
                      "movie name in %r / %r",
                      file_name[:60], torrent_name[:60])
         return ident
-    hit = find_series(clean_show_name(file_name or torrent_name))
+    # strip_year: this is a RELEASE head, where a year left of the
+    # episode marker is metadata, never title (see clean_show_name)
+    show_query = clean_show_name(file_name or torrent_name,
+                                 strip_year=True)
+    hit = find_series(show_query)
     if not hit:
         log.info("stremio: catalog search found no show for %r",
-                 clean_show_name(file_name or torrent_name))
+                 show_query)
         return None
     episode_name = ""
     try:

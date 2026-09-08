@@ -42,6 +42,15 @@
     insert, leaving the cache pinned at 12 and every later new-episode
     lookup dying the same way: autoplay reported 'nothing found' from
     then on. The cache must evict oldest-inserted and keep serving.
+[4d] 2026-09-08 10:18: a year LEFT of the episode marker must not
+    reach the series query. A torrentio resolve URL embedded a
+    Sonarr-style file name ('Bluey (2018) - S01E50 - …mkv'); the
+    cleaner's cut + end-strip left the year as a query word
+    ('Bluey (2018'), no series title carries it, and the 60% floor
+    failed EVERY lookup — open identity, autoplay and the next-click
+    all 'nothing found' while S01E51 sat one episode away.
+    strip_year=True on the release-head query; movie/canonical names
+    keep their years.
 
 [5] wiring: play_media kicks the probe with the guard.
 
@@ -512,6 +521,85 @@ def main():
         stremio._streams_cache.clear()
         stremio._query_addon = saved_qa
         stremio._addon_bases = saved_ab
+
+    print("[4d] 2026-09-08 10:18: a year LEFT of the episode marker "
+          "must not reach the series query")
+    # The incident: the morning's first debrid stream stalled, the
+    # re-picked torbox stream relaunched as a torrentio resolve URL
+    # embedding a Sonarr-style file name — 'Bluey (2018) - S01E50 -
+    # Shaun (1080p DSNP WEB-DL x265 Garshasp).mkv'. clean_show_name
+    # cut at the S/E marker, the end-strip peeled the ')' but left the
+    # year as a query word ('Bluey (2018'), no series title carries
+    # it, and the 60% floor failed EVERY lookup: the open-time
+    # identity (10:10:39), the autoplay fire (10:18:01) and the next
+    # click (10:18:28) all logged 'found no show' + 'nothing found'
+    # while S01E51 sat one episode away.
+    INCIDENT_URL = ("https://torrentio.strem.fun/resolve/torbox/"
+                    "1f7be332-5fea-4aa8-8814-46eabea63736/"
+                    "4443778978da9a14f1a873a6e0e7159c0dd7e490/"
+                    "Bluey%20(2018)%20-%20S01E50%20-%20Shaun%20(1080p"
+                    "%20DSNP%20WEB-DL%20x265%20Garshasp).mkv/49/Bluey"
+                    "%20(2018)%20-%20S01E50%20-%20Shaun%20(1080p%20DSNP"
+                    "%20WEB-DL%20x265%20Garshasp).mkv")
+    saved_fs, saved_sm = stremio.find_series, stremio.series_meta
+    queries = []
+    try:
+        def fake_find_series(q):
+            queries.append(q)
+            return ("tt7678620", "Bluey") if q == "Bluey" else None
+
+        stremio.find_series = fake_find_series
+        stremio.series_meta = lambda imdb: {
+            "name": "Bluey",
+            "videos": [{"season": 1, "episode": 50, "name": "Shaun"},
+                       {"season": 1, "episode": 51,
+                        "name": "Daddy Putdown"}]}
+        ident = stremio.resolve_identity(
+            INCIDENT_URL, stremio.StreamingServer(""))
+        check("incident URL resolves to Bluey S01E50",
+              bool(ident) and ident["stremio_imdb"] == "tt7678620"
+              and ident["season"] == 1 and ident["episode"] == 50)
+        check("episode title comes back with the identity",
+              bool(ident) and ident.get("episode_name") == "Shaun")
+        check("catalog was asked for 'Bluey', not 'Bluey (2018'",
+              queries and queries[-1] == "Bluey")
+        # the scorer itself was never the bug: with the right show in
+        # the results, the un-fixed query shape still honestly misses
+        # (2 query words, 60% floor needs 2, no title carries '2018')
+        metas = [{"id": "tt7678620", "name": "Bluey"},
+                 {"id": "tt999", "name": "The Bluey Show"}]
+        hit = stremio._find_catalog(lambda q: list(metas), "Bluey (2018")
+        check("the un-fixed query shape still misses (fix is in the "
+              "cleaning, not the scorer)", hit is None)
+        # the morning's FIRST url (debridio, year RIGHT of the marker)
+        # resolved pre-fix and must keep resolving
+        queries.clear()
+        ident = stremio.resolve_identity(
+            "https://addon.debridio.com/play/series/premiumize/0889be7c"
+            "bed8417f47e58540afea55c0/tdgs5gcukfk2fcc3/3fa123ad17042b"
+            "783436796ce7212ca24fbb8655/Bluey.S01E50.2018.2160p.WEB-DL"
+            ".H265.AAC-BlackTV.mp4", stremio.StreamingServer(""))
+        check("debridio dotted name (year right of marker) still resolves",
+              bool(ident) and ident["episode"] == 50
+              and queries == ["Bluey"])
+        # defaults pinned: strip_year is release-head-only
+        check("clean_show_name default keeps canonical title years",
+              stremio.clean_show_name("Space: 1999") == "Space: 1999")
+        check("movie cleaner keeps the release year",
+              stremio.clean_movie_name(
+                  "Everything.Everywhere.All.At.Once.2022.2160p.BluRay."
+                  "MULTI.DV.HEVC.mkv")
+              == "Everything Everywhere All At Once 2022")
+        try:
+            dotted = stremio.clean_show_name(
+                "Bluey.2018.S01E50.1080p.DSNP.WEB-DL.x265",
+                strip_year=True)
+        except TypeError as exc:   # pre-fix: the kwarg does not exist
+            dotted = "kwarg gone: %r" % exc
+        check("bare year left of the marker strips too (dotted form)",
+              dotted == "Bluey")
+    finally:
+        stremio.find_series, stremio.series_meta = saved_fs, saved_sm
 
     print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)
