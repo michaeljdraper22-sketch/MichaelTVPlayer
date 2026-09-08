@@ -744,6 +744,43 @@ def main():
         check("unmatched current -> the best ranked stream",
               nxt and nxt["url"] == A["url"])
 
+        # the 2026-09-08 11:34 incident (Alone Australia S04E05): the
+        # local streaming server, busy serving the very stream being
+        # watched, timed out (20 s ReadTimeout) creating the rank-2
+        # TORRENT — the old walk died right there and the button
+        # reported 'no other stream' while later candidates sat unused
+        # behind it. A failed create must cost ONE timeout (latched) and
+        # skip only torrent candidates, never the whole switch.
+        class BusyServer(FakeServer):
+            def create(self, info_hash, trackers=()):
+                self.created.append(info_hash)
+                return False            # the ReadTimeout shape
+
+        E = {"name": "Addon \U0001F464 2 \U0001F4BE 0.5 GB 480p",
+             "title": "Adventure.Time.S05E42.480p.WEB-DL.x264",
+             "infoHash": "0" * 40, "fileIdx": 0}
+        stremio._streams_cache.clear()
+        stremio._query_addon = \
+            lambda base, url: [dict(s) for s in (A, B, C, E, D)]
+        busy = BusyServer("")
+        stremio.StreamingServer = lambda base="": busy
+        nxt = stremio.next_stream_playable(cfg2, cur_of(B))
+        check("busy server: create failure walks past the torrent to the "
+              "next candidate (incident 11:34)",
+              nxt and nxt["url"] == D["url"])
+        check("one dead engine cost exactly ONE create attempt",
+              len(busy.created) == 1)
+
+        # only torrents left + dead server -> None, again after one attempt
+        stremio._streams_cache.clear()
+        stremio._query_addon = lambda base, url: [dict(s) for s in (C, E)]
+        busy2 = BusyServer("")
+        stremio.StreamingServer = lambda base="": busy2
+        nxt = stremio.next_stream_playable(cfg2, cur_of(C))
+        check("dead server with only torrents left -> None after one "
+              "attempt", nxt is None and len(busy2.created) == 1)
+        stremio.StreamingServer = FakeServer
+
         # movies: the movie endpoint, and movie identity carried
         stremio._streams_cache.clear()
         asked.clear()

@@ -1494,7 +1494,7 @@ def next_stream_playable(config, cur: dict):
 
     # the walk's position: the LAST entry matching the current stream
     # (the same torrent on two addons occupies several slots — step past
-    # them all), then the entry ranked after it
+    # them all), then every entry ranked after it
     cur_idx = -1
     for i, s in enumerate(ranked):
         if is_cur(s):
@@ -1507,57 +1507,74 @@ def next_stream_playable(config, cur: dict):
         log.info("stremio: next-stream — current stream not in the "
                  "ranked list (hash=%r url=%r), starting from the top",
                  cur_hash[:12], cur_url[:60])
-        nxt = ranked[0]
-    elif cur_idx + 1 >= len(ranked):
+        candidates = ranked
+    else:
+        candidates = ranked[cur_idx + 1:]
+
+    # Walk the candidates in rank order. A streaming server that refuses
+    # (or times out on) create kills only its TORRENT candidates, never
+    # the whole switch: the local engine is often busy serving the very
+    # stream being watched (live-seen 2026-09-08 11:34, Alone Australia
+    # S04E05 — a 20 s ReadTimeout on the rank-2 torrent made the button
+    # report 'no other stream' while later candidates sat unused behind
+    # it). server_ok latches so ONE dead engine costs ONE timeout, not
+    # one per remaining torrent.
+    server_ok = True
+    for nxt in candidates:
+        if nxt.get("url"):
+            url = nxt["url"]
+            # keep the torrent identity for the NEXT press's skip-match
+            # (and the debrid-stall fallback): the addon's own infoHash
+            # first — torrentio debrid entries carry it alongside the
+            # url — then the hash parsed out of a resolve link
+            info_hash = str(nxt.get("infoHash") or "").lower()
+            file_idx = nxt.get("fileIdx")
+            if not info_hash:
+                resolved = parse_resolve_url(url)
+                if resolved:
+                    info_hash, file_idx = resolved
+            if info_hash and file_idx is None:
+                file_idx = 0
+        else:
+            if not server_ok:
+                continue
+            info_hash = str(nxt["infoHash"]).lower()
+            file_idx = int(nxt.get("fileIdx") or 0)
+            if not server.create(info_hash):
+                log.warning("stremio: streaming server refused create for "
+                            "%s — skipping to the next candidate",
+                            info_hash[:12])
+                server_ok = False
+                continue
+            url = server.play_url(info_hash, file_idx)
+
+        nxt_playable = {
+            "kind": "stremio",
+            "title": cur.get("title") or "Stremio stream",
+            "url": url,
+            "fav_key": cur.get("fav_key")
+            or "stremio:%s:%d:%d" % (imdb, int(cur.get("season") or 0),
+                                     int(cur.get("episode") or 0)),
+            "icon": cur.get("icon") or "",
+            "stremio_imdb": imdb,
+        }
+        for key in ("movie", "movie_name", "year",
+                    "series_name", "season", "episode", "episode_name"):
+            if cur.get(key) is not None:
+                nxt_playable[key] = cur[key]
+        if info_hash:
+            nxt_playable["info_hash"] = info_hash
+            nxt_playable["file_idx"] = file_idx
+        return nxt_playable
+
+    if cur_idx >= 0 and not candidates:
         log.info("stremio: next-stream — the current stream is the last "
                  "usable one of %d", len(ranked))
-        nxt = None
     else:
-        nxt = ranked[cur_idx + 1]
-    if nxt is None:
-        return None
-
-    if nxt.get("url"):
-        url = nxt["url"]
-        # keep the torrent identity for the NEXT press's skip-match (and
-        # the debrid-stall fallback): the addon's own infoHash first —
-        # torrentio debrid entries carry it alongside the url — then the
-        # hash parsed out of a resolve link
-        info_hash = str(nxt.get("infoHash") or "").lower()
-        file_idx = nxt.get("fileIdx")
-        if not info_hash:
-            resolved = parse_resolve_url(url)
-            if resolved:
-                info_hash, file_idx = resolved
-        if info_hash and file_idx is None:
-            file_idx = 0
-    else:
-        info_hash = str(nxt["infoHash"]).lower()
-        file_idx = int(nxt.get("fileIdx") or 0)
-        if not server.create(info_hash):
-            log.warning("stremio: streaming server refused create for "
-                        "%s — cannot switch stream", info_hash[:12])
-            return None
-        url = server.play_url(info_hash, file_idx)
-
-    nxt_playable = {
-        "kind": "stremio",
-        "title": cur.get("title") or "Stremio stream",
-        "url": url,
-        "fav_key": cur.get("fav_key")
-        or "stremio:%s:%d:%d" % (imdb, int(cur.get("season") or 0),
-                                 int(cur.get("episode") or 0)),
-        "icon": cur.get("icon") or "",
-        "stremio_imdb": imdb,
-    }
-    for key in ("movie", "movie_name", "year",
-                "series_name", "season", "episode", "episode_name"):
-        if cur.get(key) is not None:
-            nxt_playable[key] = cur[key]
-    if info_hash:
-        nxt_playable["info_hash"] = info_hash
-        nxt_playable["file_idx"] = file_idx
-    return nxt_playable
+        log.info("stremio: next-stream — no switchable candidate left of "
+                 "%d after the walk (server_ok=%s)",
+                 len(candidates), server_ok)
+    return None
 
 
 def _episode_title(meta: dict, season: int, episode: int) -> str:
