@@ -837,6 +837,13 @@ class PlayerView(QtWidgets.QWidget):
         self._prevlook_runner.finished.connect(self._on_stremio_prevlook)
         self._prevlook_busy = ""
         self._stremio_prevlook = None    # (fav_key, playable|None, when)
+        # next-stream lookups (the S button / stream button: same
+        # episode, next-ranked source) — its own runner + busy latch so
+        # a spam of presses coalesces into ONE addon chain and can never
+        # clobber an episode lookup in flight
+        self._stream_runner = AsyncRunner()
+        self._stream_runner.finished.connect(self._on_stream_fetched)
+        self._stream_busy_base = ""
         # debrid-stall fallback (see _stremio_guard_tick): play the
         # handoff's torrent through the local Stremio server when the
         # debrid link itself refuses to start
@@ -1103,6 +1110,15 @@ class PlayerView(QtWidgets.QWidget):
         # Live TV keeps next-only (reverse channel-zapping wasn't asked
         # for), movies get neither.
         self.btn_prev = ctl_btn(ic.play_prev(), "Play previous (P)")
+        # next stream: SAME episode/movie on the next-ranked source —
+        # the "this one's wrong (foreign audio, no subs, dead)" escape
+        # hatch for Stremio handoffs. Walks autoplay's exact ranking
+        # (language / resolution / size / addon order) past the stream
+        # now playing, so repeated presses keep moving down the list.
+        # Stremio only: every other kind plays a single fixed stream.
+        self.btn_stream = ctl_btn(
+            ic.stream_next(),
+            "Try the next stream for this episode / movie (S)")
         self.sep3 = ctl_sep()
         self.btn_mute = ctl_btn(ic.volume(True), "Mute (M)", checkable=True)
         # JumpSlider = click anywhere on the bar to set the volume directly
@@ -1123,7 +1139,8 @@ class PlayerView(QtWidgets.QWidget):
                   self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
                   self.btn_dl, self.btn_win, self.btn_rec, self.sep2,
                   self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
-                  self.btn_auto, self.btn_prev, self.btn_next, self.sep3,
+                  self.btn_auto, self.btn_prev, self.btn_next,
+                  self.btn_stream, self.sep3,
                   self.btn_mute, self.vol_slider):
             rl.addWidget(w)
         ctl_lay.addWidget(row)
@@ -1137,7 +1154,7 @@ class PlayerView(QtWidgets.QWidget):
         for b in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.btn_begin, self.btn_live,
                   self.btn_rec, self.btn_audio,
-                  self.btn_next, self.btn_prev):
+                  self.btn_next, self.btn_prev, self.btn_stream):
             b.setEnabled(False)
 
         # DVR start-up pill ("DVR 12s / 20s buffered…"), centered on the
@@ -1173,6 +1190,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_auto.toggled.connect(self._on_autoplay_toggled)
         self.btn_next.clicked.connect(self._play_next_clicked)
         self.btn_prev.clicked.connect(self._play_prev_clicked)
+        self.btn_stream.clicked.connect(self._next_stream_clicked)
         self.btn_mute.toggled.connect(self._on_mute)
         self.btn_dl.clicked.connect(self._start_download)
         self.btn_win.clicked.connect(self._on_win_btn)
@@ -2530,6 +2548,103 @@ class PlayerView(QtWidgets.QWidget):
             pass
         self._kick_prev_lookup(base, cur)
 
+    # ---- next stream: same episode/movie, next-ranked source ----
+
+    def _next_stream_clicked(self):
+        try:
+            self._next_stream_core()
+        except Exception:  # noqa: BLE001
+            self._pn_fail("next-stream")
+
+    def _next_stream_core(self):
+        """The S button: the stream is wrong somehow (foreign audio, no
+        subtitles, dead link) — re-ask the addons for the SAME episode or
+        movie and switch to the stream ranked after this one, resuming
+        where playback stands. Stremio handoffs only: every other kind
+        plays a single fixed stream with nothing to walk through."""
+        cur = self.current
+        if self._closing or not cur:
+            self._pn_log("streamnext: click dropped \u2014 closing=%s "
+                         "current=%s", bool(self._closing),
+                         "none" if cur is None else cur.get("kind"))
+            return
+        if cur.get("kind") != "stremio":
+            self._pn_log("streamnext: click dropped \u2014 kind=%r",
+                         cur.get("kind"))
+            return
+        base = cur.get("fav_key")
+        self._pn_log("streamnext: click \u2014 stremio base=%r", base)
+        if base and self._stream_busy_base == base:
+            self._pn_log("streamnext: lookup for %r already running \u2014 "
+                         "click coalesced", base)
+            return
+        # grab the resume position on the GUI thread BEFORE the worker
+        # runs: get_time() walks into libvlc
+        pos_s = self._stream_resume_s()
+        self._stream_busy_base = base or ""
+        work_cur = dict(cur)
+        self._stream_runner.run(
+            lambda: (base, self._fetch_next_stream(work_cur), pos_s))
+
+    def _fetch_next_stream(self, cur):
+        """Worker-thread: the next-ranked stream for the SAME episode or
+        movie (identity resolved on demand inside the backend)."""
+        try:
+            from .. import stremio
+            return stremio.next_stream_playable(self.config, cur)
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("stremio next-stream lookup failed: %r", exc)
+            except Exception:
+                pass
+            return None
+
+    def _stream_resume_s(self) -> float:
+        """Where playback stands (seconds), to hand the SAME episode to
+        its replacement stream. 0 for the start-over shapes: nothing
+        really playing yet, or already at the credits — resuming near
+        the end would park the new stream straight into end-of-media
+        autoplay."""
+        try:
+            pos = max(0, self.vlc.get_time()) / 1000.0
+            length = max(0, self.vlc.get_length()) / 1000.0
+        except Exception:  # noqa: BLE001
+            return 0.0
+        if pos < 5.0:
+            return 0.0
+        if length and pos > length - 45.0:
+            return 0.0
+        return pos
+
+    def _on_stream_fetched(self, result):
+        self._stream_busy_base = ""
+        try:
+            ok, val = result
+            if self._closing or ok != "ok":
+                if not self._closing:
+                    try:
+                        log.warning("next-stream lookup failed: %s", val)
+                    except Exception:
+                        pass
+                    self.show_info("Could not look up another stream")
+                return
+            base, nxt, pos_s = val if isinstance(val, tuple) \
+                and len(val) == 3 else (None, None, 0.0)
+            cur = self.current or {}
+            if cur.get("fav_key") != base:
+                self._pn_log("streamnext: result stale-dropped \u2014 "
+                             "base=%r cur=%r", base, cur.get("fav_key"))
+                return
+            if not nxt:
+                self._pn_log("streamnext: no other stream after %r", base)
+                self.show_info("No other stream found for this item")
+                return
+            self._pn_log("streamnext: switching stream for %r -> %r",
+                         base, str(nxt.get("url", ""))[:70])
+            self._start_next(nxt, start_at=pos_s)
+        except Exception:  # noqa: BLE001
+            self._pn_fail("stream-result")
+
     @staticmethod
     def _nn(v):
         """Tolerant int() for provider episode/season numbers."""
@@ -2807,9 +2922,12 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             self._pn_fail("prev-result")
 
-    def _start_next(self, nxt):
+    def _start_next(self, nxt, start_at: float = 0.0):
         """Switch playback to the next item through the same bookkeeping
-        MainWindow.play() does (recents + last_channel)."""
+        MainWindow.play() does (recents + last_channel). ``start_at`` is
+        the next-STREAM path's resume position — the same episode handed
+        to a different source picks up where it left off instead of
+        replaying the cold open."""
         try:
             self.config.add_recent(nxt)
             self.config.data["last_channel"] = nxt
@@ -2818,7 +2936,7 @@ class PlayerView(QtWidgets.QWidget):
             # bookkeeping is secondary — the switch itself must still run
             self._pn_log("playnext: recents/last_channel save failed "
                          "for %r", nxt.get("title", ""))
-        self.play_media(nxt)
+        self.play_media(nxt, start_at)
         # the neighbor prefetches (lookahead + prevlook) are kicked from
         # play_media itself now — here they only fired for switches, never
         # for replays, and ran a beat later than needed
@@ -5312,6 +5430,7 @@ class PlayerView(QtWidgets.QWidget):
                                           "stremio"))
         self.btn_prev.setEnabled(kind in ("live", "series", "catchup",
                                           "stremio"))
+        self.btn_stream.setEnabled(kind == "stremio")
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled((vod or stremio) and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
@@ -5345,7 +5464,7 @@ class PlayerView(QtWidgets.QWidget):
             "speed": self.btn_speed, "mute": self.btn_mute,
             "volume": self.vol_slider,
             "autoplay": self.btn_auto, "playnext": self.btn_next,
-            "playprev": self.btn_prev,
+            "playprev": self.btn_prev, "stream": self.btn_stream,
         }
         kind = (self.current or {}).get("kind")
         # a Stremio handoff is "kind=stremio" for movies too — the episode
@@ -5393,6 +5512,12 @@ class PlayerView(QtWidgets.QWidget):
                 # pre-stream
                 w.setVisible(on and (kind in ("live", "series", "catchup")
                                      or stremio_ep))
+            elif key == "stream":
+                # next STREAM (same episode/movie, next-ranked source):
+                # every Stremio handoff gets it — movies included, identity
+                # or not (the worker resolves identity on demand). Every
+                # other kind plays a single fixed stream.
+                w.setVisible(on and stremio)
             else:
                 w.setVisible(on)
 

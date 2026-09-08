@@ -310,6 +310,11 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.player_view._play_next_clicked)
         QtWidgets.QShortcut(QtGui.QKeySequence("P"), self,
                             activated=self.player_view._play_prev_clicked)
+        # next STREAM (Stremio only — the handler drops every other kind):
+        # same episode/movie on the next-ranked source. A window-level
+        # QShortcut like N/P so it works in zen/fullscreen too.
+        QtWidgets.QShortcut(QtGui.QKeySequence("S"), self,
+                            activated=self.player_view._next_stream_clicked)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
@@ -1238,6 +1243,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "  M  ................. Mute / Unmute\n"
             "  C  ................. Subtitles: Off -> English -> other tracks\n"
             "  A  ................. Audio track: Auto (English) -> tracks\n"
+            "  S  ................. Next stream (Stremio): same episode/movie,\n"
+            "                       next-ranked source — for when the current\n"
+            "                       one is wrong (foreign audio, no subs)\n"
             "  Mouse wheel ....... Volume (over the video)\n"
             "  Double-click video  Toggle fullscreen\n"
             "  ● LIVE button ..... Jump to the live edge / end of the movie\n"

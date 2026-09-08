@@ -611,6 +611,271 @@ def main():
     check("probe_debrid lives in src/stremio.py with a range GET",
           callable(stremio.probe_debrid))
 
+    # ------------------------------------------------------------------
+    # the next-stream feature (2026-09-08 request): "if I load into a
+    # stream and it's wrong — wrong language, no subtitles — press a
+    # button and automatically try the next stream of the same episode/
+    # movie, following the same provider-preference rules as next
+    # episode. Prefer English in both language and subtitles."
+    print("[6] English-preference ranking + next_stream_playable")
+    H = {"a": "a" * 40, "b": "b" * 40, "c": "c" * 40, "d": "d" * 40,
+         "e": "e" * 40, "f": "f" * 40}
+
+    def s_url(tag, title, res_hint="1080p"):
+        return {"name": "Addon \U0001F464 20 \U0001F4BE 2 GB %s" % res_hint,
+                "title": title, "url": "http://debrid.invalid/%s" % tag,
+                "infoHash": H[tag]}
+
+    A = s_url("a", "Adventure.Time.S05E42.1080p.WEB-DL.DDP5.1.x264-NTb")
+    B = s_url("b", "Adventure.Time.S05E42.1080p.BluRay.x264-ROVERS")
+    C = {"name": "Addon \U0001F464 5 \U0001F4BE 1 GB 720p",
+         "title": "Adventure.Time.S05E42.720p.WEB-DL.AAC2.0.H.264",
+         "infoHash": H["c"], "fileIdx": 3}
+    D = s_url("d", "Adventure.Time.S05E42.VOSTFRENCH.1080p.WEB-DL")
+
+    check("plain release: no language penalty",
+          stremio.lang_penalty(A) == 0)
+    check("VOSTFRENCH release: foreign penalty",
+          stremio.lang_penalty(D) == 1)
+    check("dual audio release: no penalty (has English)",
+          stremio.lang_penalty(
+              {"title": "Anime.S01E01.1080p.DUAL.AUDIO.EN.JP"}) == 0)
+    check("MULTI release: no penalty",
+          stremio.lang_penalty(
+              {"title": "Film.2023.2160p.MULTI.WEB-DL"}) == 0)
+    # a foreign dub outranks NOTHING anymore: the plain 720p beats the
+    # TRUEFRENCH 4K (the user prefers English in audio AND subtitles)
+    fr_4k = {"title": "Film.2023.TRUEFRENCH.2160p.BluRay", "url": "http://x",
+             "infoHash": H["d"]}
+    plain_720 = {"title": "Film.2023.720p.WEB-DL.x264", "url": "http://y",
+                 "infoHash": H["c"]}
+    cfg2 = Config({}, None)
+    check("plain 720p outranks a foreign-language 4K",
+          stremio.best_stream(cfg2, [fr_4k, plain_720]) is plain_720)
+
+    saved_qa, saved_ab = stremio._query_addon, stremio._addon_bases
+    saved_srv = stremio.StreamingServer
+    stremio._streams_cache.clear()
+    bases = ("http://addon.invalid",)
+    stremio._addon_bases = lambda cfg: bases
+    asked = []
+    ALL = [A, B, C, D]
+
+    def fake_qa(base, url):
+        asked.append(url)
+        return [dict(s) for s in ALL]
+
+    stremio._query_addon = fake_qa
+
+    class FakeServer:
+        def __init__(self, base=""):
+            self.created = []
+
+        def create(self, info_hash, trackers=()):
+            self.created.append(info_hash)
+            return True
+
+        @staticmethod
+        def play_url(info_hash, file_idx):
+            return "http://server.invalid/%s/%d" % (info_hash, file_idx)
+
+    stremio.StreamingServer = FakeServer
+
+    def cur_of(stream, **extra):
+        p = {"kind": "stremio",
+             "title": "Adventure Time — S05E42 James",
+             "url": stream.get("url")
+             or "http://server.invalid/%s/%d" % (stream["infoHash"],
+                                                 stream.get("fileIdx", 0)),
+             "fav_key": "stremio:tt1305826:5:42",
+             "stremio_imdb": "tt1305826", "season": 5, "episode": 42,
+             "series_name": "Adventure Time"}
+        if stream.get("infoHash"):
+            p["info_hash"] = stream["infoHash"]
+            p["file_idx"] = int(stream.get("fileIdx") or 0)
+        p.update(extra)
+        return p
+
+    try:
+        ranked = stremio.rank_streams(cfg2, ALL, cur_of(A))
+        check("ranked order: 1080 pair, then 720p, French last",
+              [s["url"] for s in ranked[:2]] == [A["url"], B["url"]]
+              and ranked[2] is C and ranked[3] is D)
+        check("best_stream is the head of rank_streams",
+              stremio.best_stream(cfg2, ALL, cur_of(A)) is ranked[0])
+
+        # walk the whole list, pressing the button each time
+        nxt = stremio.next_stream_playable(cfg2, cur_of(A))
+        check("from the best stream -> the second one (B)",
+              nxt and nxt["url"] == B["url"]
+              and nxt["info_hash"] == H["b"])
+        check("identity carried: same fav_key/episode/title",
+              nxt["fav_key"] == "stremio:tt1305826:5:42"
+              and (nxt["season"], nxt["episode"]) == (5, 42)
+              and nxt["series_name"] == "Adventure Time"
+              and nxt["title"].startswith("Adventure Time"))
+        nxt2 = stremio.next_stream_playable(cfg2, cur_of(B))
+        check("from B -> the 720p TORRENT via the local server",
+              nxt2 and nxt2["url"] == "http://server.invalid/%s/3" % H["c"]
+              and nxt2["info_hash"] == H["c"] and nxt2["file_idx"] == 3)
+        nxt3 = stremio.next_stream_playable(cfg2, cur_of(C))
+        check("from C -> the demoted French one (last resort, not skipped)",
+              nxt3 and nxt3["url"] == D["url"])
+        check("from the last stream -> None (button says 'no other')",
+              stremio.next_stream_playable(cfg2, cur_of(D)) is None)
+
+        # the same torrent on two addons is the SAME release: the walk
+        # must not re-serve it under the second addon's URL
+        stremio._streams_cache.clear()
+        A2 = dict(A)
+        A2["_addon"] = "http://addon2.invalid"
+        A2["url"] = "http://debrid2.invalid/a"
+        stremio._query_addon = lambda base, url: [dict(s) for s in (A, A2, B)]
+        nxt = stremio.next_stream_playable(cfg2, cur_of(A))
+        check("same torrent on a second addon is skipped, not re-served",
+              nxt and nxt["url"] == B["url"])
+
+        # current not among the results (handoff from Stremio's own pick):
+        # the walk starts from the top, logged
+        stremio._streams_cache.clear()
+        stremio._query_addon = fake_qa
+        outsider = cur_of({"infoHash": "f" * 40, "fileIdx": 0})
+        nxt = stremio.next_stream_playable(cfg2, outsider)
+        check("unmatched current -> the best ranked stream",
+              nxt and nxt["url"] == A["url"])
+
+        # movies: the movie endpoint, and movie identity carried
+        stremio._streams_cache.clear()
+        asked.clear()
+        M1 = s_url("e", "Everything.Everywhere.All.at.Once.2022.1080p.WEB")
+        M2 = s_url("f", "Everything.Everywhere.All.at.Once.2022.2160p.WEB")
+        stremio._query_addon = \
+            lambda base, url: (asked.append(url)
+                               or [dict(s) for s in (M1, M2)]
+                               if "/stream/movie/" in url else [])
+        mcur = {"kind": "stremio", "movie": True,
+                "title": "Everything Everywhere All at Once (2022)",
+                "url": M1["url"], "fav_key": "stremio:url:old",
+                "info_hash": H["e"], "stremio_imdb": "tt6652842",
+                "movie_name": "Everything Everywhere All at Once",
+                "year": "2022"}
+        mn = stremio.next_stream_playable(cfg2, mcur)
+        check("movie asked the MOVIE endpoint",
+              any("/stream/movie/tt6652842.json" in u for u in asked))
+        check("movie walk: best -> second, movie identity carried",
+              mn and mn["url"] == M2["url"] and mn.get("movie") is True
+              and mn.get("movie_name") == mcur["movie_name"]
+              and mn.get("year") == "2022")
+    finally:
+        stremio._streams_cache.clear()
+        stremio._query_addon = saved_qa
+        stremio._addon_bases = saved_ab
+        stremio.StreamingServer = saved_srv
+
+    print("[7] next-stream UI: button, resume position, staleness, "
+          "coalescing, S shortcut")
+    played = []
+
+    def wait_for(cond, timeout=5.0):
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            app.processEvents()
+            if cond():
+                return True
+            time.sleep(0.02)
+        app.processEvents()
+        return cond()
+
+    saved_nsp = stremio.next_stream_playable
+
+    def mk_view(cur):
+        v = PlayerView(Config({}, None))
+        v._closing = False
+        v._attach_done = True
+        v.current = cur
+        v.show()
+        v._update_control_state()
+        v._apply_button_visibility()
+        rec = []
+
+        def _fake_play(p, s=0.0):
+            rec.append((p.get("fav_key"), s, p.get("url")))
+            v.current = p
+        v.play_media = _fake_play
+        return v, rec
+
+    e42_cur = cur_of(A)
+    v, rec = mk_view(e42_cur)
+    v.vlc.get_time = lambda: 313000          # 5:13 into the episode
+    v.vlc.get_length = lambda: 705000
+    stremio.next_stream_playable = \
+        lambda cfg, cur: dict(e42_cur, url=B["url"], info_hash=H["b"])
+    try:
+        check("button visible + enabled on a Stremio episode",
+              not v.btn_stream.isHidden() and v.btn_stream.isEnabled())
+        v.btn_stream.click()
+        check("click switched to the second stream",
+              wait_for(lambda: rec and rec[0][2] == B["url"]))
+        check("same episode resumed where it stood (313 s)",
+              rec and abs(rec[0][1] - 313.0) < 0.01)
+        check("current kept the episode's fav_key",
+              (v.current or {}).get("fav_key") == "stremio:tt1305826:5:42")
+        v.stop()
+
+        # near the credits: start the replacement from zero (never land
+        # it straight into end-of-media autoplay)
+        v, rec = mk_view(cur_of(A))
+        v.vlc.get_time = lambda: 690000       # 15 s before the end
+        v.vlc.get_length = lambda: 705000
+        v.btn_stream.click()
+        check("resume near the end starts over at 0",
+              wait_for(lambda: rec and rec[0][1] == 0.0))
+        v.stop()
+
+        # nothing else to try: the user is told, nothing switches
+        v, rec = mk_view(cur_of(A))
+        notes = []
+        v.show_info = lambda text, **kw: notes.append(text)
+        stremio.next_stream_playable = lambda cfg, cur: None
+        v.btn_stream.click()
+        check("'no other stream' banner shown",
+              wait_for(lambda: any("No other stream" in t for t in notes)))
+        check("no switch happened", not rec)
+        v.stop()
+
+        # spam coalesces into ONE lookup; the kind guard drops non-stremio
+        v, rec = mk_view(cur_of(A))
+        calls = []
+        v._fetch_next_stream = lambda cur: calls.append(1) or None
+        v._stream_busy_base = e42_cur["fav_key"]
+        v.btn_stream.click()
+        check("in-flight lookup: click coalesced",
+              not calls and not rec)
+        v._stream_busy_base = ""
+        v.current = {"kind": "live", "title": "L", "url": "http://x",
+                     "fav_key": "live:1"}
+        v._update_control_state()
+        v._apply_button_visibility()
+        check("button hidden + disabled on live TV",
+              v.btn_stream.isHidden() and not v.btn_stream.isEnabled())
+        v.btn_stream.click()
+        check("live click dropped by the kind guard", not calls)
+        v.stop()
+
+        # a Stremio MOVIE gets the button even without episode identity
+        v, rec = mk_view(dict(mcur))
+        check("button visible on a Stremio movie", not v.btn_stream.isHidden())
+        v.stop()
+
+        # the S shortcut is a window-level QShortcut wired to the handler
+        from src.ui import main_window as mw_mod
+        src_sc = inspect.getsource(mw_mod.MainWindow._setup_shortcuts)
+        check("S shortcut is a window-level QShortcut wired to the handler",
+              'QKeySequence("S")' in src_sc
+              and "_next_stream_clicked" in src_sc)
+    finally:
+        stremio.next_stream_playable = saved_nsp
+
     view.stop()
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

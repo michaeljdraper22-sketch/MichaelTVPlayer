@@ -961,29 +961,28 @@ def _query_addon(base: str, url: str) -> list:
     return []
 
 
-def addon_streams(config, imdb_id: str, season: int, episode: int):
-    """Merged /stream/series/{imdb}:{s}:{e}.json results from every
-    configured addon, queried CONCURRENTLY (they used to run serially, so
-    one slow addon added its full latency — up to 25 s, doubled by the
-    retry — to every episode open) and cached per episode for a short TTL
-    (bounces and re-lookaheads re-ask the same episode)."""
-    key = (str(imdb_id or "").lower(), int(season), int(episode))
+def _merged_addon_streams(config, resource: str, key: tuple) -> list:
+    """Every configured addon's /stream/<resource>.json list, queried
+    CONCURRENTLY (they used to run serially, so one slow addon added its
+    full latency — up to 25 s, doubled by the retry — to every episode
+    open), merged in addon-priority order and cached for a short TTL
+    (bounces and re-lookaheads re-ask the same episode). ``resource`` is
+    the path after /stream/ ('series/tt123:1:2' / 'movie/tt123'); ``key``
+    is the full cache key."""
     bases = _addon_bases(config)
-    full_key = key + (tuple(bases),)
     with _streams_cache_lock:
-        hit = _streams_cache.get(full_key)
+        hit = _streams_cache.get(key)
         if hit and time.monotonic() - hit[0] < _STREAMS_CACHE_TTL:
             return hit[1]
     if len(bases) == 1:
-        streams = _query_addon(bases[0], "%s/stream/series/%s:%d:%d.json"
-                               % (bases[0], imdb_id, season, episode))
+        streams = _query_addon(bases[0],
+                               "%s/stream/%s.json" % (bases[0], resource))
     else:
         with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(bases))) as pool:
             futures = [
                 pool.submit(_query_addon, base,
-                            "%s/stream/series/%s:%d:%d.json"
-                            % (base, imdb_id, season, episode))
+                            "%s/stream/%s.json" % (base, resource))
                 for base in bases]
             streams = []
             for f in futures:      # merge in addon-priority order
@@ -994,8 +993,28 @@ def addon_streams(config, imdb_id: str, season: int, episode: int):
             # wipe could discard a neighbor the prefetch just warmed)
             while len(_streams_cache) >= 12:
                 _streams_cache.popitem(last=False)
-            _streams_cache[full_key] = (time.monotonic(), streams)
+            _streams_cache[key] = (time.monotonic(), streams)
     return streams
+
+
+def addon_streams(config, imdb_id: str, season: int, episode: int) -> list:
+    """Merged /stream/series/{imdb}:{s}:{e}.json results from every
+    configured addon."""
+    imdb = str(imdb_id or "")
+    return _merged_addon_streams(
+        config, "series/%s:%d:%d" % (imdb, int(season), int(episode)),
+        (imdb.lower(), int(season), int(episode),
+         tuple(_addon_bases(config))))
+
+
+def addon_movie_streams(config, imdb_id: str) -> list:
+    """The movie twin of addon_streams: merged /stream/movie/{imdb}.json
+    results. Season/episode -1/-1 in the cache key marks the movie shape
+    (a real series query can never carry negative fields)."""
+    imdb = str(imdb_id or "")
+    return _merged_addon_streams(
+        config, "movie/%s" % imdb,
+        (imdb.lower(), -1, -1, tuple(_addon_bases(config))))
 
 
 _RES_RE = re.compile(r"\b(2160|1440|1080|720|480|360)(?:p|i)?\b",
@@ -1003,6 +1022,48 @@ _RES_RE = re.compile(r"\b(2160|1440|1080|720|480|360)(?:p|i)?\b",
 _RES_ALIAS_RE = re.compile(r"\b(4k|8k|uhd)\b", re.IGNORECASE)
 _SEEDS_RE = re.compile(r"\U0001F464\s*(\d+)")          # 👤 23
 _SIZE_RE = re.compile(r"\U0001F4BE\s*([\d.]+)\s*(GB|MB)", re.IGNORECASE)
+
+# English-preference ranking (the user's standing rule: "I prefer English
+# in both language and subtitles"). Release names SAY when a file is
+# foreign: scene tags like TRUEFRENCH / GERMAN / LATINO / VOSTFR mark
+# dub or hardsub languages, while EN / ENG / Dual Audio / MULTI mark
+# releases that carry an English track. A foreign-marked release with NO
+# English marker anywhere is demoted below everything else (a demotion,
+# never an exclusion — when every candidate is foreign the least-bad
+# still wins, exactly like the size demote). Unmarked releases stay
+# neutral: they are the overwhelming majority for English-market
+# content, and boosting explicitly-marked ones ABOVE neutral would let a
+# Dual Audio 480p displace the plain 1080p BluRay.
+_EN_LANG_RE = re.compile(
+    r"\b(english|eng|en|dual[ ._\-]?audio|multi)\b", re.IGNORECASE)
+_FOREIGN_LANG_RE = re.compile(
+    r"\b(french|francais|fran\u00e7ais|truefrench|vostfr\w*|vff|vfq|vfi|"
+    r"\bvf\b|subfrench|german|deutsch|italian|italiano|\bita\b|"
+    r"spanish|espanol|espa\u00f1ol|castellano|latino|portuguese|"
+    r"portugues|brasileiro|russian|\brus\b|ukrainian|ukr|polish|dutch|"
+    r"turkish|arabic|hindi|chinese|mandarin|cantonese|japanese|jpn|"
+    r"korean|kor|thai|vietnamese|indonesian|hebrew|greek|swedish|"
+    r"norwegian|danish|finnish|czech|hungarian|romanian)\b",
+    re.IGNORECASE)
+
+
+def _stream_text(stream: dict) -> str:
+    """Everything human-readable a stream entry says about itself — the
+    fields release names live in (name/title carry the torrentio-style
+    display text, behaviorHints.filename the debrid file name)."""
+    text = " ".join(str(stream.get(k) or "") for k in ("name", "title"))
+    text += " " + str(((stream.get("behaviorHints") or {})
+                       .get("filename")) or "")
+    return text
+
+
+def lang_penalty(stream: dict) -> int:
+    """0 = English-capable or unknown, 1 = clearly foreign (a foreign
+    language marker with no English marker anywhere in the name)."""
+    text = _stream_text(stream)
+    if _FOREIGN_LANG_RE.search(text) and not _EN_LANG_RE.search(text):
+        return 1
+    return 0
 
 
 def _stream_parts(stream: dict):
@@ -1041,18 +1102,20 @@ def _cur_resolution(cur: dict) -> int:
     return 0
 
 
-def best_stream(config, streams: list, cur: dict = None):
-    """Pick the stream to autoplay: playable sources only (a direct url,
-    or infoHash+fileIdx for the local server). Ranking, best first:
-    resolution preference (match current / auto 4K-first fall-down / a
-    fixed pick), then sane size (over stremio_size_demote_gb demoted,
-    never excluded), then addon priority (the stremio_addons order — the
-    same release on two addons goes to the preferred one), then
-    resolution and finally seeders as quiet tie-breaks — debrid cache
-    makes seed counts nearly meaningless, so they never override a
-    resolution choice."""
+def rank_streams(config, streams: list, cur: dict = None) -> list:
+    """ALL playable candidates in the autoplay pick order, best first
+    (best_stream is ranked[0]). Playable sources only (a direct url, or
+    infoHash+fileIdx for the local server). Ranking, best first:
+    English-capable releases (a clearly-foreign dub/hardsub name is
+    demoted below everything — see lang_penalty), then resolution
+    preference (match current / auto 4K-first fall-down / a fixed pick),
+    then sane size (over stremio_size_demote_gb demoted, never excluded),
+    then addon priority (the stremio_addons order — the same release on
+    two addons goes to the preferred one), then resolution and finally
+    seeders as quiet tie-breaks — debrid cache makes seed counts nearly
+    meaningless, so they never override a resolution choice."""
     if not streams:
-        return None
+        return []
     mode = config.stremio_resolution_pref
     if mode == "match":
         prefer, auto = _cur_resolution(cur) or 1080, False
@@ -1083,11 +1146,17 @@ def best_stream(config, streams: list, cur: dict = None):
         else:
             res_fit = 0 if res == prefer else (1 if 0 < res < prefer
                                                else 2 if res else 3)
+        lang_pen = lang_penalty(s)
         size_pen = 1 if 0 < size_max < size_gb else 0
         rank = addon_rank.get(s.get("_addon"), len(addon_rank))
-        return (res_fit, size_pen, rank, -res, -min(seeds, 500))
+        return (lang_pen, res_fit, size_pen, rank, -res, -min(seeds, 500))
 
-    ranked = sorted([s for s in streams if usable(s)], key=score)
+    return sorted([s for s in streams if usable(s)], key=score)
+
+
+def best_stream(config, streams: list, cur: dict = None):
+    """The stream autoplay picks: the head of rank_streams."""
+    ranked = rank_streams(config, streams, cur)
     return ranked[0] if ranked else None
 
 
@@ -1371,6 +1440,120 @@ def _adjacent_playable(config, cur: dict, step: int):
         "episode": e,
         "series_name": series_name,
     }
+    if info_hash:
+        nxt_playable["info_hash"] = info_hash
+        nxt_playable["file_idx"] = file_idx
+    return nxt_playable
+
+
+def next_stream_playable(config, cur: dict):
+    """Worker-thread backend of the NEXT-STREAM button: the SAME episode
+    (or movie) on the stream ranked AFTER the one now playing. Re-asks
+    the configured addons, ranks with autoplay's exact rules (language
+    preference, resolution, size, addon order), and walks past the
+    current stream — matched by info hash (the same torrent on two
+    addons is the SAME release and must not be re-served) or by exact
+    URL. Identity is resolved on demand like _adjacent_playable. Returns
+    the playable, or None (no other usable stream / unidentifiable).
+    The playable keeps the current one's fav_key and identity fields:
+    it is the same episode, so recents/lookaheads treat it as a replay,
+    never a new entry."""
+    server = StreamingServer(
+        (config.data.get("stremio_server") if config else None) or "")
+
+    imdb = cur.get("stremio_imdb")
+    if not imdb:
+        ident = resolve_identity(cur.get("url", ""), server)
+        if not ident:
+            return None
+        cur.update(ident)
+        imdb = cur["stremio_imdb"]
+        log.info("stremio: identified %r -> %s (next-stream)",
+                 ident.get("file_name", "")[:50] or imdb, imdb)
+
+    movie = bool(cur.get("movie"))
+    if movie:
+        streams = addon_movie_streams(config, imdb)
+    else:
+        streams = addon_streams(config, imdb,
+                                int(cur.get("season") or 0),
+                                int(cur.get("episode") or 0))
+    ranked = rank_streams(config, streams, cur)
+    if not ranked:
+        log.info("stremio: no usable stream list for %s (%d candidates)",
+                 imdb, len(streams))
+        return None
+
+    cur_hash = str(cur.get("info_hash") or "").lower()
+    cur_url = str(cur.get("url") or "")
+
+    def is_cur(s):
+        if cur_hash and str(s.get("infoHash") or "").lower() == cur_hash:
+            return True
+        return bool(cur_url) and str(s.get("url") or "") == cur_url
+
+    # the walk's position: the LAST entry matching the current stream
+    # (the same torrent on two addons occupies several slots — step past
+    # them all), then the entry ranked after it
+    cur_idx = -1
+    for i, s in enumerate(ranked):
+        if is_cur(s):
+            cur_idx = i
+    if cur_idx < 0:
+        # nothing matched: the handoff came from elsewhere (Stremio's own
+        # pick, an addon set that changed since) — the best ranked stream
+        # IS the next one. Logged: a re-pick of the identical stream
+        # would look exactly like a dead button.
+        log.info("stremio: next-stream — current stream not in the "
+                 "ranked list (hash=%r url=%r), starting from the top",
+                 cur_hash[:12], cur_url[:60])
+        nxt = ranked[0]
+    elif cur_idx + 1 >= len(ranked):
+        log.info("stremio: next-stream — the current stream is the last "
+                 "usable one of %d", len(ranked))
+        nxt = None
+    else:
+        nxt = ranked[cur_idx + 1]
+    if nxt is None:
+        return None
+
+    if nxt.get("url"):
+        url = nxt["url"]
+        # keep the torrent identity for the NEXT press's skip-match (and
+        # the debrid-stall fallback): the addon's own infoHash first —
+        # torrentio debrid entries carry it alongside the url — then the
+        # hash parsed out of a resolve link
+        info_hash = str(nxt.get("infoHash") or "").lower()
+        file_idx = nxt.get("fileIdx")
+        if not info_hash:
+            resolved = parse_resolve_url(url)
+            if resolved:
+                info_hash, file_idx = resolved
+        if info_hash and file_idx is None:
+            file_idx = 0
+    else:
+        info_hash = str(nxt["infoHash"]).lower()
+        file_idx = int(nxt.get("fileIdx") or 0)
+        if not server.create(info_hash):
+            log.warning("stremio: streaming server refused create for "
+                        "%s — cannot switch stream", info_hash[:12])
+            return None
+        url = server.play_url(info_hash, file_idx)
+
+    nxt_playable = {
+        "kind": "stremio",
+        "title": cur.get("title") or "Stremio stream",
+        "url": url,
+        "fav_key": cur.get("fav_key")
+        or "stremio:%s:%d:%d" % (imdb, int(cur.get("season") or 0),
+                                 int(cur.get("episode") or 0)),
+        "icon": cur.get("icon") or "",
+        "stremio_imdb": imdb,
+    }
+    for key in ("movie", "movie_name", "year",
+                "series_name", "season", "episode", "episode_name"):
+        if cur.get(key) is not None:
+            nxt_playable[key] = cur[key]
     if info_hash:
         nxt_playable["info_hash"] = info_hash
         nxt_playable["file_idx"] = file_idx

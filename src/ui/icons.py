@@ -450,6 +450,36 @@ def play_prev():
     return _icon("play_prev2", draw)
 
 
+def stream_next():
+    """Next stream for the SAME episode/movie: a compact skip-forward
+    triangle (top-left) over a refresh-style ring (bottom-right) — 'play
+    an alternate source of what's already on'. Same arrowhead geometry
+    as refresh(), scaled down; the triangle reads 'play', the ring
+    'another one of these'."""
+    def draw(p, c):
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(3.5, 3.7), _F(3.5, 10.3), _F(9.2, 7.0)]))
+        p.drawRoundedRect(QtCore.QRectF(10.1, 3.7, 1.8, 6.6), 0.9, 0.9)
+        _pen(p, c, 2.0)
+        p.setBrush(QtCore.Qt.NoBrush)
+        cx, cy, r = 15.3, 16.4, 4.4
+        p.drawArc(QtCore.QRectF(cx - r, cy - r, 2 * r, 2 * r),
+                  55 * 16, 280 * 16)
+        th = radians(55.0)
+        ex, ey = cx + r * cos(th), cy - r * sin(th)
+        tx, ty = sin(th), cos(th)                # CW travel direction there
+        nx, ny = cos(th), -sin(th)               # outward normal
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        p.drawPolygon(QtGui.QPolygonF([
+            _F(ex + tx * 3.5, ey + ty * 3.5),    # tip, along the travel
+            _F(ex + nx * 2.4, ey + ny * 2.4),
+            _F(ex - nx * 2.4, ey - ny * 2.4)]))
+    return _icon("stream_next2", draw)
+
+
 def check():
     """Checkmark — the selected row marker in the track picker panel."""
     def draw(p, c):
