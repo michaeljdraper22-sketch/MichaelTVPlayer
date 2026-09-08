@@ -288,20 +288,39 @@ def clean_movie_name(text: str) -> str:
 
 
 def _movie_queries(text: str) -> list:
-    """Searchable queries for a movie release name, best first: the head
-    before the release year (movie titles almost always sit left of it —
-    'Chinatown.1974.2160p.BluRay…' -> 'Chinatown'), then the fully
-    cleaned name ('[2ndfire]My_Neighbor_Totoro…' carries no year at
-    all)."""
+    """Searchable (query, year) pairs for a movie release name, best
+    first: the head before the release year (movie titles almost always
+    sit left of it — 'Chinatown.1974.2160p.BluRay…' -> 'Chinatown'),
+    then the fully cleaned name ('[2ndfire]My_Neighbor_Totoro…' carries
+    no year at all). The year rides along because franchise sequels
+    NEED it: the matcher counts words >2 chars, so 'Spider.Man.2.2004'
+    queries 'Spider Man 2' where the sequel digit is too short to count
+    and 'Spider-Man' (2002) ties 'Spider-Man 2' (2004) exactly — search
+    order then picked the 2002 original (live-seen 2026-09-08 12:05:
+    the handoff retitled Spider-Man 2 as 'Spider-Man (2002)', and the
+    next-stream walk switched to a stream of the WRONG MOVIE)."""
     queries = []
     m = _MOVIE_YEAR_RE.search(text or "")
+    year = m.group(0) if m else ""
     if m:
-        head = clean_movie_name(text[:m.start()])
+        head = text[:m.start()]
+        # a year parked INSIDE a paren/bracket group ('Reservoir Dogs
+        # (Тарантино … 1992) UHD') leaves the group's opener UNCLOSED in
+        # the head — the cleaner's bracket-strip needs both ends, so the
+        # annotation words stayed and the 60% word floor killed the
+        # match. Cut back to the last balanced bracket before cleaning.
+        closers = {"(": ")", "[": "]", "{": "}"}
+        while True:
+            o = max(head.rfind(c) for c in "([{")
+            if o < 0 or closers[head[o]] in head[o:]:
+                break            # balanced (or none) — the cleaner's job
+            head = head[:o]
+        head = clean_movie_name(head)
         if head:
-            queries.append(head)
+            queries.append((head, year))
     full = clean_movie_name(text)
-    if full and full not in queries:
-        queries.append(full)
+    if full and full not in [q for q, _y in queries]:
+        queries.append((full, year))
     return queries
 
 
@@ -603,18 +622,27 @@ def search_movies(name: str):
     return out
 
 
-def _find_catalog(search, name: str):
+def _find_catalog(search, name: str, year: str = ""):
     """Best word-overlapping catalog candidate for a release name, or
     None. Every candidate is SCORED by how many of the query's
-    significant words its title carries (search order breaks ties), and
-    a hit must cover most of the query — ceil of 60% of the words. The
-    old first-candidate-with-ANY-shared-word rule matched 'Real Time
-    with Bill Maher' to an 'Adventure Time' release outright the night
-    Cinemeta's search ranked Maher first (they share the word 'Time';
-    live-seen 2026-09-03 20:57 — the wrong show's meta then left every
-    episode button and autoplay dead and retitled the stream). A word
-    floor keeps a near-miss candidate from ever winning while still
+    significant words its title carries, then — when a release year is
+    known — by that candidate's year matching it, then by tightness
+    (search order breaks what's left). A hit must cover most of the
+    query — ceil of 60% of the words. The old first-candidate-with-
+    ANY-shared-word rule matched 'Real Time with Bill Maher' to an
+    'Adventure Time' release outright the night Cinemeta's search
+    ranked Maher first (they share the word 'Time'; live-seen
+    2026-09-03 20:57 — the wrong show's meta then left every episode
+    button and autoplay dead and retitled the stream). A word floor
+    keeps a near-miss candidate from ever winning while still
     tolerating canonical titles that drop or re-spell a query word.
+    The year tier is the franchise-sequel fix (live-seen 2026-09-08
+    12:05): the word filter counts only words >2 chars, so
+    'Spider.Man.2.2004' queries 'Spider Man 2' where 'Spider-Man'
+    (2002) and 'Spider-Man 2' (2004) tie EXACTLY and Cinemeta's
+    unstable order decided — the handoff retitled Spider-Man 2 as
+    'Spider-Man (2002)' and the next-stream walk switched to a stream
+    of the wrong movie.
     Release-group/site prefix spam (which the cleaner can't know about)
     is handled by re-searching with leading words progressively dropped.
     Single-word names get their one query too (range floor of 1 —
@@ -622,6 +650,7 @@ def _find_catalog(search, name: str):
     autoplay dead on one-word-titled shows)."""
     if not name:
         return None
+    year = str(year or "").strip()
     words = [w for w in re.split(r"\W+", name) if len(w) > 2]
     for trim in range(max(1, min(4, len(words) - 1))):
         query = " ".join(words[trim:])
@@ -630,18 +659,23 @@ def _find_catalog(search, name: str):
         wanted = {w for w in re.split(r"\W+", query.lower()) if len(w) > 2}
         # ceil(60%): 1 word -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3
         need = max(1, (len(wanted) * 3 + 4) // 5)
-        best, best_score = None, (0, False)
+        best, best_score = None, (0, 0, False)
         for cand in search(query):
             cand_words = {w for w in re.split(r"\W+", str(
                 cand.get("name", "")).lower()) if len(w) > 2}
             overlap = len(cand_words & wanted)
+            # the release year (when known) must outrank search order:
+            # sequel numbers are too short to count as words, so it is
+            # the only thing separating a franchise's installments
+            ymatch = 1 if year and year in str(
+                cand.get("releaseInfo") or cand.get("year") or "") else 0
             # a TIGHT candidate (every word of its title is in the
             # query) is the exact title best — 'Adventure Time' must
             # outrank the equal-overlap spinoff 'Adventure Time:
             # Fionna & Cake' when the release name carries a year
             tight = cand_words <= wanted
-            if (overlap, tight) > best_score:
-                best, best_score = cand, (overlap, tight)
+            if (overlap, ymatch, tight) > best_score:
+                best, best_score = cand, (overlap, ymatch, tight)
         if best_score[0] >= need:
             return best
     return None
@@ -654,10 +688,11 @@ def find_series(name: str):
     return (hit["id"], hit["name"]) if hit else None
 
 
-def find_movie(name: str):
+def find_movie(name: str, year: str = ""):
     """Best {id, name, year, poster} for a movie name, or None (matching
-    rules in _find_catalog)."""
-    return _find_catalog(search_movies, name)
+    rules in _find_catalog — pass the release year when the name carries
+    one; it breaks franchise-sequel ties)."""
+    return _find_catalog(search_movies, name, year)
 
 
 # ---------------------------------------------------------------------------
@@ -863,8 +898,8 @@ def resolve_vod_identity(playable: dict):
                 "season": season, "episode": episode}
     if kind == "vod":
         title = str(playable.get("title") or "")
-        for query in _movie_queries(title):
-            cand = find_movie(query)
+        for query, year in _movie_queries(title):
+            cand = find_movie(query, year)
             if cand:
                 return {"movie": True, "stremio_imdb": cand["id"]}
         log.info("stremio: vod identity: no movie for %r", title[:60])
@@ -1172,8 +1207,8 @@ def _movie_identity(file_name: str, torrent_name: str):
     dead end was also a lie here: autoplay never applies to movies.)
     None only when there is no usable name at all."""
     raw = file_name or torrent_name
-    for query in _movie_queries(raw):
-        cand = find_movie(query)
+    for query, year in _movie_queries(raw):
+        cand = find_movie(query, year)
         if cand:
             return {
                 "movie": True,
