@@ -1,0 +1,130 @@
+Installing dependencies...
+Building MichaelTVPlayer.exe ...
+856 INFO: PyInstaller: 6.22.2, contrib hooks: 2026.6
+856 INFO: Python: 3.12.10
+888 INFO: Platform: Windows-11-10.0.26200-SP0
+888 INFO: Python environment: D:\Coding\MichaelTVPlayer\.venv
+904 INFO: Module search paths (PYTHONPATH):
+['D:\\Coding\\MichaelTVPlayer\\.venv\\Scripts\\pyinstaller.exe',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\python312.zip',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\DLLs',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\Lib',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312',
+ 'D:\\Coding\\MichaelTVPlayer\\.venv',
+ 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages',
+ 'D:\\Coding\\MichaelTVPlayer']
+2030 INFO: Appending 'datas' from .spec
+2030 INFO: checking Analysis
+2125 INFO: Building because D:\Coding\MichaelTVPlayer\src\stremio.py changed
+2125 INFO: Looking for Python shared library...
+2125 INFO: Using Python shared library: C:\Users\micha\AppData\Local\Programs\Python\Python312\python312.dll
+2125 INFO: Running Analysis Analysis-00.toc
+2125 INFO: Target bytecode optimization level: 0
+2125 INFO: Initializing module dependency graph...
+2125 INFO: Initializing module graph hook caches...
+2173 INFO: Analyzing modules for base_library.zip ...
+3964 INFO: Processing standard module hook 'hook-encodings.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+5013 INFO: Processing standard module hook 'hook-math.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+6505 INFO: Processing standard module hook 'hook-pickle.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+9111 INFO: Processing standard module hook 'hook-heapq.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+9825 INFO: Caching module dependency graph...
+9888 INFO: Analyzing D:\Coding\MichaelTVPlayer\main.py
+9936 INFO: Processing standard module hook 'hook-PyQt5.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+10903 INFO: Processing standard module hook 'hook-PyQt5.QtCore.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+13665 INFO: Processing standard module hook 'hook-PyQt5.QtWidgets.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+19041 INFO: Processing standard module hook 'hook-PyQt5.QtGui.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+43141 INFO: Processing standard module hook 'hook-_ctypes.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+43570 INFO: Processing standard module hook 'hook-platform.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+43968 INFO: Processing standard module hook 'hook-urllib3.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+44206 INFO: Processing pre-safe-import-module hook 'hook-backports.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+44222 INFO: SetuptoolsInfo: initializing cached setuptools info...
+45585 INFO: Setuptools: 'backports' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.backports'!
+45616 INFO: Processing standard module hook 'hook-setuptools.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+45648 INFO: Processing pre-safe-import-module hook 'hook-distutils.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+45744 INFO: Processing standard module hook 'hook-sysconfig.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+45760 INFO: Processing pre-safe-import-module hook 'hook-jaraco.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+45760 INFO: Setuptools: 'jaraco' appears to be a full setuptools-vendored copy - creating alias to 'setuptools._vendor.jaraco'!
+45792 INFO: Processing pre-safe-import-module hook 'hook-more_itertools.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+45792 INFO: Setuptools: 'more_itertools' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.more_itertools'!
+46015 INFO: Processing standard module hook 'hook-_osx_support.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+46030 INFO: Processing pre-safe-import-module hook 'hook-typing_extensions.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+46555 INFO: Processing standard module hook 'hook-multiprocessing.util.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+46666 INFO: Processing standard module hook 'hook-xml.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+47556 INFO: Processing pre-safe-import-module hook 'hook-packaging.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+48049 INFO: Processing standard module hook 'hook-setuptools._vendor.jaraco.text.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+48049 INFO: Processing pre-safe-import-module hook 'hook-importlib_resources.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+49447 INFO: Processing pre-safe-import-module hook 'hook-tomli.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+49447 INFO: Setuptools: 'tomli' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.tomli'!
+50495 INFO: Processing pre-safe-import-module hook 'hook-wheel.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_safe_import_module'
+50495 INFO: Setuptools: 'wheel' appears to be a setuptools-vendored copy - creating alias to 'setuptools._vendor.wheel'!
+51241 INFO: Processing standard module hook 'hook-certifi.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+51320 INFO: Processing standard module hook 'hook-charset_normalizer.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\_pyinstaller_hooks_contrib\\stdhooks'
+51970 INFO: Processing standard module hook 'hook-PyQt5.QtNetwork.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+54538 INFO: Processing module hooks (post-graph stage)...
+54571 WARNING: Hidden import "sip" not found!
+54872 INFO: Processing standard module hook 'hook-webbrowser.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+55078 INFO: Performing binary vs. data reclassification (120 entries)
+55633 INFO: Looking for ctypes DLLs
+55825 INFO: Analyzing run-time hooks ...
+55825 INFO: Including run-time hook 'pyi_rth_inspect.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+55856 INFO: Including run-time hook 'pyi_rth_setuptools.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+55856 INFO: Including run-time hook 'pyi_rth_pkgutil.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+55872 INFO: Including run-time hook 'pyi_rth_multiprocessing.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+55872 INFO: Including run-time hook 'pyi_rth_pyqt5.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\rthooks'
+55872 INFO: Processing pre-find-module-path hook 'hook-_pyi_rth_utils.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks\\pre_find_module_path'
+55888 INFO: Processing standard module hook 'hook-_pyi_rth_utils.py' from 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyInstaller\\hooks'
+55920 INFO: Creating base_library.zip...
+55936 INFO: Looking for dynamic libraries
+56663 INFO: Extra DLL search directories (AddDllDirectory): ['D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyQt5\\Qt5\\bin']
+56663 INFO: Extra DLL search directories (PATH): ['D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages\\PyQt5\\Qt5\\bin']
+59428 INFO: Warnings written to D:\Coding\MichaelTVPlayer\build\MichaelTVPlayer\warn-MichaelTVPlayer.txt
+59492 INFO: Graph cross-reference written to D:\Coding\MichaelTVPlayer\build\MichaelTVPlayer\xref-MichaelTVPlayer.html
+59604 INFO: checking PYZ
+59652 INFO: Building because D:\Coding\MichaelTVPlayer\src\stremio.py changed
+59652 INFO: Building PYZ (ZlibArchive) D:\Coding\MichaelTVPlayer\build\MichaelTVPlayer\PYZ-00.pyz
+60271 INFO: Building PYZ (ZlibArchive) D:\Coding\MichaelTVPlayer\build\MichaelTVPlayer\PYZ-00.pyz completed successfully.
+60334 INFO: checking PKG
+60366 INFO: Building because toc changed
+60366 INFO: Building PKG (CArchive) MichaelTV.pkg
+112666 INFO: Building PKG (CArchive) MichaelTV.pkg completed successfully.
+112666 INFO: Bootloader D:\Coding\MichaelTVPlayer\.venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+112666 INFO: checking EXE
+112714 INFO: Building because toc changed
+112730 INFO: Building EXE from EXE-00.toc
+112745 INFO: Copying bootloader EXE to D:\Coding\MichaelTVPlayer\dist\MichaelTV.exe
+112762 INFO: Copying icon to EXE
+112809 INFO: Copying 0 resources to EXE
+112809 INFO: Embedding manifest in EXE
+112857 INFO: Appending PKG archive to EXE
+113157 INFO: Fixing EXE headers
+116928 INFO: Building EXE from EXE-00.toc completed successfully.
+116944 INFO: Build complete! The results are available in: D:\Coding\MichaelTVPlayer\dist
+Building UninstallMichaelTV.exe ...
+165 INFO: PyInstaller: 6.22.2, contrib hooks: 2026.6
+167 INFO: Python: 3.12.10
+204 INFO: Platform: Windows-11-10.0.26200-SP0
+204 INFO: Python environment: D:\Coding\MichaelTVPlayer\.venv
+204 INFO: wrote D:\Coding\MichaelTVPlayer\UninstallMichaelTV.spec
+204 INFO: Module search paths (PYTHONPATH):
+['D:\\Coding\\MichaelTVPlayer\\.venv\\Scripts\\pyinstaller.exe',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\python312.zip',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\DLLs',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312\\Lib',
+ 'C:\\Users\\micha\\AppData\\Local\\Programs\\Python\\Python312',
+ 'D:\\Coding\\MichaelTVPlayer\\.venv',
+ 'D:\\Coding\\MichaelTVPlayer\\.venv\\Lib\\site-packages',
+ 'D:\\Coding\\MichaelTVPlayer']
+679 INFO: checking Analysis
+790 INFO: checking PYZ
+810 INFO: checking PKG
+838 INFO: Bootloader D:\Coding\MichaelTVPlayer\.venv\Lib\site-packages\PyInstaller\bootloader\Windows-64bit-intel\runw.exe
+838 INFO: checking EXE
+854 INFO: Build complete! The results are available in: D:\Coding\MichaelTVPlayer\dist
+Copying private VLC runtime into dist\vlc ...
+Release package: dist\MichaelTV-2.1.zip
+Checksum:        dist\MichaelTV-2.1.zip.sha256
+
+Done. Double-click:  dist\MichaelTV.exe
+Runs fully isolated on dist\vlc\ — the installed VLC is not used.
+Uninstaller: dist\UninstallMichaelTV.exe
+Press any key to continue . . . 

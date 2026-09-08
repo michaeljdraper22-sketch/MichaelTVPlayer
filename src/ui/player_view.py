@@ -1984,7 +1984,14 @@ class PlayerView(QtWidgets.QWidget):
         self._trickle_hold = False
         self._dvr_status.hide()
         self._scrub_on = False
-        self._vid_s = 0.0
+        # Seed the TRACKED position with the resume point — the tick's
+        # 3 s snap guard would otherwise reject VLC's post-open clock as
+        # "too far" from 0 and leave the scrubber crawling up from 0:00
+        # while playback continues where it was meant to (live-seen
+        # 2026-09-08: reload / stall-rescue / next-stream resumes all
+        # showed 0:00 and the bar snapped back under drags). Same re-base
+        # _seek_ms and _jump_begin do for their targets.
+        self._vid_s = max(0.0, start_at)
         self._played_once = False  # a fresh media hasn't played a frame yet
         self._eof_next_done = False   # re-arm autoplay-next for this media
         self._eof_note_done = False

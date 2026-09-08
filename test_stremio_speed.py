@@ -368,7 +368,7 @@ def main():
         stremio.find_series = \
             lambda name: (("tt1305826", "Adventure Time")
                           if "adventure" in name.lower() else None)
-        stremio.find_movie = lambda q: (
+        stremio.find_movie = lambda q, year="": (
             {"id": "tt6652842", "name": "Everything Everywhere All at Once",
              "year": "2022", "poster": ""}
             if "everything everywhere" in q.lower() else None)
@@ -600,6 +600,61 @@ def main():
               dotted == "Bluey")
     finally:
         stremio.find_series, stremio.series_meta = saved_fs, saved_sm
+
+    print("[4e] 2026-09-08 12:05: franchise sequels — the release YEAR "
+          "must break the title tie")
+    # The incident: the Spider-Man.2.2004 torbox handoff resolved as
+    # 'Spider-Man (2002)' (the banner said so, twice) because the word
+    # filter counts only words >2 chars — 'Spider Man 2' cannot tell
+    # 'Spider-Man' (2002) from 'Spider-Man 2' (2004) and Cinemeta's
+    # unstable order decided. The next-stream walk then queried the
+    # WRONG MOVIE's stream list ('current stream not in the ranked
+    # list — starting from the top') and switched playback to a 6 GB
+    # Spider-Man 1 file mid-viewing (read by the user as 'cut several
+    # minutes off the beginning').
+    saved_sm2 = stremio.search_movies
+    saved_cd = stremio._content_disposition
+    try:
+        qs = stremio._movie_queries(
+            "Spider-Man.2.2004.UHD.BluRay.2160p.TrueHD.Atmos.7.1.DV.HEVC."
+            "HYBRID.REMUX-FraMeSToR.mkv")
+        check("incident name heads to 'Spider Man 2' + year 2004",
+              bool(qs) and qs[0] == ("Spider Man 2", "2004"))
+
+        def adversarial(q):
+            # the 2002 ORIGINAL ranked first — the tie that lost live
+            return [
+                {"id": "tt0145487", "name": "Spider-Man",
+                 "releaseInfo": "2002"},
+                {"id": "tt0316654", "name": "Spider-Man 2",
+                 "releaseInfo": "2004"},
+                {"id": "tt1872181", "name": "The Amazing Spider-Man 2",
+                 "releaseInfo": "2014"},
+            ]
+        stremio.search_movies = adversarial
+        hit = stremio.find_movie("Spider Man 2", "2004")
+        check("year breaks the sequel tie (2002 ranked first)",
+              hit and hit["id"] == "tt0316654")
+        hit = stremio.find_movie("Spider Man 2")
+        check("no year -> search order still decides (the honest miss)",
+              hit and hit["id"] == "tt0145487")
+
+        # end-to-end on the incident's exact handoff URL
+        stremio._content_disposition = lambda u: ""
+        ident = stremio.resolve_identity(
+            "https://torrentio.strem.fun/resolve/torbox/1f7be332-5fea-4aa8-"
+            "8814-46eabea63736/2e3be9519b9118c61c828b03571575902a444947/"
+            "Spider-Man.2.2004.UHD.BluRay.2160p.TrueHD.Atmos.7.1.DV.HEVC."
+            "HYBRID.REMUX-FraMeSToR.mkv/0/Spider-Man.2.2004.UHD.BluRay."
+            "2160p.TrueHD.Atmos.7.1.DV.HEVC.HYBRID.REMUX-FraMeSToR.mkv",
+            stremio.StreamingServer(""))
+        check("incident handoff URL resolves to Spider-Man 2 (2004)",
+              bool(ident) and ident.get("movie") is True
+              and ident["stremio_imdb"] == "tt0316654"
+              and ident["movie_name"] == "Spider-Man 2")
+    finally:
+        stremio.search_movies = saved_sm2
+        stremio._content_disposition = saved_cd
 
     print("[5] wiring: play_media kicks the probe with the guard")
     src_pm = inspect.getsource(pv_mod.PlayerView.play_media)
@@ -912,6 +967,53 @@ def main():
               and "_next_stream_clicked" in src_sc)
     finally:
         stremio.next_stream_playable = saved_nsp
+
+    print("[8] resume-shaped reopens keep the timeline (2026-09-08: "
+          "'reload went to the right place but the timeline said 0:00')")
+    # Every resume path (reload button, VOD stall rescue, next-stream
+    # switch) funnels through play_media(start_at=...): VLC reopens AT
+    # the resume point, but the tracked position was reset to 0 and the
+    # tick's 3 s snap guard then rejected VLC's clock as 'too far' —
+    # the scrubber crawled up from 0:00 at 0.4 s/tick and snapped the
+    # bar back under drags. play_media now seeds the tracker with the
+    # resume point (the same re-base _seek_ms/_jump_begin do).
+    tv = PlayerView(Config({}, None))
+    tv._closing = False
+    tv._attach_done = True
+    opened = []
+    tv.vlc.play = lambda *a, **k: opened.append(k.get("start_seconds"))
+    tv.vlc.stop_and_release = lambda: None
+    tv.vlc.get_time = lambda: 313500        # 5:13.5 — where it reopened
+    tv.vlc.get_length = lambda: 705000
+    tv.vlc.state_name = lambda: "playing"
+    tv.vlc.is_playing = lambda: True
+    tv._begin_stremio_lookahead = lambda: None   # no network off a test open
+    tv._begin_stremio_prevlook = lambda: None
+    tv._on_media_for_profanity = lambda kind: None
+    try:
+        cur8 = {"kind": "stremio", "title": "Adventure Time — S05E42",
+                "url": "http://127.0.0.1:11470/" + "a" * 40 + "/0",
+                "fav_key": "stremio:tt1305826:5:42",
+                "stremio_imdb": "tt1305826", "season": 5, "episode": 42,
+                "series_name": "Adventure Time", "info_hash": "a" * 40,
+                "file_idx": 0}
+        tv.play_media(cur8, start_at=313.0)
+        check("VLC reopened at the resume point",
+              opened == [313.0])
+        check("tracker seeded with the resume point (not 0:00)",
+              tv._vid_s == 313.0)
+        tv._tick()                          # one real tick, playing
+        check("tick ACCEPTS the resumed clock (no crawl from zero)",
+              313.0 <= tv._vid_s <= 314.5)
+        check("scrubber shows the resumed position",
+              tv.slider.value() >= 313000
+              and tv.time_left.text() != "0:00")
+        # and a fresh (non-resume) open still starts the tracker at 0
+        tv.play_media(dict(cur8), start_at=0.0)
+        check("a non-resume open still seeds 0",
+              opened[-1] == 0.0 and tv._vid_s == 0.0)
+    finally:
+        tv.stop()
 
     view.stop()
     print()
