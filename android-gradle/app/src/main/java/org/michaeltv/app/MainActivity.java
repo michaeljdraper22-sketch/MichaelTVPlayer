@@ -89,7 +89,7 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public String rpc(final String cmd, final String argsJson) {
             Future<String> task = pyExecutor.submit(() ->
-                    bridge.call("rpc", cmd, argsJson).toString());
+                    bridge.callAttr("rpc", cmd, argsJson).toString());
             try {
                 return task.get(180, TimeUnit.SECONDS);
             } catch (Throwable t) {
