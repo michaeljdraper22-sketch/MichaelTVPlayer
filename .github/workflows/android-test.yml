@@ -46,18 +46,22 @@ jobs:
 
       - name: Boot headless emulator
         run: |
+          test -e /dev/kvm || { echo 'ERROR: /dev/kvm missing on runner'; exit 1; }
           sudo chown -R $USER:$USER /dev/kvm || true
-          ls -la /dev/kvm || true
           nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd michaeltv \
             -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim \
-            -no-snapshot > /tmp/emulator.log 2>&1 &
-          $ANDROID_SDK_ROOT/platform-tools/adb wait-for-device
-          for i in $(seq 1 120); do
-            BOOT=$($ANDROID_SDK_ROOT/platform-tools/adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            -no-snapshot -memory 3072 > /tmp/emulator.log 2>&1 &
+          # wait-for-device has NO timeout of its own and hangs forever if
+          # the emulator process died — bound it, and keep the log either way.
+          timeout 300 "$ANDROID_SDK_ROOT/platform-tools/adb" wait-for-device \
+            || { echo 'ERROR: emulator never came up on adb'; tail -60 /tmp/emulator.log; exit 1; }
+          BOOT=""
+          for i in $(seq 1 90); do
+            BOOT=$("$ANDROID_SDK_ROOT/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
             [ "$BOOT" = "1" ] && break
             sleep 5
           done
-          [ "$BOOT" = "1" ] || { tail -40 /tmp/emulator.log; exit 1; }
+          [ "$BOOT" = "1" ] || { echo 'ERROR: boot did not complete'; tail -60 /tmp/emulator.log; exit 1; }
           echo "emulator booted"
 
       - name: Download release APK and install
@@ -65,7 +69,7 @@ jobs:
           mkdir -p artifacts
           curl -fL -o artifacts/MichaelTV.apk \
             https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/download/v2.1/MichaelTV-2.1.apk
-          $ANDROID_SDK_ROOT/platform-tools/adb install -r artifacts/MichaelTV.apk
+          "$ANDROID_SDK_ROOT/platform-tools/adb" install -r artifacts/MichaelTV.apk
 
       - name: Drive the app
         run: |
@@ -98,7 +102,8 @@ jobs:
         if: always()
         run: |
           ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
-          "$ADB" logcat -d > artifacts/logcat.txt
+          "$ADB" logcat -d > artifacts/logcat.txt || true
+          cp /tmp/emulator.log artifacts/emulator.log 2>/dev/null || true
           echo === PY EXCEPTIONS ===
           grep -iE "PyException|chaquopy.*error|FATAL" artifacts/logcat.txt | head -20 || true
           echo === SCREEN ERRORS ===
