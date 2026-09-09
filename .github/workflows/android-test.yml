@@ -41,11 +41,16 @@ jobs:
 
       - name: Create AVD
         run: |
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
           echo no | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd \
             -n michaeltv -k "system-images;android-34;google_apis;x86_64" -d pixel_5
 
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" list avd | head -12
+
       - name: Boot headless emulator
         run: |
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
           test -e /dev/kvm || { echo 'ERROR: /dev/kvm missing on runner'; exit 1; }
           sudo chown -R $USER:$USER /dev/kvm || true
           nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd michaeltv \
