@@ -84,7 +84,7 @@ jobs:
           find android/.p4a -name AndroidManifest.tmpl.xml -path '*sdl*' -exec sed -i 's|<application |<application android:usesCleartextTraffic="true" |' {} \;
           echo "Manifest templates patched:"
           grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ || true
-          test -n "$(grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ | grep -i sdl)" \n            || { echo 'ERROR: cleartext flag was not injected into any sdl manifest template'; exit 1; }
+          grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ | grep -qi sdl || { echo 'ERROR: cleartext flag was not injected into any sdl manifest template'; exit 1; }
 
       - name: Point buildozer.spec at the cloned p4a
         run: |
