@@ -54,9 +54,12 @@ icon.filename = %(source.dir)s/icon.png
 # is plain HTTPS/HTTP.
 android.permissions = INTERNET
 
-# Target / minimum Android levels (Android 14 target, 7.0 floor).
+# Target / minimum Android levels (Android 14 target, 8.0 floor).
+# minapi MUST be >= 26: bionic only declares setgrent/getgrent behind an
+# API-26 guard, and python3's grpmodule dies on the implicit declarations
+# when the NDK target is lower.
 android.api = 34
-android.minapi = 24
+android.minapi = 26
 # Pairs with the 2024-era p4a pin the CI checks out (kivy 2.3.0 / cython
 # 0.29.33 / python 3.11 / ffmpeg 6 with avfft.h still present) — that
 # stack is NDK-r25b-tested; newer p4a masters move to py3.14 + ffmpeg 7
