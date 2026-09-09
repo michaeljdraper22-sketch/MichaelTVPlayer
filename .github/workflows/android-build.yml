@@ -53,13 +53,19 @@ jobs:
         run: python android/prepare_core.py
 
       - name: Clone python-for-android (pinned)
-        # Pinned p4a commit (master HEAD as of 2026-09-09):
-        #   cda8e65d33c4851ba4e5ddcacc18041bd235c382
+        # Pinned p4a commit (2024-06-07, the kivy 2.3.0 era):
+        #   8c931ed4ddbcb20591e1551c193410e3094b9dcd
+        # A coherent stack matters more than freshness here: this commit's
+        # recipes (python 3.11, ffmpeg 6 with avfft.h, ffpyplayer 4.5,
+        # NDK r25b) all build together with the kivy==2.3.0 / cython 0.29.33
+        # pins in buildozer.spec.  2026 p4a masters move to python 3.14 +
+        # ffmpeg 7 and break those recipe versions (ffpyplayer's pic.c
+        # still includes the removed libavcodec/avfft.h).
         # Full clone on purpose (not --depth): master moves on, and a full
         # clone guarantees the pinned SHA is always available to check out.
         run: |
           git clone https://github.com/kivy/python-for-android android/.p4a
-          git -C android/.p4a checkout cda8e65d33c4851ba4e5ddcacc18041bd235c382
+          git -C android/.p4a checkout 8c931ed4ddbcb20591e1551c193410e3094b9dcd
 
       - name: Install autotools prerequisites
         # ubuntu24 runners lack the libtool m4 macros some C recipes need:
@@ -70,20 +76,15 @@ jobs:
           sudo apt-get install -y -q autoconf automake libtool libltdl-dev pkg-config
 
       - name: Patch p4a for cleartext HTTP
-        # At the pinned SHA the sdl2 bootstrap inherits from _sdl_common, so
-        # the manifest template actually used for sdl2 builds lives at
-        # pythonforandroid/bootstraps/_sdl_common/build/templates/AndroidManifest.tmpl.xml
-        # (verified in the cloned tree; bootstraps/sdl2/ has no templates of
-        # its own). The '*sdl*' glob matches _sdl_common today and would also
-        # match a future sdl2/ or sdl3/ templates dir if p4a moves it again.
+        # The sdl2 bootstrap's manifest template location moves between p4a
+        # eras (sdl2/build/templates at this 2024 pin, _sdl_common on newer
+        # masters), so patch every sdl-flavored template and then require
+        # that at least one actually carries the flag.
         run: |
           find android/.p4a -name AndroidManifest.tmpl.xml -path '*sdl*' -exec sed -i 's|<application |<application android:usesCleartextTraffic="true" |' {} \;
           echo "Manifest templates patched:"
           grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ || true
-          # Hard check: the template the sdl2 build renders must carry the flag.
-          grep -q 'android:usesCleartextTraffic="true"' \
-            android/.p4a/pythonforandroid/bootstraps/_sdl_common/build/templates/AndroidManifest.tmpl.xml \
-            || { echo 'ERROR: cleartext flag was not injected into the sdl manifest template'; exit 1; }
+          test -n "$(grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ | grep -i sdl)" \n            || { echo 'ERROR: cleartext flag was not injected into any sdl manifest template'; exit 1; }
 
       - name: Point buildozer.spec at the cloned p4a
         run: |
@@ -91,19 +92,6 @@ jobs:
           grep -q P4A_SOURCE_DIR_PLACEHOLDER android/buildozer.spec \
             && { echo 'ERROR: placeholder survived in buildozer.spec'; exit 1; } || true
           grep -n '^p4a.source_dir' android/buildozer.spec
-
-      - name: Pre-install Android NDK r28c
-        # p4a's RECOMMENDED_NDK_VERSION is 28c (recipes like libthorvg glob
-        # its clang lib layout; 25b fails with IndexError), but buildozer
-        # 1.5.0 predates the r26+ archive renames and cannot download it —
-        # so place it where buildozer looks and it will be picked up.
-        run: |
-          mkdir -p "$HOME/.buildozer/android/platform"
-          test -d "$HOME/.buildozer/android/platform/android-ndk-r28c" \
-            || { curl -fsSL -o /tmp/ndk.zip \
-                 https://dl.google.com/android/repository/android-ndk-r28c-linux.zip \
-                 && unzip -q /tmp/ndk.zip -d "$HOME/.buildozer/android/platform/"; }
-          cat "$HOME/.buildozer/android/platform/android-ndk-r28c/source.properties" | head -3
 
       - name: Cache Buildozer Android platform dir (best effort)
         # Caches the SDK/NDK buildozer unpacks under ~/.buildozer/android/platform.
