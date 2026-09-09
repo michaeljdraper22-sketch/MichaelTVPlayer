@@ -28,3 +28,7 @@ build_pyinstaller/
 
 # ZCode agent session data
 .zcode/
+/android/michaeltv_core/
+/android/.p4a/
+/android/bin/
+/android/.buildozer/
