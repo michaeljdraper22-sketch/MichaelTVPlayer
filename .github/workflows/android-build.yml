@@ -4,16 +4,17 @@
 
 name: Android APK
 
+# PARKED (manual dispatch only) after 7 attempts: every fix revealed
+# another era mismatch between 2026 runner images and the 2024-era p4a
+# stack that kivy 2.3.0 + cython 0.29.33 need (libtool macros, NDK
+# clang layouts, ffmpeg avfft removal, bionic API-26 grp guards, and
+# finally a 2026 setuptools breaking the 2024 hostpython's distutils).
+# The SHIPPED Android app is android-gradle/ (Gradle + Chaquopy) — it
+# builds in under a minute on Windows via android-gradle/build_local.py
+# and is smoke-tested by android-test.yml on a cloud emulator.  Reviving
+# this Kivy variant needs a locally-verified buildozer environment first.
 on:
   workflow_dispatch:
-  push:
-    branches: [main]
-    paths:
-      - android/**
-      - .github/workflows/android-build.yml
-      - src/stremio.py
-      - src/xtream.py
-      - src/config.py
 
 concurrency:
   group: android-build
