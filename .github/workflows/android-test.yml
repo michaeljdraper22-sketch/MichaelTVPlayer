@@ -1,0 +1,116 @@
+# Cloud emulator smoke test for the Android APK.
+#
+# Local Windows emulators all need admin-level drivers, but GitHub's
+# ubuntu runners expose /dev/kvm — so the app is tested on a real
+# headless Android emulator here instead: install the release APK,
+# drive the UI (Settings / Live TV / search), screenshot every state,
+# and fail loudly on any Chaquopy/PyException in logcat or on screen.
+#
+# The google_apis x86_64 image includes ARM translation, which the
+# arm64-only release APK needs to install.
+
+name: Android emulator test
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: android-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout (for scripts only)
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install emulator + system image
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" "emulator" "system-images;android-34;google_apis;x86_64" \
+            > /dev/null
+
+      - name: Create AVD
+        run: |
+          echo no | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd \
+            -n michaeltv -k "system-images;android-34;google_apis;x86_64" -d pixel_5
+
+      - name: Boot headless emulator
+        run: |
+          sudo chown -R $USER:$USER /dev/kvm || true
+          ls -la /dev/kvm || true
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd michaeltv \
+            -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim \
+            -no-snapshot > /tmp/emulator.log 2>&1 &
+          $ANDROID_SDK_ROOT/platform-tools/adb wait-for-device
+          for i in $(seq 1 120); do
+            BOOT=$($ANDROID_SDK_ROOT/platform-tools/adb shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          [ "$BOOT" = "1" ] || { tail -40 /tmp/emulator.log; exit 1; }
+          echo "emulator booted"
+
+      - name: Download release APK and install
+        run: |
+          mkdir -p artifacts
+          curl -fL -o artifacts/MichaelTV.apk \
+            https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/download/v2.1/MichaelTV-2.1.apk
+          $ANDROID_SDK_ROOT/platform-tools/adb install -r artifacts/MichaelTV.apk
+
+      - name: Drive the app
+        run: |
+          ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          "$ADB" shell am start -n org.michaeltv.app/.MainActivity
+          sleep 15
+          mkdir -p artifacts/shots
+
+          dump() {
+            "$ADB" exec-out uiautomator dump /dev/tty 2>/dev/null \
+              | sed -e 's/UI hierchary.*//' > "artifacts/$1.xml" || true
+          }
+          shot() { "$ADB" exec-out screencap -p > "artifacts/shots/$1.png"; }
+          tap() { python3 scripts/tap_text.py "$1" || true; }
+          export ADB="$ADB"
+
+          shot 01_home; dump 01_home
+          tap "Settings"; sleep 4
+          shot 02_settings; dump 02_settings
+          "$ADB" shell input keyevent 4; sleep 2
+          tap "Live TV"; sleep 10
+          shot 03_livetv; dump 03_livetv
+          "$ADB" shell input keyevent 4; sleep 2
+          tap "Search"; sleep 1
+          "$ADB" shell input text "bluey"; sleep 1
+          tap "Search"; sleep 12
+          shot 04_search; dump 04_search
+
+      - name: Collect logcat and verdict
+        if: always()
+        run: |
+          ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          "$ADB" logcat -d > artifacts/logcat.txt
+          echo === PY EXCEPTIONS ===
+          grep -iE "PyException|chaquopy.*error|FATAL" artifacts/logcat.txt | head -20 || true
+          echo === SCREEN ERRORS ===
+          grep -l -iE "java com.chaquo|not callable" artifacts/*.xml 2>/dev/null || true
+          # Fail if any python exception reached the UI or logcat.
+          ! grep -qiE "PyException|not callable" artifacts/logcat.txt artifacts/*.xml 2>/dev/null
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
