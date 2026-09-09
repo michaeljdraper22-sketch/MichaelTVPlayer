@@ -98,6 +98,8 @@ jobs:
           tap "Live TV"; sleep 10
           shot 03_livetv; dump 03_livetv
           "$ADB" shell input keyevent 4; sleep 2
+          "$ADB" shell am start -n org.michaeltv.app/.MainActivity; sleep 3
+          "$ADB" shell input keyevent 4; sleep 2
           tap "Search"; sleep 1
           "$ADB" shell input text "bluey"; sleep 1
           tap "Search"; sleep 12
