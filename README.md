@@ -1,12 +1,14 @@
 # MichaelTV
 
-**Current release: v1.1** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
+An **Android APK** of the same app is published alongside it — see
+[Android version](#android-version-apk).
 
 (now branded **MichaelTV**; settings/logs still live in `%APPDATA%\MichaelTVPlayer`)
-Built and tested on **Windows 11** — there is currently **no intent for
-macOS or Android development**.
+Built and tested on **Windows 11**; an Android port now ships from the
+same repo (Windows remains the primary platform).
 
 This project is specifically intended for use with an **8K Strong**
 subscription. Login is currently only available through the Xtream Codes
@@ -228,6 +230,37 @@ Build it yourself by double-clicking **`build.bat`** (needs Python 3.9+,
 64-bit). The build bundles the private VLC runtime into `dist\vlc\`, so the
 exe is fully self-contained and never touches the installed VLC.
 
+## Android version (APK)
+
+The same app — the **exact same Stremio/Xtream core code** (`src/stremio.py`,
+`src/xtream.py` are copied verbatim into every build by `prepare_core.py`) —
+also builds as an Android APK. Grab **`MichaelTV-<version>-debug.apk`** from
+the latest [release](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases),
+enable *Install unknown apps* for your browser/file manager, and install.
+
+**What works on Android (v1):** search movies & series (Cinemeta, posters),
+browse a series' seasons/episodes, get the **same ranked stream list as the
+Windows app** (English-preference, resolution, size and provider ordering),
+play debrid/direct links in-app with seek + pause, and **Xtream live TV**
+(categories → channels → play). Stream links are liveness-probed before
+playback; a dedicated button hands a stream to an external player
+(VLC for Android etc.) if the in-app one can't handle it.
+
+**Limits (v1):** plain torrent streams (no debrid URL) can't play on-device —
+configure a debrid-keyed addon URL (e.g. torrentio with your Torbox key, set
+up in a desktop browser) and paste it into the app's Settings; then the addon
+returns direct links that play fine. No subtitles, DVR/timeshift, recording,
+catch-up or profanity filter on Android yet.
+
+**Building it yourself (Windows, no Android Studio needed):**
+`python android-gradle/build_local.py` — downloads the JDK/Gradle/Android SDK
+into `android-gradle\.tools\` (user-space, ~1 GB, one time), then assembles
+the APK. The project is a Gradle + [Chaquopy](https://chaquo.com/chaquopy/)
+app (Python logic behind a WebView UI). A second variant (`android/`) uses
+Kivy + Buildozer for cloud builds via `.github/workflows/android-build.yml`
+(checked in; requires a git credential with the `workflow` scope to push the
+workflow file and run it on GitHub Actions).
+
 ## Run (from source, for development)
 Double-click **`run.bat`**. It creates a virtual environment, installs
 dependencies, and launches the app.
@@ -342,4 +375,7 @@ Channels ▸ **Add custom channel…** lets you add any stream URL
    `dist/UninstallMichaelTV.exe` and the release zip
    `dist/MichaelTV-<version>.zip` (exe + uninstaller + `vlc\` runtime).
 3. Tag the commit `v<version>` and upload the zip as a release asset —
-   the in-app updater downloads exactly that asset.
+   the in-app updater downloads exactly that asset (it matches `.zip`
+   assets only; an APK on the same release is ignored by it).
+4. For the Android build, run `python android-gradle/build_local.py` and
+   upload the resulting `MichaelTV-<version>-debug.apk` to the same release.
