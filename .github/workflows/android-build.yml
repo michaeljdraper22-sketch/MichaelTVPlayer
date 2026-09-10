@@ -1,0 +1,143 @@
+# Cloud build of the MichaelTV Android APK (Buildozer + Kivy/p4a).
+# Manual dispatch, or push to main touching the android tree, this workflow,
+# or the core modules bundled into the APK.
+
+name: Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - android/**
+      - .github/workflows/android-build.yml
+      - src/stremio.py
+      - src/xtream.py
+      - src/config.py
+
+concurrency:
+  group: android-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install buildozer and cython
+        # buildozer==1.5.0 + cython==0.29.33 are a known-good pair for p4a
+        # sdl2 builds. If the p4a pin in the "Clone python-for-android" step
+        # below is moved forward, these two pins may need revisiting.
+        run: pip install buildozer==1.5.0 cython==0.29.33
+
+      - name: Prepare MichaelTV core modules
+        # Copies the pure-python modules from src/ into android/michaeltv_core/
+        # and stamps the version into android/buildozer.spec. Exits nonzero on
+        # failure, which must fail the build.
+        run: python android/prepare_core.py
+
+      - name: Clone python-for-android (pinned)
+        # Pinned p4a commit (master HEAD as of 2026-09-09):
+        #   cda8e65d33c4851ba4e5ddcacc18041bd235c382
+        # Full clone on purpose (not --depth): master moves on, and a full
+        # clone guarantees the pinned SHA is always available to check out.
+        run: |
+          git clone https://github.com/kivy/python-for-android android/.p4a
+          git -C android/.p4a checkout cda8e65d33c4851ba4e5ddcacc18041bd235c382
+
+      - name: Patch p4a for cleartext HTTP
+        # At the pinned SHA the sdl2 bootstrap inherits from _sdl_common, so
+        # the manifest template actually used for sdl2 builds lives at
+        # pythonforandroid/bootstraps/_sdl_common/build/templates/AndroidManifest.tmpl.xml
+        # (verified in the cloned tree; bootstraps/sdl2/ has no templates of
+        # its own). The '*sdl*' glob matches _sdl_common today and would also
+        # match a future sdl2/ or sdl3/ templates dir if p4a moves it again.
+        run: |
+          find android/.p4a -name AndroidManifest.tmpl.xml -path '*sdl*' -exec sed -i 's|<application |<application android:usesCleartextTraffic="true" |' {} \;
+          echo "Manifest templates patched:"
+          grep -rl 'android:usesCleartextTraffic' android/.p4a/pythonforandroid/bootstraps/ || true
+          # Hard check: the template the sdl2 build renders must carry the flag.
+          grep -q 'android:usesCleartextTraffic="true"' \
+            android/.p4a/pythonforandroid/bootstraps/_sdl_common/build/templates/AndroidManifest.tmpl.xml \
+            || { echo 'ERROR: cleartext flag was not injected into the sdl manifest template'; exit 1; }
+
+      - name: Point buildozer.spec at the cloned p4a
+        run: |
+          sed -i "s|P4A_SOURCE_DIR_PLACEHOLDER|$GITHUB_WORKSPACE/android/.p4a|g" android/buildozer.spec
+          grep -q P4A_SOURCE_DIR_PLACEHOLDER android/buildozer.spec \
+            && { echo 'ERROR: placeholder survived in buildozer.spec'; exit 1; } || true
+          grep -n '^p4a.source_dir' android/buildozer.spec
+
+      - name: Cache Buildozer Android platform dir (best effort)
+        # Caches the SDK/NDK buildozer unpacks under ~/.buildozer/android/platform.
+        # Best effort only; a cold miss just means re-downloading.
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildozer/android/platform
+          key: buildozer-android-platform-${{ hashFiles('android/buildozer.spec') }}
+          restore-keys: |
+            buildozer-android-platform-
+
+      - name: Build debug APK
+        working-directory: android
+        env:
+          CI: 1
+        run: |
+          # ANDROID_HOME / ANDROID_SDK_ROOT are deliberately unset: buildozer
+          # 1.5.0 manages its own SDK under ~/.buildozer (it does not read
+          # these variables, but the runner image exports ANDROID_SDK_ROOT, so
+          # clear it to keep nothing from the host image leaking in).
+          # JAVA_HOME is inherited from the setup-java step above.
+          unset ANDROID_HOME ANDROID_SDK_ROOT
+          # NOTE: first run downloads the Android SDK and NDK (~20-40 min).
+          buildozer android debug
+
+      - name: Sanity-check the built APK
+        run: |
+          ls -la android/bin/
+          python - <<'PY'
+          import glob, os, sys, zipfile
+          apks = sorted(glob.glob('android/bin/*.apk'))
+          if not apks:
+              print('FAIL: no *.apk found in android/bin/')
+              sys.exit(1)
+          ok = True
+          for apk in apks:
+              size = os.path.getsize(apk)
+              with zipfile.ZipFile(apk) as z:
+                  corrupt = z.testzip()
+                  names = z.namelist()
+                  has_dex = 'classes.dex' in names
+                  has_arm64 = any(
+                      n.startswith('lib/arm64-v8a/') and n.endswith('.so')
+                      for n in names)
+              print(f'{apk}: {size} bytes ({size / 1024 / 1024:.2f} MiB), '
+                    f'valid_zip={corrupt is None}, classes.dex={has_dex}, '
+                    f'lib/arm64-v8a/*.so={has_arm64}')
+              ok = ok and corrupt is None and has_dex and has_arm64
+          sys.exit(0 if ok else 1)
+          PY
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MichaelTV-android-apk
+          path: android/bin/*.apk
+          if-no-files-found: error
+          retention-days: 30
