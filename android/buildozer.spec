@@ -37,7 +37,8 @@ version = 2.1
 requirements = python3,kivy==2.3.0,android,pyjnius,requests,ffpyplayer
 
 # Landscape and portrait; the layouts are orientation-agnostic.
-orientation = all
+# (buildozer 1.5.0 rejects "all" — a comma list is the accepted form.)
+orientation = portrait,landscape
 
 # Fullscreen when the status bar would overlay video, normal otherwise.
 fullscreen = auto
