@@ -32,3 +32,12 @@ build_pyinstaller/
 /android/.p4a/
 /android/bin/
 /android/.buildozer/
+
+# android-gradle (native Gradle/Chaquopy build) — toolchain + build output
+/android-gradle/.tools/
+/android-gradle/.gradle/
+/android-gradle/build/
+/android-gradle/app/build/
+/android-gradle/local.properties
+/android-gradle/.idea/
+*.jks

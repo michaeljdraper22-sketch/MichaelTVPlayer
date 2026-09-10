@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>MichaelTV</title>
+<style>
+  :root {
+    --bg: #0a0a0d; --panel: #16161d; --panel2: #1d1d26; --line: #26262f;
+    --text: #f2f2f4; --dim: #9a9aa5; --accent: #e0862e; --bad: #d05050;
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body {
+    margin: 0; padding: 0; min-height: 100%; background: var(--bg);
+    color: var(--text); font-family: Roboto, "Segoe UI", Arial, sans-serif;
+    font-size: 16px;
+  }
+  button {
+    background: #26262f; color: var(--text); border: 1px solid #3a3a46;
+    border-radius: 8px; padding: 10px 14px; font-size: 15px; cursor: pointer;
+  }
+  button:active { background: #3a3a46; }
+  button.accent { background: var(--accent); border-color: var(--accent); color: #14100a; font-weight: bold; }
+  input, select, textarea {
+    background: #111118; color: var(--text); border: 1px solid #3a3a46;
+    border-radius: 8px; padding: 10px; font-size: 15px; width: 100%;
+  }
+  textarea { font-family: monospace; font-size: 13px; resize: vertical; }
+  label { display: block; color: var(--dim); font-size: 13px; margin: 14px 0 6px; }
+  a { color: var(--accent); }
+
+  .screen { display: none; }
+  .screen.active { display: block; }
+
+  .topbar {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(10, 10, 13, 0.97); border-bottom: 1px solid var(--line);
+  }
+  .topbar .title { font-size: 18px; font-weight: bold; flex: 1;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .topbar .brand { font-size: 20px; font-weight: bold; flex: 1; }
+  .subbar { padding: 8px 14px; color: var(--dim); font-size: 13px;
+    border-bottom: 1px solid var(--line); }
+
+  .content { padding: 14px; }
+
+  .searchrow { display: flex; gap: 8px; padding: 14px; }
+  .searchrow input { flex: 1; }
+
+  .rowitem {
+    display: flex; gap: 12px; align-items: center; padding: 10px 14px;
+    border-bottom: 1px solid var(--line); cursor: pointer;
+  }
+  .rowitem:active { background: var(--panel2); }
+  .rowitem .thumb {
+    width: 60px; height: 90px; border-radius: 6px; background: var(--panel2);
+    object-fit: cover; flex: none; color: transparent;
+  }
+  .rowitem .thumb.ph {
+    display: flex; align-items: center; justify-content: center;
+    color: #3c3c48; font-size: 22px; font-weight: bold;
+  }
+  .rowitem .meta { flex: 1; min-width: 0; }
+  .rowitem .name { font-size: 16px; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rowitem .sub { color: var(--dim); font-size: 13px; margin-top: 3px; }
+  .rowitem.disabled { cursor: default; opacity: 0.45; }
+  .rowitem .note { color: var(--dim); font-size: 12px; margin-top: 4px; }
+  .rowitem .badge {
+    flex: none; font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; padding: 2px 6px;
+  }
+
+  .episode {
+    display: flex; gap: 12px; align-items: center; padding: 12px 14px;
+    border-bottom: 1px solid var(--line); cursor: pointer;
+  }
+  .episode:active { background: var(--panel2); }
+  .episode .epnum { color: var(--accent); font-weight: bold; flex: none;
+    min-width: 64px; font-size: 14px; }
+  .episode .epname { flex: 1; min-width: 0; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+
+  .loading { padding: 40px; text-align: center; color: var(--dim); }
+
+  #overlay {
+    position: fixed; inset: 0; z-index: 100; display: none;
+    align-items: center; justify-content: center; flex-direction: column;
+    gap: 14px; background: rgba(10, 10, 13, 0.75);
+  }
+  #overlay.show { display: flex; }
+  .spinner {
+    width: 42px; height: 42px; border-radius: 50%;
+    border: 4px solid #33333f; border-top-color: var(--accent);
+    animation: spin 0.9s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 14%; transform: translateX(-50%);
+    z-index: 120; max-width: 86%; display: none;
+    background: #26262f; color: var(--text); border: 1px solid #3a3a46;
+    padding: 12px 16px; border-radius: 10px; font-size: 14px;
+    text-align: center;
+  }
+  #toast.show { display: block; }
+
+  #screen-player.active {
+    display: flex; flex-direction: column; position: fixed; inset: 0;
+    background: #000; z-index: 50;
+  }
+  #screen-player video { flex: 1; width: 100%; min-height: 0;
+    background: #000; object-fit: contain; }
+  .player-top {
+    display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+    background: #000; border-bottom: 1px solid #1c1c24;
+  }
+  .player-top .ptitle { flex: 1; min-width: 0; font-size: 15px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+  .hint {
+    color: var(--dim); font-size: 13px; line-height: 1.5; margin-top: 8px;
+    padding: 10px 12px; background: var(--panel); border-radius: 8px;
+  }
+  .footer { color: #55555f; font-size: 12px; text-align: center;
+    padding: 24px 0 40px; }
+  .empty { padding: 40px 14px; text-align: center; color: var(--dim); }
+</style>
+</head>
+<body>
+
+<div id="overlay"><div class="spinner"></div><div id="overlay-text">Loading&hellip;</div></div>
+<div id="toast"></div>
+
+<!-- ======================= HOME ======================= -->
+<div class="screen" id="screen-home">
+  <div class="topbar">
+    <div class="brand">MichaelTV</div>
+    <button onclick="enterLive()">Live TV</button>
+    <button onclick="enterSettings()">Settings</button>
+  </div>
+  <div class="searchrow">
+    <input id="q" type="search" placeholder="Search movies &amp; series&hellip;"
+           onkeydown="if(event.key==='Enter')doSearch()">
+    <button class="accent" onclick="doSearch()">Search</button>
+  </div>
+  <div id="results"><div class="empty">Search a movie or series name.</div></div>
+  <div class="footer" id="home-footer">MichaelTV</div>
+</div>
+
+<!-- ======================= DETAIL (series) ======================= -->
+<div class="screen" id="screen-detail"></div>
+
+<!-- ======================= STREAMS ======================= -->
+<div class="screen" id="screen-streams"></div>
+
+<!-- ======================= PLAYER ======================= -->
+<div class="screen" id="screen-player"></div>
+
+<!-- ======================= SETTINGS ======================= -->
+<div class="screen" id="screen-settings"></div>
+
+<!-- ======================= LIVE TV ======================= -->
+<div class="screen" id="screen-livetv"></div>
+
+<script>
+"use strict";
+
+// ------------------------------------------------------------------
+// state + navigation (screens are swapped divs; a stack of render
+// closures drives both the on-screen Back buttons and the hardware
+// back key via window.androidBack)
+
+var state = {
+  version: "",
+  search: { q: "", results: null },
+  detail: null,            // {item, data, season}
+  streams: null,           // {title, context, items}
+  player: null,            // {url, title}
+  settings: null,
+  live: null
+};
+var stack = [];            // [{id, render}]
+
+function showScreen(id) {
+  var screens = document.querySelectorAll(".screen");
+  for (var i = 0; i < screens.length; i++) screens[i].classList.remove("active");
+  document.getElementById("screen-" + id).classList.add("active");
+  window.scrollTo(0, 0);
+}
+
+function push(id, render) {
+  stack.push({ id: id, render: render });
+  render();
+}
+
+function rerender() {
+  if (stack.length) stack[stack.length - 1].render();
+}
+
+function back() { window.androidBack(); }
+
+window.androidBack = function () {
+  if (stack.length <= 1) return false;
+  stack.pop();
+  var top = stack[stack.length - 1];
+  top.render();
+  return true;
+};
+
+// ------------------------------------------------------------------
+// py bridge — window.py.rpc() is SYNCHRONOUS (it blocks the JS thread
+// while Java/Python does the work), so the loading overlay must be
+// painted first via setTimeout before the call happens.
+
+function rpc(cmd, args, cb) {
+  var overlay = document.getElementById("overlay");
+  overlay.classList.add("show");
+  setTimeout(function () {
+    var out;
+    try {
+      var raw = window.py.rpc(cmd, JSON.stringify(args || {}));
+      out = JSON.parse(raw);
+    } catch (e) { out = { error: String(e) }; }
+    overlay.classList.remove("show");
+    if (cb) cb(out);
+  }, 60);
+}
+
+var toastTimer = null;
+function toast(msg, ms) {
+  var t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.classList.remove("show"); }, ms || 2800);
+}
+
+function esc(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+}
+function oneLine(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+
+// ------------------------------------------------------------------
+// HOME / SEARCH
+
+function doSearch() {
+  var q = document.getElementById("q").value.trim();
+  if (!q) return;
+  state.search.q = q;
+  rpc("search", { q: q }, function (out) {
+    if (out.error) { toast("Search failed: " + out.error); return; }
+    state.search.results = out.results || [];
+    renderResults();
+  });
+  document.getElementById("results").innerHTML =
+    '<div class="loading">Searching&hellip;</div>';
+}
+
+function renderResults() {
+  var el = document.getElementById("results");
+  var rs = state.search.results || [];
+  if (!rs.length) {
+    el.innerHTML = '<div class="empty">Nothing found for &ldquo;' +
+      esc(state.search.q) + '&rdquo;.</div>';
+    return;
+  }
+  var html = "";
+  for (var i = 0; i < rs.length; i++) {
+    var r = rs[i];
+    html +=
+      '<div class="rowitem" onclick="openItem(' + i + ')">' +
+      (r.poster
+        ? '<img class="thumb" loading="lazy" src="' + esc(r.poster) +
+          '" onerror="this.outerHTML=\'<div class=&quot;thumb ph&quot;>TV</div>\'">'
+        : '<div class="thumb ph">TV</div>') +
+      '<div class="meta"><div class="name">' + esc(r.name) + "</div>" +
+      '<div class="sub">' + (r.kind === "movie" ? "Movie" : "Series") +
+      (r.year ? " \u00b7 " + esc(r.year) : "") + "</div></div>" +
+      '<div class="badge">' + esc((r.imdb || "").replace(/^tt/, "tt")) + "</div>" +
+      "</div>";
+  }
+  el.innerHTML = html;
+}
+
+function openItem(i) {
+  var r = (state.search.results || [])[i];
+  if (!r) return;
+  if (r.kind === "movie") {
+    showStreams({ kind: "movie", imdb: r.imdb, season: 0, episode: 0 },
+                r.name + (r.year ? " (" + r.year + ")" : ""));
+  } else {
+    showDetail(r);
+  }
+}
+
+// ------------------------------------------------------------------
+// DETAIL (series)
+
+function showDetail(item) {
+  state.detail = { item: item, data: null, season: null };
+  push("detail", renderDetail);
+  rpc("detail", { imdb: item.imdb }, function (out) {
+    if (out.error) { toast(out.error); return; }
+    state.detail.data = out;
+    if (out.seasons && out.seasons.length) state.detail.season = out.seasons[0];
+    rerender();
+  });
+}
+
+function renderDetail() {
+  var d = state.detail;
+  var el = document.getElementById("screen-detail");
+  if (!d.data) {
+    el.innerHTML = topbarHtml("Loading&hellip;") +
+      '<div class="loading">Loading episode list&hellip;</div>';
+    showScreen("detail");
+    return;
+  }
+  var seasons = d.data.seasons || [];
+  if (d.season == null && seasons.length) d.season = seasons[0];
+  var opts = "";
+  for (var i = 0; i < seasons.length; i++) {
+    var s = seasons[i];
+    opts += '<option value="' + s + '"' +
+      (s === d.season ? " selected" : "") + ">Season " + s + "</option>";
+  }
+  var eps = (d.data.episodes || []).filter(function (e) {
+    return e.season === d.season;
+  });
+  var rows = "";
+  for (var j = 0; j < eps.length; j++) {
+    rows += '<div class="episode" onclick="openEpisode(' + eps[j].season +
+      "," + eps[j].episode + ')"><div class="epnum">S' + pad2(eps[j].season) +
+      "E" + pad2(eps[j].episode) + '</div><div class="epname">' +
+      esc(eps[j].name || "") + "</div></div>";
+  }
+  el.innerHTML =
+    topbarHtml(d.data.name || d.item.name) +
+    (seasons.length
+      ? '<div class="content" style="padding-bottom:0"><select onchange="changeSeason(this.value)">' +
+        opts + "</select></div>"
+      : "") +
+    (rows || '<div class="empty">No episodes found.</div>');
+  showScreen("detail");
+}
+
+function pad2(n) { return (n < 10 ? "0" : "") + n; }
+
+function changeSeason(v) {
+  state.detail.season = parseInt(v, 10);
+  renderDetail();
+}
+
+function openEpisode(season, episode) {
+  var item = state.detail.item;
+  showStreams({ kind: "series", imdb: item.imdb, season: season, episode: episode },
+    (state.detail.data && state.detail.data.name ? state.detail.data.name : item.name) +
+    " \u2014 S" + pad2(season) + "E" + pad2(episode));
+}
+
+// ------------------------------------------------------------------
+// STREAMS
+
+function showStreams(context, title) {
+  state.streams = { context: context, title: title, items: null };
+  push("streams", renderStreams);
+  var cmd = context.kind === "movie" ? "streams_movie" : "streams_series";
+  rpc(cmd, context, function (out) {
+    if (out.error) { toast(out.error); return; }
+    state.streams.items = out.streams || [];
+    rerender();
+  });
+}
+
+function renderStreams() {
+  var st = state.streams;
+  var el = document.getElementById("screen-streams");
+  if (!st.items) {
+    el.innerHTML = topbarHtml(st.title) +
+      '<div class="loading">Finding streams&hellip;</div>';
+    showScreen("streams");
+    return;
+  }
+  if (!st.items.length) {
+    el.innerHTML = topbarHtml(st.title) +
+      '<div class="empty">No usable streams found.<br>Check the addon URLs in Settings.</div>';
+    showScreen("streams");
+    return;
+  }
+  var html = topbarHtml(st.title) + '<div class="subbar">' +
+    st.items.length + " source(s), best first</div>";
+  for (var i = 0; i < st.items.length; i++) {
+    var s = st.items[i];
+    var label = oneLine(s.title || s.name) || "(unnamed source)";
+    if (s.playable) {
+      html += '<div class="rowitem" onclick="playStream(' + i + ')">' +
+        '<div class="meta"><div class="name">' + esc(label) + "</div>" +
+        (s.size_text ? '<div class="sub">' + esc(s.size_text) + "</div>" : "") +
+        "</div>" +
+        '<div class="badge">' + (i + 1) + "</div></div>";
+    } else {
+      html += '<div class="rowitem disabled"><div class="meta">' +
+        '<div class="name">' + esc(label) + "</div>" +
+        '<div class="note">torrent only \u2014 needs a debrid-keyed addon URL in Settings</div>' +
+        (s.size_text ? '<div class="sub">' + esc(s.size_text) + "</div>" : "") +
+        "</div>" +
+        '<div class="badge">' + (i + 1) + "</div></div>";
+    }
+  }
+  el.innerHTML = html;
+  showScreen("streams");
+}
+
+function playStream(i) {
+  var s = (state.streams.items || [])[i];
+  if (!s || !s.playable || !s.url) return;
+  rpc("probe", { url: s.url }, function (out) {
+    if (out.error) { toast(out.error); return; }
+    if (!out.alive) { toast("Link dead \u2014 pick another source."); return; }
+    openPlayer(s.url, state.streams.title);
+  });
+}
+
+// ------------------------------------------------------------------
+// PLAYER
+
+function openPlayer(url, title) {
+  state.player = { url: url, title: title || "" };
+  push("player", renderPlayer);
+}
+
+function renderPlayer() {
+  var p = state.player;
+  var el = document.getElementById("screen-player");
+  el.innerHTML =
+    '<div class="player-top">' +
+    '<button onclick="back()">&#9664; Back</button>' +
+    '<div class="ptitle">' + esc(p.title) + "</div>" +
+    '<button onclick="openExternalPlayer()">Open in external player</button>' +
+    "</div>" +
+    '<video controls autoplay playsinline src="' + esc(p.url) + '"></video>';
+  showScreen("player");
+  var v = el.querySelector("video");
+  v.addEventListener("error", function () {
+    toast("Playback error \u2014 try \u201cOpen in external player\u201d.");
+  });
+}
+
+function openExternalPlayer() {
+  if (state.player && state.player.url && window.py.openExternal) {
+    window.py.openExternal(state.player.url);
+  }
+}
+
+// ------------------------------------------------------------------
+// SETTINGS
+
+var RES_OPTIONS = [
+  ["match", "Match current stream"], ["auto", "Auto (best first)"],
+  ["2160", "4K \u00b7 2160p"], ["1440", "1440p"], ["1080", "1080p"],
+  ["720", "720p"], ["480", "480p"]
+];
+
+function enterSettings() {
+  state.settings = null;
+  push("settings", renderSettings);
+  rpc("get_settings", {}, function (out) {
+    if (out.error) { toast(out.error); return; }
+    state.settings = out.settings || {};
+    rerender();
+  });
+}
+
+function renderSettings() {
+  var el = document.getElementById("screen-settings");
+  if (!state.settings) {
+    el.innerHTML = topbarHtml("Settings") +
+      '<div class="loading">Loading settings&hellip;</div>';
+    showScreen("settings");
+    return;
+  }
+  var s = state.settings;
+  var resOpts = "";
+  for (var i = 0; i < RES_OPTIONS.length; i++) {
+    resOpts += '<option value="' + RES_OPTIONS[i][0] + '"' +
+      (String(s.resolution_pref) === RES_OPTIONS[i][0] ? " selected" : "") +
+      ">" + RES_OPTIONS[i][1] + "</option>";
+  }
+  el.innerHTML =
+    topbarHtml("Settings") +
+    '<div class="content">' +
+
+    "<label>Stream addon URLs (one per line)</label>" +
+    '<textarea id="set-addons" rows="4" placeholder="https://torrentio.strem.fun/manifest.json">&#10;' +
+    esc((s.addons || []).join("\n")) + "</textarea>" +
+    '<div class="hint">Torrent-only sources need a <b>debrid-keyed</b> addon URL: ' +
+    "configure Torrentio (or another addon) in a desktop Stremio browser session, " +
+    "copy the <b>full addon URL</b> \u2014 it contains your debrid key \u2014 and paste it above.</div>" +
+
+    "<label>Preferred resolution</label>" +
+    '<select id="set-res">' + resOpts + "</select>" +
+
+    "<label>Demote streams larger than (GB, 0 = off)</label>" +
+    '<input id="set-size" type="number" min="0" step="0.5" value="' +
+    esc(s.size_demote_gb || 0) + '">' +
+
+    "<label>Xtream server URL</label>" +
+    '<input id="set-xtserver" type="url" placeholder="http://provider.example:8080" value="' +
+    esc(s.xtream_server || "") + '">' +
+    "<label>Xtream username</label>" +
+    '<input id="set-xtuser" autocomplete="off" value="' + esc(s.xtream_username || "") + '">' +
+    "<label>Xtream password</label>" +
+    '<input id="set-xtpass" type="password" autocomplete="off" value="' +
+    esc(s.xtream_password || "") + '">' +
+
+    '<div style="margin-top:20px"><button class="accent" style="width:100%" onclick="saveSettings()">Save</button></div>' +
+    '<div class="footer">MichaelTV ' + esc(state.version || "") + "</div>" +
+    "</div>";
+  showScreen("settings");
+}
+
+function saveSettings() {
+  var addons = document.getElementById("set-addons").value
+    .split("\n").map(function (l) { return l.trim(); })
+    .filter(function (l) { return l.length > 0; });
+  var body = {
+    addons: addons,
+    resolution_pref: document.getElementById("set-res").value,
+    size_demote_gb: parseFloat(document.getElementById("set-size").value || "0") || 0,
+    xtream_server: document.getElementById("set-xtserver").value.trim(),
+    xtream_username: document.getElementById("set-xtuser").value.trim(),
+    xtream_password: document.getElementById("set-xtpass").value
+  };
+  rpc("set_settings", body, function (out) {
+    if (out.error) { toast("Save failed: " + out.error); return; }
+    state.settings = out.settings || body;
+    toast("Saved.");
+    rerender();
+  });
+}
+
+// ------------------------------------------------------------------
+// LIVE TV (Xtream)
+
+function enterLive() {
+  state.live = { authed: false, info: "", error: "", cats: [], cat: "", channels: null };
+  push("livetv", renderLive);
+  rpc("xt_auth", {}, function (out) {
+    if (out.error || !out.ok) {
+      state.live.error = out.error || "Xtream login failed.";
+      rerender();
+      return;
+    }
+    state.live.authed = true;
+    state.live.info = out.info_summary || "";
+    rpc("xt_categories", {}, function (o2) {
+      if (o2.error) { state.live.error = o2.error; rerender(); return; }
+      state.live.cats = o2.categories || [];
+      if (state.live.cats.length) {
+        loadChannels(state.live.cats[0].id);
+      } else {
+        state.live.error = "Provider has no live categories.";
+        rerender();
+      }
+    });
+  });
+}
+
+function loadChannels(catId) {
+  state.live.cat = catId;
+  state.live.channels = null;
+  rerender();
+  rpc("xt_channels", { category_id: catId }, function (out) {
+    if (out.error) { state.live.error = out.error; rerender(); return; }
+    state.live.channels = out.channels || [];
+    rerender();
+  });
+}
+
+function renderLive() {
+  var live = state.live;
+  var el = document.getElementById("screen-livetv");
+  var html = topbarHtml("Live TV");
+  if (live.error && !live.authed) {
+    el.innerHTML = html + '<div class="empty">' + esc(live.error) +
+      '<br><br><button onclick="enterSettings()">Open Settings</button></div>';
+    showScreen("livetv");
+    return;
+  }
+  if (live.error && live.authed) {
+    html += '<div class="subbar" style="color:var(--bad)">' + esc(live.error) + "</div>";
+    live.error = "";
+  }
+  if (live.info) html += '<div class="subbar">' + esc(live.info) + "</div>";
+  if (live.cats.length) {
+    var opts = "";
+    for (var i = 0; i < live.cats.length; i++) {
+      opts += '<option value="' + esc(live.cats[i].id) + '"' +
+        (String(live.cats[i].id) === String(live.cat) ? " selected" : "") +
+        ">" + esc(live.cats[i].name || live.cats[i].id) + "</option>";
+    }
+    html += '<div class="content" style="padding-bottom:0"><select onchange="loadChannels(this.value)">' +
+      opts + "</select></div>";
+  }
+  if (live.channels == null) {
+    html += '<div class="loading">Loading channels&hellip;</div>';
+  } else if (!live.channels.length) {
+    html += '<div class="empty">No channels in this category.</div>';
+  } else {
+    for (var j = 0; j < live.channels.length; j++) {
+      var c = live.channels[j];
+      html += '<div class="rowitem" onclick="playChannel(' + c.stream_id + ')">' +
+        (c.logo
+          ? '<img class="thumb" style="width:60px;height:40px" loading="lazy" src="' +
+            esc(c.logo) + '" onerror="this.style.display=\'none\'">'
+          : "") +
+        '<div class="meta"><div class="name">' + esc(c.name) + "</div></div>" +
+        '<div class="badge">LIVE</div></div>';
+    }
+  }
+  el.innerHTML = html;
+  showScreen("livetv");
+}
+
+function playChannel(streamId) {
+  rpc("xt_url", { stream_id: streamId }, function (out) {
+    if (out.error) { toast(out.error); return; }
+    var ch = null;
+    for (var i = 0; i < (state.live.channels || []).length; i++) {
+      if (state.live.channels[i].stream_id === streamId) ch = state.live.channels[i];
+    }
+    openPlayer(out.url, ch ? ch.name : "Live TV");
+  });
+}
+
+// ------------------------------------------------------------------
+// shared helpers + boot
+
+function topbarHtml(title) {
+  return '<div class="topbar"><button onclick="back()">&#9664;</button>' +
+    '<div class="title">' + esc(title) + "</div></div>";
+}
+
+push("home", function () {
+  document.getElementById("q").value = state.search.q || "";
+  renderResults();
+  showScreen("home");
+});
+
+rpc("ping", {}, function (out) {
+  if (out && out.version) {
+    state.version = out.version;
+    document.getElementById("home-footer").textContent =
+      "MichaelTV " + out.version;
+  }
+});
+</script>
+</body>
+</html>

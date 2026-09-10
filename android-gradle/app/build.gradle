@@ -1,0 +1,55 @@
+plugins {
+    id 'com.android.application'
+    id 'com.chaquo.python'
+}
+
+android {
+    namespace 'org.michaeltv.app'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "org.michaeltv.app"
+        minSdk 24
+        targetSdk 34
+        // The two version lines below are rewritten from src/config.py
+        // APP_VERSION by android-gradle/prepare_core.py — do not edit here.
+        versionCode 21  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
+        versionName "2.1"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
+
+        ndk {
+            // 64-bit phones only — halves the APK and the Chaquopy payload.
+            abiFilters "arm64-v8a"
+        }
+    }
+
+    buildTypes {
+        release {
+            debuggable false
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    // No androidx dependencies anywhere — plain android.app.Activity +
+    // android.webkit.WebView keep the APK tiny and the build simple.
+}
+
+// Chaquopy 15 DSL: a top-level chaquopy block (the old python-inside-
+// android.defaultConfig block was replaced in 15.0).  buildPython must
+// match the target Python's major.minor — build_local.py provisions a
+// user-space 3.11 in .tools/python311 and passes it via -PbuildPython.
+chaquopy {
+    defaultConfig {
+        version = "3.11"
+        if (project.hasProperty("buildPython")) {
+            buildPython(project.property("buildPython"))
+        }
+        pip {
+            install("requests")
+        }
+    }
+}

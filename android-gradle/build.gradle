@@ -1,0 +1,6 @@
+// Root build file — plugin versions are pinned and verified compatible:
+// Gradle 8.4 dist + AGP 8.1.4 + Chaquopy 15.0.1, JDK 17 (Temurin).
+plugins {
+    id 'com.android.application' version '8.1.4' apply false
+    id 'com.chaquo.python' version '15.0.1' apply false
+}
