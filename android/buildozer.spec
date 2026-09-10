@@ -57,7 +57,10 @@ android.permissions = INTERNET
 # Target / minimum Android levels (Android 14 target, 7.0 floor).
 android.api = 34
 android.minapi = 24
-android.ndk = 25b
+# Must match p4a's RECOMMENDED_NDK_VERSION (recipes like libthorvg glob
+# this NDK's clang lib layout); the workflow pre-installs it because
+# buildozer 1.5.0 can't download r26+ archive names itself.
+android.ndk = 28c
 
 # Integer build code. MANAGED BY prepare_core.py (digits of the version
 # with dots stripped: "2.1" -> 21) — bump src/config.py and re-run it.

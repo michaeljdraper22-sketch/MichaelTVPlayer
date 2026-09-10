@@ -3,6 +3,15 @@ plugins {
     id 'com.chaquo.python'
 }
 
+// Release signing: android-gradle/keystore.properties (git-ignored) points
+// at michaeltv-release.jks (also git-ignored).  build_local.py creates both
+// on first build; when they are absent only assembleDebug works.
+def keystoreProps = new Properties()
+def keystorePropsFile = rootProject.file("keystore.properties")
+if (keystorePropsFile.exists()) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
 android {
     namespace 'org.michaeltv.app'
     compileSdk 34
@@ -22,10 +31,24 @@ android {
         }
     }
 
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProps["storeFile"])
+                storePassword keystoreProps["storePassword"]
+                keyAlias keystoreProps["keyAlias"]
+                keyPassword keystoreProps["keyPassword"]
+            }
+        }
+    }
+
     buildTypes {
         release {
             debuggable false
             minifyEnabled false
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
         }
     }
 

@@ -234,7 +234,8 @@ exe is fully self-contained and never touches the installed VLC.
 
 The same app — the **exact same Stremio/Xtream core code** (`src/stremio.py`,
 `src/xtream.py` are copied verbatim into every build by `prepare_core.py`) —
-also builds as an Android APK. Grab **`MichaelTV-<version>-debug.apk`** from
+also builds as an Android APK. Grab **`MichaelTV-<version>.apk`** (release-
+signed) from
 the latest [release](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases),
 enable *Install unknown apps* for your browser/file manager, and install.
 
@@ -254,12 +255,14 @@ catch-up or profanity filter on Android yet.
 
 **Building it yourself (Windows, no Android Studio needed):**
 `python android-gradle/build_local.py` — downloads the JDK/Gradle/Android SDK
-into `android-gradle\.tools\` (user-space, ~1 GB, one time), then assembles
-the APK. The project is a Gradle + [Chaquopy](https://chaquo.com/chaquopy/)
-app (Python logic behind a WebView UI). A second variant (`android/`) uses
-Kivy + Buildozer for cloud builds via `.github/workflows/android-build.yml`
-(checked in; requires a git credential with the `workflow` scope to push the
-workflow file and run it on GitHub Actions).
+into `android-gradle\.tools\` (user-space, ~1 GB, one time), then assembles a
+**release-signed APK** (on first build it generates `michaeltv-release.jks` +
+`keystore.properties`, both git-ignored — **keep them**: Android only installs
+an update over an install signed with the same key). The project is a Gradle
++ [Chaquopy](https://chaquo.com/chaquopy/) app (Python logic behind a WebView
+UI). A second variant (`android/`) uses Kivy + Buildozer for cloud builds via
+`.github/workflows/android-build.yml` (runs on GitHub Actions on pushes
+touching the android tree or the shared core modules).
 
 ## Run (from source, for development)
 Double-click **`run.bat`**. It creates a virtual environment, installs
@@ -378,4 +381,5 @@ Channels ▸ **Add custom channel…** lets you add any stream URL
    the in-app updater downloads exactly that asset (it matches `.zip`
    assets only; an APK on the same release is ignored by it).
 4. For the Android build, run `python android-gradle/build_local.py` and
-   upload the resulting `MichaelTV-<version>-debug.apk` to the same release.
+   upload the resulting `MichaelTV-<version>.apk` (release-signed) to the
+   same release.

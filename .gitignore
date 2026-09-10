@@ -41,3 +41,4 @@ build_pyinstaller/
 /android-gradle/local.properties
 /android-gradle/.idea/
 *.jks
+/android-gradle/keystore.properties

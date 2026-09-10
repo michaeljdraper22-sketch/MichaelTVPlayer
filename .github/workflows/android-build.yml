@@ -92,6 +92,19 @@ jobs:
             && { echo 'ERROR: placeholder survived in buildozer.spec'; exit 1; } || true
           grep -n '^p4a.source_dir' android/buildozer.spec
 
+      - name: Pre-install Android NDK r28c
+        # p4a's RECOMMENDED_NDK_VERSION is 28c (recipes like libthorvg glob
+        # its clang lib layout; 25b fails with IndexError), but buildozer
+        # 1.5.0 predates the r26+ archive renames and cannot download it —
+        # so place it where buildozer looks and it will be picked up.
+        run: |
+          mkdir -p "$HOME/.buildozer/android/platform"
+          test -d "$HOME/.buildozer/android/platform/android-ndk-r28c" \
+            || { curl -fsSL -o /tmp/ndk.zip \
+                 https://dl.google.com/android/repository/android-ndk-r28c-linux.zip \
+                 && unzip -q /tmp/ndk.zip -d "$HOME/.buildozer/android/platform/"; }
+          cat "$HOME/.buildozer/android/platform/android-ndk-r28c/source.properties" | head -3
+
       - name: Cache Buildozer Android platform dir (best effort)
         # Caches the SDK/NDK buildozer unpacks under ~/.buildozer/android/platform.
         # Best effort only; a cold miss just means re-downloading.

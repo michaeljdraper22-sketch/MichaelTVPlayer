@@ -21,8 +21,15 @@ Steps:
      not acceptable to Chaquopy).
   5. local.properties (sdk.dir, forward slashes)
   6. prepare_core.py (copies src/ core, rewrites version, py_compile)
-  7. gradle --no-daemon :app:assembleDebug  (JAVA_HOME=.tools/jdk)
-  8. copy app-debug.apk -> MichaelTV-<version>-debug.apk + sha256
+  7. RELEASE KEYSTORE (once): if keystore.properties is absent, generate
+     michaeltv-release.jks with a random password via the toolchain JDK's
+     keytool and write keystore.properties (both git-ignored).  KEEP BOTH
+     FILES — Android only installs an update over an install signed with
+     the SAME key; losing them means uninstall/reinstall on the phone.
+  8. gradle --no-daemon :app:assembleRelease (assembleDebug when no
+     keystore.properties)  (JAVA_HOME=.tools/jdk)
+  9. copy app-release.apk -> MichaelTV-<version>.apk + sha256
+     (debug builds keep the -debug suffix)
 
 Stdlib only.
 """
@@ -30,6 +37,7 @@ Stdlib only.
 import hashlib
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -319,14 +327,53 @@ def run_prepare_core():
 
 
 # ----------------------------------------------------------------------
-# 7/8. gradle build + apk
+# 7/8/9. release keystore, gradle build + apk
+
+KEYSTORE_FILE = "michaeltv-release.jks"
+KEYSTORE_ALIAS = "michaeltv"
+
+
+def release_mode():
+    return (AG_DIR / "keystore.properties").is_file()
+
+
+def ensure_release_keystore(jdk):
+    """First run: generate the release keystore + keystore.properties."""
+    props = AG_DIR / "keystore.properties"
+    if props.is_file():
+        log("[skip] release keystore configured (%s)" % props.name)
+        return
+    ks = AG_DIR / KEYSTORE_FILE
+    if ks.exists():
+        fail("%s exists but keystore.properties is missing — recreate "
+             "keystore.properties pointing at it (the key cannot be "
+             "regenerated)" % ks.name)
+    password = secrets.token_urlsafe(18)
+    keytool = jdk / "bin" / ("keytool.exe" if IS_WIN else "keytool")
+    run([keytool, "-genkeypair", "-v",
+         "-keystore", ks, "-alias", KEYSTORE_ALIAS,
+         "-keyalg", "RSA", "-keysize", "2048", "-validity", "10950",
+         "-storepass", password, "-keypass", password,
+         "-dname", "CN=MichaelTV, O=MichaelTV, C=US"],
+        name="keytool")
+    props.write_text(
+        "storeFile=%s\nstorePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n"
+        % (KEYSTORE_FILE, password, KEYSTORE_ALIAS, password),
+        encoding="utf-8")
+    log("[ok  ] release keystore created: %s (alias %s)"
+        % (ks.name, KEYSTORE_ALIAS))
+    log("       KEEP %s and %s — updates must be signed with the SAME"
+        % (ks.name, props.name))
+    log("       key, losing them means uninstall/reinstall on the phone.")
+
 
 def run_gradle(jdk, build_python):
     env = os.environ.copy()
     env["JAVA_HOME"] = str(jdk)
     env["GRADLE_USER_HOME"] = str((AG_DIR / ".gradle").resolve())
+    task = ":app:assembleRelease" if release_mode() else ":app:assembleDebug"
     cmd = [gradle_exe(), "--no-daemon", "--console=plain",
-           "-p", AG_DIR, ":app:assembleDebug",
+           "-p", AG_DIR, task,
            "-PbuildPython=" + build_python]
     log("[run ] %s" % " ".join(str(c) for c in cmd))
     proc = subprocess.Popen([str(c) for c in cmd], env=env,
@@ -338,11 +385,16 @@ def run_gradle(jdk, build_python):
 
 def finalize_apk():
     version = read_app_version()
-    src = (AG_DIR / "app" / "build" / "outputs" / "apk" / "debug"
-           / "app-debug.apk")
+    if release_mode():
+        src = (AG_DIR / "app" / "build" / "outputs" / "apk" / "release"
+               / "app-release.apk")
+        dst = AG_DIR / ("MichaelTV-%s.apk" % version)
+    else:
+        src = (AG_DIR / "app" / "build" / "outputs" / "apk" / "debug"
+               / "app-debug.apk")
+        dst = AG_DIR / ("MichaelTV-%s-debug.apk" % version)
     if not src.is_file():
         fail("APK not found at %s" % src)
-    dst = AG_DIR / ("MichaelTV-%s-debug.apk" % version)
     shutil.copyfile(src, dst)
     sha = hashlib.sha256(dst.read_bytes()).hexdigest()
     log("[ok  ] APK ready")
@@ -367,6 +419,7 @@ def main():
     write_local_properties()
     build_python = ensure_build_python()
     run_prepare_core()
+    ensure_release_keystore(jdk)
     if step == "tools":
         log("[done] toolchain + core prepared (gradle skipped) "
             "(%.0fs)" % (time.time() - t0))
