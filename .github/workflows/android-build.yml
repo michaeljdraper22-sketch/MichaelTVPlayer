@@ -61,6 +61,14 @@ jobs:
           git clone https://github.com/kivy/python-for-android android/.p4a
           git -C android/.p4a checkout cda8e65d33c4851ba4e5ddcacc18041bd235c382
 
+      - name: Install autotools prerequisites
+        # ubuntu24 runners lack the libtool m4 macros some C recipes need:
+        # autoreconf dies with "possibly undefined macro: LT_SYS_SYMBOL_USCORE"
+        # unless libltdl-dev (ltdl.m4) is present.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q autoconf automake libtool libltdl-dev pkg-config
+
       - name: Patch p4a for cleartext HTTP
         # At the pinned SHA the sdl2 bootstrap inherits from _sdl_common, so
         # the manifest template actually used for sdl2 builds lives at
