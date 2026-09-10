@@ -17,6 +17,11 @@ import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
 import com.chaquo.python.android.AndroidPlatform;
 
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
 /**
  * The whole app: one Activity hosting a WebView (assets/www/index.html is
  * the UI) plus the Chaquopy Python runtime (bridge.py holds the
@@ -29,6 +34,14 @@ public class MainActivity extends Activity {
 
     private WebView webView;
     private PyObject bridge;
+    // Every Python call runs on this ONE plain worker thread instead of
+    // the WebView's JavaBridge thread: field reports showed calls made
+    // from the JavaBridge thread dying with a native-level Java exception
+    // even though the Python side cannot raise (bridge.rpc catches
+    // everything) — running on our own thread removes that whole class of
+    // Chromium-thread-state interference, and the try/catch below turns
+    // any survivor into a diagnostic {"error": ...} the UI can show.
+    private final ExecutorService pyExecutor = Executors.newSingleThreadExecutor();
 
     @SuppressLint("SetJavaScriptEnabled")
     @Override
@@ -74,8 +87,33 @@ public class MainActivity extends Activity {
     private class JavaBridge {
 
         @JavascriptInterface
-        public String rpc(String cmd, String argsJson) {
-            return bridge.call("rpc", cmd, argsJson).toString();
+        public String rpc(final String cmd, final String argsJson) {
+            Future<String> task = pyExecutor.submit(() ->
+                    bridge.call("rpc", cmd, argsJson).toString());
+            try {
+                return task.get(180, TimeUnit.SECONDS);
+            } catch (Throwable t) {
+                // Never let a Java-side exception escape to the WebView
+                // (that kills the JS call with a useless generic message).
+                // Return the exception's class/message/location instead so
+                // the page's error toast names the real culprit.
+                StackTraceElement[] st = t.getCause() != null
+                        ? t.getCause().getStackTrace() : t.getStackTrace();
+                String where = st != null && st.length > 0
+                        ? String.valueOf(st[0]) : "";
+                String cause = t.getCause() != null
+                        ? t.getCause().getClass().getName() + ": "
+                          + t.getCause().getMessage()
+                        : t.getClass().getName() + ": " + t.getMessage();
+                return "{\"error\": \"java "
+                        + jsonSafe(cause + (where.isEmpty() ? "" : " @ " + where))
+                        + "\"}";
+            }
+        }
+
+        private String jsonSafe(String s) {
+            return s == null ? "" : s.replace("\\", "\\\\")
+                    .replace("\"", "'").replace("\n", " ").replace("\r", " ");
         }
 
         @JavascriptInterface
@@ -115,6 +153,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        pyExecutor.shutdownNow();
         if (webView != null) {
             webView.destroy();
             webView = null;
