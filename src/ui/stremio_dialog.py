@@ -272,23 +272,78 @@ class StremioDialog(QtWidgets.QDialog):
                 "effect after Stremio restarts; re-applied "
                 "automatically after Stremio updates.")
             self.btn_patch.setText("Restore VLC")
-        else:
-            partial = st["titled"] or st["backup"]
+            return
+        if st.get("reason") == "needs_admin":
             self._set_status(
-                self.patch_lbl, False,
-                "Opens VLC \u2014 partly set up" if partial
-                else "Opens VLC",
-                "Stremio\u2019s in-player external-player menu "
-                "currently launches VLC. Redirect it to MichaelTV?")
+                self.patch_lbl, False, "Needs one admin click",
+                "Stremio is installed for all users (Program Files), so "
+                "MichaelTV may not rewrite its player file on its own.\n"
+                "Use \u201cApply as administrator\u201d (one Windows "
+                "prompt), then restart Stremio.")
+            self.btn_patch.setText("Apply as administrator")
+            return
+        if st.get("reason") == "target_missing":
+            self._set_status(
+                self.patch_lbl, False, "Stremio changed its player file",
+                "The redirect target is gone from server.js (a Stremio "
+                "update changed it) \u2014 MichaelTV logged the details "
+                "and will retry on future launches. The Downloads "
+                "auto-play route above still works meanwhile.")
+            self.btn_patch.setEnabled(False)
             self.btn_patch.setText("Redirect to MichaelTV")
+            return
+        partial = st["titled"] or st["backup"]
+        self._set_status(
+            self.patch_lbl, False,
+            "Opens VLC \u2014 partly set up" if partial
+            else "Opens VLC",
+            "Stremio\u2019s in-player external-player menu "
+            "currently launches VLC. Redirect it to MichaelTV?")
+        self.btn_patch.setText("Redirect to MichaelTV")
 
     def _toggle_patch(self):
         from .. import streampatch
         if streampatch.status().get("patched"):
             streampatch.restore()
         else:
-            streampatch.patch()
+            if not streampatch.patch() \
+                    and streampatch.status().get("reason") == "needs_admin":
+                self._apply_as_admin()
         self._refresh_patch_status()
+
+    def _apply_as_admin(self):
+        """One UAC prompt: a tiny elevated MichaelTV instance applies
+        the redirect and exits (server.js is admin-owned; Stremio was
+        installed for all users). Status refreshes when it finishes."""
+        import ctypes
+        import os
+        import sys as _sys
+        from PyQt5 import QtCore
+
+        if getattr(_sys, "frozen", False):
+            exe, params = _sys.executable, "--apply-stremio-patch"
+        else:
+            main_py = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__)))), "main.py")
+            exe, params = _sys.executable, '"%s" --apply-stremio-patch' \
+                % main_py
+        res = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", exe, params, None, 1)   # SW_SHOWNORMAL
+        if res <= 32:
+            # UAC declined / failed — leave the row as it is
+            return
+        self._admin_polls = 0
+
+        def poll():
+            from .. import streampatch
+            self._admin_polls += 1
+            if streampatch.is_patched() or self._admin_polls >= 20:
+                self._refresh_patch_status()
+                return
+            QtCore.QTimer.singleShot(1500, poll)
+
+        QtCore.QTimer.singleShot(1500, poll)
 
     # ---- default .m3u handler ----
 

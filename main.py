@@ -142,6 +142,27 @@ def main() -> int:
         setup_logging()
     except Exception:
         pass
+
+    # Elevated one-shot helper (--apply-stremio-patch): the Stremio
+    # settings dialog spawns this when server.js lives in an admin-owned
+    # install (Stremio set up "for all users" under Program Files) that
+    # the normal unelevated app cannot write. Patch, confirm, exit —
+    # before the session marker (this is NOT a player session), before
+    # the VLC check, and before the single-instance relay (an elevated
+    # instance must not forward itself to the running normal one and
+    # exit without patching).
+    if "--apply-stremio-patch" in sys.argv:
+        from src import streampatch
+        ok = bool(streampatch.patch()) or streampatch.is_patched()
+        if ok:
+            body = ("Stremio's player menu is now set to \u201cPlay in "
+                    "MichaelTV\u201d.\n\nRestart Stremio to apply.")
+        else:
+            body = ("Could not set up Stremio's player redirect.\n\n"
+                    "Details: %APPDATA%\\MichaelTVPlayer\\player.log")
+        QtWidgets.QMessageBox.information(None, "MichaelTV", body)
+        return 0
+
     # Dirty-session marker + version-drift record (proves a previous run
     # died without a clean exit; shows when this machine last changed
     # versions — the "stuck on an old build" detector).
@@ -289,6 +310,21 @@ def main() -> int:
         if forwarded:
             QtCore.QTimer.singleShot(
                 50, lambda: win.handle_handoff(sys.argv[1:]))
+    except Exception:
+        pass
+
+    # Stremio rewrites server.js whenever it installs or updates, and a
+    # plain relaunch of MichaelTV forwards to THIS process before the
+    # startup patch hook ever runs — so re-check here, on a slow timer,
+    # for as long as the app runs (cheap: one file read when already
+    # patched; a Stremio update heals within minutes instead of needing
+    # a full MichaelTV restart).
+    try:
+        from src import streampatch
+        heal = QtCore.QTimer(win)
+        heal.setInterval(5 * 60 * 1000)
+        heal.timeout.connect(streampatch.patch_if_needed)
+        heal.start()
     except Exception:
         pass
 

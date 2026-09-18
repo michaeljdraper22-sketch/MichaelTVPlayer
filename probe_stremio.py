@@ -13,9 +13,11 @@
     args -> MainWindow.handle_handoff -> PlayerView plays (VLC stubbed
     to record, no real playback) -> identity resolution
 [F] fileassoc register/unregister round-trip (does NOT touch UserChoice)
-[G] streampatch round-trip on a temp copy (the live server.js is never
-    touched by the probe) — path redirect + "Play in MichaelTV" title
-    relabel + v1->v2 migration + restore
+[G] streampatch round-trip on a temp copy (the live file is never
+    touched): redirect + relabel + v1 migration + restore + failure
+    reasons (unpatched / target_missing / needs_admin)
+[G2] server.js discovery: install-location candidates, ImagePath
+    parsing, the Windows-service registry walk (fake winreg)
 [H] watchfolder: the Downloads auto-play — name gate, baseline (old
     files never replay), new-download pickup, .mtpdone consume, name
     reuse, url-less files ignored
@@ -1260,8 +1262,109 @@ def leg_g():
         check("restore round-trips", sp.restore())
         with open(tmp, "r", encoding="utf-8") as f:
             check("restore byte-identical", f.read() == sample)
+        # failure reasons (the 2026-09-18 silent-failure class: a remote
+        # install never saw the option and nothing said why)
+        st = sp.status()
+        check("status reports unpatched reason",
+              st.get("reason") == "unpatched", st.get("reason"))
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write("no vlc block in this one\n")
+        check("changed format fails", not sp.patch())
+        check("changed format reason",
+              sp._last_reason == "target_missing", sp._last_reason)
+        check("status mirrors target_missing",
+              sp.status().get("reason") == "target_missing")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(sample)
+        os.chmod(tmp, 0o444)   # Windows: read-only attribute
+        try:
+            check("read-only file fails", not sp.patch())
+            check("read-only reason",
+                  sp._last_reason == "needs_admin", sp._last_reason)
+            check("status mirrors needs_admin",
+                  sp.status().get("reason") == "needs_admin")
+        finally:
+            os.chmod(tmp, 0o666)
+        check("writable again patches", sp.patch())
     finally:
         sp.find_server_js = real_finder
+
+
+# ------------------------------------------------ [G2] discovery
+def leg_g2():
+    print("\n[G2] server.js discovery candidates + ImagePath parsing")
+    import types
+    from src import streampatch as sp
+    cands = sp._server_js_candidates()
+    check("candidates mention Program Files",
+          any("Program Files\\Stremio" in c for c in cands), cands[:6])
+    check("candidates mention Program Files (x86)",
+          any("(x86)\\Stremio" in c for c in cands))
+    check("candidates mention Stremio Service",
+          any("Stremio Service" in c for c in cands))
+    check("candidates mention per-user Stremio",
+          any("Programs\\Stremio" in c for c in cands))
+    parse = sp._exe_dir_from_imagepath
+    check("quoted ImagePath with args",
+          parse(r'"C:\Program Files\Stremio Service\stremio-service.exe" '
+                r'--run') == r"C:\Program Files\Stremio Service")
+    check("bare ImagePath",
+          parse(r"C:\Stremio\stremio-service.exe -s")
+          == r"C:\Stremio")
+    check("non-exe ImagePath rejected", parse(r"C:\x\stremio.dll") == "")
+    check("empty ImagePath rejected", parse("") == "")
+    # the Windows-service registry walk, against a fake winreg so the
+    # test is deterministic (this machine has no Stremio service)
+    svc_key = _FakeRegKey(values={
+        "ImagePath": ('"C:\\Program Files\\Stremio Service'
+                      '\\stremio-service.exe" --run', 2)})
+    other_key = _FakeRegKey(values={"ImagePath": ("C:\\x\\other.exe", 2)})
+    services = _FakeRegKey(sub={"StremioService": svc_key,
+                                "OtherSvc": other_key})
+    fake = types.ModuleType("winreg_fake")
+    fake.HKEY_LOCAL_MACHINE = "HKLM"
+    fake.OpenKey = lambda root, path: (
+        services if root == "HKLM"
+        and str(path).endswith("Services")
+        else (root._sub.get(str(path)) or _FakeRegKey()))
+    # real winreg exposes these module-level, taking the key first
+    fake.QueryInfoKey = lambda key: key.QueryInfoKey()
+    fake.EnumKey = lambda key, i: key.EnumKey(i)
+    fake.QueryValueEx = lambda key, name: key.QueryValueEx(name)
+    real_winreg = sys.modules.get("winreg")
+    sys.modules["winreg"] = fake
+    try:
+        got = sp._service_candidates()
+        check("service walk finds stremio service server.js",
+              got == [r"C:\Program Files\Stremio Service\server.js"], got)
+    finally:
+        if real_winreg is None:
+            sys.modules.pop("winreg", None)
+        else:
+            sys.modules["winreg"] = real_winreg
+
+
+class _FakeRegKey:
+    """Bare winreg key stand-in for the service-walk test."""
+
+    def __init__(self, sub=None, values=None):
+        self._sub = sub or {}
+        self._values = values or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def QueryInfoKey(self):
+        return (len(self._sub), len(self._values), 0)
+
+    def EnumKey(self, i):
+        return list(self._sub)[i]
+
+    def QueryValueEx(self, name):
+        return self._values[name]
 
 
 # ------------------------------------------------ [H] watchfolder
@@ -1367,6 +1470,7 @@ if __name__ == "__main__":
     leg_e()
     leg_f()
     leg_g()
+    leg_g2()
     leg_h()
     print("\n%s (%d failures)" % ("ALL PASS" if not FAILS else "FAILURES",
                                   len(FAILS)))
