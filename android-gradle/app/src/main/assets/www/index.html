@@ -126,6 +126,17 @@
   .footer { color: #55555f; font-size: 12px; text-align: center;
     padding: 24px 0 40px; }
   .empty { padding: 40px 14px; text-align: center; color: var(--dim); }
+
+  .banner {
+    margin: 0 14px 14px; padding: 14px; font-size: 14px; line-height: 1.55;
+    background: #221a10; border: 1px solid #4d3a1c;
+    border-left: 4px solid var(--accent); border-radius: 10px;
+  }
+  .banner .btitle { font-weight: bold; margin-bottom: 6px; }
+  .banner ol { margin: 8px 0 12px; padding-left: 20px; color: var(--dim); }
+  .banner ol li { margin: 4px 0; }
+  .banner .brow { display: flex; gap: 8px; }
+  .banner .brow button { flex: 1; }
 </style>
 </head>
 <body>
@@ -145,6 +156,7 @@
            onkeydown="if(event.key==='Enter')doSearch()">
     <button class="accent" onclick="doSearch()">Search</button>
   </div>
+  <div id="banner-slot"></div>
   <div id="results"><div class="empty">Search a movie or series name.</div></div>
   <div class="footer" id="home-footer">MichaelTV</div>
 </div>
@@ -243,6 +255,63 @@ function esc(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 function oneLine(s) { return String(s == null ? "" : s).replace(/\s+/g, " ").trim(); }
+
+// ------------------------------------------------------------------
+// FIRST-RUN SETUP BANNER
+//
+// With no debrid-keyed addon URL configured (fresh install: the addon
+// list is empty and the core falls back to PLAIN torrentio), every
+// movie/series stream comes back torrent-only and greyed — a phone has
+// no local Stremio server to fetch torrents, so nothing plays in-app.
+// Until the user configures a keyed addon (or an Xtream account), the
+// Home screen carries a banner explaining the one-time fix.
+
+var bannerDismissed = false;
+
+function addonIsKeyed(url) {
+  // Keyed addon URLs embed their configuration in the path, e.g.
+  // .../providers=yts,rarbg/realdebrid=KEY/manifest.json — anything
+  // with "=" after the host qualifies; plain torrentio has none.
+  var s = String(url || "").replace(/^[a-z]+:\/\//i, "");
+  var slash = s.indexOf("/");
+  return slash >= 0 && s.indexOf("=", slash) >= 0;
+}
+
+function bannerNeeded() {
+  if (bannerDismissed) return false;
+  var s = state.settings || {};
+  var addons = s.addons || [];
+  for (var i = 0; i < addons.length; i++) {
+    if (addonIsKeyed(addons[i])) return false;
+  }
+  return !(s.xtream_server && s.xtream_username);
+}
+
+function renderBanner() {
+  var el = document.getElementById("banner-slot");
+  if (!el) return;
+  if (!bannerNeeded()) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    '<div class="banner" id="setup-banner">' +
+    '<div class="btitle">&#9888; Not set up yet \u2014 streams won\u2019t play</div>' +
+    "Searches will show torrent-only sources that <b>cannot play in-app</b> " +
+    "(a phone has no Stremio server to fetch torrents)." +
+    "<ol>" +
+    "<li>Open <b>torrentio.strem.fun</b> in any browser and tap <b>Configure</b></li>" +
+    "<li>Add your Torbox (or other debrid) API key and pick providers</li>" +
+    "<li>Copy the addon URL it shows \u2014 it contains your key</li>" +
+    "<li>Paste it into <b>Stream addon URLs</b> in Settings</li>" +
+    "</ol>" +
+    '<div class="brow">' +
+    '<button class="accent" onclick="enterSettings()">Open Settings</button>' +
+    '<button onclick="dismissBanner()">Dismiss</button>' +
+    "</div></div>";
+}
+
+function dismissBanner() {
+  bannerDismissed = true;      // session only — returns until configured
+  renderBanner();
+}
 
 // ------------------------------------------------------------------
 // HOME / SEARCH
@@ -391,7 +460,22 @@ function renderStreams() {
     showScreen("streams");
     return;
   }
-  var html = topbarHtml(st.title) + '<div class="subbar">' +
+  var html = topbarHtml(st.title);
+  var anyPlayable = false;
+  for (var k = 0; k < st.items.length; k++) {
+    if (st.items[k].playable) { anyPlayable = true; break; }
+  }
+  if (!anyPlayable) {
+    html +=
+      '<div class="banner"><div class="btitle">All ' + st.items.length +
+      " sources are torrent-only</div>" +
+      "They cannot play in-app without a <b>debrid-keyed</b> addon URL " +
+      "(setup steps on the Home screen)." +
+      '<div class="brow" style="margin-top:10px">' +
+      '<button class="accent" onclick="enterSettings()">Open Settings</button>' +
+      "</div></div>";
+  }
+  html += '<div class="subbar">' +
     st.items.length + " source(s), best first</div>";
   for (var i = 0; i < st.items.length; i++) {
     var s = st.items[i];
@@ -538,6 +622,7 @@ function saveSettings() {
   rpc("set_settings", body, function (out) {
     if (out.error) { toast("Save failed: " + out.error); return; }
     state.settings = out.settings || body;
+    renderBanner();            // adding a keyed addon clears the banner
     toast("Saved.");
     rerender();
   });
@@ -647,6 +732,7 @@ function topbarHtml(title) {
 
 push("home", function () {
   document.getElementById("q").value = state.search.q || "";
+  renderBanner();
   renderResults();
   showScreen("home");
 });
@@ -662,8 +748,12 @@ rpc("ping", {}, function (out) {
 // Test hook (cloud emulator): a settings file carrying autoplay_test_url
 // makes the app open the player on that URL at boot, so CI can verify the
 // real <video> pipeline with a public sample video. Never set otherwise.
+// The same fetch also feeds the first-run setup banner (state.settings).
 rpc("get_settings", {}, function (out) {
-  var u = out && out.settings && out.settings.autoplay_test_url;
+  var s = out && out.settings;
+  if (s) state.settings = s;
+  renderBanner();
+  var u = s && s.autoplay_test_url;
   if (u) { openPlayer(u, "Playback test"); }
 });
 </script>

@@ -1,13 +1,20 @@
-# Cloud emulator smoke test for the Android APK.
+# Cloud emulator test for the Android app.
 #
 # Local Windows emulators all need admin-level drivers, but GitHub's
 # ubuntu runners expose /dev/kvm — so the app is tested on a real
-# headless Android emulator here instead: install the release APK,
-# drive the UI (Settings / Live TV / search), screenshot every state,
-# and fail loudly on any Chaquopy/PyException in logcat or on screen.
+# headless Android emulator here. The runner BUILDS an x86_64 debug APK
+# from HEAD first: the release APK is arm64-only and would run
+# ARM-TRANSLATED on this image, and translated chromium could not init
+# its media stack — exactly what the playback leg exercises. Building
+# native x86_64 removes that variable and also makes the test verify
+# HEAD rather than the last release.
 #
-# The google_apis x86_64 image includes ARM translation, which the
-# arm64-only release APK needs to install.
+# Drive: home (first-run setup banner), Settings, Live TV, search,
+# playback (public sample video via autoplay_test_url). Every leg
+# re-focuses the app task and ASSERTS its screen's text — past runs
+# sometimes found the app exited mid-drive and screenshotted the
+# launcher instead. Fail loudly on any Chaquopy/PyException in logcat
+# or on screen.
 
 name: Android emulator test
 
@@ -23,7 +30,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout (for scripts only)
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
@@ -32,11 +39,44 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Install emulator + system image
+      - name: Set up Python 3.11 (Chaquopy buildPython)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Ensure SDK packages for the build
         run: |
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" "emulator" "system-images;android-34;google_apis;x86_64" \
+            "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+            > /dev/null
+
+      - name: Build x86_64 debug APK (native, no ARM translation)
+        run: |
+          cd android-gradle
+          # The release APK is arm64-only (ndk abiFilters in
+          # app/build.gradle); switch the ABI for this test build so the
+          # app AND its WebView media stack run natively on the x86_64
+          # image. The 2.1.1 release-APK runs failed playback right at
+          # media init under ARM translation.
+          sed -i 's/abiFilters "arm64-v8a"/abiFilters "x86_64"/' app/build.gradle
+          grep -n "abiFilters" app/build.gradle
+          echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
+          python3 prepare_core.py
+          curl -fsSL -o /tmp/gradle-8.4-bin.zip \
+            https://services.gradle.org/distributions/gradle-8.4-bin.zip
+          unzip -q /tmp/gradle-8.4-bin.zip -d /tmp/gradle-dist
+          mkdir -p ../artifacts
+          /tmp/gradle-dist/gradle-8.4/bin/gradle --no-daemon --console=plain \
+            -p . :app:assembleDebug -PbuildPython="$(command -v python3)"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            ../artifacts/MichaelTV-x86_64-debug.apk
+          ls -la ../artifacts/
+
+      - name: Install emulator + system image
+        run: |
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "emulator" "system-images;android-34;google_apis;x86_64" \
             > /dev/null
 
       - name: Create AVD
@@ -69,81 +109,100 @@ jobs:
           [ "$BOOT" = "1" ] || { echo 'ERROR: boot did not complete'; tail -60 /tmp/emulator.log; exit 1; }
           echo "emulator booted"
 
-      - name: Download release APK and install
+      - name: Install APK
         run: |
-          mkdir -p artifacts
-          curl -fL -o artifacts/MichaelTV.apk \
-            https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/download/v2.1/MichaelTV-2.1.1.apk
-          "$ANDROID_SDK_ROOT/platform-tools/adb" install -r artifacts/MichaelTV.apk
+          "$ANDROID_SDK_ROOT/platform-tools/adb" install -r artifacts/MichaelTV-x86_64-debug.apk
 
       - name: Drive the app
         run: |
           ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
-          "$ADB" shell am start -n org.michaeltv.app/.MainActivity
-          sleep 15
+          export ADB="$ADB"
           mkdir -p artifacts/shots
 
+          # The app occasionally exits mid-drive (past 04_search shots
+          # showed the launcher) — so EVERY leg re-focuses the app task
+          # first, and asserts its screen's text so a dead app fails the
+          # leg instead of screenshotting the launcher.
+          focus() {
+            "$ADB" shell am start -n org.michaeltv.app/.MainActivity > /dev/null
+            sleep 2
+          }
           dump() {
             "$ADB" exec-out uiautomator dump /dev/tty 2>/dev/null \
               | sed -e 's/UI hierchary.*//' > "artifacts/$1.xml" || true
           }
           shot() { "$ADB" exec-out screencap -p > "artifacts/shots/$1.png"; }
           tap() { python3 scripts/tap_text.py "$1" || true; }
-          export ADB="$ADB"
-
-          shot 01_home; dump 01_home
-          tap "Settings"; sleep 4
-          shot 02_settings; dump 02_settings
-          "$ADB" shell input keyevent 4; sleep 2
-          tap "Live TV"; sleep 10
-          shot 03_livetv; dump 03_livetv
-          "$ADB" shell input keyevent 4; sleep 2
-          "$ADB" shell am start -n org.michaeltv.app/.MainActivity; sleep 3
-          "$ADB" shell input keyevent 4; sleep 2
-          tap "Search"; sleep 1
-          "$ADB" shell input text "bluey"; sleep 1
-          tap "Search"; sleep 12
-          shot 04_search; dump 04_search
-
-
-          # --- playback leg: public sample video, no credentials ---
-
-          "$ADB" root > /dev/null 2>&1; sleep 3
-
-          "$ADB" shell am force-stop org.michaeltv.app
-
-          cat > /tmp/settings.json << 'JSON'
-
-          {
-
-            "addons": ["https://torrentio.strem.fun"],
-
-            "resolution_pref": "1080",
-
-            "size_demote_gb": 0,
-
-            "xtream_server": "",
-
-            "xtream_username": "",
-
-            "xtream_password": "",
-
-            "autoplay_test_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
-
+          assert_on() {
+            if ! grep -q "$2" "artifacts/$1.xml"; then
+              echo "ASSERT FAIL: '$2' not on screen in $1"
+              exit 1
+            fi
           }
 
+          # --- leg 1: home. Fresh install (no keyed addon, no Xtream):
+          # the first-run setup banner MUST explain itself. ---
+          focus; sleep 8
+          shot 01_home; dump 01_home
+          assert_on 01_home "MichaelTV"
+          assert_on 01_home "debrid-keyed"
+
+          # --- leg 2: settings ---
+          focus
+          tap "Settings"; sleep 4
+          shot 02_settings; dump 02_settings
+          assert_on 02_settings "Stream addon URLs"
+
+          # --- leg 3: live TV without Xtream creds → friendly prompt ---
+          "$ADB" shell input keyevent 4; sleep 2
+          focus
+          tap "Live TV"; sleep 10
+          shot 03_livetv; dump 03_livetv
+          assert_on 03_livetv "No Xtream account configured"
+
+          # --- leg 4: search (focus field, type, VERIFY text landed) ---
+          "$ADB" shell input keyevent 4; sleep 2
+          focus
+          for i in 1 2 3; do
+            if [ "$i" -eq 1 ]; then
+              tap "Search movies"          # the query field's placeholder
+            else
+              "$ADB" shell input tap 420 220   # field center, fallback
+            fi
+            sleep 1
+            "$ADB" shell input text "bluey"; sleep 1
+            dump 04_typed
+            grep -q "bluey" artifacts/04_typed.xml && break
+            echo "search leg: text did not land (attempt $i), retrying"
+          done
+          if ! grep -q "bluey" artifacts/04_typed.xml; then
+            echo "ASSERT FAIL: query never landed in the search field"
+            exit 1
+          fi
+          tap "Search"; sleep 12
+          shot 04_search; dump 04_search
+          assert_on 04_search "Bluey"
+
+          # --- playback leg: public sample video, no credentials ---
+          "$ADB" root > /dev/null 2>&1; sleep 3
+          "$ADB" shell am force-stop org.michaeltv.app
+          cat > /tmp/settings.json << 'JSON'
+          {
+            "addons": ["https://torrentio.strem.fun"],
+            "resolution_pref": "1080",
+            "size_demote_gb": 0,
+            "xtream_server": "",
+            "xtream_username": "",
+            "xtream_password": "",
+            "autoplay_test_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+          }
           JSON
-
           "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
-
           "$ADB" shell am start -n org.michaeltv.app/.MainActivity
-
           sleep 18
-
           shot 05_playback_a; dump 05_playback_a
-
+          assert_on 05_playback_a "external player"
           sleep 12
-
           shot 05_playback_b; dump 05_playback_b
 
       - name: Collect logcat and verdict
