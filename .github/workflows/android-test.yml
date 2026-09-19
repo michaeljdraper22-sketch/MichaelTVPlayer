@@ -215,15 +215,17 @@ jobs:
 
           # --- leg 4: search (focus field, type, VERIFY text landed) ---
           "$ADB" shell input keyevent 4; sleep 2
+          # The query field is exposed as an EditText with empty text
+          # (its placeholder is NOT in the a11y tree, so text-based
+          # tapping cannot focus it). Observed bounds on this AVD
+          # (1080x2340 @440dpi): [35,347][811,457] — tap the center.
+          # Note the +136px status-bar offset when deriving coordinates
+          # from CSS layout math.
           typed=0
           for round in 1 2 3 4 5; do
             focus
-            if [ "$round" -eq 1 ]; then
-              python3 scripts/tap_text.py "Search movies" || true  # placeholder
-            else
-              "$ADB" shell input tap 420 220   # query-field center
-            fi
-            sleep 1
+            "$ADB" shell input tap 420 400
+            sleep 2
             "$ADB" shell input text "bluey"
             sleep 2
             # a single dump right after typing often comes back empty
