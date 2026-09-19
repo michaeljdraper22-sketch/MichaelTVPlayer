@@ -120,15 +120,24 @@ jobs:
           mkdir -p artifacts/shots
 
           # Two hard-won facts about WebView + uiautomator dumps:
-          # 1. the app occasionally exits mid-drive (past 04_search shots
-          #    showed the launcher) — every leg re-focuses the app task
-          #    and ASSERTS its screen's text so a dead app fails loudly;
-          # 2. right after a cold start the WebView exposes only a bare
+          # 1. right after a cold start the WebView exposes only a bare
           #    NAF node — the DOM reaches the accessibility tree with a
           #    delay (a previous run's first dump after a restart was
           #    empty while a later one had full text). So never dump
           #    once at a fixed sleep: re-dump until the expected text
-          #    appears (wait_text), and screenshot only after that.
+          #    appears (wait_text), screenshot only after that.
+          # 2. the app process can be killed mid-drive out of nowhere:
+          #    logcat shows ActivityManager killing it because it
+          #    "depends on provider com.google.android.gms/...
+          #    FontsProvider in dying proc com.google.android.gms" —
+          #    when Play Services hiccups on the emulator, every app
+          #    bound to its font provider dies with it. This is the
+          #    historical "04_search shows the launcher" flakiness. So
+          #    every retry iteration RE-FOCUSES the app (am start
+          #    relaunches a dead task, no-ops a live one) and asserts
+          #    only on text that exists solely inside the app's WebView
+          #    ("Live TV" etc — never "MichaelTV", which also matches
+          #    the launcher's icon label).
           focus() {
             "$ADB" shell am start -n org.michaeltv.app/.MainActivity > /dev/null
             sleep 2
@@ -142,6 +151,7 @@ jobs:
             # wait_text <dump-name> <must-appear-text>
             local i
             for i in $(seq 1 15); do
+              focus
               dump "$1"
               grep -q "$2" "artifacts/$1.xml" && return 0
               sleep 3
@@ -150,10 +160,12 @@ jobs:
             exit 1
           }
           tapr() {
-            # tap by visible text, retrying while the DOM is still
-            # missing from the accessibility tree
+            # tap by visible text, refocusing + retrying while the DOM
+            # is still missing from the accessibility tree or the app
+            # was killed
             local i
             for i in 1 2 3 4 5; do
+              focus
               python3 scripts/tap_text.py "$1" && return 0
               sleep 3
             done
@@ -162,10 +174,11 @@ jobs:
           }
 
           # --- leg 1: home. Fresh install (no keyed addon, no Xtream):
-          # the first-run setup banner MUST explain itself. ---
+          # the first-run setup banner MUST explain itself ("torrentio.
+          # strem.fun" appears on the home screen ONLY inside the banner). ---
           focus
-          wait_text 01_home "MichaelTV"
-          wait_text 01_home "debrid-keyed"
+          wait_text 01_home "Live TV"
+          wait_text 01_home "torrentio.strem.fun"
           shot 01_home
 
           # --- leg 2: settings ---
@@ -183,9 +196,9 @@ jobs:
 
           # --- leg 4: search (focus field, type, VERIFY text landed) ---
           "$ADB" shell input keyevent 4; sleep 2
-          focus
           typed=0
           for i in 1 2 3; do
+            focus
             if [ "$i" -eq 1 ]; then
               python3 scripts/tap_text.py "Search movies" || true  # placeholder
             else
@@ -198,7 +211,7 @@ jobs:
             echo "search leg: text did not land (attempt $i), retrying"
           done
           [ "$typed" = "1" ] || { echo "ASSERT FAIL: query never landed in the search field"; exit 1; }
-          python3 scripts/tap_text.py "Search" || true
+          tapr "Search"
           wait_text 04_search "Bluey"
           shot 04_search
 
