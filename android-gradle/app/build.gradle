@@ -22,8 +22,8 @@ android {
         targetSdk 34
         // The two version lines below are rewritten from src/config.py
         // APP_VERSION by android-gradle/prepare_core.py — do not edit here.
-        versionCode 21  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
-        versionName "2.1"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
+        versionCode 211  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
+        versionName "2.1.1"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
 
         ndk {
             // 64-bit phones only — halves the APK and the Chaquopy payload.
