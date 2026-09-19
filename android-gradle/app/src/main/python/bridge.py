@@ -27,6 +27,11 @@ DEFAULT_SETTINGS = {
     "xtream_server": "",
     "xtream_username": "",
     "xtream_password": "",
+    # Test-only knob (never shown in the Settings UI): when set, the app
+    # opens the player on this URL at boot — lets the cloud emulator test
+    # exercise the real <video> pipeline with a public sample video,
+    # no credentials involved.
+    "autoplay_test_url": "",
 }
 
 _RESOLUTIONS = ("match", "auto", "2160", "1440", "1080", "720", "480")
@@ -125,6 +130,8 @@ class Bridge:
                 clean[key] = str(args[key] or "").strip()
         if "xtream_password" in args:
             clean["xtream_password"] = str(args["xtream_password"] or "")
+        if "autoplay_test_url" in args:
+            clean["autoplay_test_url"] = str(args["autoplay_test_url"] or "")
         self._settings = clean
         self._save_settings()
         self._xt = None            # creds may have changed

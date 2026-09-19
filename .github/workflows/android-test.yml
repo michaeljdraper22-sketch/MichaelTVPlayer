@@ -73,7 +73,7 @@ jobs:
         run: |
           mkdir -p artifacts
           curl -fL -o artifacts/MichaelTV.apk \
-            https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/download/v2.1/MichaelTV-2.1.apk
+            https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/download/v2.1/MichaelTV-2.1.1.apk
           "$ANDROID_SDK_ROOT/platform-tools/adb" install -r artifacts/MichaelTV.apk
 
       - name: Drive the app
@@ -105,6 +105,47 @@ jobs:
           tap "Search"; sleep 12
           shot 04_search; dump 04_search
 
+
+          # --- playback leg: public sample video, no credentials ---
+
+          "$ADB" root > /dev/null 2>&1; sleep 3
+
+          "$ADB" shell am force-stop org.michaeltv.app
+
+          cat > /tmp/settings.json << 'JSON'
+
+          {
+
+            "addons": ["https://torrentio.strem.fun"],
+
+            "resolution_pref": "1080",
+
+            "size_demote_gb": 0,
+
+            "xtream_server": "",
+
+            "xtream_username": "",
+
+            "xtream_password": "",
+
+            "autoplay_test_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+
+          }
+
+          JSON
+
+          "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
+
+          "$ADB" shell am start -n org.michaeltv.app/.MainActivity
+
+          sleep 18
+
+          shot 05_playback_a; dump 05_playback_a
+
+          sleep 12
+
+          shot 05_playback_b; dump 05_playback_b
+
       - name: Collect logcat and verdict
         if: always()
         run: |
@@ -117,6 +158,19 @@ jobs:
           grep -l -iE "java com.chaquo|not callable" artifacts/*.xml 2>/dev/null || true
           # Fail if any python exception reached the UI or logcat.
           ! grep -qiE "PyException|not callable" artifacts/logcat.txt artifacts/*.xml 2>/dev/null
+
+      - name: Playback verdict
+        if: always()
+        run: |
+          if [ -f artifacts/shots/05_playback_a.png ] && [ -f artifacts/shots/05_playback_b.png ]; then
+            if cmp -s artifacts/shots/05_playback_a.png artifacts/shots/05_playback_b.png; then
+              echo "FAIL: playback screenshots identical - video did not advance"
+              exit 1
+            fi
+            echo "playback advanced (frames differ)"
+          else
+            echo "WARN: playback screenshots missing"
+          fi
 
       - name: Upload artifacts
         if: always()

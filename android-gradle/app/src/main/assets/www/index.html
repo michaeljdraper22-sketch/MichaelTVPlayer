@@ -658,6 +658,14 @@ rpc("ping", {}, function (out) {
       "MichaelTV " + out.version;
   }
 });
+
+// Test hook (cloud emulator): a settings file carrying autoplay_test_url
+// makes the app open the player on that URL at boot, so CI can verify the
+// real <video> pipeline with a public sample video. Never set otherwise.
+rpc("get_settings", {}, function (out) {
+  var u = out && out.settings && out.settings.autoplay_test_url;
+  if (u) { openPlayer(u, "Playback test"); }
+});
 </script>
 </body>
 </html>
