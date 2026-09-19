@@ -2,8 +2,10 @@
 
 > Paste this file (or point the new session at it) to continue the Android
 > work. Written 2026-09-09 after the first working, release-signed,
-> emulator-verified APK shipped. Everything here is verified unless marked
-> UNVERIFIED. Read the SAFETY RULES before doing anything.
+> emulator-verified APK shipped; updated 2026-09-19 after the 2.1.2 APK
+> (first-run setup banner) shipped and playback verification went green.
+> Everything here is verified unless marked UNVERIFIED. Read the SAFETY
+> RULES before doing anything.
 
 ## What exists (state as of the handoff)
 
@@ -65,20 +67,21 @@ allow "Install unknown apps", open. Same signing key (`michaeltv-release.jks`
 + `keystore.properties`, both git-ignored, generated on first build) means
 updates install over the old copy — **never lose those two files**.
 
-## Current release state (tag v2.1)
+## Current release state (tag v2.1.2, published 2026-09-19)
 
-- `MichaelTV-2.1.zip` + `.sha256` — latest Windows build (the in-app
-  updater matches `.zip` assets only; APKs on the same release are ignored
-  by it — verified in `src/updater.py`).
-- `MichaelTV-2.1.1.apk` — the Android app. Version 2.1.1/versionCode 211:
-  `prepare_core.py` read the working tree's `APP_VERSION` which the
-  PARALLEL SESSION had bumped to 2.1.1 (see warning below). sha256
-  `554417e357a247f4edbe4c695959072a2a716571d3bee36d843ad77795f86484`.
-- Emulator test verified green on the previous 2.1 build (Settings screen
-  renders real Python data; Live TV shows its designed
-  "No Xtream account configured" prompt; zero PyException in logcat).
-  A playback leg (public Big Buck Bunny mp4 via `autoplay_test_url`,
-  two screenshots 12 s apart must DIFFER) was added for 2.1.1.
+- `MichaelTV-2.1.2.zip` + `.zip.sha256` — Windows build (parallel session's
+  debrid auto-advance work; the in-app updater matches `.zip` assets only).
+- `MichaelTV-2.1.2.apk` — the Android app, versionCode 212 (stamps from
+  src/config.py APP_VERSION 2.1.2), release-signed with the same key, so it
+  updates over the 2.1.1 install. sha256
+  `0efc733bf703f7fa4514c077a4ebdccbae67bb7bdd2eab721189109190211ebf`.
+  Carries the first-run setup banner + streams explainer (see priority 1a).
+- The stale `MichaelTV-2.1.apk` asset (versionCode 21) was REMOVED from the
+  release — Android refuses downgrade installs, so it was dead weight.
+- Cloud emulator test GREEN on the exact HEAD that shipped: banner, Settings,
+  Live TV, search ("Bluey" via typed query), and PLAYBACK in both H.264 and
+  VP9 (frames-differ verdict). See priority 2 — the old "playback blocked"
+  conclusion is RETIRED.
 
 ## ⚠️ PARALLEL SESSION WARNING
 
@@ -106,62 +109,46 @@ has needed ZERO src/ changes; keep it that way where possible.
 
 ## TOP PRIORITIES (in order)
 
-1. **The user reports the app "doesn't really work" on their phone.**
-   ROOT CAUSE CONFIRMED (2026-09-09, from the local machine's facts):
-   out of the box the phone app queries PLAIN torrentio — every entry is
-   torrent-only and greyed (no local Stremio server exists on a phone).
-   The desktop player's own settings.json carries only plain torrentio
-   too (verified with a redacted check) and no Xtream creds — the desktop
-   flows that actually play work either through handoff URLs from the
-   desktop Stremio app (which embed the debrid resolve links) or through
-   the LOCAL Stremio server at 127.0.0.1:11470; neither exists on the
-   phone. The keyed addon URL lives in the desktop Stremio profile
-   leveldb (src/stremio_profile.discover_stream_addons, imported via the
-   Stremio dialog's Import button).
-   THE IMMEDIATE USER FIX (no code): configure torrentio with their
-   Torbox API key in any browser (torrentio's setup page), copy the
-   resulting addon URL (it embeds the key), paste it into the phone
-   app's Settings — then every stream comes back as a direct debrid
-   link that plays in-app.
-   Code fixes worth building, in order:
-   a. A friendlier empty state: when no keyed addon is configured, show
-      a first-run banner explaining the above instead of a list of greyed
-      rows.
-   b. FLAGSHIP: config export from the Windows app (QR code / share
-      text with addon URLs sourced from discover_stream_addons +
-      settings) — requires src/ changes, a build.bat run, and the user's
-      go-ahead since it touches the Windows program.
-   c. Playback failures on real-device WebViews (mkv/HLS support varies):
+1. **The phone "doesn't really work" report — mitigation SHIPPED (2.1.2),
+   user fix still needed once.** Root cause (confirmed 2026-09-09): out of
+   the box the phone app queries PLAIN torrentio (src/stremio.py:971
+   fallback) — every entry is torrent-only and greyed; the keyed addon URL
+   lives only in the desktop Stremio profile. DONE in 2.1.2: the Home
+   screen carries a setup banner (shown while no addon URL has "=" in its
+   path — the debrid-key signature — and no Xtream creds) walking through
+   the torrentio+Torbox fix, and an all-torrent-only Streams list explains
+   itself. The user still has to do the one-time paste: configure torrentio
+   with their Torbox key in any browser, copy the addon URL, paste into the
+   phone app's Settings — then every stream is a direct debrid link that
+   plays in-app. Remaining code fixes, in order:
+   a. FLAGSHIP: config export from the Windows app (QR code / share text
+      with addon URLs sourced from discover_stream_addons + settings) —
+      requires src/ changes, a build.bat run, and the user's go-ahead.
+   b. Playback failures on real-device WebViews (mkv/HLS support varies):
       the external-player button covers this; consider detecting error
       events and prompting it automatically.
-   d. Crashes on their specific device — get adb logcat output or the
-      on-screen diagnostic text (it now names the exception).
+   c. Real-device verification (adb logcat from the user's phone) — the
+      emulator path is now fully green, so any remaining failure is
+      device-specific.
    NEVER commit/upload the user's real addon URLs or creds — the URLs
    embed the debrid API key (repo is public).
 
-2. **Playback verification on the emulator is BLOCKED (2026-09-19).**
-   Status: the player screen opens via autoplay_test_url, the <video>
-   element fires its error event ("Unable to play media."), and the
-   frames-must-differ verdict correctly fails the run — the safety net
-   works, playback itself does not start on the emulator. Ruled out:
-   -no-audio (removed, same result) and codec errors (logcat clean).
-   Prime suspect: the app runs ARM-TRANSLATED on the x86_64 image, and
-   Chromium's WebView renderer/media stack runs partly inside the app
-   process, where translation can break media init. Real arm64 phones
-   with hardware codecs likely do NOT share this limitation.
-   Unblock options for the next session, best first:
-   a. CI-only x86_64 build: in the test job, sed app/build.gradle's
-      abiFilters to "x86_64", build :app:assembleDebug with the runner's
-      preinstalled JDK 17 + SDK (download gradle-8.4-bin.zip, run gradle
-      with JAVA_HOME set; Chaquopy buildPython: setup-python 3.11), and
-      test THAT APK — no translation involved.
-   b. User installs BlueStacks locally (their choice) with ADB enabled;
-      drive it via adb connect 127.0.0.1:5555 — still quiet, no OS input
-      automation needed.
-   c. The user's real phone over USB with adb logcat for ground truth.
-   ALSO: the test's search leg is flaky — the app sometimes exits during
-   the drive (04_search screenshots show the launcher). Re-focus with
-   am start before EACH leg and consider dump-asserting the screen name.
+2. **Playback verification: RESOLVED (2026-09-19).** The 2.1.1-era
+   "playback blocked on the emulator / ARM-translation suspect" was WRONG:
+   the Big Buck Bunny sample URL
+   (commondatastorage gtv-videos-bucket) now returns 403 Forbidden — the
+   video element failed to LOAD (broken-media badge, controls at 0:00,
+   zero codec errors in logcat). The test now:
+   - builds an x86_64 DEBUG APK from HEAD on the runner (sed abiFilters,
+     setup-python 3.11 buildPython, gradle 8.4 dist, prepare_core,
+     assembleDebug) — tests HEAD natively instead of the release APK;
+   - plays two verified-live public samples via autoplay_test_url
+     (H.264: mdn.github.io/shared-assets/videos/flower.mp4; VP9:
+     upload.wikimedia.org ... Schlossbergbahn.webm.480p.vp9.webm) and
+     passes if either advances — both advanced on the green run, so the
+     emulator WebView has full codec support and the app's whole
+     autoplay→<video>→render pipeline is proven.
+   NEVER reuse a sample URL without a fresh HEAD check (they rot).
 3. **Never put the user's addon URLs / Xtream creds in the public repo or
    CI** — the addon URLs embed their debrid API keys. Test with public
    URLs only; inject real creds only via a local emulator/adb push.
@@ -189,16 +176,45 @@ has needed ZERO src/ changes; keep it that way where possible.
   for BOTH avdmanager and emulator (the runner's avdmanager writes
   elsewhere by default and the emulator dies with "Unknown AVD name");
   bound `adb wait-for-device` with `timeout 300` (it hangs forever);
-  google_apis x86_64 images run arm64-only APKs via ARM translation and
-  allow `adb root` (needed to push a settings.json into the app's private
-  files dir after `am force-stop`).
+  google_apis x86_64 images allow `adb root` (needed to push a
+  settings.json into the app's private files dir after `am force-stop`).
+  The whole build+boot+drive pipeline runs in ~6 min — fast iteration.
+- **GMS kills bound apps (root cause of the historical drive flakiness):**
+  when com.google.android.gms.persistent dies on the emulator,
+  ActivityManager kills every app bound to its FontsProvider — including
+  this WebView app ("depends on provider ... in dying proc"). Survive it
+  by refocusing with `am start` on EVERY retry iteration (relaunches a
+  dead task, no-ops a live one) and by re-establishing UI state (the
+  search leg retries type→tap→poll as a unit; a kill mid-RPC loses the
+  JS state along with the in-flight search).
+- **uiautomator vs WebView, four traps:** (1) right after a cold start the
+  WebView exposes only a bare `NAF` node — the DOM reaches the a11y tree
+  seconds later, so dump-with-retry, never dump once at a fixed sleep;
+  (2) piping `exec-out uiautomator dump /dev/tty` silently swallows
+  "could not get idle state" failures — dump via /sdcard + adb pull
+  (rm the stale file first!) so failures are visible and retryable;
+  (3) the query field's placeholder is NOT exposed as text (EditText
+  shows text="" when empty) so placeholder-based tapping can never focus
+  it — tap coordinates from the field's observed a11y bounds
+  ([35,347][811,457] on the pixel_5 AVD; remember the +136px status-bar
+  offset when converting CSS layout math to device px; density is 440
+  → 2.75, not the pixel_5 spec's 2.625); (4) assert on strings that
+  exist ONLY inside the app's WebView — "MichaelTV" also matches the
+  launcher icon label.
+- **Sample media URLs rot:** the gtv-videos-bucket Big Buck Bunny mp4
+  started returning 403 and cost multiple debugging rounds that wrongly
+  blamed ARM translation and codecs. HEAD-check every sample URL before
+  a run (and prefer mdn.github.io / upload.wikimedia.org, which are
+  stable CDNs).
 - **Windows updater safety:** it picks the first `.zip` asset containing
   "michaeltv" and the first `.sha256` asset — an `.apk` asset is safe,
   but never upload an `.apk.sha256` (it could be picked as the zip's
   checksum).
 - **Version flow:** `prepare_core.py` derives versionName/versionCode from
-  `src/config.py` APP_VERSION ("2.1.1" → 211). versionCode must only ever
-  increase.
+  `src/config.py` APP_VERSION ("2.1.2" → 212). versionCode must only ever
+  increase; a release page must never carry an APK with a versionCode
+  lower than one already shipped (Android refuses downgrade installs —
+  the stale MichaelTV-2.1.apk asset was removed for this reason).
 
 ## Files that matter
 
