@@ -42,3 +42,11 @@ build_pyinstaller/
 /android-gradle/.idea/
 *.jks
 /android-gradle/keystore.properties
+
+# Session-run outputs (probes/tests write these at repo root — never
+# commit results, only the scripts; past runs littered ~100 files)
+/*.out
+/p5_out_*.txt
+/*.log
+/probe_*.png
+/build_uninst/
