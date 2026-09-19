@@ -3,18 +3,19 @@
 # Local Windows emulators all need admin-level drivers, but GitHub's
 # ubuntu runners expose /dev/kvm — so the app is tested on a real
 # headless Android emulator here. The runner BUILDS an x86_64 debug APK
-# from HEAD first: the release APK is arm64-only and would run
-# ARM-TRANSLATED on this image, and translated chromium could not init
-# its media stack — exactly what the playback leg exercises. Building
-# native x86_64 removes that variable and also makes the test verify
-# HEAD rather than the last release.
+# from HEAD first (tests HEAD natively; the release APK is arm64-only).
+#
+# Historical note: the 2.1.1-era "playback blocked on the emulator"
+# was NOT ARM translation and not codecs — the Big Buck Bunny sample
+# URL (commondatastorage gtv-videos-bucket) now returns 403 Forbidden.
+# Playback legs now use verified-live public URLs in two codecs
+# (H.264 mp4 + VP9 webm); either advancing proves the pipeline.
 #
 # Drive: home (first-run setup banner), Settings, Live TV, search,
-# playback (public sample video via autoplay_test_url). Every leg
-# re-focuses the app task and ASSERTS its screen's text — past runs
-# sometimes found the app exited mid-drive and screenshotted the
-# launcher instead. Fail loudly on any Chaquopy/PyException in logcat
-# or on screen.
+# playback via autoplay_test_url. Every leg re-focuses the app task
+# (Play Services hiccups on the emulator kill bound apps) and waits
+# until its screen's text appears in the accessibility dump. Fail
+# loudly on any Chaquopy/PyException in logcat or on screen.
 
 name: Android emulator test
 
@@ -245,10 +246,21 @@ jobs:
           wait_text 04_search "Bluey"
           shot 04_search
 
-          # --- playback leg: public sample video, no credentials ---
+          # --- playback legs: public sample videos, no credentials.
+          # Two codecs: H.264 mp4 (what debrid/Torrentio actually
+          # serves) and VP9 webm (open codec every chromium supports).
+          # Either advancing proves the pipeline (autoplay_test_url →
+          # <video> → frames on screen); if only webm advances, the
+          # image's WebView lacks proprietary codecs — real phones'
+          # updatable WebViews have both. ---
           "$ADB" root > /dev/null 2>&1; sleep 3
-          "$ADB" shell am force-stop org.michaeltv.app
-          cat > /tmp/settings.json << 'JSON'
+          playback_probe() {
+            # playback_probe <label> <url>: relaunch the app on the URL
+            # via autoplay_test_url, wait for the player screen, grab
+            # two frames 12 s apart
+            local label="$1" url="$2"
+            "$ADB" shell am force-stop org.michaeltv.app
+            cat > /tmp/settings.json << JSON
           {
             "addons": ["https://torrentio.strem.fun"],
             "resolution_pref": "1080",
@@ -256,17 +268,18 @@ jobs:
             "xtream_server": "",
             "xtream_username": "",
             "xtream_password": "",
-            "autoplay_test_url": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4"
+            "autoplay_test_url": "$url"
           }
           JSON
-          "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
-          "$ADB" shell am start -n org.michaeltv.app/.MainActivity
-          # player screen must be up (its top-bar text) BEFORE the first
-          # playback frame is captured
-          wait_text 05_playback_a "external player"
-          shot 05_playback_a
-          sleep 12
-          shot 05_playback_b
+            "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
+            "$ADB" shell am start -n org.michaeltv.app/.MainActivity
+            wait_text "05_$label" "external player"
+            shot "05_${label}_a"
+            sleep 12
+            shot "05_${label}_b"
+          }
+          playback_probe h264 "https://mdn.github.io/shared-assets/videos/flower.mp4"
+          playback_probe vp9 "https://upload.wikimedia.org/wikipedia/commons/transcoded/8/87/Schlossbergbahn.webm/Schlossbergbahn.webm.480p.vp9.webm"
 
       - name: Collect logcat and verdict
         if: always()
@@ -284,15 +297,26 @@ jobs:
       - name: Playback verdict
         if: always()
         run: |
-          if [ -f artifacts/shots/05_playback_a.png ] && [ -f artifacts/shots/05_playback_b.png ]; then
-            if cmp -s artifacts/shots/05_playback_a.png artifacts/shots/05_playback_b.png; then
-              echo "FAIL: playback screenshots identical - video did not advance"
-              exit 1
+          advanced=""
+          for codec in h264 vp9; do
+            a="artifacts/shots/05_${codec}_a.png"
+            b="artifacts/shots/05_${codec}_b.png"
+            if [ -f "$a" ] && [ -f "$b" ]; then
+              if cmp -s "$a" "$b"; then
+                echo "playback $codec: frames identical - no advance"
+              else
+                echo "playback $codec: ADVANCED (frames differ)"
+                advanced="$codec"
+              fi
+            else
+              echo "playback $codec: screenshots missing"
             fi
-            echo "playback advanced (frames differ)"
-          else
-            echo "WARN: playback screenshots missing"
+          done
+          if [ -z "$advanced" ]; then
+            echo "FAIL: no sample video advanced in either codec"
+            exit 1
           fi
+          echo "playback verified via $advanced"
 
       - name: Upload artifacts
         if: always()
