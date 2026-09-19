@@ -119,10 +119,16 @@ jobs:
           export ADB="$ADB"
           mkdir -p artifacts/shots
 
-          # The app occasionally exits mid-drive (past 04_search shots
-          # showed the launcher) — so EVERY leg re-focuses the app task
-          # first, and asserts its screen's text so a dead app fails the
-          # leg instead of screenshotting the launcher.
+          # Two hard-won facts about WebView + uiautomator dumps:
+          # 1. the app occasionally exits mid-drive (past 04_search shots
+          #    showed the launcher) — every leg re-focuses the app task
+          #    and ASSERTS its screen's text so a dead app fails loudly;
+          # 2. right after a cold start the WebView exposes only a bare
+          #    NAF node — the DOM reaches the accessibility tree with a
+          #    delay (a previous run's first dump after a restart was
+          #    empty while a later one had full text). So never dump
+          #    once at a fixed sleep: re-dump until the expected text
+          #    appears (wait_text), and screenshot only after that.
           focus() {
             "$ADB" shell am start -n org.michaeltv.app/.MainActivity > /dev/null
             sleep 2
@@ -132,56 +138,69 @@ jobs:
               | sed -e 's/UI hierchary.*//' > "artifacts/$1.xml" || true
           }
           shot() { "$ADB" exec-out screencap -p > "artifacts/shots/$1.png"; }
-          tap() { python3 scripts/tap_text.py "$1" || true; }
-          assert_on() {
-            if ! grep -q "$2" "artifacts/$1.xml"; then
-              echo "ASSERT FAIL: '$2' not on screen in $1"
-              exit 1
-            fi
+          wait_text() {
+            # wait_text <dump-name> <must-appear-text>
+            local i
+            for i in $(seq 1 15); do
+              dump "$1"
+              grep -q "$2" "artifacts/$1.xml" && return 0
+              sleep 3
+            done
+            echo "ASSERT FAIL: '$2' not on screen in $1"
+            exit 1
+          }
+          tapr() {
+            # tap by visible text, retrying while the DOM is still
+            # missing from the accessibility tree
+            local i
+            for i in 1 2 3 4 5; do
+              python3 scripts/tap_text.py "$1" && return 0
+              sleep 3
+            done
+            echo "TAP FAIL: '$1' never found on screen"
+            return 1
           }
 
           # --- leg 1: home. Fresh install (no keyed addon, no Xtream):
           # the first-run setup banner MUST explain itself. ---
-          focus; sleep 8
-          shot 01_home; dump 01_home
-          assert_on 01_home "MichaelTV"
-          assert_on 01_home "debrid-keyed"
+          focus
+          wait_text 01_home "MichaelTV"
+          wait_text 01_home "debrid-keyed"
+          shot 01_home
 
           # --- leg 2: settings ---
           focus
-          tap "Settings"; sleep 4
-          shot 02_settings; dump 02_settings
-          assert_on 02_settings "Stream addon URLs"
+          tapr "Settings"
+          wait_text 02_settings "Stream addon URLs"
+          shot 02_settings
 
           # --- leg 3: live TV without Xtream creds → friendly prompt ---
           "$ADB" shell input keyevent 4; sleep 2
           focus
-          tap "Live TV"; sleep 10
-          shot 03_livetv; dump 03_livetv
-          assert_on 03_livetv "No Xtream account configured"
+          tapr "Live TV"
+          wait_text 03_livetv "No Xtream account configured"
+          shot 03_livetv
 
           # --- leg 4: search (focus field, type, VERIFY text landed) ---
           "$ADB" shell input keyevent 4; sleep 2
           focus
+          typed=0
           for i in 1 2 3; do
             if [ "$i" -eq 1 ]; then
-              tap "Search movies"          # the query field's placeholder
+              python3 scripts/tap_text.py "Search movies" || true  # placeholder
             else
-              "$ADB" shell input tap 420 220   # field center, fallback
+              "$ADB" shell input tap 420 220   # query-field center
             fi
             sleep 1
-            "$ADB" shell input text "bluey"; sleep 1
+            "$ADB" shell input text "bluey"; sleep 2
             dump 04_typed
-            grep -q "bluey" artifacts/04_typed.xml && break
+            if grep -q "bluey" artifacts/04_typed.xml; then typed=1; break; fi
             echo "search leg: text did not land (attempt $i), retrying"
           done
-          if ! grep -q "bluey" artifacts/04_typed.xml; then
-            echo "ASSERT FAIL: query never landed in the search field"
-            exit 1
-          fi
-          tap "Search"; sleep 12
-          shot 04_search; dump 04_search
-          assert_on 04_search "Bluey"
+          [ "$typed" = "1" ] || { echo "ASSERT FAIL: query never landed in the search field"; exit 1; }
+          python3 scripts/tap_text.py "Search" || true
+          wait_text 04_search "Bluey"
+          shot 04_search
 
           # --- playback leg: public sample video, no credentials ---
           "$ADB" root > /dev/null 2>&1; sleep 3
@@ -199,11 +218,12 @@ jobs:
           JSON
           "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
           "$ADB" shell am start -n org.michaeltv.app/.MainActivity
-          sleep 18
-          shot 05_playback_a; dump 05_playback_a
-          assert_on 05_playback_a "external player"
+          # player screen must be up (its top-bar text) BEFORE the first
+          # playback frame is captured
+          wait_text 05_playback_a "external player"
+          shot 05_playback_a
           sleep 12
-          shot 05_playback_b; dump 05_playback_b
+          shot 05_playback_b
 
       - name: Collect logcat and verdict
         if: always()
