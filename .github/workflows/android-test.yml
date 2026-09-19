@@ -222,28 +222,45 @@ jobs:
           # (1080x2340 @440dpi): [35,347][811,457] — tap the center.
           # Note the +136px status-bar offset when deriving coordinates
           # from CSS layout math.
-          typed=0
-          for round in 1 2 3 4 5; do
-            focus
-            "$ADB" shell input tap 420 400
-            sleep 2
-            "$ADB" shell input text "bluey"
-            sleep 2
-            # a single dump right after typing often comes back empty
-            # (uiautomator idle-timeout while the IME settles) — the
-            # text may still have landed, so re-dump patiently before
-            # concluding it didn't and retyping
-            for d in 1 2 3 4; do
-              dump 04_typed
-              grep -q "bluey" artifacts/04_typed.xml && { typed=1; break; }
+          #
+          # The whole type→search→results sequence is retried as a unit:
+          # the GMS provider-kill can strike mid-search, focus()
+          # relaunches a fresh instance (query and in-flight search both
+          # lost), and re-waiting on the dead search would never pass.
+          search_ok=0
+          for attempt in 1 2 3; do
+            typed=0
+            for round in 1 2 3; do
+              focus
+              "$ADB" shell input tap 420 400
               sleep 2
+              "$ADB" shell input text "bluey"
+              sleep 2
+              # a single dump right after typing often comes back empty
+              # (uiautomator idle-timeout while the IME settles) — the
+              # text may still have landed, so re-dump patiently first
+              for d in 1 2 3; do
+                dump 04_typed
+                grep -q "bluey" artifacts/04_typed.xml && { typed=1; break; }
+                sleep 2
+              done
+              [ "$typed" = "1" ] && break
+              echo "search leg: 'bluey' not visible yet (attempt $attempt round $round)"
             done
-            [ "$typed" = "1" ] && break
-            echo "search leg: 'bluey' not visible yet (round $round)"
+            [ "$typed" = "1" ] || continue
+            tapr "Search" || continue
+            # results take seconds (Cinemeta + addon catalogs over the
+            # runner's network) — poll with refocus in case of a kill
+            for d in $(seq 1 10); do
+              focus
+              dump 04_search
+              grep -q "Bluey" artifacts/04_search.xml && { search_ok=1; break; }
+              sleep 3
+            done
+            [ "$search_ok" = "1" ] && break
+            echo "search leg: results not seen (attempt $attempt), retrying from typing"
           done
-          [ "$typed" = "1" ] || { echo "ASSERT FAIL: query never landed in the search field"; exit 1; }
-          tapr "Search"
-          wait_text 04_search "Bluey"
+          [ "$search_ok" = "1" ] || { echo "ASSERT FAIL: search results never appeared"; exit 1; }
           shot 04_search
 
           # --- playback legs: public sample videos, no credentials.
@@ -275,7 +292,17 @@ jobs:
             "$ADB" shell am start -n org.michaeltv.app/.MainActivity
             wait_text "05_$label" "external player"
             shot "05_${label}_a"
-            sleep 12
+            # frame b only once the player is confirmed STILL up ~12 s
+            # later — a GMS kill mid-playback would otherwise compare a
+            # player frame against the relaunched home screen and
+            # falsely "advance"
+            for d in 1 2 3; do
+              sleep 12
+              dump "05_${label}_check"
+              grep -q "external player" "artifacts/05_${label}_check.xml" && break
+              echo "playback $label: player gone mid-flight, relaunching (autoplay reopens it)"
+              focus
+            done
             shot "05_${label}_b"
           }
           playback_probe h264 "https://mdn.github.io/shared-assets/videos/flower.mp4"
