@@ -1,6 +1,6 @@
 # MichaelTV
 
-**Current release: v2.1** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1.2** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
 An **Android APK** of the same app is published alongside it — see
@@ -197,6 +197,30 @@ through a single VLC connection.
   list and the full "All" view.
 - **Adjustable network cache** — Settings ▸ Network cache size (0–50,000 ms)
 - **Enter** plays the selected item; **mouse wheel** over the video = volume
+
+## Stremio handoff (Windows)
+Play a stream from Stremio (desktop or web) inside MichaelTV, then let
+MichaelTV take over autoplay — no Stremio needed after the first click.
+
+- **In Stremio's player**: the external-player menu entry is relabeled
+  **"Play in MichaelTV"** (MichaelTV patches its own local streaming
+  server's player list on startup — VLC itself is never touched; a
+  one-click restore lives in Settings ▸ Stremio handoff). Takes effect
+  after Stremio restarts once.
+- **From the stream list**: with Stremio's player set to *M3U Playlist*,
+  MichaelTV (while running) watches the Downloads folder and plays the
+  downloaded `playlist.m3u` the moment it lands.
+- **Next-episode autoplay, ⏮/⏭ episode buttons and the NEXT-STREAM
+  button** then run entirely through MichaelTV — Cinemeta for episode
+  lists, your stream addons for sources, the same ranked order as the
+  app (English preference, resolution, size, provider order).
+- **Debrid-only switching (v2.1.2):** while playing a debrid/direct
+  link, every automatic switch stays on direct links. A dead link
+  advances to the next-ranked debrid stream — the built-in torrent
+  engine is **never** engaged (the machine never joins a swarm from a
+  debrid context). A torrent stream you picked by hand in Stremio still
+  plays as before. Setup, live status and diagnostics for all of this:
+  Settings ▸ Stremio handoff.
 
 ## Requirements
 - **Windows 10/11**

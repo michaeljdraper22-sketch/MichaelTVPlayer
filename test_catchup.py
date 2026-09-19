@@ -70,11 +70,13 @@ class StubEpgClient:
         self.username = "stubuser"
         self.password = "stubpass"
 
-    def live_categories(self):
+    def live_categories(self, refresh=False):
         return [{"category_id": 1, "category_name": "News"},
                 {"category_id": 2, "category_name": "Sports"}]
 
-    def live_streams(self, cat_id):
+    def live_streams(self, cat_id, refresh=False):
+        # refresh kwarg: the v2.1 provider-reliability API (browsers
+        # pass it on every fetch; the stub ignores cache semantics)
         return [
             {"name": "Archive Chan", "stream_id": 501, "tv_archive": 1,
              "tv_archive_duration": "3", "stream_icon": "i1",

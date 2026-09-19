@@ -50,3 +50,5 @@ build_pyinstaller/
 /*.log
 /probe_*.png
 /build_uninst/
+/.tmp-artifacts/
+/.tmp-prev/
