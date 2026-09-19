@@ -54,7 +54,7 @@ jobs:
           test -e /dev/kvm || { echo 'ERROR: /dev/kvm missing on runner'; exit 1; }
           sudo chown -R $USER:$USER /dev/kvm || true
           nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd michaeltv \
-            -no-window -no-audio -gpu swiftshader_indirect -no-boot-anim \
+            -no-window -gpu swiftshader_indirect -no-boot-anim \
             -no-snapshot -memory 3072 > /tmp/emulator.log 2>&1 &
           # wait-for-device has NO timeout of its own and hangs forever if
           # the emulator process died — bound it, and keep the log either way.
