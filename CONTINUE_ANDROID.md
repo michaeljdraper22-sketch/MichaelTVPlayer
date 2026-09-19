@@ -139,9 +139,29 @@ has needed ZERO src/ changes; keep it that way where possible.
    NEVER commit/upload the user's real addon URLs or creds — the URLs
    embed the debrid API key (repo is public).
 
-2. **Verify playback on the emulator and LOOK at the screenshots** —
-   the playback leg exists; run it, download artifacts, Read the PNGs
-   with the image viewer (the UI XML dumps carry the on-screen text).
+2. **Playback verification on the emulator is BLOCKED (2026-09-19).**
+   Status: the player screen opens via autoplay_test_url, the <video>
+   element fires its error event ("Unable to play media."), and the
+   frames-must-differ verdict correctly fails the run — the safety net
+   works, playback itself does not start on the emulator. Ruled out:
+   -no-audio (removed, same result) and codec errors (logcat clean).
+   Prime suspect: the app runs ARM-TRANSLATED on the x86_64 image, and
+   Chromium's WebView renderer/media stack runs partly inside the app
+   process, where translation can break media init. Real arm64 phones
+   with hardware codecs likely do NOT share this limitation.
+   Unblock options for the next session, best first:
+   a. CI-only x86_64 build: in the test job, sed app/build.gradle's
+      abiFilters to "x86_64", build :app:assembleDebug with the runner's
+      preinstalled JDK 17 + SDK (download gradle-8.4-bin.zip, run gradle
+      with JAVA_HOME set; Chaquopy buildPython: setup-python 3.11), and
+      test THAT APK — no translation involved.
+   b. User installs BlueStacks locally (their choice) with ADB enabled;
+      drive it via adb connect 127.0.0.1:5555 — still quiet, no OS input
+      automation needed.
+   c. The user's real phone over USB with adb logcat for ground truth.
+   ALSO: the test's search leg is flaky — the app sometimes exits during
+   the drive (04_search screenshots show the launcher). Re-focus with
+   am start before EACH leg and consider dump-asserting the screen name.
 3. **Never put the user's addon URLs / Xtream creds in the public repo or
    CI** — the addon URLs embed their debrid API keys. Test with public
    URLs only; inject real creds only via a local emulator/adb push.
