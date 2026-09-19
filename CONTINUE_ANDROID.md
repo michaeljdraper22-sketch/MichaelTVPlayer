@@ -107,22 +107,38 @@ has needed ZERO src/ changes; keep it that way where possible.
 ## TOP PRIORITIES (in order)
 
 1. **The user reports the app "doesn't really work" on their phone.**
-   Get the EXACT symptom first (which screen, what happens). Most likely
-   causes, in order of probability:
-   a. **No playable streams out of the box**: default addons list is plain
-      torrentio (torrent-only entries are greyed — they need the local
-      Stremio server that doesn't exist on a phone). The Windows app
-      auto-discovers the user's debrid-keyed addon URLs from their desktop
-      Stremio profile; the phone app cannot. The user must paste a
-      debrid-keyed addon URL (torrentio configured with their Torbox key)
-      into Settings. **Flagship fix: a config export path from the Windows
-      app (QR code / share link / file) — requires src/ changes, build.bat
-      run, and the user's go-ahead since it touches the Windows program.**
-   b. Playback failures on real-device WebViews (mkv/HLS support varies):
+   ROOT CAUSE CONFIRMED (2026-09-09, from the local machine's facts):
+   out of the box the phone app queries PLAIN torrentio — every entry is
+   torrent-only and greyed (no local Stremio server exists on a phone).
+   The desktop player's own settings.json carries only plain torrentio
+   too (verified with a redacted check) and no Xtream creds — the desktop
+   flows that actually play work either through handoff URLs from the
+   desktop Stremio app (which embed the debrid resolve links) or through
+   the LOCAL Stremio server at 127.0.0.1:11470; neither exists on the
+   phone. The keyed addon URL lives in the desktop Stremio profile
+   leveldb (src/stremio_profile.discover_stream_addons, imported via the
+   Stremio dialog's Import button).
+   THE IMMEDIATE USER FIX (no code): configure torrentio with their
+   Torbox API key in any browser (torrentio's setup page), copy the
+   resulting addon URL (it embeds the key), paste it into the phone
+   app's Settings — then every stream comes back as a direct debrid
+   link that plays in-app.
+   Code fixes worth building, in order:
+   a. A friendlier empty state: when no keyed addon is configured, show
+      a first-run banner explaining the above instead of a list of greyed
+      rows.
+   b. FLAGSHIP: config export from the Windows app (QR code / share
+      text with addon URLs sourced from discover_stream_addons +
+      settings) — requires src/ changes, a build.bat run, and the user's
+      go-ahead since it touches the Windows program.
+   c. Playback failures on real-device WebViews (mkv/HLS support varies):
       the external-player button covers this; consider detecting error
       events and prompting it automatically.
-   c. Crashes on their specific device — get `adb logcat` output or the
+   d. Crashes on their specific device — get adb logcat output or the
       on-screen diagnostic text (it now names the exception).
+   NEVER commit/upload the user's real addon URLs or creds — the URLs
+   embed the debrid API key (repo is public).
+
 2. **Verify playback on the emulator and LOOK at the screenshots** —
    the playback leg exists; run it, download artifacts, Read the PNGs
    with the image viewer (the UI XML dumps carry the on-screen text).
