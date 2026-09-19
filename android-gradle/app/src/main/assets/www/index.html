@@ -331,7 +331,11 @@ function doSearch() {
 
 function renderResults() {
   var el = document.getElementById("results");
-  var rs = state.search.results || [];
+  var rs = state.search.results;
+  if (rs == null) {          // boot: no search made yet
+    el.innerHTML = '<div class="empty">Search a movie or series name.</div>';
+    return;
+  }
   if (!rs.length) {
     el.innerHTML = '<div class="empty">Nothing found for &ldquo;' +
       esc(state.search.q) + '&rdquo;.</div>';

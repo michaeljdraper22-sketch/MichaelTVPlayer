@@ -21,6 +21,11 @@ def main():
     want = sys.argv[1].lower()
     adb = os.environ.get("ADB", "adb")
 
+    # drop any stale dump first: on uiautomator's "could not get idle
+    # state" failures nothing new is written, and pulling the old file
+    # would tap based on a long-gone screen
+    subprocess.run([adb, "shell", "rm", "-f", "/sdcard/ui.xml"],
+                   capture_output=True)
     subprocess.run([adb, "shell", "uiautomator", "dump", "/sdcard/ui.xml"],
                    capture_output=True, text=True)
     subprocess.run([adb, "pull", "/sdcard/ui.xml", "/tmp/ui.xml"],

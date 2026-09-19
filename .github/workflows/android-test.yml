@@ -118,6 +118,8 @@ jobs:
           ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
           export ADB="$ADB"
           mkdir -p artifacts/shots
+          { "$ADB" shell wm size; "$ADB" shell wm density; } \
+            > artifacts/screen.txt 2>&1 || true
 
           # Two hard-won facts about WebView + uiautomator dumps:
           # 1. right after a cold start the WebView exposes only a bare
@@ -143,8 +145,25 @@ jobs:
             sleep 2
           }
           dump() {
-            "$ADB" exec-out uiautomator dump /dev/tty 2>/dev/null \
-              | sed -e 's/UI hierchary.*//' > "artifacts/$1.xml" || true
+            # file-based dump: piping `exec-out uiautomator dump
+            # /dev/tty` silently swallows uiautomator's "could not get
+            # idle state" failures (which leave a bare one-node tree —
+            # the empty dumps that looked like a missing DOM). Going
+            # via /sdcard + pull lets us drop the stale file first and
+            # log the failure, so wait_text can retry meaningfully.
+            "$ADB" shell rm -f /sdcard/uidump.xml > /dev/null 2>&1 || true
+            "$ADB" shell uiautomator dump /sdcard/uidump.xml \
+              > /tmp/uidump.log 2>&1 || true
+            "$ADB" pull /sdcard/uidump.xml /tmp/uidump.xml \
+              > /dev/null 2>&1 || true
+            if [ -s /tmp/uidump.xml ]; then
+              tr -d "\r" < /tmp/uidump.xml \
+                | sed -e "s/UI hierchary.*//" > "artifacts/$1.xml"
+            else
+              : > "artifacts/$1.xml"
+              echo "dump: uiautomator failed for $1:" \
+                "$(tail -1 /tmp/uidump.log 2>/dev/null)"
+            fi
           }
           shot() { "$ADB" exec-out screencap -p > "artifacts/shots/$1.png"; }
           wait_text() {
@@ -197,18 +216,27 @@ jobs:
           # --- leg 4: search (focus field, type, VERIFY text landed) ---
           "$ADB" shell input keyevent 4; sleep 2
           typed=0
-          for i in 1 2 3; do
+          for round in 1 2 3 4 5; do
             focus
-            if [ "$i" -eq 1 ]; then
+            if [ "$round" -eq 1 ]; then
               python3 scripts/tap_text.py "Search movies" || true  # placeholder
             else
               "$ADB" shell input tap 420 220   # query-field center
             fi
             sleep 1
-            "$ADB" shell input text "bluey"; sleep 2
-            dump 04_typed
-            if grep -q "bluey" artifacts/04_typed.xml; then typed=1; break; fi
-            echo "search leg: text did not land (attempt $i), retrying"
+            "$ADB" shell input text "bluey"
+            sleep 2
+            # a single dump right after typing often comes back empty
+            # (uiautomator idle-timeout while the IME settles) — the
+            # text may still have landed, so re-dump patiently before
+            # concluding it didn't and retyping
+            for d in 1 2 3 4; do
+              dump 04_typed
+              grep -q "bluey" artifacts/04_typed.xml && { typed=1; break; }
+              sleep 2
+            done
+            [ "$typed" = "1" ] && break
+            echo "search leg: 'bluey' not visible yet (round $round)"
           done
           [ "$typed" = "1" ] || { echo "ASSERT FAIL: query never landed in the search field"; exit 1; }
           tapr "Search"
