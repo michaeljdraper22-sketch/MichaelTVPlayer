@@ -187,13 +187,29 @@ def parse_server_url(url: str):
     return m.group("hash").lower(), int(m.group("idx") or 0)
 
 
+def _wants_debrid_only(cur: dict) -> bool:
+    """True when the current playable is a DIRECT link (debrid / addon
+    HTTP — anything that is not a local-server torrent URL): every
+    automatic switch out of such a context must stay on direct links.
+    The local-server torrent engine is NEVER the automatic answer from
+    a debrid context (the user runs debrid services precisely so it
+    never runs — a torrent-only candidate would connect this machine
+    straight into the swarm). A server-URL playable keeps engine
+    rights: that torrent was picked by the user's own click in
+    Stremio, and non-debrid setups have nothing else."""
+    url = str(cur.get("url") or "")
+    if not url:
+        return False
+    return parse_server_url(url) is None
+
+
 def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
     """Cheap liveness check for a handed-off debrid link: a 1-byte range
     GET that must produce ANY 2xx within ``timeout_s`` (redirects
     followed, body never read — headers only). True = the link serves;
     False = the 502 / hang / refused shapes that leave VLC dead on
-    arrival. The caller treats False as "switch to the local-server
-    torrent now" instead of waiting out the 10 s guard (live-measured
+    arrival. The caller treats False as "advance to the next-ranked
+    stream now" instead of waiting out the 10 s guard (live-measured
     2026-09-02/03: every debrid handoff on record was one of these
     shapes, paying the full 10 s or worse)."""
     try:
@@ -1375,8 +1391,9 @@ def _playable_base(url: str) -> dict:
         }
     resolved = parse_resolve_url(url)
     if resolved:
-        # debrid resolve link: carries the torrent identity for the
-        # local-server fallback when the debrid link stalls
+        # debrid resolve link: carries the torrent identity for
+        # skip-matching and the dead-debrid advance (the identity is
+        # NEVER a license to play this torrent on the local engine)
         info_hash, file_idx = resolved
         return {
             "kind": "stremio",
@@ -1440,6 +1457,18 @@ def _adjacent_playable(config, cur: dict, step: int):
     s, e = nxt
 
     streams = addon_streams(config, imdb, s, e)
+    if _wants_debrid_only(cur):
+        # debrid/direct context: torrent-only candidates would land
+        # autoplay on the local-server torrent engine — never (see
+        # _wants_debrid_only). Drop them BEFORE ranking so the best
+        # DIRECT stream is picked, not the best torrent demoted.
+        direct = [st for st in streams if st.get("url")]
+        if len(direct) != len(streams):
+            log.info("stremio: debrid context — skipping %d of %d "
+                     "torrent-only streams for S%02dE%02d (engine "
+                     "never engages)",
+                     len(streams) - len(direct), len(streams), s, e)
+        streams = direct
     stream = best_stream(config, streams, cur)
     if not stream:
         log.info("stremio: no usable stream for %s S%02dE%02d "
@@ -1481,7 +1510,7 @@ def _adjacent_playable(config, cur: dict, step: int):
     return nxt_playable
 
 
-def next_stream_playable(config, cur: dict):
+def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None):
     """Worker-thread backend of the NEXT-STREAM button: the SAME episode
     (or movie) on the stream ranked AFTER the one now playing. Re-asks
     the configured addons, ranks with autoplay's exact rules (language
@@ -1492,7 +1521,21 @@ def next_stream_playable(config, cur: dict):
     the playable, or None (no other usable stream / unidentifiable).
     The playable keeps the current one's fav_key and identity fields:
     it is the same episode, so recents/lookaheads treat it as a replay,
-    never a new entry."""
+    never a new entry.
+    ``exclude`` (set of lowercased infoHashes / exact URLs) marks
+    streams already tried dead earlier in an auto-advance chain — the
+    dead-debrid advance passes it so a release listed twice in the
+    ranking is never re-served after it already failed once.
+    ``debrid_only`` skips torrent-only candidates (no direct URL) so
+    the walk never lands playback on the local-server torrent engine.
+    None (the default) DERIVES it from the current playable: a direct
+    (debrid) link in hand means debrid covers this machine — switching
+    to a torrent would connect it straight into the swarm, which is
+    never wanted from such a context. A local-server URL keeps engine
+    rights (that torrent was the user's own pick; non-debrid setups
+    have nothing else)."""
+    if debrid_only is None:
+        debrid_only = _wants_debrid_only(cur)
     server = StreamingServer(
         (config.data.get("stremio_server") if config else None) or "")
 
@@ -1556,10 +1599,20 @@ def next_stream_playable(config, cur: dict):
     # one per remaining torrent.
     server_ok = True
     for nxt in candidates:
+        if exclude:
+            ex_hash = str(nxt.get("infoHash") or "").lower()
+            ex_url = str(nxt.get("url") or "")
+            if not ex_hash and ex_url:
+                resolved_ex = parse_resolve_url(ex_url)
+                if resolved_ex:
+                    ex_hash = resolved_ex[0]
+            if (ex_hash and ex_hash in exclude) \
+                    or (ex_url and ex_url in exclude):
+                continue    # already tried dead in this chain
         if nxt.get("url"):
             url = nxt["url"]
             # keep the torrent identity for the NEXT press's skip-match
-            # (and the debrid-stall fallback): the addon's own infoHash
+            # (and the dead-debrid advance): the addon's own infoHash
             # first — torrentio debrid entries carry it alongside the
             # url — then the hash parsed out of a resolve link
             info_hash = str(nxt.get("infoHash") or "").lower()
@@ -1571,6 +1624,8 @@ def next_stream_playable(config, cur: dict):
             if info_hash and file_idx is None:
                 file_idx = 0
         else:
+            if debrid_only:
+                continue    # never auto-advance onto the local engine
             if not server_ok:
                 continue
             info_hash = str(nxt["infoHash"]).lower()

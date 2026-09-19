@@ -8,11 +8,11 @@
 [2] _stremio_guard_tick alive rule: only playing/paused or >5 s of
     tracked playback counts as alive. The opening-hang shape (VLC stuck
     in 'opening', is_playing() True — live-seen 2026-09-02 16:01, 55 s
-    dead screen) must now fall back after the 10 s budget; a mid-play
+    dead screen) must now advance after the 10 s budget; a mid-play
     stall (>5 s played) must NOT restart the stream from zero.
-[3] _on_stremio_probe: a dead probe switches to the local-server torrent
+[3] _on_stremio_probe: a dead probe advances to the next-ranked stream
     immediately; an alive probe, a stale fav_key, an already-done
-    fallback, or a VLC that already started all leave it alone.
+    advance, or a VLC that already started all leave it alone.
 [4] stremio._find_catalog: candidates are scored by word overlap with a
     60% floor — the 2026-09-03 20:57 incident (Cinemeta's search ranked
     'Real Time with Bill Maher' above 'Adventure Time'; the old first-
@@ -161,36 +161,36 @@ def main():
 
     def arm(state_name, playing, vid_s, age_s=11.0, done=False):
         """One guard tick against a faked VLC; returns how many times the
-        fallback began."""
+        dead-stream advance began."""
         fired = []
         view.current = {"kind": "stremio", "fav_key": "stremio:abc:0",
                         "title": "T", "url": base + "/ok206"}
         view._closing = False
         view._vid_s = vid_s
-        view._stremio_fallback_done = done
+        view._stremio_nextstream_done = done
         view._stremio_guard_t0 = pv_mod.now_s() - age_s
         view.vlc.state_name = lambda: state_name
         view.vlc.is_playing = lambda: playing
-        view._begin_stremio_fallback = lambda: fired.append(1)
+        view._begin_stremio_nextstream = lambda: fired.append(1)
         view._stremio_guard_tick()
         app.processEvents()
         return fired
 
-    check("opening-hang (is_playing() True, 0 s played) -> fallback fires",
+    check("opening-hang (is_playing() True, 0 s played) -> advance fires",
           len(arm("opening", True, 0.0)) == 1)
     check("same shape inside the 10 s budget -> still waiting",
           len(arm("opening", True, 0.0, age_s=4.0)) == 0)
-    check("playing -> alive, no fallback",
+    check("playing -> alive, no advance",
           len(arm("playing", True, 600.0)) == 0)
-    check("paused -> alive, no fallback",
+    check("paused -> alive, no advance",
           len(arm("paused", False, 600.0)) == 0)
-    check("502 shape (ended, 0 s played) -> fallback fires",
+    check("502 shape (ended, 0 s played) -> advance fires",
           len(arm("ended", False, 0.0)) == 1)
     check("played >5 s then ended -> alive (EOF paths own it)",
           len(arm("ended", False, 120.0)) == 0)
     check("mid-play buffering stall -> alive (no restart from zero)",
           len(arm("buffering", True, 120.0)) == 0)
-    check("fallback already spent -> nothing left to try",
+    check("advance already spent -> nothing left to try",
           len(arm("ended", False, 0.0, done=True)) == 0)
 
     print("[3] probe result handler")
@@ -201,28 +201,75 @@ def main():
                         "title": "T", "url": base + "/ok206"}
         view._closing = False
         view._vid_s = vid_s
-        view._stremio_fallback_done = done
+        view._stremio_nextstream_done = done
         view.vlc.state_name = lambda: state_name
         view.vlc.is_playing = lambda: False
-        view._begin_stremio_fallback = lambda: fired.append(1)
+        view._begin_stremio_nextstream = lambda: fired.append(1)
         view._stremio_guard.start()
         view._on_stremio_probe(("ok", ("stremio:abc:0", alive, 1.5)))
         app.processEvents()
         return fired, view._stremio_guard.isActive()
 
     fired, guard_on = probe_case(False)
-    check("dead probe -> early fallback + guard disarmed",
+    check("dead probe -> early advance + guard disarmed",
           len(fired) == 1 and guard_on is False)
     fired, guard_on = probe_case(True)
-    check("alive probe -> no fallback, guard stays armed as backstop",
+    check("alive probe -> no advance, guard stays armed as backstop",
           len(fired) == 0 and guard_on is True)
     fired, _ = probe_case(False, fav="stremio:other:0")
-    check("stale fav_key (user moved on) -> no fallback", len(fired) == 0)
+    check("stale fav_key (user moved on) -> no advance", len(fired) == 0)
     fired, _ = probe_case(False, state_name="playing")
-    check("VLC already started (beat the probe home) -> no fallback",
+    check("VLC already started (beat the probe home) -> no advance",
           len(fired) == 0)
     fired, _ = probe_case(False, done=True)
-    check("fallback already spent -> no second try", len(fired) == 0)
+    check("advance already spent -> no second try", len(fired) == 0)
+
+    print("[3b] dead-debrid advance chain (guard -> lookup -> switch)")
+    # The full wiring the probe/guard fire: _begin_stremio_nextstream
+    # -> worker (next_stream_playable, debrid-only, dead-hash excluded)
+    # -> _on_stremio_nextstream -> _start_next -> play_media. Canned
+    # lookup; the engine's create() must never be called.
+    nsp_calls = []
+    real_nsp = stremio.next_stream_playable
+    stremio.next_stream_playable = (
+        lambda cfg, cur, exclude=None, debrid_only=None:
+        nsp_calls.append({"debrid_only": debrid_only,
+                          "exclude": set(exclude or ())}) or {
+            "kind": "stremio", "title": "T",
+            "fav_key": "stremio:abc:0",
+            "url": "https://debrid.example/next.mkv"})
+    played = []
+    real_play = view.play_media
+    view.play_media = lambda media, start_at=0.0: \
+        played.append((media.get("url"), start_at))
+    try:
+        # [2]/[3] stubbed the advance on this instance — put the real
+        # method back before driving the chain
+        view._begin_stremio_nextstream = \
+            PlayerView._begin_stremio_nextstream.__get__(view)
+        view.current = {"kind": "stremio", "fav_key": "stremio:abc:0",
+                        "title": "T", "url": base + "/ok206",
+                        "info_hash": "a" * 40, "file_idx": 3}
+        view._closing = False
+        view._stremio_nextstream_done = False
+        view._stremio_dead = set()
+        view._stremio_dead_key = ""
+        view._stremio_chain = 0
+        view._begin_stremio_nextstream()
+        for _ in range(300):
+            app.processEvents()
+            if played:
+                break
+            time.sleep(0.01)
+        check("advance chain switches playback to the next debrid stream",
+              played and played[0] == ("https://debrid.example/next.mkv",
+                                       0.0))
+        check("advance chain asks debrid-only with the dead hash excluded",
+              nsp_calls and nsp_calls[0]["debrid_only"] is True
+              and "a" * 40 in nsp_calls[0]["exclude"])
+    finally:
+        stremio.next_stream_playable = real_nsp
+        view.play_media = real_play
 
     print("[4] _find_catalog: best-overlap with a 60% word floor")
     metas = [
@@ -770,11 +817,13 @@ def main():
               and nxt["series_name"] == "Adventure Time"
               and nxt["title"].startswith("Adventure Time"))
         nxt2 = stremio.next_stream_playable(cfg2, cur_of(B))
-        check("from B -> the 720p TORRENT via the local server",
-              nxt2 and nxt2["url"] == "http://server.invalid/%s/3" % H["c"]
-              and nxt2["info_hash"] == H["c"] and nxt2["file_idx"] == 3)
+        check("debrid context (B): the torrent-only C is SKIPPED, "
+              "the next DIRECT stream (D) is served",
+              nxt2 and nxt2["url"] == D["url"]
+              and nxt2.get("info_hash") == H["d"])
         nxt3 = stremio.next_stream_playable(cfg2, cur_of(C))
-        check("from C -> the demoted French one (last resort, not skipped)",
+        check("engine context (C): the demoted French one is still "
+              "reachable last-resort",
               nxt3 and nxt3["url"] == D["url"])
         check("from the last stream -> None (button says 'no other')",
               stremio.next_stream_playable(cfg2, cur_of(D)) is None)
@@ -819,7 +868,10 @@ def main():
             lambda base, url: [dict(s) for s in (A, B, C, E, D)]
         busy = BusyServer("")
         stremio.StreamingServer = lambda base="": busy
-        nxt = stremio.next_stream_playable(cfg2, cur_of(B))
+        # engine-context cur (the incident's shape: the engine was
+        # serving the very stream being watched); a debrid-context cur
+        # would never ask the engine at all (see the gate block below)
+        nxt = stremio.next_stream_playable(cfg2, cur_of(C))
         check("busy server: create failure walks past the torrent to the "
               "next candidate (incident 11:34)",
               nxt and nxt["url"] == D["url"])
@@ -834,6 +886,64 @@ def main():
         nxt = stremio.next_stream_playable(cfg2, cur_of(C))
         check("dead server with only torrents left -> None after one "
               "attempt", nxt is None and len(busy2.created) == 1)
+        stremio.StreamingServer = FakeServer
+
+        # ---- 2026-09-19 debrid gate: a direct (debrid) link in hand
+        # means NO automatic switch may land on the local-server torrent
+        # engine — the machine never joins a swarm from a debrid
+        # context (user policy: debrid services back the torrents).
+        check("_wants_debrid_only: debrid/direct url -> True",
+              stremio._wants_debrid_only(
+                  {"url": "https://torbox.app/friede/file.mkv"}) is True)
+        check("_wants_debrid_only: local-server url -> False",
+              stremio._wants_debrid_only(
+                  {"url": "http://127.0.0.1:11470/" + "a" * 40 + "/2"})
+              is False)
+        check("_wants_debrid_only: no url -> False",
+              stremio._wants_debrid_only({}) is False)
+        stremio._streams_cache.clear()
+        stremio._query_addon = \
+            lambda base, url: [dict(s) for s in (A, B, C, E, D)]
+        gate_srv = FakeServer("")
+        stremio.StreamingServer = lambda base="": gate_srv
+        nxt = stremio.next_stream_playable(cfg2, cur_of(B))
+        check("gate: debrid context walks straight past every "
+              "torrent-only candidate",
+              nxt and nxt["url"] == D["url"]
+              and gate_srv.created == [])
+        nxt = stremio.next_stream_playable(cfg2, cur_of(C), debrid_only=True)
+        check("gate: explicit debrid_only forces direct links even from "
+              "an engine url",
+              nxt and nxt["url"] == D["url"]
+              and gate_srv.created == [])
+        # autoplay / next-episode (via _adjacent_playable) honors the
+        # same gate: the next EPISODE must also land on a direct link.
+        # Candidates: the 720p torrent-only C outranks the demoted
+        # French debrid D — exactly the shape that used to autoplay
+        # straight onto the engine.
+        saved_meta = stremio.series_meta
+        stremio.series_meta = lambda imdb: {
+            "name": "Adventure Time",
+            "videos": [{"season": 5, "episode": 42, "name": "James"},
+                       {"season": 5, "episode": 43, "name": "Oracle"}]}
+        try:
+            stremio._streams_cache.clear()
+            stremio._query_addon = \
+                lambda base, url: [dict(s) for s in (C, D)]
+            ap = stremio.next_playable(cfg2, cur_of(B))
+            check("autoplay from a debrid link -> next episode on a "
+                  "DIRECT stream, engine never asked",
+                  ap and ap["url"] == D["url"]
+                  and (ap["season"], ap["episode"]) == (5, 43)
+                  and gate_srv.created == [])
+            stremio._streams_cache.clear()
+            ap = stremio.next_playable(cfg2, cur_of(C))
+            check("autoplay from an engine link keeps engine rights "
+                  "(non-debrid setups)",
+                  ap and ap["url"].startswith("http://server.invalid/")
+                  and gate_srv.created == [H["c"]])
+        finally:
+            stremio.series_meta = saved_meta
         stremio.StreamingServer = FakeServer
 
         # movies: the movie endpoint, and movie identity carried

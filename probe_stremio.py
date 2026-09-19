@@ -529,10 +529,23 @@ def leg_a():
         {"name": "A", "title": "S01E01 1080p \U0001F464 9 \U0001F4BE 2.2 GB",
          "infoHash": "c" * 40, "fileIdx": 3}]
     stremio.StreamingServer = lambda base="": fake_server
+    # 2026-09-19 debrid gate: a DIRECT link in hand means the adjacent
+    # chain never engages the local torrent engine — a torrent-only
+    # addon list yields an honest None, not a swarm connection
     prv = stremio.prev_playable(cfg, {
         "kind": "stremio", "url": "http://x/s", "fav_key": "stremio:zz:0",
         "stremio_imdb": "tt9", "season": 1, "episode": 2,
         "series_name": "Game of Thrones"})
+    check("prev_playable from a DIRECT link never touches the engine",
+          prv is None and fake_server.created == [])
+    # the same chain from an engine URL (the user's own torrent pick in
+    # Stremio; non-debrid setups): the engine serves as before
+    engine_cur = {
+        "kind": "stremio",
+        "url": "http://127.0.0.1:11470/%s/3" % ("d" * 40),
+        "fav_key": "stremio:zz:0", "stremio_imdb": "tt9",
+        "season": 1, "episode": 2, "series_name": "Game of Thrones"}
+    prv = stremio.prev_playable(cfg, dict(engine_cur))
     check("prev_playable -> S01E01 via local server",
           prv and prv.get("season") == 1 and prv.get("episode") == 1
           and prv.get("info_hash") == "c" * 40
@@ -547,12 +560,9 @@ def leg_a():
     check("prev_playable created the torrent on the server",
           fake_server.created == ["c" * 40])
     check("prev_playable E1 -> None",
-          stremio.prev_playable(cfg, {
-              "kind": "stremio", "url": "http://x/s",
-              "stremio_imdb": "tt9", "season": 1, "episode": 1}) is None)
-    nxt = stremio.next_playable(cfg, {
-        "kind": "stremio", "url": "http://x/s", "stremio_imdb": "tt9",
-        "season": 1, "episode": 2, "series_name": "Game of Thrones"})
+          stremio.prev_playable(cfg, dict(engine_cur, season=1,
+                                          episode=1)) is None)
+    nxt = stremio.next_playable(cfg, dict(engine_cur))
     check("next_playable intact through the shared core",
           nxt and nxt.get("episode") == 3
           and "Lord Snow" in nxt.get("title", ""),
@@ -1092,10 +1102,13 @@ _pv._vid_s = 600.0
 win.player_view._maybe_autoplay_next(False, 600000, 599000)
 report("finished movie never rolls autoplay", not _pv._eof_next_done)
 
-# ---- debrid-stall guard: dead-on-arrival vs genuinely finished ----
+# ---- dead-debrid guard: dead-on-arrival vs genuinely finished ----
 # (live 2026-09-02 16:01: a dead torrentio resolve URL left VLC "ended"
-# having played NOTHING; "ended" read as alive, the fallback never fired
-# and the user stared at a dead screen for 55 s until a manual reload)
+# having played NOTHING; "ended" read as alive, no switch fired
+# and the user stared at a dead screen for 55 s until a manual reload.
+# Since 2026-09-19 the switch is the next-ranked DEBRID stream — the
+# local-server torrent engine is never the answer, so this leg also
+# asserts the engine's create() is never called.)
 import src.stremio as _st
 _gfk = "stremio:guard:1"
 _fbs = []
@@ -1115,8 +1128,22 @@ class _FBSrv:
 _real_srv = _st.StreamingServer
 _st.StreamingServer = _FBSrv
 
+# the advance's lookup, canned: records how it was called and returns
+# the next-ranked debrid playable (same fav_key — it is the SAME
+# episode on a different source)
+_adv_calls = []
+
+def _fake_nsp(config, cur, exclude=None, debrid_only=None):
+    _adv_calls.append({"debrid_only": debrid_only,
+                       "exclude": set(exclude or ())})
+    return {"kind": "stremio", "title": "t", "fav_key": _gfk,
+            "url": "https://debrid.example/next-link.mkv"}
+
+_real_nsp = _st.next_stream_playable
+_st.next_stream_playable = _fake_nsp
+
 # shadow just the liveness probes on the REAL player instance (play_media
-# still needs its play/poke methods for the fallback replay)
+# still needs its play/poke methods for the advance replay)
 _real_live = (_pv.vlc.is_playing, _pv.vlc.state_name, _pv.vlc.get_time)
 win.player_view.current = {
     "kind": "stremio", "fav_key": _gfk, "title": "t", "url":
@@ -1126,10 +1153,11 @@ win.player_view.current = {
 _pv.vlc.is_playing = lambda: False
 _pv.vlc.state_name = lambda: "ended"
 _pv.vlc.get_time = lambda: 0
-_pv._stremio_fallback_done = False
+_pv._stremio_nextstream_done = False
 _pv._stremio_guard_t0 = time.time() - 20.0
 _pv._vid_s = 0.0
 n_before_fb = len(plays)
+n_before_adv = len(_adv_calls)
 _pv._stremio_guard_tick()
 fell = False
 for _ in range(100):
@@ -1138,27 +1166,32 @@ for _ in range(100):
         fell = True
         break
     time.sleep(0.05)
-report("guard: dead-on-arrival 'ended' fires the torrent fallback",
-       fell and _fbs == ["a" * 40] and
-       plays[-1][0].endswith("11470/" + "a" * 40 + "/3"),
+report("guard: dead-on-arrival 'ended' advances to the next debrid stream",
+       fell and len(_adv_calls) == n_before_adv + 1
+       and _adv_calls[-1]["debrid_only"] is True
+       and "a" * 40 in _adv_calls[-1]["exclude"]
+       and plays[-1][0] == "https://debrid.example/next-link.mkv",
        str(plays[-1][0][-60:]) if len(plays) > n_before_fb else "no replay")
+report("guard: the advance NEVER touches the local torrent engine",
+       _fbs == [], "create() calls: %r" % _fbs)
 # genuinely finished (played 600 s) "ended" stays alive — end-of-media
-# owns that state, not the fallback
-_pv._stremio_fallback_done = False
+# owns that state, not the advance
+_pv._stremio_nextstream_done = False
 _pv._stremio_guard_t0 = time.time() - 20.0
 _pv._vid_s = 600.0
 _fbs.clear()
 _pv._stremio_guard_tick()
-report("guard: 'ended' AFTER real playback disarms (no fallback)",
-       len(plays) == n_before_fb + 1 and not _fbs)
+report("guard: 'ended' AFTER real playback disarms (no advance)",
+       len(plays) == n_before_fb + 1 and len(_adv_calls) == n_before_adv + 1)
 # paused mid-playback stays alive
 _pv._vid_s = 30.0
 _pv.vlc.state_name = lambda: "paused"
 _pv._stremio_guard_tick()
-report("guard: paused disarms (no fallback)",
-       len(plays) == n_before_fb + 1 and not _fbs)
+report("guard: paused disarms (no advance)",
+       len(plays) == n_before_fb + 1 and len(_adv_calls) == n_before_adv + 1)
 (_pv.vlc.is_playing, _pv.vlc.state_name, _pv.vlc.get_time) = _real_live
 _st.StreamingServer = _real_srv
+_st.next_stream_playable = _real_nsp
 
 # ---- prevlook wiring: the ⏮ twin of the lookahead ----
 _cfk = "stremio:prevlook:1"

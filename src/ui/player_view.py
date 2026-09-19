@@ -844,11 +844,13 @@ class PlayerView(QtWidgets.QWidget):
         self._stream_runner = AsyncRunner()
         self._stream_runner.finished.connect(self._on_stream_fetched)
         self._stream_busy_base = ""
-        # debrid-stall fallback (see _stremio_guard_tick): play the
-        # handoff's torrent through the local Stremio server when the
-        # debrid link itself refuses to start
+        # dead-debrid auto-advance (see _stremio_guard_tick): when a
+        # handed-off debrid link refuses to start, switch to the
+        # NEXT-ranked stream for the same item — never the local-server
+        # torrent engine (the user runs debrid services precisely so
+        # that engine never has to serve a stream)
         self._fb_runner = AsyncRunner()
-        self._fb_runner.finished.connect(self._on_stremio_fallback)
+        self._fb_runner.finished.connect(self._on_stremio_nextstream)
         # fast dead-debrid detector (see _kick_stremio_probe): a 1-byte
         # range GET raced against VLC's own open of the same URL
         self._probe_runner = AsyncRunner()
@@ -861,8 +863,18 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_guard = QtCore.QTimer(self)
         self._stremio_guard.setInterval(2000)
         self._stremio_guard.timeout.connect(self._stremio_guard_tick)
-        self._stremio_fallback_done = False
+        self._stremio_nextstream_done = False
         self._stremio_guard_t0 = 0.0
+        # auto-advance chain guards: streams already tried dead in this
+        # chain (lowercased infoHash + exact URL) and a hard cap on
+        # consecutive dead advances with zero frames played between
+        # them — without the set, a release listed twice in the ranking
+        # could be re-served after one intervening switch (see
+        # _begin_stremio_nextstream); without the cap, hash-less
+        # candidates minting fresh URLs every round could cycle forever
+        self._stremio_dead = set()
+        self._stremio_dead_key = ""
+        self._stremio_chain = 0
         self._eof_next_done = False   # one autoplay shot per media
         self._eof_note_done = False   # one end-of-media log per media
         self._eof_hold_noted = False  # one held-autoplay reason per media
@@ -2086,13 +2098,15 @@ class PlayerView(QtWidgets.QWidget):
                     2000, self._begin_stremio_prevlook)
             # a debrid link that hasn't started in ~10 s is dead (live
             # seen: transient resolve-endpoint 502s) — watch for it and
-            # fall back to the same torrent on the local server. Server
-            # URLs (fresh torrents) skip the guard on purpose.
+            # advance to the NEXT-ranked stream for the same item. The
+            # local-server torrent engine is never the automatic answer
+            # (the user runs debrid services). Server URLs (fresh
+            # torrents) skip the guard on purpose.
             try:
                 from .. import stremio as _st
                 if (playable.get("info_hash")
                         and not _st.parse_server_url(url)):
-                    self._stremio_fallback_done = False
+                    self._stremio_nextstream_done = False
                     self._stremio_guard_t0 = now_s()
                     self._stremio_guard.start()
                     self._kick_stremio_probe(url)
@@ -2295,7 +2309,7 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    # ---- stremio: debrid-stall fallback (local-server torrent) ----
+    # ---- stremio: dead-debrid advance (next-ranked stream) ----
 
     def _kick_stremio_probe(self, url):
         """Race a 1-byte range GET against VLC's own open of the same
@@ -2315,6 +2329,13 @@ class PlayerView(QtWidgets.QWidget):
                 now_s() - t0
         self._probe_runner.run(_work)
 
+    def _stremio_chain_reset(self):
+        """A stream genuinely played — the auto-advance chain is broken,
+        so a future dead link starts a fresh one (both the tried-dead set
+        and the round cap reset here)."""
+        self._stremio_dead = set()
+        self._stremio_chain = 0
+
     def _on_stremio_probe(self, result):
         ok, val = result
         if ok != "ok" or self._closing:
@@ -2324,8 +2345,11 @@ class PlayerView(QtWidgets.QWidget):
         cur = self.current or {}
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the probe ran
-        if alive or self._stremio_fallback_done:
+        if alive:
+            self._stremio_chain_reset()
             return          # link healthy — the 10 s guard stays the backstop
+        if self._stremio_nextstream_done:
+            return          # already advancing this handoff
         # The probe saw no bytes, but a fast debrid start can still beat
         # it home: only switch when VLC shows no real playback either
         # (same alive rule the guard uses).
@@ -2336,20 +2360,22 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
         try:
-            log.info("stremio: debrid probe dead after %.1fs — falling "
-                     "back to the local-server torrent early", took_s)
+            log.info("stremio: debrid probe dead after %.1fs — advancing "
+                     "to the next-ranked stream early", took_s)
         except Exception:
             pass
         self._stremio_guard.stop()
-        self._begin_stremio_fallback()
+        self._begin_stremio_nextstream()
 
     def _stremio_guard_tick(self):
         """Every 2 s after a debrid handoff opens: if VLC still hasn't
         started after ~10 s the debrid link is dead (live-seen: transient
-        502s from torrentio's resolve endpoint) — switch to the same
-        torrent on the local Stremio server. Server-URL handoffs never
-        arm this guard (fresh torrents legitimately take minutes; the
-        60 s start watchdog covers those)."""
+        502s from torrentio's resolve endpoint) — advance to the
+        NEXT-ranked stream for the same episode/movie (never the local
+        Stremio server's torrent engine; the user runs debrid services).
+        Server-URL handoffs never arm this guard (fresh torrents
+        legitimately take minutes; the 60 s start watchdog covers
+        those)."""
         cur = self.current or {}
         if self._closing or cur.get("kind") != "stremio":
             self._stremio_guard.stop()
@@ -2370,59 +2396,94 @@ class PlayerView(QtWidgets.QWidget):
             alive = False
         if alive:
             self._stremio_guard.stop()
+            self._stremio_chain_reset()
             return
         if now_s() - self._stremio_guard_t0 < 10.0:
             return
         self._stremio_guard.stop()
-        if self._stremio_fallback_done:
-            log.warning("stremio: stream never started, no fallback "
+        if self._stremio_nextstream_done:
+            log.warning("stremio: stream never started, no switch "
                         "left — %r", cur.get("title", ""))
             self.show_info("Stream failed to open")
             return
-        self._begin_stremio_fallback()
+        self._begin_stremio_nextstream()
 
-    def _begin_stremio_fallback(self):
-        """Worker: create the handoff's torrent on the local Stremio
-        streaming server and hand back its play URL."""
+    def _begin_stremio_nextstream(self):
+        """A debrid link refused to start (probe or 10 s guard): look up
+        the next-ranked stream for the SAME episode/movie and switch to
+        it — debrid-only, never the local-server torrent engine.
+        Chaining is free: the replacement goes through play_media, which
+        re-arms the probe + guard, so each dead candidate walks one slot
+        further down the ranking until something plays or the list (or
+        the round cap) runs out."""
         cur = dict(self.current or {})
-        if cur.get("kind") != "stremio" or not cur.get("info_hash"):
+        if cur.get("kind") != "stremio":
             return
-        self._stremio_fallback_done = True
-        self.show_info("Debrid link stalled \u2014 switching to the "
-                       "torrent\u2026")
+        self._stremio_nextstream_done = True
         base = cur.get("fav_key")
+        if base != self._stremio_dead_key:
+            # new episode/movie — the previous chain's dead set does not
+            # apply (a multi-episode pack that failed one episode may
+            # legitimately serve the next)
+            self._stremio_dead_key = base or ""
+            self._stremio_chain_reset()
+        if self._stremio_chain >= 6:
+            try:
+                log.warning("stremio: %d consecutive dead streams for %r "
+                            "— giving up the auto-advance",
+                            self._stremio_chain, cur.get("title", ""))
+            except Exception:
+                pass
+            self.show_info("Stream failed to open")
+            return
+        self._stremio_chain += 1
+        dead_hash = str(cur.get("info_hash") or "").lower()
+        if dead_hash:
+            self._stremio_dead.add(dead_hash)
+        if cur.get("url"):
+            self._stremio_dead.add(str(cur["url"]))
+        self.show_info("Stream failed \u2014 trying the next one\u2026")
 
         def _work():
             from .. import stremio
-            server = stremio.StreamingServer(
-                self.config.data.get("stremio_server") or "")
-            info_hash = str(cur["info_hash"]).lower()
-            if not server.create(info_hash):
+            try:
+                return base, stremio.next_stream_playable(
+                    self.config, cur, exclude=set(self._stremio_dead),
+                    debrid_only=True)
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    log.warning("stremio next-stream lookup failed: %r",
+                                exc)
+                except Exception:
+                    pass
                 return base, None
-            return base, server.play_url(
-                info_hash, int(cur.get("file_idx") or 0))
         self._fb_runner.run(_work)
 
-    def _on_stremio_fallback(self, result):
+    def _on_stremio_nextstream(self, result):
         ok, val = result
-        if ok != "ok" or self._closing:
+        if self._closing:
             return
-        base, url = val
+        if ok != "ok":
+            self.show_info("Stream failed to open")
+            return
+        base, nxt = val
         cur = self.current or {}
         if cur.get("fav_key") != base:
-            return          # the user moved on while the fallback ran
-        if not url:
-            log.warning("stremio: torrent fallback refused by the "
-                        "streaming server")
+            return          # the user moved on while the lookup ran
+        if not nxt:
+            try:
+                log.warning("stremio: no other debrid stream left "
+                            "after the dead link — %r", cur.get("title", ""))
+            except Exception:
+                pass
             self.show_info("Stream failed to open")
             return
         try:
-            log.info("stremio: falling back to the local-server torrent "
-                     "after the debrid stall: %s", url)
+            log.info("stremio: advancing to the next-ranked stream after "
+                     "the dead debrid link: %s", str(nxt.get("url", ""))[:70])
         except Exception:
             pass
-        cur["url"] = url
-        self.play_media(cur, 0.0)
+        self._start_next(nxt, start_at=0.0)
 
     # ---- play next / autoplay next ----
     def _on_autoplay_toggled(self, on):
@@ -3003,8 +3064,8 @@ class PlayerView(QtWidgets.QWidget):
             # open, not a finish: a stalled debrid resolve parks a fresh
             # handoff in "ended" within seconds (live-seen 2026-09-03
             # 20:57: autoplay fired 3 s after the click and raced the
-            # debrid→local-torrent fallback for the same media). That
-            # failure belongs to the fallback/guard machinery — rolling
+            # dead-debrid advance for the same media). That
+            # failure belongs to the advance/guard machinery — rolling
             # into the NEXT episode here would eat the one the user just
             # clicked.
             return
