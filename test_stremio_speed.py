@@ -946,6 +946,103 @@ def main():
             stremio.series_meta = saved_meta
         stremio.StreamingServer = FakeServer
 
+        # ---- 2026-09-19 10:06 incident: the addons list is PLAIN
+        # torrentio (no debrid key), so every candidate of every episode
+        # is torrent-only — the debrid-only walk and the autoplay gate
+        # served NOTHING ("no other stream") while 19-22 streams sat
+        # listed, minutes after the same torrents played in Stremio web.
+        # The handoff URL is a torrentio resolve link: its provider+key
+        # prefix is a reusable resolve pipeline, so ranked torrents
+        # re-resolve through the user's OWN debrid (still direct links
+        # — the machine never joins the swarm).
+        H["g"] = "g" * 40
+        RU = ("https://torrentio.strem.fun/resolve/torbox/key-1234/"
+              "%s/Adventure.Time.S05E42.1080p.WEB-DL.NTb.mkv/2/"
+              "Adventure.Time.S05E42.1080p.WEB-DL.NTb.mkv" % H["g"])
+        check("resolve_base: torrentio resolve prefix extracted",
+              stremio.resolve_base(RU) ==
+              "https://torrentio.strem.fun/resolve/torbox/key-1234/")
+        check("resolve_base: server/debridio/direct urls -> \"\"",
+              stremio.resolve_base("http://127.0.0.1:11470/%s/2" % H["g"])
+              == "" and stremio.resolve_base(
+                  "https://addon.debridio.com/play/series/premiumize/"
+                  "k/x/NAME") == "" and stremio.resolve_base(
+                  "https://torbox.app/friede/file.mkv") == "")
+        built = stremio.build_resolve_url(
+            stremio.resolve_base(RU), H["c"],
+            "Adventure.Time.S05E42.720p.WEB-DL.AAC2.0.H.264.mkv", 3)
+        check("build_resolve_url: parse_resolve_url recovers the "
+              "identity (dead-chain exclusion keeps working)",
+              stremio.parse_resolve_url(built) == (H["c"], 3))
+        check("_resolve_file_name: title line 2 is the file name",
+              stremio._resolve_file_name(
+                  {"title": "Torrent Name\nFile.Name.S01E01.mkv\n"
+                            "\U0001F464 5"}) == "File.Name.S01E01.mkv")
+
+        # the morning's exact shape: torrent-only candidates only, cur
+        # handed off as a (dead) resolve link -> the walk re-resolves
+        # instead of dead-ending
+        T1 = {"name": "Torrentio\n1080p",
+              "title": "Adventure.Time.S05E42.1080p.WEB-DL.x264-GROUP\n"
+                       "Adventure.Time.S05E42.1080p.WEB-DL.x264-GROUP.mkv\n"
+                       "\U0001F464 20 \U0001F4BE 2 GB \u2699\ufe0f 1337x",
+              "infoHash": H["a"], "fileIdx": 0}
+        T2 = {"name": "Torrentio\n720p",
+              "title": "Adventure.Time.S05E42.720p.WEB-DL.x264-OTHER\n"
+                       "Adventure.Time.S05E42.720p.WEB-DL.x264-OTHER.mkv\n"
+                       "\U0001F464 5 \U0001F4BE 1 GB \u2699\ufe0f 1337x",
+              "infoHash": H["b"], "fileIdx": 4}
+        stremio._streams_cache.clear()
+        stremio._query_addon = lambda base, url: [dict(T1), dict(T2)]
+        res_srv = FakeServer("")
+        stremio.StreamingServer = lambda base="": res_srv
+        rcur = cur_of({"infoHash": H["g"], "fileIdx": 2}, url=RU)
+        nxt = stremio.next_stream_playable(cfg2, rcur)
+        check("incident: torrent-only list re-resolves through the "
+              "handoff's debrid pipeline (T1 first)",
+              nxt and nxt["url"] == stremio.build_resolve_url(
+                  stremio.resolve_base(RU), H["a"],
+                  "Adventure.Time.S05E42.1080p.WEB-DL.x264-GROUP.mkv", 0)
+              and nxt.get("info_hash") == H["a"]
+              and nxt.get("file_idx") == 0
+              and res_srv.created == [])
+        nxt = stremio.next_stream_playable(
+            cfg2, rcur, exclude={H["a"]})
+        check("incident: the dead-chain exclusion walks the re-resolve "
+              "candidates in rank order",
+              nxt and stremio.parse_resolve_url(nxt["url"]) == (H["b"], 4))
+        # a direct (non-resolve) debrid link still has no pipeline:
+        # torrent-only candidates stay skipped there
+        stremio._streams_cache.clear()
+        nxt = stremio.next_stream_playable(
+            cfg2, cur_of({"infoHash": H["g"], "fileIdx": 0},
+                         url="https://torbox.app/friede/file.mkv"))
+        check("non-resolve debrid link: no pipeline, torrent-only still "
+              "skipped (no other stream)",
+              nxt is None and res_srv.created == [])
+        # autoplay / next-episode from a resolve handoff: the next
+        # episode's torrent-only list re-resolves too (the 22/22
+        # S07E04 lookahead dead-end)
+        saved_meta2 = stremio.series_meta
+        stremio.series_meta = lambda imdb: {
+            "name": "Adventure Time",
+            "videos": [{"season": 5, "episode": 42, "name": "James"},
+                       {"season": 5, "episode": 43, "name": "Oracle"}]}
+        try:
+            stremio._streams_cache.clear()
+            stremio._query_addon = \
+                lambda base, url: [dict(T1), dict(T2)]
+            ap = stremio.next_playable(cfg2, rcur)
+            check("autoplay from a resolve handoff -> next episode "
+                  "RE-RESOLVED through the debrid pipeline",
+                  ap and stremio.parse_resolve_url(ap["url"])[0] == H["a"]
+                  and (ap["season"], ap["episode"]) == (5, 43)
+                  and ap.get("info_hash") == H["a"]
+                  and res_srv.created == [])
+        finally:
+            stremio.series_meta = saved_meta2
+        stremio.StreamingServer = FakeServer
+
         # movies: the movie endpoint, and movie identity carried
         stremio._streams_cache.clear()
         asked.clear()

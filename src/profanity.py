@@ -584,6 +584,15 @@ class ProfanityEngine(QtCore.QObject):
         if on == self.muted:
             return
         self.muted = on
+        # INFO on every flip: mute state was previously DEBUG-invisible,
+        # which left "is the filter actually muting?" unanswerable from
+        # the log (the 2026-09-22 report). Flips are bounded by spoken
+        # bad words — a few lines per media at most.
+        try:
+            log.info("profanity: filter mute %s (%d windows armed)",
+                     "ON" if on else "off", len(self.windows))
+        except Exception:
+            pass
         try:
             self.player.set_filter_mute(on)
         except Exception as exc:  # noqa: BLE001

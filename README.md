@@ -1,6 +1,6 @@
 # MichaelTV
 
-**Current release: v2.1.2** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1.3** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
 An **Android APK** of the same app is published alongside it — see
@@ -11,8 +11,12 @@ Built and tested on **Windows 11**; an Android port now ships from the
 same repo (Windows remains the primary platform).
 
 This project is specifically intended for use with an **8K Strong**
-subscription. Login is currently only available through the Xtream Codes
-API ("extreme code") credentials supplied by your provider.
+subscription, but an IPTV subscription is **not required**: click
+**Skip — no IPTV** in the setup dialog and MichaelTV runs account-less
+(open local video files, custom stream URLs, favorites, Stremio handoff;
+an account can be added any time via File ▸ Account). When an account is
+used, login is through the Xtream Codes API ("extreme code") credentials
+supplied by your provider.
 
 A VLC-powered IPTV player for **Xtream Codes API** accounts — your own
 personal "Smarters"-style player. **VLC (libvlc) is
@@ -26,6 +30,9 @@ through a single VLC connection.
 - **Direct download** of movies and series (no re-encode)
 - **Unified subtitles** — live-TV closed captions and movies/series text
   tracks render through one app-styled overlay (`C` cycles them)
+- **Open any local video file like VLC** — File ▸ Open video… (Ctrl+O),
+  drag & drop onto the window, or Windows' "Open with ▸ MichaelTV" —
+  with the same profanity filtering and subtitle restyling as streams
 
 ## Features
 - **Dark mode by default** (theme applied on every launch) and a **black
@@ -215,12 +222,16 @@ MichaelTV take over autoplay — no Stremio needed after the first click.
   lists, your stream addons for sources, the same ranked order as the
   app (English preference, resolution, size, provider order).
 - **Debrid-only switching (v2.1.2):** while playing a debrid/direct
-  link, every automatic switch stays on direct links. A dead link
-  advances to the next-ranked debrid stream — the built-in torrent
-  engine is **never** engaged (the machine never joins a swarm from a
-  debrid context). A torrent stream you picked by hand in Stremio still
-  plays as before. Setup, live status and diagnostics for all of this:
-  Settings ▸ Stremio handoff.
+  link, every automatic switch stays on direct links — the built-in
+  torrent engine is **never** engaged (the machine never joins a swarm
+  from a debrid context). A dead link advances to the next-ranked
+  stream: a debrid URL directly, or — when the handoff came through a
+  torrentio resolve link — a fresh resolve of the ranked torrent through
+  your own debrid provider (Torbox/Premiumize/RealDebrid …), so a plain
+  torrentio addon list still has dozens of playable candidates. A
+  torrent stream you picked by hand in Stremio still plays as before.
+  Setup, live status and diagnostics for all of this: Settings ▸ Stremio
+  handoff.
 
 ## Requirements
 - **Windows 10/11**
@@ -297,7 +308,10 @@ On first launch you'll be asked for your Xtream details:
 - **Username**
 - **Password**
 
-Click **Test Connection** to verify before saving. Your details are stored in
+Click **Test Connection** to verify before saving, or **Skip — no IPTV**
+to use the app without an account (local files, custom channels,
+favorites, Stremio; the four IPTV tabs show a hint instead of lists until
+an account is added via File ▸ Account). Your details are stored in
 `%APPDATA%\MichaelTVPlayer\settings.json`.
 
 ### Manual acceptance — unified subtitles
@@ -355,6 +369,27 @@ through the same single connection.
 ## Adding your own channels
 Channels ▸ **Add custom channel…** lets you add any stream URL
 (HLS `.m3u8`, MPEG-TS, RTSP, etc.). These appear under the **➕ Custom** tab.
+
+## Opening local video files
+MichaelTV plays files straight off your disk with the full pipeline —
+restyled captions, the profanity filter (mutes + word substitution), seek
+scrubber, speed, LIVE-as-skip-to-end — no IPTV account needed:
+
+- **File ▸ Open video… / Ctrl+O** — the standard file picker
+  (mp4, mkv, avi, webm, mov, ts and friends).
+- **Drag & drop** a file anywhere on the window.
+- **Right-click a file ▸ Open with ▸ MichaelTV** (MichaelTV appears in
+  the Windows "Open with" list for video files once it has run once; it
+  never makes itself the default player).
+
+Embedded **MKV/MP4 text subtitles** are picked up automatically and
+rendered through the app's styled overlay (the file is parsed beside
+playback — no network relay needed); a **sidecar subtitle** (`Movie.srt`
+or `Movie.en.srt` next to `Movie.mkv`) is detected and rendered the same
+way. Bitmap-only tracks (PGS) and containers without text parsers
+(AVI/TS…) fall back to VLC's own rendering, exactly like on streams.
+Files land in **Recently Played** and can be favorited like anything
+else.
 
 ## Movies & Series notes
 - For movies and episodes the **REC button is replaced by a Download

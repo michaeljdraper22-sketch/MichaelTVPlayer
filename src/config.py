@@ -8,7 +8,7 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "2.1.2"
+APP_VERSION = "2.1.3"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -100,6 +100,11 @@ DEFAULTS = {
     "telemetry_id": "",            # random install id, set on first send
     "telemetry_last_sent": 0.0,    # epoch of the last uploaded report
     "telemetry_repo": "",          # "" = diagnostics.REPO
+    # Setup was skipped ("Skip — no IPTV"): the app runs account-less
+    # (local video files, custom channels, favorites, Stremio handoffs)
+    # and the first-run login gate stays out of the way until real
+    # credentials are saved via File > Account.
+    "setup_skipped": False,
     # Stremio handoff (Settings > Stremio handoff…): addon URLs queried
     # for next-episode streams (Torrentio-shaped /stream/series/… API) —
     # in priority order, the first line breaks ties — the local Stremio
@@ -238,6 +243,14 @@ class Config:
 
     def has_account(self) -> bool:
         return bool(self.server_url and self.username and self.password)
+
+    @property
+    def setup_skipped(self) -> bool:
+        return bool(self.data.get("setup_skipped", False))
+
+    @setup_skipped.setter
+    def setup_skipped(self, value: bool) -> None:
+        self.data["setup_skipped"] = bool(value)
 
     def normalized_server(self) -> str:
         from .xtream import normalize_server_url

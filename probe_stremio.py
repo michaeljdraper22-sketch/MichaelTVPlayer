@@ -116,6 +116,27 @@ def leg_a():
     check("SE marker 2x05", stremio.parse_se("Show 2x05 REPACK") == (2, 5))
     check("SE marker none", stremio.parse_se("A Movie 2023 1080p") is None)
 
+    # country-code variant tokens: 'Love Is Blind' vs 'Love Is Blind:
+    # UK' tie on every >2-char word — the 2-char 'UK' is the only
+    # distinguisher (live-seen 2026-09-22: the US show won the tie, the
+    # banner showed the US S03E11 title and ⏭ walked the US episode map
+    # for a UK-file binge)
+    variants = [
+        {"id": "tt100", "name": "Love Is Blind", "type": "series"},
+        {"id": "tt200", "name": "Love Is Blind: UK", "type": "series"},
+        {"id": "tt300", "name": "Love Is Blind: Sweden", "type": "series"},
+    ]
+    hit = stremio._find_catalog(lambda q: variants, "Love is Blind UK")
+    check("variant: UK release matches the UK show",
+          hit and hit["id"] == "tt200", hit and hit["name"])
+    hit = stremio._find_catalog(lambda q: variants, "Love is Blind")
+    check("variant: plain release matches the original",
+          hit and hit["id"] == "tt100", hit and hit["name"])
+    check("sig words keep 2-char country codes",
+          stremio._sig_words("Love is Blind UK") == {"love", "blind", "uk"})
+    check("sig words still drop sequel digits",
+          stremio._sig_words("Spider Man 2") == {"spider", "man"})
+
     # url_episode_seed: the S/E marker in a handoff URL seeds the playable
     # at OPEN (episode buttons visible immediately; identity refines later)
     seed = stremio.url_episode_seed(
@@ -1292,6 +1313,35 @@ def leg_g():
             up = f.read()
         check("v1 upgrade keeps redirect",
               sp._patched_line() in up and sp._TITLE_NEW in up)
+        # the dev patch form must survive server.js's device gate: it
+        # registers the device only when the path entry — JS string
+        # quotes and Windows double-quotes stripped, backslashes
+        # unescaped — names ONE existing file (fs.existsSync). The old
+        # two-part '"python" "main.py"' form glued both into one string
+        # and failed it, silently removing the device (live 2026-09-22)
+        line = sp._patched_line()
+        entry = line[len("path: [ "):-len(" ] " + sp._MARKER)]
+        check("patched entry is a single quoted path",
+              entry.count('"') == 2, entry)
+        gate_path = entry.strip("'").replace('"', "") \
+            .replace("\\" * 2, "\\")
+        check("patched entry passes server.js existsSync gate",
+              os.path.exists(gate_path), gate_path)
+        # a file patched for a DIFFERENT MichaelTV location must read
+        # as unpatched (so the startup hook / heal timer re-point it),
+        # and patch_if_needed must heal it on its own. Title relabel
+        # intact — ONLY the path is foreign, isolating the condition.
+        foreign = sp._patched_line().replace(
+            os.path.basename(gate_path), "elsewhere.cmd")
+        with open(tmp, "w", encoding="utf-8", newline="") as f:
+            f.write(sample.replace(sp._ORIGINAL, foreign)
+                    .replace(sp._TITLE_ORIG, sp._TITLE_NEW))
+        check("foreign-location patch reads unpatched",
+              not sp.is_patched())
+        sp._last_reason = ""
+        sp.patch_if_needed()
+        check("patch_if_needed heals foreign location",
+              sp.is_patched(), sp._last_reason)
         check("restore round-trips", sp.restore())
         with open(tmp, "r", encoding="utf-8") as f:
             check("restore byte-identical", f.read() == sample)

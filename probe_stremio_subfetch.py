@@ -263,8 +263,9 @@ saved_find = (stremio.find_series, stremio.find_movie)
 try:
     stremio.find_series = lambda n: ("tt0944947", "Game of Thrones") \
         if "game" in n.lower() else None
-    stremio.find_movie = lambda n: {"id": "tt0071315", "name": "Chinatown",
-                                    "year": "1974", "poster": ""} \
+    stremio.find_movie = lambda n, y="": {"id": "tt0071315",
+                                          "name": "Chinatown",
+                                          "year": "1974", "poster": ""} \
         if "chinatown" in n.lower() else None
     ident = stremio.resolve_vod_identity({
         "kind": "series", "series_name": "Game of Thrones",
@@ -797,10 +798,14 @@ try:
     check("waited for delivery", wait_job())
     check("captions stay OFF (no forced re-enable)",
           not pv._cap_on and not pv._cap_store_ext)
-    check("no engage side effects (no cur writes, no cues)",
-          not pv.current.get("sub_file")
-          and not pv.current.get("_fetched_sub")
-          and len(pv._cap_cues.cues) == 0)
+    check("no OVERLAY cues (captions off means nothing paints)",
+          len(pv._cap_cues.cues) == 0)
+    check("but the file is STORED and feeds the FILTER (2026-09-22: the "
+          "filter never needed visible subtitles)",
+          (pv.current.get("sub_file") or pv.current.get("_fetched_sub")
+           or "").endswith("45.srt")
+          and len(pv._stremio_handoff_cues()) > 0
+          and len(pv._filter_engine.windows) > 0)
     check("no fail-restore either (the user wants captions off)",
           not pv._cap_fail)
     check("pending/fetching state dropped",

@@ -131,6 +131,20 @@ class BaseBrowser(QtWidgets.QWidget):
         layout.addWidget(self.status)
 
     def _reload_categories(self, force=False):
+        if not self.config.has_account():
+            # Skipped setup / account-less mode: no provider to ask. A
+            # friendly hint instead of the connection error the dummy
+            # server would produce; the tab comes alive by itself the
+            # moment real credentials are saved (reload_all).
+            self._mode = "cats"
+            self.cat_combo.clear()
+            self.list.clear()
+            self.all_items = []
+            self.status.setText(
+                "No IPTV account — File ▸ Account… to add one, or play "
+                "anything without IPTV (File ▸ Open video…, ➕ Custom, "
+                "Stremio).")
+            return
         self.status.setText("Loading categories…")
         self._mode = "cats"
         # an explicit reload (F5 / menu / account re-save) also refreshes

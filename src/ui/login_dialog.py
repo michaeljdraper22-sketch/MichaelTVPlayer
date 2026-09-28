@@ -30,6 +30,14 @@ class LoginDialog(QtWidgets.QDialog):
         self.test_btn = QtWidgets.QPushButton("Test Connection")
         self.test_btn.clicked.connect(self._test)
 
+        self.skip_btn = QtWidgets.QPushButton("Skip — no IPTV")
+        self.skip_btn.setToolTip(
+            "Use MichaelTV without an IPTV subscription: open local video "
+            "files (File ▸ Open video…), play custom stream URLs, and keep "
+            "the Stremio handoff. An account can be added any time via "
+            "File ▸ Account…")
+        self.skip_btn.clicked.connect(self._skip)
+
         self.save_btn = QtWidgets.QPushButton("Save")
         self.save_btn.setDefault(True)
         self.save_btn.clicked.connect(self._save)
@@ -39,11 +47,14 @@ class LoginDialog(QtWidgets.QDialog):
 
         btns = QtWidgets.QHBoxLayout()
         btns.addWidget(self.test_btn)
+        btns.addWidget(self.skip_btn)
         btns.addStretch(1)
         btns.addWidget(cancel_btn)
         btns.addWidget(self.save_btn)
 
-        self.status = QtWidgets.QLabel("Enter your Xtream account details.")
+        self.status = QtWidgets.QLabel(
+            "Enter your Xtream account details — or Skip to use MichaelTV "
+            "without IPTV (local video files, custom channels, Stremio).")
         self.status.setWordWrap(True)
         self.status.setMinimumHeight(48)
 
@@ -99,5 +110,15 @@ class LoginDialog(QtWidgets.QDialog):
         self.config.data["server_url"] = server
         self.config.data["username"] = user
         self.config.data["password"] = pw
+        # real credentials retire the skip: the account gate stays closed
+        # on future launches
+        self.config.data["setup_skipped"] = False
+        self.config.save()
+        self.accept()
+
+    def _skip(self):
+        """Account-less mode: no IPTV lists, everything else plays. The
+        flag is what keeps the first-run gate from reappearing."""
+        self.config.data["setup_skipped"] = True
         self.config.save()
         self.accept()

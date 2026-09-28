@@ -352,6 +352,51 @@ def main():
           "too short" in view._dvr_status.text() and cfg.chase_delay == 3)
     view._set_dvr_status("")
 
+    print("[7b] status dot — green armed / red no-source / hidden off")
+    # the dot rides the corner buttons' visibility: show the overlay so
+    # isVisible() answers like a live session
+    view.overlay.show()
+    view._btn_reload.show()
+    cfg.profanity = {"enabled": True}
+    view._apply_profanity_config()
+    view._update_filter_dot()
+    check("no text source -> RED dot visible",
+          view._filter_dot.isVisible()
+          and view._filter_dot_state == view._FD_RED
+          and "NOT filtering" in view._filter_dot.toolTip())
+    fd_srt = tempfile.mkstemp(suffix=".srt")[1]
+    with open(fd_srt, "w", encoding="utf-8") as f:
+        f.write("1\n00:00:05,000 --> 00:00:08,000\n"
+                "what the hell is this\n\n")
+    view._filter_engine.clear()
+    view.current = {"kind": "stremio", "url": "http://x/v",
+                    "sub_file": fd_srt, "title": "S"}
+    view._load_stremio_sub_cues()
+    view._update_filter_dot()
+    check("external sub file -> GREEN dot (armed)",
+          view._filter_dot.isVisible()
+          and view._filter_dot_state == view._FD_GREEN
+          and "ON" in view._filter_dot.toolTip())
+    check("tooltip carries the window count",
+          "1 mute window" in view._filter_dot.toolTip())
+    view._filter_engine.muted = True
+    view._update_filter_dot()
+    check("active mute -> bright green + MUTING in tooltip",
+          view._filter_dot_state == view._FD_GREEN_ACTIVE
+          and "MUTING" in view._filter_dot.toolTip())
+    view._filter_engine.muted = False
+    view.overlay.hide()
+    view._update_filter_dot()
+    check("dot hides with the corner buttons (immersive sleep)",
+          not view._filter_dot.isVisible())
+    view.overlay.show()
+    cfg.profanity = {"enabled": False}
+    view.apply_profanity_settings()
+    check("filter off in settings -> dot hidden",
+          not view._filter_dot.isVisible())
+    cfg.profanity = {"enabled": True}
+    view._apply_profanity_config()
+
     print("[8] settings dialog")
     cfg2 = temp_config()
     saved = []

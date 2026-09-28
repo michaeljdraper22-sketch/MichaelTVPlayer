@@ -72,16 +72,40 @@ def _exe_path() -> str:
     return "%s|%s" % (sys.executable, main_py)   # exe|script form
 
 
+_DEV_LAUNCHER = "stremio-handoff-dev.cmd"
+
+
+def _dev_launcher() -> str:
+    """The dev-mode patch target: a one-line cmd wrapper next to main.py
+    that relays "%*" into ``python main.py``. server.js registers the
+    device only when the patched path — QUOTES STRIPPED — names ONE
+    existing file (fs.existsSync), and its launch is a plain shell
+    concatenation of that path plus VLC-style args. A two-part
+    '"python.exe" "main.py"' path list fails that gate (the glued string
+    is no file path at all), so every dev-run patch silently REMOVED
+    Stremio's "Play in MichaelTV" device until a dist run re-pointed
+    the file (live-seen 2026-09-22: a 2026-09-18 dev patch left the
+    user without the button for days). Best-effort: unwritable just
+    logs — the mismatch then shows as unpatched, never as a dead
+    device."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(root, _DEV_LAUNCHER)
+    try:
+        with open(path, "w", encoding="utf-8", newline="") as f:
+            f.write('@echo off\r\n"%s" "%s" %%*\r\n'
+                    % (sys.executable, os.path.join(root, "main.py")))
+    except OSError as exc:
+        log.warning("streampatch: cannot write dev launcher %s: %r",
+                    path, exc)
+    return path
+
+
 def _patched_line() -> str:
     """The replacement path list for server.js."""
     exe = _exe_path()
-    if "|" in exe:      # dev: spawn "python" "main.py" <url>
-        py, script = exe.split("|", 1)
-        entries = "'\"%s\" \"%s\"'" % (py.replace("\\", "\\\\"),
-                                       script.replace("\\", "\\\\"))
-    else:
-        entries = "'\"%s\"'" % exe.replace("\\", "\\\\")
-    return "path: [ %s ] %s" % (entries, _MARKER)
+    if "|" in exe:      # dev: the wrapper relays into "python main.py"
+        exe = _dev_launcher()
+    return "path: [ '\"%s\"' ] %s" % (exe.replace("\\", "\\\\"), _MARKER)
 
 
 def _exe_dir_from_imagepath(image: str) -> str:
@@ -192,9 +216,15 @@ def _writable(path: str) -> bool:
 
 
 def is_patched(path: str = "") -> bool:
-    """True when BOTH the path redirect and the menu-title relabel are
-    in place (a v1-era file with only the path patch reads as
-    unpatched, so startup re-patching upgrades it)."""
+    """True when the path redirect AND the menu-title relabel are in
+    place AND the redirect points at THIS instance. A file patched for
+    a different MichaelTV location (a dev run re-patching over the
+    dist install, or a moved install) reads as unpatched, so the
+    startup hook and the 5-min heal timer re-point it — the 2026-09-22
+    missing-button bug was exactly such a file living on uncorrected
+    for days because this check only looked for the marker. (A v1-era
+    file with only the path patch also reads as unpatched, so startup
+    re-patching upgrades it.)"""
     path = path or find_server_js()
     if not path:
         return False
@@ -204,7 +234,8 @@ def is_patched(path: str = "") -> bool:
     except OSError:
         return False
     return (_MARKER in text and _TITLE_NEW in text
-            and _ORIGINAL not in text and _TITLE_ORIG not in text)
+            and _ORIGINAL not in text and _TITLE_ORIG not in text
+            and _patched_line() in text)
 
 
 def status() -> dict:

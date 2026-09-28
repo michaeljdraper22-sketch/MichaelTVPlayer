@@ -71,6 +71,13 @@ class _CountryPane(QtWidgets.QWidget):
 
     # ---- loading ----
     def _load(self, force=False):
+        if not self.config.has_account():
+            # account-less mode: no provider categories to filter by
+            self.status.setText(
+                "No IPTV account — country filters apply once one is added "
+                "(File ▸ Account…).")
+            self._clear_layout(self.check_layout)
+            return
         self.status.setText("Loading categories…")
         self._clear_layout(self.check_layout)
         fn = getattr(self.client, self._fetch_name)

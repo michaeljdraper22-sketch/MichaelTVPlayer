@@ -52,3 +52,6 @@ build_pyinstaller/
 /build_uninst/
 /.tmp-artifacts/
 /.tmp-prev/
+
+# Generated dev-mode Stremio handoff launcher (src/streampatch.py)
+/stremio-handoff-dev.cmd

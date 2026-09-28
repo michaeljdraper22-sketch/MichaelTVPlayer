@@ -134,9 +134,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # a smaller window minimum made Qt's layout fight the splitter while
         # dragging, producing window trails ("shadows") and crashes.
         self.setMinimumSize(470, 320)
+        # local video files drop straight onto the window (VLC-style)
+        self.setAcceptDrops(True)
 
         self.client = XtreamClient(
-            config.normalized_server(), config.username, config.password,
+            # No account (setup skipped / handoff launch): XtreamClient
+            # refuses to build without a server, and MainWindow needs one
+            # to exist at all — an unreachable dummy keeps it alive in its
+            # no-account mode (never saved; File > Account installs the
+            # real thing).
+            config.normalized_server() or "http://127.0.0.1:9",
+            config.username, config.password,
             max_concurrent=config.api_concurrency,
         )
 
@@ -315,17 +323,25 @@ class MainWindow(QtWidgets.QMainWindow):
         # QShortcut like N/P so it works in zen/fullscreen too.
         QtWidgets.QShortcut(QtGui.QKeySequence("S"), self,
                             activated=self.player_view._next_stream_clicked)
+        # open a local video file — window-level so it works over the
+        # player too (zen/fullscreen), like VLC's Ctrl+O
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+O"), self,
+                            activated=self.open_video_file)
 
     def _build_menu(self):
         menu_bar = self.menuBar()
 
         file_menu = menu_bar.addMenu("&File")
+        act_open = QtWidgets.QAction("Open video…\tCtrl+O", self)
+        act_open.triggered.connect(self.open_video_file)
         act_account = QtWidgets.QAction("Account…", self)
         act_account.triggered.connect(self.open_account)
         act_reload = QtWidgets.QAction("Reload all lists", self)
         act_reload.triggered.connect(self.reload_all)
         act_quit = QtWidgets.QAction("Quit", self)
         act_quit.triggered.connect(self.close)
+        file_menu.addAction(act_open)
+        file_menu.addSeparator()
         file_menu.addAction(act_account)
         file_menu.addAction(act_reload)
         file_menu.addSeparator()
@@ -419,13 +435,15 @@ class MainWindow(QtWidgets.QMainWindow):
             # Direct activation of an archive channel: open its program picker
             self.catchup_tab._open_picker(playable)
             return
-        if playable.get("kind") == "stremio" and not self._channels_hidden:
-            # A Stremio stream takes over the window (handoff, favorites,
-            # recents — every path lands here), so fold the channel list
-            # away exactly like Ctrl+L does: splitter sizes are saved first
-            # so showing it again restores them, and the floating chevron
-            # on the video's left edge brings it back. Already hidden means
-            # the user hid it themselves — keep THEIR saved sizes.
+        if playable.get("kind") in ("stremio", "file") \
+                and not self._channels_hidden:
+            # A Stremio stream or a local video file takes over the window
+            # (handoff, open, drag-drop, favorites, recents — every path
+            # lands here), so fold the channel list away exactly like
+            # Ctrl+L does: splitter sizes are saved first so showing it
+            # again restores them, and the floating chevron on the
+            # video's left edge brings it back. Already hidden means the
+            # user hid it themselves — keep THEIR saved sizes.
             self._splitter_saved = self.splitter.sizes()
             self._channels_hidden = True
             self._apply_channels()
@@ -460,13 +478,24 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception:  # noqa: BLE001
             launch = None
         if launch:
+            url = launch["url"]
+            is_file = os.path.isfile(url)
             try:
                 from .. import feedback
-                feedback.usage("stremio_handoff")
-                feedback.crumb("stremio handoff")
+                feedback.usage("file_handoff" if is_file
+                               else "stremio_handoff")
+                feedback.crumb("file handoff" if is_file
+                               else "stremio handoff")
             except Exception:  # noqa: BLE001
                 pass
-            playable = stremio.playable_from_url(launch["url"])
+            if is_file:
+                # a local VIDEO file launch (Windows "Open with" /
+                # double-click / drag onto the exe): play it as a file,
+                # not a stream URL
+                from ..localplay import make_file_playable
+                playable = make_file_playable(url)
+            else:
+                playable = stremio.playable_from_url(url)
             if launch.get("sub_file"):
                 playable["sub_file"] = launch["sub_file"]
             self.play(playable, launch.get("start_at") or 0.0)
@@ -778,8 +807,8 @@ class MainWindow(QtWidgets.QMainWindow):
             # latent NameError (the __init__ parameter is not in scope) that
             # crashed the app the moment the Account dialog was saved.
             self.client = XtreamClient(
-                self.config.normalized_server(), self.config.username,
-                self.config.password,
+                self.config.normalized_server() or "http://127.0.0.1:9",
+                self.config.username, self.config.password,
                 max_concurrent=self.config.api_concurrency,
             )
             self.player_view.set_client(self.client)
@@ -805,6 +834,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def add_custom(self):
         self.custom_tab.add_channel_dialog(self)
+
+    # ---- local video files (File ▸ Open video… / drag-drop) ----
+    def open_video_file(self):
+        """File ▸ Open video… (Ctrl+O): play any local video file with
+        the full pipeline — restyled captions, profanity filter, sidecar
+        subtitles (movie.srt next to movie.mkv) picked up automatically."""
+        from ..localplay import VIDEO_EXTENSIONS, make_file_playable
+        exts = " ".join("*" + e for e in VIDEO_EXTENSIONS)
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Open video", "",
+            "Video files (%s);;All files (*.*)" % exts)
+        if path:
+            self.play(make_file_playable(path))
+
+    def _video_drop_path(self, event) -> str:
+        """First local video file in a drag's mime data, or ''."""
+        try:
+            from ..localplay import is_video_path
+            for url in event.mimeData().urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if is_video_path(path):
+                        return path
+        except Exception:  # noqa: BLE001 - a bad mime never crashes a drag
+            pass
+        return ""
+
+    def dragEnterEvent(self, event):
+        if self._video_drop_path(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dropEvent(self, event):
+        path = self._video_drop_path(event)
+        if path:
+            event.acceptProposedAction()
+            from ..localplay import make_file_playable
+            self.play(make_file_playable(path))
+            return
+        super().dropEvent(event)
 
     def toggle_zen(self):
         """Hide every bit of chrome so the video is as large as possible.
@@ -1227,6 +1297,9 @@ class MainWindow(QtWidgets.QMainWindow):
         ok, val = result
         if ok == "ok":
             self.setWindowTitle("MichaelTV")
+        elif not self.config.has_account():
+            # skipped setup / account-less mode: not an error, just a hint
+            self.setWindowTitle("MichaelTV — no IPTV (File > Account)")
         else:
             # No status bar / popup spam — a quiet hint in the title instead.
             self.setWindowTitle("MichaelTV — account error (File > Account)")

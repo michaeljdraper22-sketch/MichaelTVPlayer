@@ -23,9 +23,19 @@ import sys
 log = logging.getLogger("mtp.fileassoc")
 
 PROGID = "MichaelTVPlayer.Playlist"
+VIDEO_PROGID = "MichaelTVPlayer.Video"
 _EXT = ".m3u"
 _APP_REG_NAME = "MichaelTV"
 _AT_FILEEXTENSION = 0        # APPLICATION_ASSOCIATION_TYPE
+
+
+def _video_exts():
+    """The local-play extension list (kept in one place: src.localplay)."""
+    try:
+        from .localplay import VIDEO_EXTENSIONS
+        return list(VIDEO_EXTENSIONS)
+    except Exception:  # noqa: BLE001 - registration is best-effort
+        return []
 
 
 def _launch_command() -> str:
@@ -71,6 +81,39 @@ def register() -> None:
                 existing = None
             if existing is None:
                 winreg.SetValueEx(k, PROGID, 0, winreg.REG_SZ, "")
+        # Local video files: a SECOND ProgId on the "Open with" list of
+        # every extension MichaelTV can play. Never forced as the
+        # default — VLC & friends keep theirs; the user opts in per file
+        # via Right-click ▸ Open with ▸ MichaelTV (or a manual "Always").
+        video_exts = _video_exts()
+        if video_exts:
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Classes\%s"
+                                    % VIDEO_PROGID) as k:
+                winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
+                                  "MichaelTV Video")
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Classes\%s\DefaultIcon"
+                                    % VIDEO_PROGID) as k:
+                winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
+                                  sys.executable + ",0")
+            with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
+                                    r"Software\Classes\%s\shell\open"
+                                    r"\command" % VIDEO_PROGID) as k:
+                winreg.SetValueEx(k, None, 0, winreg.REG_SZ, cmd)
+            for ext in video_exts:
+                with winreg.CreateKeyEx(
+                        winreg.HKEY_CURRENT_USER,
+                        r"Software\Microsoft\Windows\CurrentVersion"
+                        r"\Explorer\FileExts\%s\OpenWithProgids"
+                        % ext) as k:
+                    try:
+                        existing, _ = winreg.QueryValueEx(k, VIDEO_PROGID)
+                    except OSError:
+                        existing = None
+                    if existing is None:
+                        winreg.SetValueEx(k, VIDEO_PROGID, 0,
+                                          winreg.REG_SZ, "")
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
                                 r"Software\MichaelTVPlayer\Capabilities") as k:
             winreg.SetValueEx(k, "ApplicationName", 0, winreg.REG_SZ,
@@ -81,11 +124,14 @@ def register() -> None:
                                 r"Software\MichaelTVPlayer\Capabilities"
                                 r"\FileAssociations") as k:
             winreg.SetValueEx(k, _EXT, 0, winreg.REG_SZ, PROGID)
+            for ext in video_exts:
+                winreg.SetValueEx(k, ext, 0, winreg.REG_SZ, VIDEO_PROGID)
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
                                 r"Software\RegisteredApplications") as k:
             winreg.SetValueEx(k, _APP_REG_NAME, 0, winreg.REG_SZ,
                               r"Software\MichaelTVPlayer\Capabilities")
-        log.info("fileassoc: registered ProgId + OpenWith for %s", _EXT)
+        log.info("fileassoc: registered ProgId + OpenWith for %s (+%d "
+                 "video exts)", _EXT, len(video_exts))
     except OSError as exc:
         log.warning("fileassoc: registration failed: %r", exc)
 
@@ -223,14 +269,27 @@ def unregister() -> None:
         _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell\open"
                                        r"\command" % PROGID)
         _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell\open"
+                                       r"\command" % VIDEO_PROGID)
+        _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell\open"
                                        % PROGID)
+        _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell\open"
+                                       % VIDEO_PROGID)
         _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell" % PROGID)
+        _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\shell"
+                                       % VIDEO_PROGID)
         _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\DefaultIcon"
                                        % PROGID)
+        _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s\DefaultIcon"
+                                       % VIDEO_PROGID)
         _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s" % PROGID)
+        _del(winreg.HKEY_CURRENT_USER, r"Software\Classes\%s" % VIDEO_PROGID)
         _del(winreg.HKEY_CURRENT_USER,
              r"Software\Microsoft\Windows\CurrentVersion\Explorer"
              r"\FileExts\%s\OpenWithProgids" % _EXT, PROGID)
+        for ext in _video_exts():
+            _del(winreg.HKEY_CURRENT_USER,
+                 r"Software\Microsoft\Windows\CurrentVersion\Explorer"
+                 r"\FileExts\%s\OpenWithProgids" % ext, VIDEO_PROGID)
         _del(winreg.HKEY_CURRENT_USER,
              r"Software\MichaelTVPlayer\Capabilities\FileAssociations")
         _del(winreg.HKEY_CURRENT_USER,

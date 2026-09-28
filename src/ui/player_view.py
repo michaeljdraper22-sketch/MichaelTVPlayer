@@ -22,6 +22,7 @@ from ..live_cc import CCSource, find_ccextractor, probe_tail_pcr, \
     probe_first_pcr_at
 from .. import vod_splitter
 from ..vod_splitter import VodRelay
+from ..localplay import LocalSubTap
 from ..mkv_subs import (is_text_codec, is_language_name, lang_matches,
                         lang_token, track_language_evidence)
 from . import browsers
@@ -682,6 +683,7 @@ class PlayerView(QtWidgets.QWidget):
         # profanity filter (live TV: captions from the DVR buffer + engine)
         self._cc_source = None        # live closed-caption reader
         self._vod_relay = None        # VOD splitter (single-connection)
+        self._file_tap = None         # local-file subtitle tap (kind="file")
         self._catchup_relay = None    # catch-up range proxy (scrub-ability)
         self._catchup_local_url = ""  # the relay URL VLC plays (rescue path)
         self._cu_raw_wall = 0.0       # catch-up watchdog: wall time raw last
@@ -838,7 +840,8 @@ class PlayerView(QtWidgets.QWidget):
         self._prevlook_busy = ""
         self._stremio_prevlook = None    # (fav_key, playable|None, when)
         # next-stream lookups (the S button / stream button: same
-        # episode, next-ranked source) — its own runner + busy latch so
+        # episode, next source down the list) — its own runner + busy
+        # latch so
         # a spam of presses coalesces into ONE addon chain and can never
         # clobber an episode lookup in flight
         self._stream_runner = AsyncRunner()
@@ -949,6 +952,18 @@ class PlayerView(QtWidgets.QWidget):
         self._btn_panel.clicked.connect(self.request_toggle_panel.emit)
         self._btn_ovfs.clicked.connect(self.request_fullscreen.emit)
         self._btn_reload.clicked.connect(self._reload_stream)
+
+        # profanity-filter status dot — LEFT of the reload button, same
+        # corner stack (user-placed, 2026-09-22): green = armed with a
+        # live text source (brightens while a mute window is actually
+        # engaged), red = filter on but this stream offers no text to
+        # filter from, hidden = filter off / nothing playing. Clickless,
+        # tooltip carries the detail (_update_filter_dot).
+        self._filter_dot = QtWidgets.QWidget(self.overlay)
+        self._filter_dot.setFixedSize(10, 10)
+        self._filter_dot.setToolTip("Profanity filter")
+        self._filter_dot.hide()
+        self._filter_dot_state = ""   # last applied style key
 
         # floating "show channel list" chevron (only while the panel is
         # hidden — MainWindow drives that via set_panel_hidden())
@@ -1122,7 +1137,8 @@ class PlayerView(QtWidgets.QWidget):
         # Live TV keeps next-only (reverse channel-zapping wasn't asked
         # for), movies get neither.
         self.btn_prev = ctl_btn(ic.play_prev(), "Play previous (P)")
-        # next stream: SAME episode/movie on the next-ranked source —
+        # next stream: SAME episode/movie on the next source down the
+        # list —
         # the "this one's wrong (foreign audio, no subs, dead)" escape
         # hatch for Stremio handoffs. Walks autoplay's exact ranking
         # (language / resolution / size / addon order) past the stream
@@ -1341,6 +1357,14 @@ class PlayerView(QtWidgets.QWidget):
             x -= (b.width() + 4)
             b.move(x, g.top() + m)
             b.raise_()
+        # filter status dot: LEFT of the reload button, vertically
+        # centered on the corner-button row
+        self._filter_dot.move(
+            x - self._filter_dot.width() - 6,
+            g.top() + m + ((self._btn_reload.height()
+                            - self._filter_dot.height()) // 2))
+        if self._filter_dot.isVisible():
+            self._filter_dot.raise_()
         # floating restore-channels chevron: left edge, vertically centered
         self._btn_showpanel.move(g.left() + 6,
                                  g.top() + (g.height()
@@ -1464,6 +1488,13 @@ class PlayerView(QtWidgets.QWidget):
         caption-wise it behaves like VOD."""
         return bool(self.current and self.current.get("kind") == "stremio")
 
+    def _is_file(self) -> bool:
+        """A local video file (File ▸ Open video… / drag-drop / handoff):
+        VLC plays the path directly; LocalSubTap feeds the caption
+        overlay + profanity filter from the same file. Seekable like VOD,
+        with cues pre-timed on the file's own timeline."""
+        return bool(self.current and self.current.get("kind") == "file")
+
     def _is_catchup(self) -> bool:
         """A provider catch-up (archive) program — window-downloadable."""
         return bool(self.current and self.current.get("kind") == "catchup")
@@ -1529,7 +1560,8 @@ class PlayerView(QtWidgets.QWidget):
         if (self._closing or self._live_paused or self._seeking
                 or not self.current
                 or self.current.get("kind") not in ("series", "movie",
-                                                    "vod", "stremio")):
+                                                    "vod", "stremio",
+                                                    "file")):
             self._vod_raw_wall = now
             self._vod_demux_wall = now
             self._vod_pic_win_t = now
@@ -2309,7 +2341,7 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
 
-    # ---- stremio: dead-debrid advance (next-ranked stream) ----
+    # ---- stremio: dead-debrid advance (next stream down the list) ----
 
     def _kick_stremio_probe(self, url):
         """Race a 1-byte range GET against VLC's own open of the same
@@ -2361,7 +2393,7 @@ class PlayerView(QtWidgets.QWidget):
             pass
         try:
             log.info("stremio: debrid probe dead after %.1fs — advancing "
-                     "to the next-ranked stream early", took_s)
+                     "to the next stream down the list early", took_s)
         except Exception:
             pass
         self._stremio_guard.stop()
@@ -2371,11 +2403,11 @@ class PlayerView(QtWidgets.QWidget):
         """Every 2 s after a debrid handoff opens: if VLC still hasn't
         started after ~10 s the debrid link is dead (live-seen: transient
         502s from torrentio's resolve endpoint) — advance to the
-        NEXT-ranked stream for the same episode/movie (never the local
-        Stremio server's torrent engine; the user runs debrid services).
-        Server-URL handoffs never arm this guard (fresh torrents
-        legitimately take minutes; the 60 s start watchdog covers
-        those)."""
+        NEXT stream down the list for the same episode/movie (never the
+        local Stremio server's torrent engine; the user runs debrid
+        services). Server-URL handoffs never arm this guard (fresh
+        torrents legitimately take minutes; the 60 s start watchdog
+        covers those)."""
         cur = self.current or {}
         if self._closing or cur.get("kind") != "stremio":
             self._stremio_guard.stop()
@@ -2410,11 +2442,11 @@ class PlayerView(QtWidgets.QWidget):
 
     def _begin_stremio_nextstream(self):
         """A debrid link refused to start (probe or 10 s guard): look up
-        the next-ranked stream for the SAME episode/movie and switch to
-        it — debrid-only, never the local-server torrent engine.
-        Chaining is free: the replacement goes through play_media, which
-        re-arms the probe + guard, so each dead candidate walks one slot
-        further down the ranking until something plays or the list (or
+        the next stream DOWN THE ADDON'S LIST for the SAME episode/movie
+        and switch to it — debrid-only, never the local-server torrent
+        engine. Chaining is free: the replacement goes through play_media,
+        which re-arms the probe + guard, so each dead candidate walks one
+        slot further down the list until something plays or the list (or
         the round cap) runs out."""
         cur = dict(self.current or {})
         if cur.get("kind") != "stremio":
@@ -2479,8 +2511,9 @@ class PlayerView(QtWidgets.QWidget):
             self.show_info("Stream failed to open")
             return
         try:
-            log.info("stremio: advancing to the next-ranked stream after "
-                     "the dead debrid link: %s", str(nxt.get("url", ""))[:70])
+            log.info("stremio: advancing to the next stream down the list "
+                     "after the dead debrid link: %s",
+                     str(nxt.get("url", ""))[:70])
         except Exception:
             pass
         self._start_next(nxt, start_at=0.0)
@@ -2616,7 +2649,7 @@ class PlayerView(QtWidgets.QWidget):
             pass
         self._kick_prev_lookup(base, cur)
 
-    # ---- next stream: same episode/movie, next-ranked source ----
+    # ---- next stream: same episode/movie, next source down the list ----
 
     def _next_stream_clicked(self):
         try:
@@ -2627,9 +2660,10 @@ class PlayerView(QtWidgets.QWidget):
     def _next_stream_core(self):
         """The S button: the stream is wrong somehow (foreign audio, no
         subtitles, dead link) — re-ask the addons for the SAME episode or
-        movie and switch to the stream ranked after this one, resuming
-        where playback stands. Stremio handoffs only: every other kind
-        plays a single fixed stream with nothing to walk through."""
+        movie and switch to the next stream DOWN THE ADDON'S LIST (the
+        order Stremio displays), resuming where playback stands. Stremio
+        handoffs only: every other kind plays a single fixed stream with
+        nothing to walk through."""
         cur = self.current
         if self._closing or not cur:
             self._pn_log("streamnext: click dropped \u2014 closing=%s "
@@ -2655,8 +2689,9 @@ class PlayerView(QtWidgets.QWidget):
             lambda: (base, self._fetch_next_stream(work_cur), pos_s))
 
     def _fetch_next_stream(self, cur):
-        """Worker-thread: the next-ranked stream for the SAME episode or
-        movie (identity resolved on demand inside the backend)."""
+        """Worker-thread: the next stream down the addon's list for the
+        SAME episode or movie (identity resolved on demand inside the
+        backend)."""
         try:
             from .. import stremio
             return stremio.next_stream_playable(self.config, cur)
@@ -3933,11 +3968,12 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             down = False
         if down and self.current and self.current.get("url") \
-                and not (self._is_vod() or kind == "stremio"):
+                and not (self._is_vod() or kind == "stremio"
+                         or self._is_file()):
             # long-paused past the provider's patience: reconnect at live.
-            # (VOD AND Stremio skip this: for them "live" is the END of
-            # the file — reconnecting would restart the episode, which is
-            # exactly what LIVE must not do there.)
+            # (VOD, Stremio AND local files skip this: for them "live" is
+            # the END of the file — reconnecting would restart the
+            # episode, which is exactly what LIVE must not do there.)
             self._reopen_display()
             self._live_paused = False
             self._update_control_state()
@@ -4947,6 +4983,7 @@ class PlayerView(QtWidgets.QWidget):
                 w.show()
                 shown = True
             w.raise_()
+        self._update_filter_dot()
         if self._panel_hidden:
             if not self._btn_showpanel.isVisible():
                 self._btn_showpanel.show()
@@ -5151,6 +5188,9 @@ class PlayerView(QtWidgets.QWidget):
         # duplicated slider handles, stacked mute icons).
         if playing != self._was_playing:
             self.btn_play.setIcon(ic.pause() if playing else ic.play())
+        # profanity dot follows the text-source story (armed / blind /
+        # muting) — cheap attribute reads, repaints only on change
+        self._update_filter_dot()
         # Subtitles: enforce the user's choice every tick. VLC re-selects
         # (and renders) a stream's own subtitle track on media opens and ES
         # updates, a fresh player after a hung-stop swap loses the selection
@@ -5335,7 +5375,7 @@ class PlayerView(QtWidgets.QWidget):
             self._last_vod_len_ms = length
         elif (self._scrub_on and self._last_vod_len_ms > 0
                 and (self.current or {}).get("kind")
-                in ("series", "movie", "vod", "stremio")):
+                in ("series", "movie", "vod", "stremio", "file")):
             # VLC drops get_length() the moment a network VOD ends —
             # without the last known length the tick flips to "live"
             # here, the scrubber vanishes, and end-of-media autoplay
@@ -5380,7 +5420,7 @@ class PlayerView(QtWidgets.QWidget):
                 self._catchup_watchdog(now, playing, raw_s,
                                        length / 1000.0, raw_moved)
             elif self.current.get("kind") in ("series", "movie", "vod",
-                                              "stremio"):
+                                              "stremio", "file"):
                 try:
                     demux = self.vlc.demuxed_bytes()
                 except Exception:      # stub players / binding gaps —
@@ -5479,10 +5519,13 @@ class PlayerView(QtWidgets.QWidget):
         live_prestream = self.current is None
         # Stremio handoffs play as plain "live" mode but ARE seekable files
         # — the rewinds and the speed pick apply to them exactly like VOD.
+        # Local files are the same shape: a real length, fully seekable.
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
                   self.btn_begin, self.btn_speed):
-            b.setEnabled(chase or vod or stremio or live_prestream)
-        self.btn_live.setEnabled(chase or vod or bool(self.current))
+            b.setEnabled(chase or vod or stremio or self._is_file()
+                         or live_prestream)
+        self.btn_live.setEnabled(chase or vod or self._is_file()
+                                 or bool(self.current))
         # play/pause + audio need SOMETHING loaded; REC needs the DVR
         # recorder of a live chase stream (VOD/catch-up swap the slot to
         # Download/Window) — never disable it mid-recording
@@ -5555,9 +5598,12 @@ class PlayerView(QtWidgets.QWidget):
                 # on untouched (recording it through VLC's record output
                 # would re-mux to TS from position 0 and lose the position).
                 # Catch-up programs get the WINDOW download button instead
-                # (pick a start/end stretch of the recording). Evaluated
-                # end-to-end and deliberately left as the swap.
-                w.setVisible(on and not vod and not stremio)
+                # (pick a start/end stretch of the recording). A local file
+                # gets NEITHER: it is already on disk — recording re-muxes
+                # it from position 0 and downloading copies it to itself.
+                # Evaluated end-to-end and deliberately left as the swap.
+                w.setVisible(on and not vod and not stremio
+                             and not self._is_file())
                 self.btn_dl.setVisible(on and (vod or stremio)
                                        and not catchup)
                 self.btn_win.setVisible(on and catchup)
@@ -5581,7 +5627,7 @@ class PlayerView(QtWidgets.QWidget):
                 w.setVisible(on and (kind in ("live", "series", "catchup")
                                      or stremio_ep))
             elif key == "stream":
-                # next STREAM (same episode/movie, next-ranked source):
+                # next STREAM (same episode/movie, next source down the list):
                 # every Stremio handoff gets it — movies included, identity
                 # or not (the worker resolves identity on demand). Every
                 # other kind plays a single fixed stream.
@@ -5905,13 +5951,15 @@ class PlayerView(QtWidgets.QWidget):
 
     def _cap_eligible(self, name: str) -> bool:
         """Can the overlay render this track? Text always; ASS and plain
-        names on VOD and Stremio handoffs (the relay's MKV parser
-        flattens ASS to text there, and a Stremio handoff's own sub FILE
-        is parsed directly — live has no ASS tracks, so VLC keeps those)."""
+        names on VOD, Stremio handoffs and local files (the relay/tap's
+        MKV parser flattens ASS to text there, and a handoff's or file's
+        own sub FILE is parsed directly — live has no ASS tracks, so VLC
+        keeps those)."""
         kind = self._cap_track_kind(name)
         return (kind == "text"
                 or (kind in ("other", "ass")
-                    and (self._is_vod() or self._is_stremio())))
+                    and (self._is_vod() or self._is_stremio()
+                         or self._is_file())))
 
     @staticmethod
     def _cap_lang_hint(name: str) -> str:
@@ -5940,7 +5988,9 @@ class PlayerView(QtWidgets.QWidget):
         so the MKV parser can feed cues (restarts in place when the relay
         isn't up yet). Stremio: the handoff's own sub FILE is parsed
         directly (no relay needed); an embedded pick rides the relay
-        exactly like VOD."""
+        exactly like VOD. Local files: LocalSubTap reads the file beside
+        playback — a sidecar file parses directly, an embedded pick rides
+        the tap (startable mid-file, no restart)."""
         if self._closing or self._cap_fail:
             return
         self._cap_want = True
@@ -5973,6 +6023,31 @@ class PlayerView(QtWidgets.QWidget):
                 self._schedule_cap_vod_check()
             else:
                 self._restart_through_relay()
+        elif self._is_file():
+            if (self.current or {}).get("sub_file") and (
+                    self._file_tap is None
+                    or self._stremio_ext_slave(self._spu_name)):
+                # the file's own sidecar subtitle: parse it directly, no
+                # tap needed
+                self._engage_stremio_external()
+            else:
+                if self._file_tap is None:
+                    # captions engaged after open (they were off at play
+                    # time): unlike the network relay the tap is NOT the
+                    # playback URL — start it now, no restart, no reconnect
+                    self._start_file_tap(
+                        (self.current or {}).get("url") or "")
+                if self._file_tap is None:
+                    return   # not MKV/MP4 / unreadable — already noted
+                if self._cap_store_ext:
+                    # an embedded pick takes the store back from a sidecar
+                    self._cap_cues.clear()
+                    self._cap_store_ext = False
+                self._set_cap_on(True)
+                if self._file_tap.set_prefer_language(
+                        self._cap_lang_hint(self._spu_name)):
+                    self._cap_cues.clear()
+                self._schedule_cap_vod_check()
         elif self._is_vod():
             if self._vod_relay is not None:
                 self._set_cap_on(True)
@@ -6016,7 +6091,7 @@ class PlayerView(QtWidgets.QWidget):
         read/parse. [] when there is nothing to render."""
         cur = self.current or {}
         if self._closing or cur.get("kind") not in ("stremio", "vod",
-                                                    "series"):
+                                                    "series", "file"):
             return []
         path = (cur.get("sub_file") or cur.get("_fetched_sub") or "")
         if not path:
@@ -6065,14 +6140,17 @@ class PlayerView(QtWidgets.QWidget):
         """play_media(): a Stremio handoff carries the user's subtitle
         pick as a FILE — VLC auto-shows it with its OWN renderer (freetype
         styling that ignores the app's), so take it over at open and let
-        the overlay render it instead. Quiet: no pill, no flash.
+        the overlay render it instead. A local video file's SIDECAR
+        subtitle (movie.srt next to movie.mkv) is the same case: VLC
+        auto-detects and shows it with its own styling. Quiet: no pill,
+        no flash.
 
         The file outranks the app's STICKY language pick (it is the more
         recent deliberate choice); only an overlay already engaged for
         this media (the sticky language rode the relay in) defers. An
         unparseable file stays on VLC."""
         cur = self.current or {}
-        if self._closing or cur.get("kind") != "stremio":
+        if self._closing or cur.get("kind") not in ("stremio", "file"):
             return
         if not cur.get("sub_file") or self._cap_on:
             return
@@ -6287,7 +6365,8 @@ class PlayerView(QtWidgets.QWidget):
             return
         try:
             chase = self._mode == "chase" and self.dvr
-            if chase or self._is_vod() or self._is_stremio():
+            if chase or self._is_vod() or self._is_stremio() \
+                    or self._is_file():
                 if chase:
                     # the deferred arrival-batch anchor lands here (see
                     # _cc_flush_pending) — before the paint decision
@@ -6467,11 +6546,12 @@ class PlayerView(QtWidgets.QWidget):
             else self.play_media(cur, start_at=start_at))
 
     def _stremio_external_takeover(self) -> bool:
-        """A relay/embedded dead-end on a Stremio handoff: if the handoff's
-        own sub FILE parses, the overlay renders IT (app styling) instead
-        of falling back to VLC's freetype or going dark. True when the
-        takeover happened."""
-        if not (self._is_stremio() and (self.current or {}).get("sub_file")):
+        """A relay/embedded dead-end on a Stremio handoff or local file: if
+        the media's own sub FILE (handoff download, sidecar .srt) parses,
+        the overlay renders IT (app styling) instead of falling back to
+        VLC's freetype or going dark. True when the takeover happened."""
+        if not ((self._is_stremio() or self._is_file())
+                and (self.current or {}).get("sub_file")):
             return False
         if not self._stremio_handoff_cues():
             return False
@@ -6545,7 +6625,7 @@ class PlayerView(QtWidgets.QWidget):
         (c) the tap never produced ANY track metadata (dead tap after a
         cache rebase, hopeless container) — sitting mute forever helps
         nobody."""
-        relay = self._vod_relay
+        relay = self._vod_relay or self._file_tap
         if (self._closing or not self._cap_on or not self._cap_want
                 or relay is None or self._is_dvrable()):
             return
@@ -6555,7 +6635,9 @@ class PlayerView(QtWidgets.QWidget):
             # cold relay can take longer than the first check). While the
             # relay's background startup (tail prefetch on a slow/large
             # file) hasn't finished, the try isn't counted — a 4K rip can
-            # legitimately take tens of seconds there.
+            # legitimately take tens of seconds there. (A local file tap
+            # has no _ready event: it falls to plain try counting, which
+            # its disk-speed head parse easily beats.)
             starting = hasattr(relay, "_ready") \
                 and not relay._ready.is_set() and relay._alive
             if starting:
@@ -6803,11 +6885,20 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not self._cap_want:
             # the user turned captions OFF while the multi-second search
-            # ran: engaging would force-re-enable them. Drop the
-            # pending/fetching state ONLY — no engage, no fail-restore.
-            # (The manual row re-sets _cap_want at its kick, so an
-            # explicit ask still engages.)
+            # ran: engaging would force-re-enable them, so no overlay —
+            # but a DOWNLOADED file still feeds the profanity FILTER
+            # (it never needed visible subtitles; see profanity.py's
+            # header). Store it and drop the pending/fetching state ONLY
+            # — no engage, no fail-restore. (The manual row re-sets
+            # _cap_want at its kick, so an explicit ask still engages.)
             self._sub_fetch_pending = False
+            if ok == "ok" and val:
+                path, _disp = val
+                if cur.get("kind") == "stremio":
+                    cur["sub_file"] = path
+                else:
+                    cur["_fetched_sub"] = path
+                self._load_stremio_sub_cues()
             return
         if ok != "ok" or not val:
             if ok != "ok":
@@ -7056,7 +7147,7 @@ class PlayerView(QtWidgets.QWidget):
             return          # nothing playing: next playback picks them up
         kind = cur.get("kind", "live")
         start_at = 0.0
-        if kind in ("vod", "series", "catchup", "stremio"):
+        if kind in ("vod", "series", "catchup", "stremio", "file"):
             # stremio is a seekable file like any VOD (get_time is the
             # file timeline) — without this a style change with the
             # overlay NOT engaged (subs Off / VLC-rendered pick) rebuilt
@@ -7368,6 +7459,7 @@ class PlayerView(QtWidgets.QWidget):
             prof_mod.DEFAULT_SUBSTITUTION if raw_sub is None \
             else str(raw_sub).strip()
         self._filter_engine.enabled = bool(prof.get("enabled"))
+        self._update_filter_dot()
 
     def apply_profanity_settings(self):
         """The settings dialog saved: re-apply; engage on the current
@@ -7396,6 +7488,15 @@ class PlayerView(QtWidgets.QWidget):
         at the switch position."""
         offset = self._relay_start_offset
         self._relay_start_offset = 0
+        if kind == "file" and url and not self._closing:
+            # VLC plays the local path directly; LocalSubTap reads the
+            # same file beside playback to feed the overlay + filter.
+            # No relay — nothing to proxy (and the tap can start later
+            # without touching playback, unlike the network relay).
+            want_caps = self._cap_want and not self._cap_fail
+            if want_caps or self.config.profanity.get("enabled"):
+                self._start_file_tap(url)
+            return url
         if kind == "catchup" and url and url.startswith("http") \
                 and not self._closing:
             return self._start_catchup_relay(url) or url
@@ -7445,6 +7546,80 @@ class PlayerView(QtWidgets.QWidget):
         self._filter_timer.start()
         return local
 
+    # ---- local-file subtitle tap (kind="file": cues without a relay) ----
+    def _start_file_tap(self, path: str):
+        """Attach a LocalSubTap to the playing file. Mirrors the VOD
+        relay's contract (cue/failed signals, parser_tracks metadata) but
+        never touches playback: VLC is already playing the path. A
+        non-MKV/MP4 container fails quietly — VLC keeps rendering."""
+        if self._closing or self._file_tap is not None or not path:
+            return
+        want_caps = self._cap_want and not self._cap_fail
+        try:
+            tap = LocalSubTap(self)
+            ok = tap.start(path, self._cap_lang_hint(self._spu_name)
+                           or "eng")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("file tap: start failed (%r)", exc)
+            except Exception:
+                pass
+            ok = False
+        if not ok:
+            try:
+                tap.deleteLater()
+            except Exception:  # noqa: BLE001
+                pass
+            if want_caps:
+                self._cap_fail = True   # no text source: VLC renders
+            return
+        tap.cue.connect(self._on_vod_cue)
+        tap.failed.connect(self._cap_file_tap_failed)
+        self._file_tap = tap
+        self._cap_relay_gen = self._session   # stale-delivery guard mark
+        self._filter_timer.start()
+
+    def _cap_file_tap_failed(self, why: str):
+        """The local tap died mid-scan (not MKV/MP4, unreadable, parser
+        crash): captions hand back to VLC's own rendering."""
+        if self._closing or self._cap_fail or self._file_tap is None \
+                or not self._cap_relay_live():
+            return
+        try:
+            log.warning("captions: file tap failed (%s) — VLC renders",
+                        why)
+        except Exception:
+            pass
+        self._cap_fail = True
+        self._set_cap_on(False)
+        try:
+            self.vlc.set_spu(self._spu_want)
+        except Exception:  # noqa: BLE001
+            pass
+        self._cap_note("Subtitles: switched to VLC rendering")
+
+    def _stop_file_tap(self):
+        """Teardown twin of the relay's stop (play_media switch / close):
+        disconnect, stop the scan thread, drop the reference. Called from
+        _stop_profanity, which owns the _cap_on survival claim."""
+        tap = self._file_tap
+        self._file_tap = None
+        if tap is None:
+            return
+        try:
+            tap.cue.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            tap.failed.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            tap.stop()
+            tap.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- catch-up relay (localhost range proxy: scrub-ability) ----
     def _start_catchup_relay(self, url: str) -> str:
         """Serve the timeshift stream locally with correct range headers;
@@ -7476,25 +7651,25 @@ class PlayerView(QtWidgets.QWidget):
                 pass
 
     def _cap_relay_live(self) -> bool:
-        """Stale-delivery guard for the VOD relay's queued cue/failed
-        signals.
+        """Stale-delivery guard for the VOD relay's and the local file
+        tap's queued cue/failed signals.
 
-        VodRelay emits from worker threads over queued connections, and
-        play_media's teardown (disconnect + stop + store clear + session
-        bump) races emissions that were already in flight — ``failed``
-        isn't disconnected at all — so a delivery from the PREVIOUS
-        media's relay can land after the new media attached its own
-        relay (stray caption, phantom profanity-mute window, cap_fail
-        latched against a healthy relay). Accept a delivery only from
-        the relay the CURRENT media attached; with no sender (direct
-        call, or a delivery whose sender was already destroyed) fall
-        back to the session marker set at attach time."""
+        VodRelay and LocalSubTap emit from worker threads over queued
+        connections, and play_media's teardown (disconnect + stop + store
+        clear + session bump) races emissions that were already in
+        flight — ``failed`` isn't disconnected at all — so a delivery
+        from the PREVIOUS media's source can land after the new media
+        attached its own (stray caption, phantom profanity-mute window,
+        cap_fail latched against a healthy relay). Accept a delivery only
+        from the source the CURRENT media attached; with no sender
+        (direct call, or a delivery whose sender was already destroyed)
+        fall back to the session marker set at attach time."""
         try:
             snd = self.sender()
         except Exception:  # noqa: BLE001
             snd = None
         if snd is not None:
-            return snd is self._vod_relay
+            return snd is self._vod_relay or snd is self._file_tap
         return self._cap_relay_gen == self._session
 
     def _on_vod_cue(self, start: float, end: float, text: str):
@@ -7527,15 +7702,14 @@ class PlayerView(QtWidgets.QWidget):
         """
         if not self.config.profanity.get("enabled"):
             return
-        if kind == "stremio" or (
+        if kind in ("stremio", "file") or (
                 kind in ("vod", "series")
                 and (self.current or {}).get("_fetched_sub")):
-            # the relay (embedded tracks) was already routed in
-            # _effective_url; the handoff's EXTERNAL subtitle file is the
-            # other half — most debrid/torrent files carry no text track
-            # at all, so without it the filter has nothing to read. A
-            # VOD/series media whose captions were rescued by a FETCHED
-            # file re-feeds it here on re-open the same way.
+            # the relay / local tap (embedded tracks) was already routed
+            # in _effective_url; the EXTERNAL subtitle file is the other
+            # half — a Stremio handoff's --sub-file, a local file's
+            # sidecar, or a VOD/series media whose captions were rescued
+            # by a FETCHED file (re-fed here on re-open the same way).
             self._load_stremio_sub_cues()
             return
         if kind != "live" or not self._is_dvrable():
@@ -7567,11 +7741,36 @@ class PlayerView(QtWidgets.QWidget):
         # direct playback (relay refused the stream) never started the
         # evaluation loop — without it the windows pile up unapplied
         self._filter_timer.start()
+        self._update_filter_dot()
         try:
             log.info("profanity: stremio external subs — %d cues, %d "
                      "mute windows", len(cues),
                      len(self._filter_engine.windows))
         except Exception:
+            pass
+        # A fetched file timed to a DIFFERENT release (other cut, other
+        # fps) is the one failure nothing downstream can catch: windows
+        # arm on the SRT's timeline while the spoken words sit elsewhere
+        # on the video's — muting fires in silence and the user hears it
+        # raw ("filter doesn't work on internet subs"). Compare the cue
+        # span against the media length whenever one is known so the
+        # next field report diagnoses itself. (At open-time delivery the
+        # length may still be unknown — skip silently then.)
+        try:
+            length_s = self.vlc.get_length() / 1000.0
+            if length_s > 60.0:
+                last_s = max(e for _s, e, _t in cues)
+                ratio = last_s / length_s
+                if ratio > 1.03 or ratio < 0.5:
+                    log.warning("profanity: external subs look MISALIGNED "
+                                "for this file — cues end at %.0f s but the "
+                                "media runs %.0f s (%.0f%%): a different "
+                                "release's timing would mute the wrong "
+                                "spots", last_s, length_s, ratio * 100.0)
+                else:
+                    log.info("profanity: external sub span ok — cues end "
+                             "%.0f s of %.0f s media", last_s, length_s)
+        except Exception:  # noqa: BLE001
             pass
 
     def _start_cc_when_buffer(self, tries_left: int = 75):
@@ -7646,6 +7845,7 @@ class PlayerView(QtWidgets.QWidget):
                 # evaluation loop for the caption windows (see
                 # _effective_url: nothing else starts this timer)
                 self._filter_timer.start()
+                self._update_filter_dot()
                 try:
                     log.info("profanity: caption reader on %s "
                              "(join_byte=%d arrival-anchored)", buf, join)
@@ -7884,9 +8084,12 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing or not self._filter_engine.enabled \
                 or not self._filter_engine.windows:
             return
-        if (self._mode == "chase" or self._is_vod()
+        if (self._mode == "chase" or self._is_vod() or self._is_file()
                 or (self.current or {}).get("kind") == "stremio"):
             self._filter_engine.evaluate(self._caption_clock_s())
+            # the dot's MUTING emphasis rides the 100 ms cadence so the
+            # green brightens/dims exactly with the mute windows
+            self._update_filter_dot()
 
     def _stop_profanity(self, keep_windows: bool = False):
         """Kill the caption reader / VOD splitter + clear the filter mute.
@@ -7913,6 +8116,8 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:  # noqa: BLE001
                 pass
             self._vod_relay = None
+        if self._file_tap is not None and not self._cap_on:
+            self._stop_file_tap()
         if not self._cap_on:
             self._stop_cc_source()
         try:
@@ -7923,6 +8128,97 @@ class PlayerView(QtWidgets.QWidget):
             self._filter_engine.set_muted(False)
         else:
             self._filter_engine.clear()
+        self._update_filter_dot()
+
+    # ---- profanity filter status dot (corner, next to reload) ----
+    _FD_GREEN = "#43a047"        # armed: a text source is live
+    _FD_GREEN_ACTIVE = "#8fe29a"  # a mute window is engaged right now
+    _FD_RED = "#e53935"          # filter on, but no text to filter from
+
+    def _filter_source_state(self):
+        """The filter's text-source situation for the CURRENT media ->
+        (armed, detail) or None when the dot should hide (filter off,
+        closing, nothing playing). Pure attribute reads — cheap enough
+        for the 400 ms UI tick."""
+        if self._closing or not self._filter_engine.enabled \
+                or not self.current:
+            return None
+        if self._cc_source is not None:
+            return (True, "live captions (%d mute windows armed)"
+                    % len(self._filter_engine.windows))
+        if self._stremio_sub_cues:
+            src = "online" if (self.current.get("_fetched_lang")
+                               or (self.current.get("kind") != "stremio"
+                                   and self.current.get("_fetched_sub"))) \
+                else "subtitle file"
+            return (True, "%s subtitles (%d mute windows armed)"
+                    % (src, len(self._filter_engine.windows)))
+        relay = self._vod_relay or self._file_tap
+        if relay is not None:
+            tracks = getattr(relay, "parser_tracks", None) or {}
+            if any(is_text_codec(c) for c in tracks.values()):
+                return (True, "embedded subtitle track "
+                        "(%d mute windows armed)"
+                        % len(self._filter_engine.windows))
+            if tracks:
+                if self._sub_fetch_pending or self._sub_fetching:
+                    return (False, "no text track — searching online\u2026")
+                return (False, "no text subtitle track on this stream")
+            # head not parsed yet (or the relay never offered tracks):
+            # pending, not a verdict
+            return (False, "checking this stream for subtitles\u2026")
+        if self._sub_fetch_pending or self._sub_fetching:
+            return (False, "searching online subtitles\u2026")
+        kind = self.current.get("kind")
+        if kind == "live":
+            return (False, "no captions on this channel")
+        return (False, "no subtitle text on this stream")
+
+    def _update_filter_dot(self):
+        """Recompute + repaint the corner status dot. No-op unless the
+        state actually changed (repainting a styled child of the layered
+        overlay every tick would recompose the whole window)."""
+        dot = getattr(self, "_filter_dot", None)
+        if dot is None:      # _apply_profanity_config runs before creation
+            return
+        try:
+            st = self._filter_source_state()
+        except Exception:  # noqa: BLE001
+            st = None
+        if st is None:
+            if self._filter_dot_state:
+                self._filter_dot_state = ""
+                self._filter_dot.hide()
+            return
+        # the dot shares the corner buttons' sleep/wake lifecycle: while
+        # they are hidden (immersive idle) the dot hides too, whatever
+        # its state — a lone green dot over a movie would be anything
+        # but subtle. _wake re-shows the buttons first, then this.
+        if not self._btn_reload.isVisible():
+            if self._filter_dot.isVisible():
+                self._filter_dot.hide()
+            return
+        armed, detail = st
+        muting = bool(self._filter_engine.muted)
+        color = (self._FD_GREEN_ACTIVE if muting
+                 else self._FD_GREEN) if armed else self._FD_RED
+        if armed:
+            tip = "Profanity filter: ON \u2014 %s%s" % (
+                detail, " \u2014 MUTING now" if muting else "")
+        else:
+            tip = ("Profanity filter: ON but NOT filtering \u2014 %s. "
+                   "Pick subtitles (or let them be found online) to "
+                   "give it text; mutes need a subtitle/caption "
+                   "source." % detail)
+        key = color
+        if key != self._filter_dot_state:
+            self._filter_dot_state = key
+            self._filter_dot.setStyleSheet(
+                "background: %s; border-radius: 5px;" % color)
+        if self._filter_dot.toolTip() != tip:
+            self._filter_dot.setToolTip(tip)
+        if not self._filter_dot.isVisible():
+            self._filter_dot.show()
 
 
 

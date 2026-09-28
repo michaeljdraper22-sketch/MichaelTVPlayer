@@ -286,19 +286,14 @@ def main() -> int:
     except Exception:
         pass
 
-    # The login gate blocks MainWindow when no account is saved; a launch
-    # WITH a handoff arg steps around it (play the stream first — the
-    # tabs just show the account-error hint until File > Account).
-    if not config.has_account() and not forwarded:
+    # The login gate blocks MainWindow when no account is saved AND setup
+    # wasn't skipped; a launch WITH a handoff arg steps around it too (play
+    # the stream first — the tabs just show the no-account hint until
+    # File > Account). The no-account dummy server lives in MainWindow now.
+    if (not config.has_account() and not forwarded
+            and not config.setup_skipped):
         if LoginDialog.configure(config).exec_() != QtWidgets.QDialog.Accepted:
             return 0
-    if not config.has_account() and forwarded:
-        # XtreamClient refuses to build without a server; a dummy
-        # unreachable one keeps the window (and the player) alive in its
-        # normal account-error mode. Not saved — the login gate returns
-        # on the next normal launch.
-        if not config.normalized_server():
-            config.data["server_url"] = "http://127.0.0.1:9"
 
     win = MainWindow(config)
     win.show()
