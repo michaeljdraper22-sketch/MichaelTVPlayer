@@ -5,6 +5,9 @@
     read as alive; 502 / connection-refused / hang read as dead — and a
     hang returns within the requested timeout, not the default 3 s.
     The probe must ask for ONE byte (Range: bytes=0-0), never the body.
+    A 2xx that lands on the resolve host's /videos/failed* placeholder
+    (torrentio masks a dead debrid resolve as a 302 to a ~137 KB error
+    mp4 — live-seen 2026-09-29) reads as DEAD despite the 200.
 [2] _stremio_guard_tick alive rule: only playing/paused or >5 s of
     tracked playback counts as alive. The opening-hang shape (VLC stuck
     in 'opening', is_playing() True — live-seen 2026-09-02 16:01, 55 s
@@ -12,7 +15,12 @@
     stall (>5 s played) must NOT restart the stream from zero.
 [3] _on_stremio_probe: a dead probe advances to the next-ranked stream
     immediately; an alive probe, a stale fav_key, an already-done
-    advance, or a VLC that already started all leave it alone.
+    advance, or a VLC that already started all leave it alone. A VOD
+    relay that is ALIVE on the same url (settled total or cached bytes
+    — it read the link seconds ago) OVERRULES a dead probe verdict
+    (live-seen 2026-09-29 16:12: a 0.0 s probe killed a healthy handoff
+    whose splitter was mid-prefetch, and the advance landed on a dead
+    replacement).
 [4] stremio._find_catalog: candidates are scored by word overlap with a
     60% floor — the 2026-09-03 20:57 incident (Cinemeta's search ranked
     'Real Time with Bill Maher' above 'Adventure Time'; the old first-
@@ -114,6 +122,21 @@ def main():
                 self.send_header("Location", "/ok200")
                 self.send_header("Content-Length", "0")
                 self.end_headers()
+            elif self.path.startswith("/failvid"):
+                # torrentio's dead-resolve shape: 302 to its own
+                # placeholder error mp4 (which answers a real 200)
+                self.send_response(302)
+                self.send_header(
+                    "Location", "/videos/failed_unexpected_v3.mp4")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif self.path.startswith("/videos/failed"):
+                body = b"f" * 100        # the 136,909-byte error clip
+                self.send_response(200)
+                self.send_header("Content-Type", "video/mp4")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path.startswith("/bad502"):
                 body = b"upstream error"
                 self.send_response(502)
@@ -140,6 +163,8 @@ def main():
           stremio.probe_debrid(base + "/ok200", timeout_s=3.0) is True)
     check("redirect followed -> alive",
           stremio.probe_debrid(base + "/redir", timeout_s=3.0) is True)
+    check("failure-video redirect (200 on a dead resolve) -> dead",
+          stremio.probe_debrid(base + "/failvid", timeout_s=3.0) is False)
     check("502 -> dead",
           stremio.probe_debrid(base + "/bad502", timeout_s=3.0) is False)
     t0 = time.monotonic()
@@ -194,14 +219,23 @@ def main():
           len(arm("ended", False, 0.0, done=True)) == 0)
 
     print("[3] probe result handler")
+
+    class _FakeRelay:
+        def __init__(self, url, alive=True, total=0, cached=0):
+            self.url = url
+            self._alive = alive
+            self.total = total
+            self.cache_size = cached
+
     def probe_case(alive, state_name="opening", fav="stremio:abc:0",
-                   done=False, vid_s=0.0):
+                   done=False, vid_s=0.0, relay=None):
         fired = []
         view.current = {"kind": "stremio", "fav_key": fav,
                         "title": "T", "url": base + "/ok206"}
         view._closing = False
         view._vid_s = vid_s
         view._stremio_nextstream_done = done
+        view._vod_relay = relay
         view.vlc.state_name = lambda: state_name
         view.vlc.is_playing = lambda: False
         view._begin_stremio_nextstream = lambda: fired.append(1)
@@ -223,6 +257,25 @@ def main():
           len(fired) == 0)
     fired, _ = probe_case(False, done=True)
     check("advance already spent -> no second try", len(fired) == 0)
+    # the relay override (2026-09-29 16:12 shape): VLC still 'opening'
+    # through the async relay startup, probe says dead — but the relay
+    # on THIS url already read the link (settled total / cached bytes)
+    fired, guard_on = probe_case(
+        False, relay=_FakeRelay(base + "/ok206", total=1287333531))
+    check("relay serving this link (total settled) -> dead probe "
+          "overruled, no advance, guard armed",
+          len(fired) == 0 and guard_on is True)
+    fired, guard_on = probe_case(
+        False, relay=_FakeRelay(base + "/ok206", cached=2621440))
+    check("relay serving this link (bytes cached) -> no advance",
+          len(fired) == 0 and guard_on is True)
+    fired, _ = probe_case(
+        False, relay=_FakeRelay("http://elsewhere/x", total=999))
+    check("relay on a DIFFERENT url (stale) -> advance fires",
+          len(fired) == 1)
+    fired, _ = probe_case(
+        False, relay=_FakeRelay(base + "/ok206", alive=False, total=999))
+    check("dead relay proves nothing -> advance fires", len(fired) == 1)
 
     print("[3b] dead-debrid advance chain (guard -> lookup -> switch)")
     # The full wiring the probe/guard fire: _begin_stremio_nextstream

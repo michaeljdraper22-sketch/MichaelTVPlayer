@@ -264,15 +264,31 @@ def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
     arrival. The caller treats False as "advance to the next stream
     down the list now" instead of waiting out the 10 s guard (live-measured
     2026-09-02/03: every debrid handoff on record was one of these
-    shapes, paying the full 10 s or worse)."""
+    shapes, paying the full 10 s or worse).
+
+    A 2xx whose redirect chain lands on the RESOLVE HOST'S OWN
+    /videos/failed* placeholder is dead too: torrentio masks a failed
+    debrid resolve as a 302 to a ~137 KB error mp4 (live-seen
+    2026-09-29 16:11: 'total=136909' on two different torrents, both
+    redirecting to torrentio.strem.fun/videos/failed_unexpected_v3.mp4
+    — a 200 that VLC can never really play)."""
     try:
         resp = _session.get(url, timeout=timeout_s, stream=True,
                             headers={"Range": "bytes=0-0"})
         try:
-            return 200 <= resp.status_code < 300
+            if not 200 <= resp.status_code < 300:
+                log.info("stremio: debrid probe dead: HTTP %d — %s",
+                         resp.status_code, str(url)[:70])
+                return False
+            if "/videos/failed" in str(resp.url or ""):
+                log.info("stremio: debrid probe dead: provider failure "
+                         "video redirect — %s", str(resp.url)[:70])
+                return False
+            return True
         finally:
             resp.close()
-    except requests.RequestException:
+    except requests.RequestException as exc:
+        log.info("stremio: debrid probe dead: %r", exc)
         return False
 
 

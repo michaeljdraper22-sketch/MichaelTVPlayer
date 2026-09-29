@@ -143,11 +143,8 @@ class _ProviderStream:
         # a stream that starts exactly at the cache frontier extends it;
         # one opened at a seek target past a gap stays passthrough
         self.appendable = True   # the window rebases on jumps
-        req = urllib.request.Request(
-            relay.url, headers={"User-Agent": relay.ua,
-                                "Range": f"bytes={offset}-"})
         t0 = time.monotonic()
-        self.resp = urllib.request.urlopen(req, timeout=30)
+        self.resp = relay._provider_urlopen(f"bytes={offset}-", 30)
         status = getattr(self.resp, "status", None)
         if status is not None and status not in (200, 206):
             # 403 (expired signed URL) / 5xx (provider down): fail the
@@ -250,6 +247,10 @@ class VodRelay(QtCore.QObject):
         self._startup_failed = False
         self._head = b""            # prefetched file head (metadata + VLC probes)
         self._start_offset = 0      # where the main stream opens (resume/switch)
+        self._direct_url = None     # resolved redirect target of self.url —
+        #                            # see _provider_urlopen (resolve the
+        #                            # debrid chain ONCE per playback, not
+        #                            # once per range request)
 
     # ---- lifecycle ----
     def start(self, url: str, ua: str, prefer_language: str = "eng",
@@ -275,6 +276,7 @@ class VodRelay(QtCore.QObject):
         self.stop()
         self.url = url
         self.ua = ua or self.ua
+        self._direct_url = None      # new media: resolve the chain fresh
         self._prefer = (prefer_language or "eng").lower() or "eng"
         self._tap_restart = False
         self._tail_harvested = False
@@ -482,21 +484,32 @@ class VodRelay(QtCore.QObject):
         ftyp box at offset 4 (MP4) plus the total size from
         Content-Range. Sets ``self._container``/``_content_type``."""
         try:
-            req = urllib.request.Request(
-                self.url, headers={"User-Agent": self.ua,
-                                   "Range": "bytes=0-11"})
             # 10 s for a 12-byte ranged GET is already generous; this runs
             # synchronously on the UI thread inside VodRelay.start, so a
             # hanging (not fast-erroring) debrid URL used to freeze the
             # open path for the old 20 s before playback even began
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with self._provider_urlopen("bytes=0-11", 10) as r:
                 head = r.read(12)
+                final = r.geturl() or ""
                 cr = r.headers.get("Content-Range") or ""
                 if "/" in cr:
                     try:
                         self.total = int(cr.split("/")[1])
                     except ValueError:
                         pass
+            # torrentio masks a failed debrid resolve as a 302 to its own
+            # placeholder mp4 (live-seen 2026-09-29 16:11: two dead
+            # torrents both 'played' a 136,909-byte failed_unexpected_v3
+            # mp4 while VLC sat stalled for 60 s) — that redirect is a
+            # DEAD LINK wearing a 200, refuse it here so the caller falls
+            # back and the stremio advance chain moves on
+            if "/videos/failed" in final:
+                try:
+                    log.info("vod splitter: debrid resolve failed (provider "
+                             "failure-video redirect) — %s", final[:80])
+                except Exception:
+                    pass
+                return False
             if head[:4] == _EBML_MAGIC:
                 self._container = "mkv"
                 self._content_type = "video/x-matroska"
@@ -526,11 +539,8 @@ class VodRelay(QtCore.QObject):
             #                                          # VLC's whole index
             #                                          # GET is served from
             #                                          # the prefetch
-            req = urllib.request.Request(
-                self.url, headers={
-                    "User-Agent": self.ua,
-                    "Range": f"bytes={self.total - tail_len}-"})
-            with urllib.request.urlopen(req, timeout=30) as r:
+            with self._provider_urlopen(
+                    f"bytes={self.total - tail_len}-", 30) as r:
                 self._tail = r.read()
             self._tail_base = self.total - len(self._tail)
             try:
@@ -548,6 +558,40 @@ class VodRelay(QtCore.QObject):
     def bump_gen(self) -> int:
         self._gen += 1
         return self._gen
+
+    def _provider_urlopen(self, rng: str, timeout: float):
+        """Open one ranged provider request, resolving the debrid
+        redirect chain (torrentio resolve -> debrid API -> CDN) only
+        ONCE per relay: every later range rides the cached FINAL url
+        directly. Each re-open used to re-walk the whole chain, so one
+        playback cost 4+ resolve-endpoint hits (probe, tail, main,
+        re-acquires) and a seek-heavy session dozens — that endpoint is
+        the shared, intermittently-502ing one Stremio web also uses.
+        A cached-direct open that fails clears the cache and re-resolves
+        through the original url once (signed CDN urls expire).
+
+        No locks in here: callers run from the Qt thread (probe), the
+        startup thread (tail) and handler threads (_acquire, which
+        already holds self._lock) — a plain str attr write is atomic
+        and the worst race is one extra resolve."""
+        headers = {"User-Agent": self.ua, "Range": rng}
+        if self._direct_url:
+            try:
+                r = urllib.request.urlopen(
+                    urllib.request.Request(self._direct_url,
+                                           headers=headers),
+                    timeout=timeout)
+                self._direct_url = r.geturl() or self._direct_url
+                return r
+            except Exception:  # noqa: BLE001 - stale signed url
+                self._direct_url = None
+        r = urllib.request.urlopen(
+            urllib.request.Request(self.url, headers=headers),
+            timeout=timeout)
+        final = r.geturl() or ""
+        if final.startswith("http") and final != self.url:
+            self._direct_url = final
+        return r
 
     def _acquire(self, offset: int, owner=None):
         """The single provider slot: reuse a matching live stream, else

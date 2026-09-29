@@ -313,6 +313,89 @@ def main():
                        .replace("\\", "/"), "MichaelTVPlayer/1.0") == "")
     relay2.stop()
 
+    print("[1b] debrid resolve: resolve-once + failure-video refusal")
+    # The 2026-09-29 16:11/16:12 Tarzan incident, distilled: torrentio
+    # 302s healthy resolves to a CDN url but dead ones to its own
+    # /videos/failed_unexpected_v3.mp4 placeholder (a 200 the relay used
+    # to accept as a 136,909-byte 'movie'), and every range request used
+    # to re-walk the whole resolve chain.
+    resolve_hits = []
+
+    class ResolveHandler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *a):
+            pass
+
+        def _body(self, data, rng=None):
+            self.send_response(206 if rng else 200)
+            if rng:
+                self.send_header("Content-Range",
+                                 "bytes %s/%d" % (rng, len(data) + 12345))
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.startswith("/resolve-ok/"):
+                resolve_hits.append("resolve")
+                self.send_response(302)
+                self.send_header("Location", "/cdn/file.mp4")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif self.path.startswith("/resolve-fail/"):
+                resolve_hits.append("resolve-fail")
+                self.send_response(302)
+                self.send_header(
+                    "Location", "/videos/failed_unexpected_v3.mp4")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            elif self.path.startswith("/videos/failed"):
+                self._body(b"\x00\x00\x00\x18ftypisom" + b"f" * 88)
+            elif self.path.startswith("/cdn/"):
+                self._body(b"\x00\x00\x00\x18ftypisom", rng="0-11")
+
+    rsrv = ThreadingHTTPServer(("127.0.0.1", 0), ResolveHandler)
+    rsrv.daemon_threads = True
+    threading.Thread(target=rsrv.serve_forever, daemon=True).start()
+    rbase = "http://127.0.0.1:%d" % rsrv.server_address[1]
+
+    relay3 = VodRelay()
+    relay3.url = rbase + "/resolve-ok/hash/file.mp4"
+    relay3.ua = "test-ua"
+    with relay3._provider_urlopen("bytes=0-11", 5) as r:
+        first = r.geturl()
+    check("first provider open resolves the redirect chain once",
+          len(resolve_hits) == 1 and first.endswith("/cdn/file.mp4"))
+    check("resolved CDN url cached on the relay",
+          (relay3._direct_url or "").endswith("/cdn/file.mp4"))
+    with relay3._provider_urlopen("bytes=12-", 5) as r:
+        pass
+    check("second range rides the CDN url (no re-resolve)",
+          len(resolve_hits) == 1)
+    # a stale signed CDN url (expired token -> refused) re-resolves once
+    dead = ThreadingHTTPServer(("127.0.0.1", 0), ResolveHandler)
+    dead_port = dead.server_address[1]
+    dead.server_close()
+    relay3._direct_url = "http://127.0.0.1:%d/stale?token=x" % dead_port
+    with relay3._provider_urlopen("bytes=0-11", 5) as r:
+        pass
+    check("stale cached url -> re-resolve through the original url",
+          len(resolve_hits) == 2
+          and (relay3._direct_url or "").endswith("/cdn/file.mp4"))
+
+    relay4 = VodRelay()
+    relay4.url = rbase + "/resolve-fail/hash/file.mp4"
+    relay4.ua = "test-ua"
+    check("failure-video redirect refused as a dead link",
+          relay4._probe_head() is False and relay4.total == 0)
+    check("failure-video refusal still cost only one resolve hit",
+          resolve_hits.count("resolve-fail") == 1)
+    rsrv.shutdown()
+    relay3.stop()
+    relay4.stop()
+
     print("[2] byte fidelity + range requests through the relay")
     opens_before = relay.provider_opens
     status, body, hdrs = get_h(local)

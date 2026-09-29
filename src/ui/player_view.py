@@ -736,8 +736,17 @@ class PlayerView(QtWidgets.QWidget):
         #                   tuple — no shared field (a second kick used to
         #                   overwrite the stamp and let the first kick's
         #                   late result engage on the wrong media).
+        # _subfetch_job = monotonic kick counter: a result whose stamped
+        #                   job is not the latest kick may not touch the
+        #                   flags (and a result whose job IS the latest may
+        #                   clear them even when its session went stale —
+        #                   a media change mid-search used to strand the
+        #                   flags True forever, silently refusing every
+        #                   later "Find subtitles online…" press until
+        #                   restart).
         self._sub_fetch_pending = False
         self._sub_fetching = False
+        self._subfetch_job = 0
         self._sub_fetch_lang = "eng"
         self._sub_fetch_lang_name = "English"
         self._sub_fetch_fail = None
@@ -1904,6 +1913,16 @@ class PlayerView(QtWidgets.QWidget):
             return
         self.current = playable
         self._session += 1   # invalidate any deferred DVR callbacks
+        # orphan any online-subtitle state from the previous media: a
+        # search it kicked may still be running, but its arm/pending/fail
+        # hooks describe THAT media's dead-end. Without this, a fetch that
+        # armed on episode A and resolved after the move to episode B left
+        # _sub_fetch_pending/_sub_fetching stuck True — every later
+        # "Find subtitles online…" press was then silently refused.
+        self._sub_fetch_pending = False
+        self._sub_fetching = False
+        self._sub_fetch_fail = None
+        self._subfetch_job += 1
         # Re-arm after an earlier stop() (Playback > Stop): the teardown
         # guards and the tick timer must not outlive the teardown they
         # protect. Re-attaching the surface is a no-op for the same player
@@ -2388,6 +2407,32 @@ class PlayerView(QtWidgets.QWidget):
         try:
             state = self.vlc.state_name() or ""
             if state in ("playing", "paused") or self._vid_s > 5.0:
+                return
+        except Exception:  # noqa: BLE001
+            pass
+        # Ground truth beats the probe: a VOD relay on THIS url that is
+        # alive with a settled content length (its own head probe got a
+        # 206 seconds ago) or cached provider bytes is READING the same
+        # debrid link successfully — the probe's "dead" is then a false
+        # alarm and must not murder a healthy start (live-seen
+        # 2026-09-29 16:12: a 0.0 s probe verdict killed a handoff whose
+        # splitter had a 1.28 GB total and a 2.6 MB tail prefetch in
+        # flight; the auto-advance then landed on a dead replacement and
+        # the user got a 60 s stall on a stream Stremio web played fine).
+        # VLC sits in 'opening' through the async relay startup, so the
+        # state check above cannot catch this shape — the relay can.
+        try:
+            relay = self._vod_relay
+            url = str(cur.get("url") or "")
+            if relay is not None and url and relay.url == url \
+                    and getattr(relay, "_alive", False) \
+                    and (getattr(relay, "cache_size", 0) > 0
+                         or getattr(relay, "total", 0) > 0):
+                log.info("stremio: probe dead verdict ignored — the VOD "
+                         "relay is serving this link (total=%d "
+                         "cached=%d); the 10 s guard stays armed",
+                         int(getattr(relay, "total", 0) or 0),
+                         int(getattr(relay, "cache_size", 0) or 0))
                 return
         except Exception:  # noqa: BLE001
             pass
@@ -6787,6 +6832,13 @@ class PlayerView(QtWidgets.QWidget):
             return      # waiting on _on_stremio_identity
         self._sub_fetch_pending = False
         self._sub_fetching = True
+        self._subfetch_job += 1
+        job = self._subfetch_job    # THIS kick's job number: a result not
+        #                             carrying the latest number may not
+        #                             touch the shared flags (a second kick
+        #                             used to overwrite a shared stamp and
+        #                             let the first kick's late result
+        #                             engage on the wrong media)
         gen = self._session    # THIS kick's generation, captured in the
         #                        closure and stamped into the result tuple:
         #                        a shared field would be overwritten by the
@@ -6816,10 +6868,10 @@ class PlayerView(QtWidgets.QWidget):
                     # round-trips only ever happen for a caption dead-end
                     ident = stremio.resolve_vod_identity(cur_snap)
                     if not ident:
-                        return (gen, "ok", None)
+                        return (job, gen, "ok", None)
                     my_imdb = str(ident.get("stremio_imdb") or "")
                     if not my_imdb:
-                        return (gen, "ok", None)
+                        return (job, gen, "ok", None)
                     my_movie = bool(ident.get("movie"))
                     try:
                         my_season = int(ident.get("season") or season or 0)
@@ -6851,34 +6903,44 @@ class PlayerView(QtWidgets.QWidget):
                     text = prof_mod.read_subtitle_text(dest)
                     cues = prof_mod.parse_subtitle_cues(text) if text else []
                     if cues:
-                        return (gen, "ok", (dest, (cand.get("name")
+                        return (job, gen, "ok", (dest, (cand.get("name")
                                                    or cand.get("release")
                                                    or "subtitle")))
-                return (gen, "ok", None)
+                return (job, gen, "ok", None)
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-                return (gen, "err", str(exc))
+                return (job, gen, "err", str(exc))
 
         self._subfetch_runner.run(_work)
 
     def _on_subs_fetched(self, result):
         """The online-subtitle job came back (any of the three kinds).
-        The worker STAMPS its kick's session generation into the result
-        tuple — only a result from the CURRENT generation may touch
-        flags or engage (the old shared-counter guard let a newer kick
-        overwrite the stamp, so media A's late result engaged on media
-        B, cleared B's fail hook and clobbered B's _sub_fetching flag).
-        Stale results drop silently, flags untouched; failure runs the
-        arming dead-end's classic body verbatim; success renders the
-        fetched file in the styled overlay. The engage is called
-        DIRECTLY — _engage_caption_overlay's _cap_fail early-out must be
-        bypassed because the dead-end deliberately left the failure
-        unlatched while the search ran."""
+        The worker STAMPS its kick's job number AND session generation
+        into the result tuple. The job number says who owns the shared
+        flags: only the LATEST kick's result may clear or engage them (an
+        older kick's late result drops untouched — it never wins over a
+        newer search). The session generation says whether the media the
+        kick ran for is still on screen: a stale-but-latest result clears
+        the flags it owns and drops — the old code left them set forever,
+        which silently refused every later "Find subtitles online…"
+        press until restart. Success renders the fetched file in the
+        styled overlay. The engage is called DIRECTLY —
+        _engage_caption_overlay's _cap_fail early-out must be bypassed
+        because the dead-end deliberately left the failure unlatched while
+        the search ran."""
         ok, val = result
-        if ok != "ok" or not (isinstance(val, tuple) and len(val) == 3):
-            return      # the worker died before stamping its generation
-        gen, ok, val = val
-        if self._closing or gen != self._session:
-            return      # the user moved on — drop, flags untouched
+        if ok != "ok" or not (isinstance(val, tuple) and len(val) == 4):
+            return      # the worker died before stamping its job
+        job, gen, ok, val = val
+        if self._closing:
+            return
+        if job != self._subfetch_job:
+            return      # a newer kick owns the flags — drop, untouched
+        if gen != self._session:
+            # this job was the latest kick, but its media went away: free
+            # the flags it owns (no newer kick to clobber) and drop
+            self._sub_fetching = False
+            self._sub_fetch_pending = False
+            return
         self._sub_fetching = False
         cur = self.current or {}
         if cur.get("kind") not in ("stremio", "vod", "series"):
@@ -6906,9 +6968,24 @@ class PlayerView(QtWidgets.QWidget):
                     log.info("online subs: fetch failed: %s", val)
                 except Exception:  # noqa: BLE001
                     pass
+            else:
+                # searched, downloaded, nothing parsed — this outcome was
+                # invisible in player.log (a SUCCESS is logged below, but
+                # "none found" only flashed a note); diagnosis from the
+                # log alone was impossible
+                try:
+                    log.info("online subs: none found (lang=%s)",
+                             self._sub_fetch_lang)
+                except Exception:  # noqa: BLE001
+                    pass
             self._run_sub_fetch_fail()
             return
         path, _disp = val
+        try:
+            log.info("online subs: engaged %r (lang=%s)",
+                     val[1], self._sub_fetch_lang)
+        except Exception:  # noqa: BLE001
+            pass
         if cur.get("kind") == "stremio":
             # sub_file on stremio: the whole existing takeover machinery
             # (auto-engage at open, restart, VLC slave adoption) rides
@@ -6950,7 +7027,11 @@ class PlayerView(QtWidgets.QWidget):
         rendering; the user asking again wants another try). While a
         search runs, further asks are ignored."""
         self._cap_want = True      # asking for subtitles IS wanting them
-        self._arm_online_sub_fetch(None, manual=True)
+        if not self._arm_online_sub_fetch(None, manual=True) \
+                and not self._closing and self._sub_fetching:
+            # the only quiet refusal left after the stuck-flag fix: a
+            # search is already in flight — SAY so instead of a dead press
+            self._cap_note("Subtitles: still searching\u2026")
 
     def _cycle_spu(self):
         """C key: Off -> English-first track -> ... -> Off. English is the
@@ -7017,6 +7098,17 @@ class PlayerView(QtWidgets.QWidget):
                 # (a missing CCExtractor disengages with a note inside)
                 self._spu_name = "English CC"
                 self._engage_caption_overlay()
+                return
+            if (not tracks
+                    and (self.current or {}).get("kind")
+                    in ("stremio", "vod", "series")
+                    and self._arm_online_sub_fetch(None, manual=True)):
+                # online media with ZERO embedded tracks: the one click IS
+                # the ask — search online now (asking again inside the
+                # card via the "Find subtitles online…" row stayed the
+                # only path, and a trackless card reading as "no options"
+                # was the live-seen dead end)
+                self._cap_want = True
                 return
         self._subs_panel()
 

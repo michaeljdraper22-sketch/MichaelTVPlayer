@@ -303,6 +303,7 @@ class _EligShim:
 
     _is_vod = PlayerView._is_vod
     _is_stremio = PlayerView._is_stremio
+    _is_file = PlayerView._is_file
     _cap_track_kind = staticmethod(PlayerView._cap_track_kind)
 
     def __init__(self, kind):
@@ -1262,6 +1263,31 @@ try:
 finally:
     (_stremio.search_online_subtitles, _stremio.download_online_subtitle,
      _stremio.resolve_vod_identity) = _saved
+
+# 2026-09-28 regression: a search that resolved AFTER the media changed
+# used to strand _sub_fetching/_sub_fetch_pending True forever — every
+# later "Find subtitles online…" press (and every auto dead-end arm) was
+# then silently refused until app restart. Deterministic: stale results
+# delivered straight to the slot, no worker thread.
+view._sub_fetch_pending = False
+view._sub_fetching = True
+view._subfetch_job = 1
+view.current = {"kind": "stremio", "title": "T", "url": "u",
+                "fav_key": "stremio:t:1", "stremio_imdb": "tt1"}
+view._on_subs_fetched(("ok", (1, view._session - 1, "ok", None)))
+check("stale-but-latest result frees the fetch flags",
+      not view._sub_fetching and not view._sub_fetch_pending)
+
+view._sub_fetch_pending = False
+view._sub_fetching = True          # a NEWER kick owns the flags now
+view._subfetch_job = 2
+view._on_subs_fetched(("ok", (1, view._session - 1, "ok", None)))
+check("older kick's stale result leaves the newer kick's flags alone",
+      view._sub_fetching and view._subfetch_job == 2)
+view._on_subs_fetched(("ok", (1, 2, 3)))     # legacy 3-tuple shape
+check("malformed result drops silently, flags untouched",
+      view._sub_fetching)
+view._sub_fetching = False
 
 # second engage REPLACES the previous file's cues (no double render).
 # Hermetic: reset every piece of state the engage reads so nothing an
