@@ -1,0 +1,185 @@
+# Cloud emulator test for the SHIPPED release APK (not a HEAD build).
+#
+# android-test.yml builds an x86_64 debug APK from HEAD, which proves the
+# code but NOT the artifact the phone installs: the release APK is
+# arm64-only and release-signed. This workflow downloads the latest
+# release's APK asset and drives its Settings screen on the emulator —
+# the phone's bug report was "hit Settings, it loads forever", so the
+# settings leg is the acceptance test.
+#
+# ARM translation note: the arm64 app + WebView UI run fine translated
+# on the x86_64 image (the 2.1-era legs proved this); only media init
+# fails under translation, so there is no playback leg here.
+#
+# Also asserts the update-check plumbing: this APK IS the latest
+# release, so the "Update available" banner must NOT appear, and the
+# bridge-health banner must NOT appear.
+
+name: Android release APK test
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: android-release-test
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download latest release APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          URL=$(gh api repos/michaeljdraper22-sketch/MichaelTVPlayer/releases/latest \
+            --jq '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' \
+            | head -1)
+          [ -n "$URL" ] || { echo 'ERROR: latest release has no .apk asset'; exit 1; }
+          echo "downloading $URL"
+          mkdir -p artifacts
+          curl -fsSL -o artifacts/MichaelTV-release.apk "$URL"
+          ls -la artifacts/
+
+      - name: Install emulator + system image
+        run: |
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "emulator" "system-images;android-34;google_apis;x86_64" \
+            > /dev/null
+
+      - name: Create AVD
+        run: |
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/avdmanager" create avd \
+            -n michaeltv-rel -k "system-images;android-34;google_apis;x86_64" -d pixel_5
+
+      - name: Boot headless emulator
+        run: |
+          export ANDROID_AVD_HOME="$HOME/.android/avd"
+          test -e /dev/kvm || { echo 'ERROR: /dev/kvm missing on runner'; exit 1; }
+          sudo chown -R $USER:$USER /dev/kvm || true
+          nohup "$ANDROID_SDK_ROOT/emulator/emulator" -avd michaeltv-rel \
+            -no-window -gpu swiftshader_indirect -no-boot-anim \
+            -no-snapshot -memory 3072 > /tmp/emulator.log 2>&1 &
+          timeout 300 "$ANDROID_SDK_ROOT/platform-tools/adb" wait-for-device \
+            || { echo 'ERROR: emulator never came up on adb'; tail -60 /tmp/emulator.log; exit 1; }
+          BOOT=""
+          for i in $(seq 1 90); do
+            BOOT=$("$ANDROID_SDK_ROOT/platform-tools/adb" shell getprop sys.boot_completed 2>/dev/null | tr -d '\r')
+            [ "$BOOT" = "1" ] && break
+            sleep 5
+          done
+          [ "$BOOT" = "1" ] || { echo 'ERROR: boot did not complete'; tail -60 /tmp/emulator.log; exit 1; }
+          echo "emulator booted"
+
+      - name: Install + drive the release APK
+        run: |
+          ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          export ADB="$ADB"
+          "$ADB" install -r artifacts/MichaelTV-release.apk
+          mkdir -p artifacts/shots
+
+          focus() {
+            "$ADB" shell am start -n org.michaeltv.app/.MainActivity > /dev/null
+            sleep 2
+          }
+          dump() {
+            "$ADB" shell rm -f /sdcard/uidump.xml > /dev/null 2>&1 || true
+            "$ADB" shell uiautomator dump /sdcard/uidump.xml \
+              > /tmp/uidump.log 2>&1 || true
+            "$ADB" pull /sdcard/uidump.xml /tmp/uidump.xml \
+              > /dev/null 2>&1 || true
+            if [ -s /tmp/uidump.xml ]; then
+              tr -d "\r" < /tmp/uidump.xml \
+                | sed -e "s/UI hierchary.*//" > "artifacts/$1.xml"
+            else
+              : > "artifacts/$1.xml"
+              echo "dump: uiautomator failed for $1:" \
+                "$(tail -1 /tmp/uidump.log 2>/dev/null)"
+            fi
+          }
+          shot() { "$ADB" exec-out screencap -p > "artifacts/shots/$1.png"; }
+          wait_text() {
+            local i
+            for i in $(seq 1 15); do
+              focus
+              dump "$1"
+              grep -q "$2" "artifacts/$1.xml" && return 0
+              sleep 3
+            done
+            echo "ASSERT FAIL: '$2' not on screen in $1"
+            exit 1
+          }
+          tapr() {
+            local i
+            for i in 1 2 3 4 5; do
+              focus
+              python3 scripts/tap_text.py "$1" && return 0
+              sleep 3
+            done
+            echo "TAP FAIL: '$1' never found on screen"
+            return 1
+          }
+
+          # --- leg 1: home renders (topbar exists only inside the app) ---
+          focus
+          wait_text 01_home "Live TV"
+          wait_text 01_home "torrentio.strem.fun"
+          shot 01_home
+
+          # --- leg 1b: this APK IS the latest release, so no update
+          # banner may show; and the bridge-health banner must be absent
+          # (a present tense check would race the async check_update,
+          # so settle first). ---
+          sleep 15
+          dump 01_home_settled
+          ! grep -q "Update available" artifacts/01_home_settled.xml \
+            || { echo 'FAIL: update banner shown on the latest APK'; exit 1; }
+          ! grep -q "App engine error" artifacts/01_home_settled.xml \
+            || { echo 'FAIL: bridge error banner on home'; exit 1; }
+
+          # --- leg 2: SETTINGS — the phone's reported bug. The form
+          # ("Stream addon URLs") must appear; an eternal "Loading
+          # settings…" fails the wait. ---
+          focus
+          tapr "Settings"
+          wait_text 02_settings "Stream addon URLs"
+          shot 02_settings
+
+          # --- leg 3: settings SAVE round-trips through the bridge.
+          # The "Saved." toast lives ~3 s, so poll for it rather than
+          # dumping once after a fixed sleep. ---
+          tapr "Save"
+          saved=0
+          for d in 1 2 3 4; do
+            sleep 1
+            dump 03_saved
+            grep -q "Saved" artifacts/03_saved.xml && { saved=1; break; }
+          done
+          [ "$saved" = "1" ] || { echo 'FAIL: settings save toast never appeared'; exit 1; }
+          shot 03_saved
+
+      - name: Collect logcat and verdict
+        if: always()
+        run: |
+          ADB="$ANDROID_SDK_ROOT/platform-tools/adb"
+          "$ADB" logcat -d > artifacts/logcat.txt || true
+          cp /tmp/emulator.log artifacts/emulator.log 2>/dev/null || true
+          echo === PY EXCEPTIONS ===
+          grep -iE "PyException|chaquopy.*error|FATAL" artifacts/logcat.txt | head -20 || true
+          ! grep -qiE "PyException|not callable" artifacts/logcat.txt
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-test-artifacts
+          path: artifacts/
+          if-no-files-found: warn
+          retention-days: 14
