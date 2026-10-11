@@ -67,21 +67,43 @@ allow "Install unknown apps", open. Same signing key (`michaeltv-release.jks`
 + `keystore.properties`, both git-ignored, generated on first build) means
 updates install over the old copy — **never lose those two files**.
 
-## Current release state (tag v2.1.2, published 2026-09-19)
+## Current release state (tag v2.1.3.1, published 2026-10-11)
 
-- `MichaelTV-2.1.2.zip` + `.zip.sha256` — Windows build (parallel session's
-  debrid auto-advance work; the in-app updater matches `.zip` assets only).
-- `MichaelTV-2.1.2.apk` — the Android app, versionCode 212 (stamps from
-  src/config.py APP_VERSION 2.1.2), release-signed with the same key, so it
-  updates over the 2.1.1 install. sha256
-  `0efc733bf703f7fa4514c077a4ebdccbae67bb7bdd2eab721189109190211ebf`.
-  Carries the first-run setup banner + streams explainer (see priority 1a).
-- The stale `MichaelTV-2.1.apk` asset (versionCode 21) was REMOVED from the
-  release — Android refuses downgrade installs, so it was dead weight.
-- Cloud emulator test GREEN on the exact HEAD that shipped: banner, Settings,
-  Live TV, search ("Bluey" via typed query), and PLAYBACK in both H.264 and
-  VP9 (frames-differ verdict). See priority 2 — the old "playback blocked"
-  conclusion is RETIRED.
+- `MichaelTV-2.1.3.1.apk` — versionCode 2131 (stamped from a WORKTREE-only
+  `src/config.py` bump to "2.1.3.1" — main's config.py is the parallel
+  session's 2.1.4 WIP; never commit that into an Android build), release-
+  signed with the same key as 2.1.1/2.1.2, core = committed HEAD (74e8433
+  era, i.e. desktop 2.1.3 + dead-debrid-advance v2, NOT the uncommitted
+  src/ WIP). sha256
+  `2b33d095b89783911f637f9b40f75e799a304e0e8872ddc095616ee33530e499`.
+  What it adds over 2.1.2: rpc errors surface on screen (Settings inline
+  error + Retry, search inline, red "App engine error" boot banner) and
+  the in-app UPDATE CHECK (bridge `check_update` vs the public
+  releases/latest API + Home banner + `py.openUrl`), because sideloaded
+  APKs never update themselves — the phone had been left on an old
+  broken build with nothing saying so.
+- New CI: `.github/workflows/android-release-apk-test.yml` drives the
+  SHIPPED release APK (downloads latest release's .apk, installs on the
+  x86_64 emulator — ARM-translation UI legs only, media is known-broken
+  translated): home render, NO update banner on the latest APK, no
+  engine-error banner, Settings form load, Save round-trip verified by
+  adb-root-pulling settings.json. Lesson: the Save button sits below the
+  fold and uiautomator only exposes visible WebView nodes — scroll before
+  tapping (tap_text.py does not scroll).
+- Prior state (v2.1.3, 2026-09-28): Windows-only release (zip + zip.sha256,
+  NO APK ever attached — which is exactly how the phone got left behind).
+  v2.1.2 (versionCode 212, 2026-09-19) was the previous APK: setup banner
+  + streams explainer. The stale `MichaelTV-2.1.apk` asset was REMOVED
+  from v2.1 long ago (Android refuses downgrade installs).
+- Cloud emulator tests GREEN: `Android emulator test` (x86_64 debug from
+  HEAD: home/settings/live/search + H.264 & VP9 playback) and
+  `Android release APK test` (the shipped 2.1.3.1 artifact itself) both
+  passed on 2026-10-11.
+- KNOWN follow-up: if the user's phone STILL misbehaves on 2.1.3.1, the
+  app now names the cause on screen — get that text (screenshot) instead
+  of guessing. If their installed base is older than the release-signed
+  era (v2.0 debug key), the update install fails on signature →
+  uninstall + reinstall (settings lost, re-paste the keyed addon URL).
 
 ## ⚠️ PARALLEL SESSION WARNING
 
