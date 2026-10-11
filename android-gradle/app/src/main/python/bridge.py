@@ -38,6 +38,10 @@ _RESOLUTIONS = ("match", "auto", "2160", "1440", "1080", "720", "480")
 
 _YEAR_RE = re.compile(r"(?:19|20)\d{2}")
 
+# Public release metadata only — no credentials ever touch this call.
+_GH_LATEST = ("https://api.github.com/repos/michaeljdraper22-sketch/"
+              "MichaelTVPlayer/releases/latest")
+
 
 class BridgeError(Exception):
     """A command failed in an expected, user-presentable way."""
@@ -307,3 +311,37 @@ class Bridge:
         except (TypeError, ValueError):
             raise BridgeError("stream_id required")
         return {"ok": True, "url": client.live_url(stream_id, "ts")}
+
+    # ------------------------------------------------------------------
+    # update check (public GitHub release metadata only)
+
+    @staticmethod
+    def _version_tuple(version):
+        """Numeric compare pieces: 'v2.1.3.1' -> (2, 1, 3, 1)."""
+        parts = []
+        for piece in str(version or "").strip().lstrip("vV").split("."):
+            digits = "".join(c for c in piece if c.isdigit())
+            parts.append(int(digits) if digits else 0)
+        return tuple(parts) or (0,)
+
+    def _cmd_check_update(self, args):
+        try:
+            resp = stremio._session.get(_GH_LATEST, timeout=(5, 10))
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001 — diagnostics only
+            return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        latest = str(data.get("tag_name") or "").strip()
+        if not latest:
+            return {"ok": False, "error": "latest release has no tag"}
+        if self._version_tuple(latest) <= self._version_tuple(APP_VERSION):
+            return {"ok": True, "uptodate": True}
+        apk_url = ""
+        for asset in data.get("assets") or []:
+            name = str(asset.get("name") or "")
+            if name.lower().endswith(".apk"):
+                apk_url = str(asset.get("browser_download_url") or "")
+                break
+        return {"ok": True, "uptodate": False, "latest": latest,
+                "apk_url": apk_url,
+                "release_url": str(data.get("html_url") or "")}

@@ -133,6 +133,29 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
+        /**
+         * Open a plain web URL (the release page / APK download) in the
+         * browser — used by the in-app update banner. Unlike
+         * openExternal it sets no MIME type, so the browser (or the
+         * system download flow for an APK) handles it.
+         */
+        @JavascriptInterface
+        public void openUrl(final String url) {
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    try {
+                        startActivity(new Intent(Intent.ACTION_VIEW,
+                                Uri.parse(url)));
+                    } catch (ActivityNotFoundException e) {
+                        Toast.makeText(MainActivity.this,
+                                "No browser installed",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                }
+            });
+        }
     }
 
     @Override

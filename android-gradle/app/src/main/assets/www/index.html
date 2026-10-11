@@ -156,7 +156,9 @@
            onkeydown="if(event.key==='Enter')doSearch()">
     <button class="accent" onclick="doSearch()">Search</button>
   </div>
+  <div id="bridge-slot"></div>
   <div id="banner-slot"></div>
+  <div id="update-slot"></div>
   <div id="results"><div class="empty">Search a movie or series name.</div></div>
   <div class="footer" id="home-footer">MichaelTV</div>
 </div>
@@ -186,12 +188,15 @@
 
 var state = {
   version: "",
-  search: { q: "", results: null },
+  bridgeError: "",         // non-empty: the py bridge failed at boot (red banner)
+  search: { q: "", results: null, error: "" },
   detail: null,            // {item, data, season}
   streams: null,           // {title, context, items}
   player: null,            // {url, title}
   settings: null,
-  live: null
+  settingsError: "",       // last settings-load failure (shown inline + Retry)
+  live: null,
+  update: null             // check_update reply ({uptodate:true} when current)
 };
 var stack = [];            // [{id, render}]
 
@@ -314,14 +319,105 @@ function dismissBanner() {
 }
 
 // ------------------------------------------------------------------
+// BRIDGE HEALTH BANNER
+//
+// The UI shell renders even when the Python engine behind it is dead,
+// which used to look like "Loading settings…" forever. A failed boot
+// rpc now names its cause here instead.
+
+function renderBridgeError() {
+  var el = document.getElementById("bridge-slot");
+  if (!el) return;
+  if (!state.bridgeError) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    '<div class="banner" style="border-color:var(--bad)">' +
+    '<div class="btitle">&#10060; App engine error</div>' +
+    '<div class="hint">The app engine (search / settings / live TV) failed to ' +
+    "answer: <b>" + esc(state.bridgeError) + "</b><br>" +
+    "Force-close the app and reopen it. If the error returns, include this " +
+    "message in a bug report.</div></div>";
+}
+
+// ------------------------------------------------------------------
+// UPDATE CHECK
+//
+// Sideloaded APKs never update themselves — without this banner a
+// phone silently keeps running whatever APK was downloaded last, no
+// matter how many releases ship. Compares APP_VERSION against the
+// latest public GitHub release and offers the new APK directly.
+
+var updateDismissed = false;
+
+function verTuple(v) {
+  var parts = String(v || "").replace(/^[vV]/, "").split(".");
+  var out = [];
+  for (var i = 0; i < parts.length; i++) {
+    out.push(parseInt(parts[i].replace(/\D/g, "") || "0", 10));
+  }
+  return out;
+}
+
+function isNewer(latest, current) {
+  var a = verTuple(latest), b = verTuple(current);
+  var n = Math.max(a.length, b.length);
+  for (var i = 0; i < n; i++) {
+    var x = a[i] || 0, y = b[i] || 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+function checkUpdate() {
+  rpc("check_update", {}, function (out) {
+    // never nag or block on a failed check — the app works offline
+    if (!out || out.error || !out.ok) return;
+    state.update = out;
+    renderUpdates();
+  });
+}
+
+function renderUpdates() {
+  var el = document.getElementById("update-slot");
+  if (!el) return;
+  var u = state.update;
+  if (!u || u.uptodate || updateDismissed) { el.innerHTML = ""; return; }
+  el.innerHTML =
+    '<div class="banner" style="border-color:var(--accent)">' +
+    '<div class="btitle">&#8593; Update available \u2014 ' + esc(u.latest) + "</div>" +
+    "This phone is running an old build. Download the new APK and install " +
+    "it over this one (your settings are kept)." +
+    '<div class="brow">' +
+    '<button class="accent" onclick="getUpdate()">Get the update</button>' +
+    '<button onclick="dismissUpdate()">Later</button>' +
+    "</div></div>";
+}
+
+function dismissUpdate() {
+  updateDismissed = true;      // session only — returns next launch
+  renderUpdates();
+}
+
+function getUpdate() {
+  var u = state.update || {};
+  window.py.openUrl(u.apk_url || u.release_url ||
+    "https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases/latest");
+}
+
+// ------------------------------------------------------------------
 // HOME / SEARCH
 
 function doSearch() {
   var q = document.getElementById("q").value.trim();
   if (!q) return;
   state.search.q = q;
+  state.search.error = "";
   rpc("search", { q: q }, function (out) {
-    if (out.error) { toast("Search failed: " + out.error); return; }
+    if (out.error) {
+      state.search.results = null;
+      state.search.error = out.error;
+      renderResults();
+      return;
+    }
     state.search.results = out.results || [];
     renderResults();
   });
@@ -332,6 +428,11 @@ function doSearch() {
 function renderResults() {
   var el = document.getElementById("results");
   var rs = state.search.results;
+  if (state.search.error) {
+    el.innerHTML = '<div class="empty">Search failed:<br><span style="color:var(--bad)">' +
+      esc(state.search.error) + "</span></div>";
+    return;
+  }
   if (rs == null) {          // boot: no search made yet
     el.innerHTML = '<div class="empty">Search a movie or series name.</div>';
     return;
@@ -555,10 +656,20 @@ var RES_OPTIONS = [
 
 function enterSettings() {
   state.settings = null;
+  state.settingsError = "";
   push("settings", renderSettings);
+  loadSettings();
+}
+
+function loadSettings() {
   rpc("get_settings", {}, function (out) {
-    if (out.error) { toast(out.error); return; }
+    if (out.error) {
+      state.settingsError = out.error;   // shown inline — never a dead spinner
+      rerender();
+      return;
+    }
     state.settings = out.settings || {};
+    state.settingsError = "";
     rerender();
   });
 }
@@ -567,7 +678,11 @@ function renderSettings() {
   var el = document.getElementById("screen-settings");
   if (!state.settings) {
     el.innerHTML = topbarHtml("Settings") +
-      '<div class="loading">Loading settings&hellip;</div>';
+      (state.settingsError
+        ? '<div class="empty">Couldn\u2019t load settings.<br><br>' +
+          '<span style="color:var(--bad)">' + esc(state.settingsError) + "</span>" +
+          '<br><br><button onclick="loadSettings()">Retry</button></div>'
+        : '<div class="loading">Loading settings&hellip;</div>');
     showScreen("settings");
     return;
   }
@@ -734,14 +849,23 @@ function topbarHtml(title) {
     '<div class="title">' + esc(title) + "</div></div>";
 }
 
-push("home", function () {
+function renderHome() {
   document.getElementById("q").value = state.search.q || "";
+  renderBridgeError();
   renderBanner();
+  renderUpdates();
   renderResults();
   showScreen("home");
-});
+}
+
+push("home", renderHome);
 
 rpc("ping", {}, function (out) {
+  if (out && out.error) {
+    state.bridgeError = out.error;
+    renderHome();
+    return;
+  }
   if (out && out.version) {
     state.version = out.version;
     document.getElementById("home-footer").textContent =
@@ -754,11 +878,17 @@ rpc("ping", {}, function (out) {
 // real <video> pipeline with a public sample video. Never set otherwise.
 // The same fetch also feeds the first-run setup banner (state.settings).
 rpc("get_settings", {}, function (out) {
-  var s = out && out.settings;
+  if (!out || out.error) {
+    state.bridgeError = (out && out.error) || "no reply from app engine";
+    renderHome();
+    return;
+  }
+  var s = out.settings;
   if (s) state.settings = s;
   renderBanner();
   var u = s && s.autoplay_test_url;
-  if (u) { openPlayer(u, "Playback test"); }
+  if (u) { openPlayer(u, "Playback test"); return; }
+  checkUpdate();            // skipped on CI playback legs (player is up)
 });
 </script>
 </body>
