@@ -153,16 +153,24 @@ jobs:
           shot 02_settings
 
           # --- leg 3: settings SAVE round-trips through the bridge.
-          # The "Saved." toast lives ~3 s, so poll for it rather than
-          # dumping once after a fixed sleep. ---
-          tapr "Save"
-          saved=0
-          for d in 1 2 3 4; do
-            sleep 1
-            dump 03_saved
-            grep -q "Saved" artifacts/03_saved.xml && { saved=1; break; }
+          # The Save button sits below the fold and uiautomator only
+          # exposes visible WebView nodes, so scroll it into view
+          # first; then verify deterministically by pulling the
+          # settings file the bridge wrote (no toast-timing flakes). ---
+          for s in 1 2 3 4; do
+            dump 03_scroll
+            grep -q "Save" artifacts/03_scroll.xml && break
+            "$ADB" shell input swipe 540 1700 540 500 300
+            sleep 2
           done
-          [ "$saved" = "1" ] || { echo 'FAIL: settings save toast never appeared'; exit 1; }
+          tapr "Save" || { echo 'FAIL: Save button unreachable'; exit 1; }
+          sleep 5
+          "$ADB" root > /dev/null 2>&1; sleep 3
+          "$ADB" pull /data/data/org.michaeltv.app/files/settings.json \
+            /tmp/settings.json > /dev/null 2>&1 \
+            || { echo 'FAIL: could not pull settings.json'; exit 1; }
+          python3 -c "import json; d=json.load(open('/tmp/settings.json')); assert isinstance(d.get('addons'), list), d; print('settings round-trip OK:', sorted(d))" \
+            || { echo 'FAIL: settings.json not valid JSON with addons'; exit 1; }
           shot 03_saved
 
       - name: Collect logcat and verdict
