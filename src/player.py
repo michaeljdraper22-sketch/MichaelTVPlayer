@@ -13,6 +13,10 @@ log = logging.getLogger("mtp")
 # up on it and swapping in a fresh one (VLCPlayer.stop, see docstring there).
 _STOP_WAIT_S = 2.5
 
+# After unblock_hook fired (kill VLC's local peer sockets), how much longer
+# the wedged stop gets to finish before the fresh-player swap really happens.
+_UNBLOCK_GRACE_S = 2.0
+
 # User-Agent presented to the provider when VLC opens a stream. Some CDNs
 # (e.g. this account's) reject unknown/default agent strings with 520 while
 # serving this exact one — and it is what the app's API session already uses.
@@ -130,6 +134,10 @@ class VLCPlayer:
         self._scale_last = None       # (mode, w, h) last sent to a player
         self._ems = []                # keep event-manager refs alive (GC segfault)
         self._window_id = None   # last HWND/XID handed to set_window()
+        # Set by the UI (player_view): force-kills whatever local source the
+        # wedged player's input thread is blocked reading from (relay client
+        # sockets), so a hung stop can finish instead of forcing a swap.
+        self.unblock_hook = None
         self._setup_player(self.player)
         self.media = None
 
@@ -507,10 +515,26 @@ class VLCPlayer:
                 # it detached — its OWN small top-level window the app
                 # cannot control (live-seen: switching from a hung Stremio
                 # stream to live TV). Re-asserting the binding re-parents
-                # the running vout back onto our surface.
+                # the running vout back onto our surface. The recreation is
+                # ASYNCHRONOUS, so one immediate re-parent can land before
+                # it: re-assert a few times over the next seconds.
                 try:
                     self._bind_window(self.player)
                 except Exception:
+                    pass
+                try:
+                    rebind = self.player
+                    for delay in (0.4, 1.2, 2.5):
+
+                        def _reassert(pl=rebind):
+                            if pl is self.player:
+                                try:
+                                    self._bind_window(pl)
+                                except Exception:  # noqa: BLE001
+                                    pass
+
+                        threading.Timer(delay, _reassert).start()
+                except Exception:  # noqa: BLE001
                     pass
                 try:
                     log.info("display stop: wedged player finally stopped; "
@@ -521,6 +545,27 @@ class VLCPlayer:
         threading.Thread(target=_teardown, name="mtp-display-stop",
                          daemon=True).start()
         if done.wait(_STOP_WAIT_S):
+            self._apply_volume(self.player)   # undo the pre-stop mute
+            self._unmute_late(self.player)
+            return
+        # Still hung. Before reaching for the player swap (two vouts on one
+        # HWND — the frozen-picture / floating-window incident), let the UI
+        # kill the wedged input's local peer (relay client sockets) and give
+        # libvlc one short grace: with the peer gone the stop usually lands
+        # in well under a second and the SAME player keeps serving.
+        try:
+            hook = self.unblock_hook
+            if hook is not None:
+                log.info("display stop: hung after %.1fs — kicking local "
+                         "media sources before any player swap",
+                         _STOP_WAIT_S)
+                hook()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("display stop: unblock hook failed: %r", exc)
+            except Exception:
+                pass
+        if done.wait(_UNBLOCK_GRACE_S):
             self._apply_volume(self.player)   # undo the pre-stop mute
             self._unmute_late(self.player)
             return

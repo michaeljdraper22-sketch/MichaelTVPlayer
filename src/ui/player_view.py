@@ -138,6 +138,31 @@ _RAW_MOVE_FRAC = 0.5            # raw "moved" if |d| > max(0.02 s, this
 # The budget resets on every channel change (play_media).
 _CHASE_RETRY_DELAYS = (10.0, 30.0)
 
+# Tail-hold at the write head: when the display player eats forward into
+# the end of the growing DVR buffer (the provider trickles, the viewer at
+# the live edge catches up, VLC hits the file's end and parks in "ended"),
+# the rescue used to reopen a few seconds BEHIND the end point every
+# cooldown — the viewer watched the same 2-4 s replay forever (2026-10-11
+# 14:44: five rescues in 27 s on NFL Network, each landing 2-3 s behind
+# where the player ended; the anchor crept forward ~2-4 s per cycle, just
+# past the same-anchor loop-breaker's 2.0 s tolerance, so it never fired).
+# Instead, HOLD the last frame and wait until REAL data exists ahead of the
+# freeze point (PCR head when the pins exist, confirmed frontier
+# otherwise), then resume FORWARD from the freeze point — a freeze during
+# a provider lull, never a rewind. No data within the give-up window hands
+# over to the plain-live fallback ladder (which retries chase on backoff).
+_HOLD_RESUME_AHEAD_S = 6.0
+_HOLD_GIVE_UP_S = 45.0
+# Dead-open rescue: a chase (re)open that ends WITHOUT ever reaching a
+# playing tick (e.g. a start-time past the file's write head) leaves
+# _chase_started False, and the stall rescue below requires it — the
+# watchdog went SILENT and the screen just sat dead (2026-10-11 15:05:36:
+# poisoned-div reopen at 2991 s in a 1500 s buffer ended instantly; no
+# rescue line ever followed). One open that never plays for this long
+# gets reopened at the tracked position (the same-anchor loop-breaker
+# then escalates if it keeps failing).
+_CHASE_OPEN_DEAD_S = 10.0
+
 # Live-CC pipeline lag FALLBACK (buffer-tail poll + CCExtractor processing
 # + SRT harvest) for when the tail-PCR probe cannot measure the real lag
 # (no PCR in the buffer yet, probe failure). Stage 2 measures L live and
@@ -625,6 +650,9 @@ class PlayerView(QtWidgets.QWidget):
         self._last_reopen = 0.0    # cooldown for frontier reopens
         self._chase_started = False  # chase playback actually began once
         self._chase_fail_count = 0   # give-ups this channel (retry budget)
+        self._chase_hold = None    # tail-hold at the write head:
+        #                          # [freeze_pos_s, since] or None (see
+        #                          # _chase_hold_tick / _HOLD_* constants)
         self._last_slider_max = -1
         self._rate = 1.0              # current playback speed (DVR/VOD)
         self._vid_s = 0.0             # TRACKED playback position in the
@@ -765,6 +793,12 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_div_ok = False      # clock): the axis divergence used to
         #                              # convert content-axis seek targets
         #                              # into VLC set_time numbers
+        self._cap_renum_pend = None   # unconfirmed axis jump (raw, clock):
+        #                              # a renumber is only TRUSTED once the
+        #                              # next reading advances ~1:1 from it —
+        #                              # a lone garbage get_time spike must
+        #                              # never re-anchor the axis (see
+        #                              # _caption_clock_s)
         # live-CC arrival anchor: the newest FRESH cue is pinned at
         # edge - L on the app's content axis (L = the MEASURED CCX lag
         # from the tail-PCR probe; the old hardcoded 1 s was wrong by
@@ -897,6 +931,7 @@ class PlayerView(QtWidgets.QWidget):
             sub_args=subtitle_instance_args(config.subtitle_appearance),
             spu_delay_ms=int(config.subtitle_appearance.get("delay_ms", 0)
                              or 0))
+        self.vlc.unblock_hook = self._kick_wedged_media_sources
         # the freetype args this running VLC instance was BUILT with — used
         # to tell the user when a style change needs a restart to apply
         self._sub_args_built = subtitle_instance_args(
@@ -1957,20 +1992,29 @@ class PlayerView(QtWidgets.QWidget):
         # Default is the plain live stream (single connection).
         # Handoff order (ONE provider stream max, Windows-safe temp cleanup):
         #   1) release record-output bookkeeping,
-        #   2) stop the DISPLAY player (closes its live stream / DVR buffer
-        #      file handle),
-        #   3) safe_stop() the recorder — its temp dir is deleted only now,
-        #      after BOTH players are idle,
-        #   4) only then open the new URL on the display player.
+        #   2) kill the OLD media's caption/filter machinery FIRST — the
+        #      VOD relay is VLC's actual peer socket, and VLC's input
+        #      thread can sit BLOCKED on a silent relay read for minutes
+        #      (live-seen 2026-10-06 17:15: an episode that had sat ~3 h
+        #      on a dead provider wedged the display stop for 76 s; the
+        #      2.5 s stop timeout then swapped in a fresh player onto the
+        #      SAME video surface, whose vout the wedged one still owned —
+        #      audio played while the picture froze, and the fresh vout
+        #      fell back to its own floating window). Closing the relay
+        #      gives VLC's read an immediate EOF so stop() returns while
+        #      the SAME player is still in use,
+        #   3) stop the DISPLAY player (closes its live stream / DVR
+        #      buffer file handle),
+        #   4) safe_stop() the recorder — its temp dir is deleted only
+        #      now, after BOTH players are idle,
+        #   5) only then open the new URL on the display player.
         self._stop_recording(stopping=True)
-        self.vlc.stop_and_release()
-        self._ensure_dvr_stopped()
-        # The OLD media's caption/filter machinery: the VOD relay holds a
-        # provider connection and must release it BEFORE the new URL opens
+        # The overlay drops its claim on the old sources first (while it
+        # owns them, _stop_profanity keeps them alive), then the live
+        # caption reader + filter windows go. The relay holds a provider
+        # connection that must release before the new URL opens anyway
         # (the account allows one connection — a leaked relay stalled the
-        # next channel). The overlay drops its claim on those sources
-        # first (while it owns them, _stop_profanity keeps them alive),
-        # then the live caption reader + filter windows go.
+        # next channel); doing it here ALSO unblocks the VLC stop below.
         self._set_cap_on(False)
         self._cap_fail = False
         self._cap_store_ext = False
@@ -1983,6 +2027,8 @@ class PlayerView(QtWidgets.QWidget):
         self._sub_fetching = False
         self._sub_fetch_fail = None
         self._stop_profanity()
+        self.vlc.stop_and_release()
+        self._ensure_dvr_stopped()
         self._cap_cues.clear()
         self._cap_tick_errs.clear()   # a new media logs its own errors
         # fresh live-CC arrival anchor + tracked caption clock per media
@@ -2007,6 +2053,7 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_backlog_s = None
         self._cap_div_s = 0.0
         self._cap_div_ok = False
+        self._cap_renum_pend = None
         self._sync_pcr_join = None      # new media -> new CCX join reference
         self._sync_pcr_join_tries = 0
         self._sync_credit_s = 0.0
@@ -2032,6 +2079,7 @@ class PlayerView(QtWidgets.QWidget):
         self._reopen_last_at = -1e9
         self._reopen_last_t = 0.0
         self._reopen_repeats = 0
+        self._chase_hold = None
         self._cu_raw_wall = 0.0
         self._cu_raw_moved = False
         self._chase_started = False
@@ -2271,6 +2319,19 @@ class PlayerView(QtWidgets.QWidget):
                 int(ident.get("episode") or 0))
             if ident.get("episode_name"):
                 title += " %s" % ident["episode_name"]
+            # series identifications log like the movie branch does —
+            # the 2026-10-13 wrong-show incident (Adventure Time ->
+            # 'Equal Time with Ted Red and Lou Blue') left NO trace of
+            # where the garbage imdb id came from
+            try:
+                log.info("stremio: identified %r -> %s S%02dE%02d",
+                         (ident.get("file_name") or "")[:50]
+                         or ident.get("series_name", ""),
+                         ident.get("stremio_imdb"),
+                         int(ident.get("season") or 0),
+                         int(ident.get("episode") or 0))
+            except Exception:
+                pass
         cur["title"] = title
         self.show_info(title, sticky=True)
         # the episode buttons (prev/next/autoplay) are gated on the
@@ -3231,7 +3292,7 @@ class PlayerView(QtWidgets.QWidget):
                 self._sync_transport("resume")
                 if down:
                     cur = self.vlc.get_time()
-                    at = self._cap_content_for_raw(cur / 1000.0) \
+                    at = max(0.0, self._cap_content_for_raw(cur / 1000.0)) \
                         if cur >= 0 else self._frontier_s()
                     self._chase_seek(at, resume=True)
                 else:
@@ -3241,7 +3302,7 @@ class PlayerView(QtWidgets.QWidget):
                 # stalled at the edge (not user-paused): play revives it
                 self._sync_transport("revive-resume")
                 cur = self.vlc.get_time()
-                at = self._cap_content_for_raw(cur / 1000.0) \
+                at = max(0.0, self._cap_content_for_raw(cur / 1000.0)) \
                     if cur >= 0 else self._frontier_s()
                 self._chase_seek(at, resume=True)
             else:
@@ -3583,6 +3644,18 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_raw_s = None
         self._cap_raw_wall = 0.0
         self._cap_raw_clock = None
+        # The old axis divergence is VOID at a transport: the open/seek
+        # lands raw at the commanded number by construction, so whatever
+        # raw believed before no longer applies. Keeping a stale div made
+        # one poisoned reading COMPOUND — every play_at start-time got
+        # target+div (seeking clean past the write head: instant end,
+        # rescue loop; live-seen 2026-10-11 15:03, div=+1495 doubling
+        # start 1495->2991). A genuinely offset file re-measures its div
+        # from the landing within a reading or two (the fold below
+        # captures the absolute offset once deltas agree).
+        self._cap_div_s = 0.0
+        self._cap_div_ok = False
+        self._cap_renum_pend = None
         self._cap_wall = now_s()
 
     def _cc_probe_head_pcr(self):
@@ -3770,6 +3843,7 @@ class PlayerView(QtWidgets.QWidget):
         """
         if not (self._mode == "chase" and self.dvr):
             return
+        self._chase_hold = None   # any transport supersedes a tail-hold
         target_s = float(target_s)
         if jump_live:
             back = _chase_jump_back_s(self._cc_lag)
@@ -4114,6 +4188,7 @@ class PlayerView(QtWidgets.QWidget):
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0
+        self._chase_hold = None
         self._chase_started = False
         self.vlc.stop_and_release()                 # (1)
         self._ensure_dvr_stopped()                  # drop any stale buffer
@@ -4147,6 +4222,7 @@ class PlayerView(QtWidgets.QWidget):
         self._dvr_base = 0.0
         self._reset_dvr_clock()
         self._stall_ticks = 0
+        self._chase_hold = None
         self._chase_started = False
         self._vid_s = 0.0
         self._last_raw = None
@@ -4468,6 +4544,56 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_verify = None   # the reopen supersedes any pending verify
         self._reopen_display(at=target)
         self._poke_audio()
+
+    def _chase_hold_tick(self, now: float):
+        """Tail-hold state machine (entered by the rescue branch in _tick,
+        see _HOLD_* constants): the display player ate to the write head of
+        the growing DVR buffer. HOLD the last frame while the provider
+        trickles; once real data exists ahead of the freeze point, reopen
+        AT that point (play_at — set_time is a no-op on an ended player)
+        and playback continues FORWARD exactly where it stopped. A no-data
+        stretch past the give-up window goes to the plain-live fallback
+        ladder, like a chase engagement that never produced data."""
+        hold = self._chase_hold
+        if hold is None or self._closing \
+                or not (self._mode == "chase" and self.dvr):
+            self._chase_hold = None
+            return
+        if self._chase_paused:
+            return      # a user pause outranks the hold; resume handles it
+        freeze, since = hold
+        if self._cc_head_pcr is None \
+                or now - self._cc_head_pcr[1] > 2.0:
+            self._cc_probe_head_pcr()   # ~20 ms, throttled to ~2/s
+        # Data ahead of the RESUME point (not _vid_s — the clock may sit a
+        # hair behind): PCR head when the pins exist, confirmed frontier
+        # otherwise. Both only ever count content that is really on disk.
+        ahead = self._head_ahead_s(freeze)
+        if ahead is not None and ahead >= _HOLD_RESUME_AHEAD_S:
+            at = max(0.0, min(freeze, self._frontier_s() + 60.0))
+            self._chase_hold = None
+            try:
+                log.warning("chase tail-hold: %.1fs of data past the "
+                            "freeze point — resuming at %.1fs (held "
+                            "%.1fs)", ahead, at, now - since)
+            except Exception:
+                pass
+            self._set_dvr_status("")
+            self._chase_started = False   # re-armed by the first playing tick
+            self._stall_ticks = 0
+            self._last_reopen = now
+            self._seek_verify = None
+            self._reopen_display(at=at)
+            return
+        if now - since > _HOLD_GIVE_UP_S:
+            self._chase_hold = None
+            try:
+                log.warning("chase tail-hold: no data for %.1fs — plain "
+                            "live fallback", now - since)
+            except Exception:
+                pass
+            self._set_dvr_status("")
+            self._fallback_from_chase(now - since)
 
     # ---- permanent recording (kept file; still a single connection) ----
     def _on_rec_toggled(self, on):
@@ -5346,14 +5472,50 @@ class PlayerView(QtWidgets.QWidget):
                         or now - self._cc_head_pcr[1] > 2.0:
                     self._cc_probe_head_pcr()   # ~20 ms, on suspicion only
                 head_ahead = self._head_ahead_s(current)
-            if (not self._chase_paused
+            if self._chase_hold is not None:
+                # Tail-hold active (player ate to the buffer write head):
+                # hold the last frame and wait for data — the state machine
+                # below resumes forward from the freeze point or gives up
+                # to the plain-live fallback. Never a rewind. Terminal:
+                # both outcomes may leave chase mode; nothing below the
+                # rescue block may run against the new mode this tick.
+                self._chase_hold_tick(now)
+                return
+            elif (not self._chase_paused
                     and now - self._last_reopen > _REOPEN_COOLDOWN_S
                     and self.dvr.buffer_file()
                     and ((self._stall_ticks >= 3 and self._chase_started
                           and not playing and raw >= 0)
                          or (raw_frozen and playing and head_ahead is not None
-                             and head_ahead > _WEDGE_DATA_AHEAD_S))):
+                             and head_ahead > _WEDGE_DATA_AHEAD_S)
+                         or (not playing and raw >= 0
+                             and not self._chase_started
+                             and self._last_reopen > 0.0
+                             and now - self._last_reopen
+                             > _CHASE_OPEN_DEAD_S))):
                 self._last_reopen = now
+                self._stall_ticks = 0
+                if not playing and self._chase_started:
+                    # Signature (a) with the player parked in "ended": it
+                    # almost always ATE TO THE WRITE HEAD of the growing
+                    # buffer (the normal live-edge stall on a trickling
+                    # provider), not a dead file. Reopening a few seconds
+                    # back replayed those seconds on every cooldown — the
+                    # endless short loop (2026-10-11 14:44) — so hold the
+                    # frame instead and wait for data to resume INTO.
+                    freeze = max(self._cap_clock_s, self._vid_s)
+                    self._chase_hold = [freeze, now]
+                    self._seek_verify = None   # stale beside the hold
+                    try:
+                        log.warning("chase tail-hold: player reached the "
+                                    "buffer write head at %.1fs — holding "
+                                    "frame until data returns", freeze)
+                    except Exception:
+                        pass
+                    self._chase_note("Signal stalled \u2014 holding picture "
+                                     "until the stream catches up",
+                                     clear_after_ms=0)
+                    return
                 try:
                     log.warning("chase rescue: playing=%s raw=%.1f "
                                 "frozen=%.1fs frontier=%.1fs "
@@ -5366,7 +5528,6 @@ class PlayerView(QtWidgets.QWidget):
                                 else "%.1f" % head_ahead)
                 except Exception:
                     pass
-                self._stall_ticks = 0
                 self._reopen_chase(gen)
                 return
             # (a) verify the last set_time landed; escalate on a no-op
@@ -6320,12 +6481,27 @@ class PlayerView(QtWidgets.QWidget):
                     fold = residual
                     branch = "fold"
                 else:
-                    # PTS renumbering / garbage jump: frames keep playing
-                    # 1:1, the clock stays — remember the axis divergence
-                    # so transport targets convert to VLC's numbers
-                    self._cap_div_s = raw - (prev_clock + wall_adv)
-                    self._cap_div_ok = True
-                    branch = "renum"
+                    # Big jump: either PTS renumbering (frames keep
+                    # playing 1:1 on a shifted number axis) or a lone
+                    # garbage get_time spike (opens/ends lie). PARK it:
+                    # if the next reading FOLDS — advances ~1:1 from the
+                    # jumped number — it was a real renumber and the
+                    # fold's absolute offset snaps the div below; any
+                    # other jump discards it. Capturing div from the one
+                    # reading (the old code) let a single transient spike
+                    # poison every later play_at start-time (live-seen
+                    # 2026-10-11 15:03: div=+1495 doubled starts past
+                    # the write head — instant end, rescue storm — and a
+                    # pause/play revive converted raw 0 to a NEGATIVE
+                    # content position, replaying the game from 0:00).
+                    if playing:
+                        branch = "renum?" \
+                            if self._cap_renum_pend is None else "spike"
+                        self._cap_renum_pend = (raw,
+                                                prev_clock + wall_adv)
+                    else:
+                        self._cap_renum_pend = None
+                        branch = "spike"
                     reject = "jump(%+.2f)" % residual
             else:
                 branch = "base"       # first reading after a seed
@@ -6350,7 +6526,14 @@ class PlayerView(QtWidgets.QWidget):
             branch = "seed"
         if branch == "fold":
             d_now = raw - self._cap_clock_s
-            if self._cap_div_ok:
+            if self._cap_renum_pend is not None:
+                # the parked jump CONTINUED 1:1: a real renumber — snap
+                # the axis divergence to the measured absolute offset
+                # (no EWMA crawl through the old offset)
+                self._cap_div_s = d_now
+                self._cap_div_ok = True
+                self._cap_renum_pend = None
+            elif self._cap_div_ok:
                 self._cap_div_s += (d_now - self._cap_div_s) * _CC_D_ALPHA
             else:
                 self._cap_div_s = d_now
@@ -7263,6 +7446,7 @@ class PlayerView(QtWidgets.QWidget):
                 sub_args=self._sub_args_built,
                 spu_delay_ms=int(
                     self.config.subtitle_appearance.get("delay_ms", 0) or 0))
+            self.vlc.unblock_hook = self._kick_wedged_media_sources
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("sub style: player rebuild failed (%r) — "
@@ -8182,6 +8366,24 @@ class PlayerView(QtWidgets.QWidget):
             # the dot's MUTING emphasis rides the 100 ms cadence so the
             # green brightens/dims exactly with the mute windows
             self._update_filter_dot()
+
+    def _kick_wedged_media_sources(self):
+        """VLCPlayer.stop unblock hook (see VLCPlayer.stop): a display stop
+        that hangs is almost always libvlc's input thread parked on a read
+        from one of OUR local relay sockets (VOD splitter / catch-up proxy)
+        whose provider upstream died long ago — libvlc cannot finish its
+        stop until that read returns. Force-closing the client sockets ends
+        it now, so the SAME player keeps serving instead of the stop timing
+        out and swapping a fresh player onto the still-owned video surface
+        (live-seen 2026-10-06 17:15: 76 s wedged stop on a 3 h stale
+        Stremio relay; the swap cost the picture and spawned a detached
+        vout window). Runs on the UI thread — fast, never raises."""
+        for relay in (self._vod_relay, self._catchup_relay):
+            try:
+                if relay is not None:
+                    relay.kick()
+            except Exception:  # noqa: BLE001
+                pass
 
     def _stop_profanity(self, keep_windows: bool = False):
         """Kill the caption reader / VOD splitter + clear the filter mute.

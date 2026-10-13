@@ -256,6 +256,72 @@ def build_resolve_url(base: str, info_hash: str, file_name: str,
                               int(file_idx or 0), name)
 
 
+# ---------------------------------------------------------------------------
+# season-pack mislabel veto
+
+_PACK_MIN_TITLE = 5       # normalized chars a matchable title needs
+
+
+def _norm_name(text) -> str:
+    """Lowercase, non-alphanumerics -> single spaces, space-PADDED so a
+    word-boundary title test is just a padded substring test.
+    Apostrophes drop OUT first (no space): release packs write
+    'Daddys.Little.Monster' where Cinemeta writes "Daddy's Little
+    Monster" — a space there would make the two never equal."""
+    text = re.sub(r"['\u2019]", "", str(text or "").lower())
+    return " %s " % re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def _episode_titles(meta: dict, series_name: str = "") -> dict:
+    """{(season, episode): normalized title} for real episodes
+    (season >= 1). Titles too short to match on are skipped, and so are
+    titles contained in the show's own name — a special literally
+    titled 'Adventure Time' would otherwise put every pack file under
+    suspicion."""
+    show = _norm_name(series_name)
+    out = {}
+    for v in (meta or {}).get("videos") or []:
+        try:
+            se = (int(v.get("season", -1)), int(v.get("episode", -1)))
+        except (TypeError, ValueError):
+            continue
+        norm = _norm_name(v.get("name") or v.get("title") or "")
+        if se[0] >= 1 and se[1] >= 1 \
+                and len(norm.strip()) >= _PACK_MIN_TITLE \
+                and (not show or norm not in show):
+            out[se] = norm
+    return out
+
+
+def _file_is_other_episode(file_name, meta: dict, season: int,
+                           episode: int, series_name: str = "") -> bool:
+    """True when a season-pack file name provably belongs to a DIFFERENT
+    episode than the one asked for: the name contains exactly one
+    episode title of the series and it is not this episode's. Torrentio
+    matches pack files by the SxxExy STRING in the name, and bulk packs
+    numbered by production order carry air-order titles that disagree —
+    live-seen 2026-10-06 12:07 (Adventure Time S04E11): the dead-debrid
+    advance landed on 'Adventure.Time.S04E11.Daddys.Little.Monster…
+    .mkv' (fileIdx 10 of a pack), which plays Daddy's Little Monster —
+    aired as S04E06 — under an S04E11 banner. Only a CONFIDENT match
+    vetoes: the requested title present in the name (multi-episode
+    files list it too), two+ other titles (ambiguous — the fileIdx
+    decides), or no match at all (foreign-language titles never match
+    English) all keep the candidate."""
+    if not meta or not season or not episode:
+        return False
+    file_n = _norm_name(file_name)
+    if len(file_n.strip()) < _PACK_MIN_TITLE:
+        return False
+    titles = _episode_titles(meta, series_name)
+    wanted = titles.get((int(season), int(episode)))
+    if wanted and wanted in file_n:
+        return False
+    others = [se for se, t in titles.items()
+              if se != (int(season), int(episode)) and t in file_n]
+    return len(others) == 1
+
+
 def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
     """Cheap liveness check for a handed-off debrid link: a 1-byte range
     GET that must produce ANY 2xx within ``timeout_s`` (redirects
@@ -271,11 +337,27 @@ def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
     debrid resolve as a 302 to a ~137 KB error mp4 (live-seen
     2026-09-29 16:11: 'total=136909' on two different torrents, both
     redirecting to torrentio.strem.fun/videos/failed_unexpected_v3.mp4
-    — a 200 that VLC can never really play)."""
+    — a 200 that VLC can never really play).
+
+    HTTP 429 is THROTTLING, not death: the resolve endpoint rate-limits
+    bursts (Stremio's own traffic + the player's lookaheads share the
+    same IP), and a 429 on the probe does not mean VLC's open failed.
+    Returning alive here keeps the user's own pick in VLC's hands; if
+    the link really cannot open, the 10 s start guard advances instead
+    — seconds later, from a calm rate state. Killing on 429 walked the
+    auto-advance off the picked stream twice in a row on healthy
+    handoffs (live-seen 2026-10-06 12:07/12:08, Adventure Time S04E11:
+    both user-picked links probed 429 within ~2 s, both got silently
+    replaced, and the replacement landed on a mislabeled season-pack
+    file that plays a DIFFERENT episode)."""
     try:
         resp = _session.get(url, timeout=timeout_s, stream=True,
                             headers={"Range": "bytes=0-0"})
         try:
+            if resp.status_code == 429:
+                log.info("stremio: debrid probe throttled (HTTP 429) — "
+                         "not dead, the 10 s start guard stays armed")
+                return True
             if not 200 <= resp.status_code < 300:
                 log.info("stremio: debrid probe dead: HTTP %d — %s",
                          resp.status_code, str(url)[:70])
@@ -794,7 +876,19 @@ def _find_catalog(search, name: str, year: str = ""):
     is handled by re-searching with leading words progressively dropped.
     Single-word names get their one query too (range floor of 1 —
     "Silo" silently never searched, which left the episode buttons/
-    autoplay dead on one-word-titled shows)."""
+    autoplay dead on one-word-titled shows).
+    When a trim level's floor fails, the best TIGHT candidate — a title
+    made ENTIRELY of query words (>= 2 of them) — is accepted before
+    the ladder descends. The canonical catalog title is often shorter
+    than the release head ('Adventure Time' vs 'Adventure Time With
+    Finn And Jake'), can never reach the 60% floor, and the ladder's
+    next rung drops the DISTINCTIVE head word and lowers the floor
+    until subtitle-word garbage ties it: 'Equal Time with Ted Red and
+    Lou Blue' and 'Living by Design with Jake and Jazz' both won that
+    coin flip on separate nights (live-seen 2026-10-07 13:10 and
+    2026-10-13 02:12 — wrong show identified, autoplay and both
+    episode buttons dead). A tight candidate carries no outside word,
+    which no such garbage title survives."""
     if not name:
         return None
     year = str(year or "").strip()
@@ -832,6 +926,7 @@ def _find_catalog(search, name: str, year: str = ""):
         # ceil(60%): 1 word -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3
         need = max(1, (len(wanted) * 3 + 4) // 5)
         best, best_score = None, (0, 0, False)
+        tight_best, tight_score = None, (0, 0)   # (ymatch, overlap)
         for cand in search(query):
             cand_words = _sig_words(cand.get("name"))
             overlap = len(cand_words & wanted)
@@ -847,8 +942,16 @@ def _find_catalog(search, name: str, year: str = ""):
             tight = cand_words <= wanted
             if (overlap, ymatch, tight) > best_score:
                 best, best_score = cand, (overlap, ymatch, tight)
+            if tight and (ymatch, overlap) > tight_score:
+                tight_best, tight_score = cand, (ymatch, overlap)
         if best_score[0] >= need:
             return best
+        # the tight fallback answers ONLY an unanswered floor — a
+        # floor-passing pick is byte-identical to before, and a
+        # 1-word tight title is generic noise a single-word query's
+        # own need=1 floor already handles
+        if tight_best is not None and tight_score[1] >= 2:
+            return tight_best
     return None
 
 
@@ -1513,6 +1616,43 @@ def resolve_identity(url: str, server: StreamingServer):
         pass
     if se:
         season, episode = se
+        # wrong-show veto: the file name carries an explicit SxxEyy, so
+        # a series whose episode map lacks that slot is NOT this file's
+        # show, whatever the word-overlap scorer thought. The net for
+        # every matcher shape the floor/tight rules still miss
+        # (live-seen 2026-10-13 02:12: 'Adventure Time With Finn And
+        # Jake.S05E25' matched 'Equal Time with Ted Red and Lou Blue' —
+        # a 6-episode one-season talk show; autoplay, play-next and
+        # next-stream all dead on the garbage id while Stremio's own
+        # next-episode button worked). Walk the search's own ranked
+        # candidates for one that HAS the slot; an empty map (meta
+        # fetch failed) never vetoes — a network blip must not undo a
+        # healthy identification.
+        if meta.get("videos") and \
+                (season, episode) not in _ordered_episodes(meta, season):
+            log.info("stremio: %r has no S%02dE%02d — wrong-show veto, "
+                     "walking the other candidates", hit[1], season,
+                     episode)
+            for cand in search_series(show_query)[:6]:
+                cid = str(cand.get("id") or "")
+                if not cid or cid == hit[0]:
+                    continue
+                try:
+                    m = series_meta(cid)
+                except Exception:  # noqa: BLE001
+                    continue
+                if m.get("videos") and \
+                        (season, episode) in _ordered_episodes(m, season):
+                    log.info("stremio: veto recovered — %r (%s) has "
+                             "S%02dE%02d", m.get("name") or cid, cid,
+                             season, episode)
+                    hit = (cid, m.get("name") or cid)
+                    meta = m
+                    break
+            else:
+                log.info("stremio: no candidate carries S%02dE%02d — "
+                         "refusing to guess the show", season, episode)
+                return None
     else:
         # place the absolute number on the meta's own episode order:
         # 'Episode (11)' of a whole-series pack is its 11th episode —
@@ -1685,6 +1825,20 @@ def _adjacent_playable(config, cur: dict, step: int):
                      "pipeline, engine never engages)",
                      len(streams) - len(direct), len(streams), s, e)
         streams = direct
+    if streams and s >= 1:
+        # season-pack mislabels out BEFORE ranking: the pack file a
+        # wrong release name carries can be a DIFFERENT episode (see
+        # _file_is_other_episode) — autoplay ranking a lie would play
+        # the lie
+        series_name = cur.get("series_name") or meta.get("name") or ""
+        clean = [st for st in streams
+                 if not _file_is_other_episode(
+                     _resolve_file_name(st), meta, s, e, str(series_name))]
+        if len(clean) != len(streams):
+            log.info("stremio: skipped %d of %d streams for S%02dE%02d "
+                     "whose pack files are titled as OTHER episodes",
+                     len(streams) - len(clean), len(streams), s, e)
+        streams = clean
     stream = best_stream(config, streams, cur)
     if not stream:
         log.info("stremio: no usable stream for %s S%02dE%02d "
@@ -1840,10 +1994,24 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None):
     # report 'no other stream' while later candidates sat unused behind
     # it). server_ok latches so ONE dead engine costs ONE timeout, not
     # one per remaining torrent.
+    meta = {}
+    if not movie:
+        try:
+            meta = series_meta(imdb)     # cached; identity fetched it too
+        except Exception:  # noqa: BLE001
+            meta = {}
     server_ok = True
     for nxt in candidates:
         if is_cur(nxt):
             continue    # the not-in-list walk still never re-serves it
+        if not movie and _file_is_other_episode(
+                _resolve_file_name(nxt), meta,
+                int(cur.get("season") or 0), int(cur.get("episode") or 0),
+                str(cur.get("series_name") or meta.get("name") or "")):
+            log.info("stremio: next-stream — skipping a candidate whose "
+                     "pack file is titled as a DIFFERENT episode: %s",
+                     _resolve_file_name(nxt)[:70])
+            continue
         if exclude:
             ex_hash = str(nxt.get("infoHash") or "").lower()
             ex_url = str(nxt.get("url") or "")

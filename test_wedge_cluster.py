@@ -30,7 +30,8 @@ from src.ui.player_view import (  # noqa: E402
     PlayerView, _chase_jump_back_s, _cc_join_byte,
     _SEEK_VERIFY_BASE_S, _SEEK_VERIFY_PROP_S, _SEEK_VERIFY_MAX_S,
     _SEEK_ESC_BACKOFF_S, _CC_ADAPTIVE_MIN_L_S, _CHASE_SAFETY_S,
-    _CC_JOIN_BACK_S, _CC_TRICKLE_WIN_S, _WEDGE_DATA_AHEAD_S)
+    _CC_JOIN_BACK_S, _CC_TRICKLE_WIN_S, _WEDGE_DATA_AHEAD_S,
+    _HOLD_GIVE_UP_S, _CHASE_OPEN_DEAD_S)
 
 PASS = []
 FAIL = []
@@ -168,6 +169,10 @@ class FakeVLC:
 
     def get_length(self):
         return 0
+
+    def play(self, url, timeshift=False):
+        self.commanded.append(("play", url))
+        self.state = "playing"
 
 
 class FakeDVR:
@@ -344,6 +349,271 @@ check("(c): raw rate clamps at the playback rate",
 view._raw_win = [(VT["t"] - 1.0, None), (VT["t"], 10.0)]
 check("(c): insane readings fall back to the playback rate",
       abs(view._raw_win_rate(VT["t"]) - 1.0) < 1e-9, "")
+
+# ----------------------------------------------------------------------------
+# tail-hold at the write head (2026-10-11 14:44 NFL Network incident: the
+# rescue reopened 2-3 s behind the end point every cooldown and the viewer
+# watched the same seconds replay forever). The tick's actual behavior is
+# asserted: eat-to-head HOLDS, resumes FORWARD from the freeze point once
+# data exists past it, gives up to the plain-live fallback when it doesn't.
+# ----------------------------------------------------------------------------
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._rate = 1.0
+view._chase_started = True
+view._chase_paused = False
+view._chase_hold = None
+view._seek_verify = None
+view._stall_ticks = 5            # past the 3-tick not-playing gate
+view._last_reopen = 0.0
+view._tick_t = None
+view._vid_s = 349.0              # where the player ate to the file end
+view._last_raw = 349.0
+view._raw_change_wall = 0.0
+view._raw_win = []
+view._trickle_hold = False
+view._dvr_first_data = VT["t"] - 300.0
+view._dvr_content_s = 40.0       # frontier 340 (under-credits, like live)
+view._dvr_base = 300.0
+view._dvr_size = os.path.getsize(bufpath)
+view._dvr_last_growth = VT["t"]
+view._cap_clock_s = 349.0
+view._cap_wall = VT["t"]
+view._cap_div_s = 0.0
+view._cap_div_ok = False
+view._cc_head_pcr = (350.0, VT["t"])   # content head 252 -> BEHIND freeze
+view._sync_pcr_join = (100, 100.0)     # (a real provider trickle)
+view._cc_join_app_s = 2.0
+view.vlc.state = "ended"
+view.vlc.paused = False
+view.vlc.t = 349.0
+view.vlc.commanded.clear()
+VT["t"] += 1.0
+view._tick()                     # the rescue fires: tail-eat branch
+check("tail-hold: eat-to-head enters the hold, never reopens",
+      view._chase_hold is not None
+      and abs(view._chase_hold[0] - 349.0) < 0.5
+      and not [c for c in view.vlc.commanded
+               if c[0] in ("play_at", "set_time")],
+      f"hold={view._chase_hold} cmd={view.vlc.commanded}")
+check("tail-hold: the DVR pill explains the freeze",
+      bool(view._dvr_status.text()), f"text={view._dvr_status.text()!r}")
+
+# holding ticks with still no data: no transport commands, still holding
+view.vlc.commanded.clear()
+VT["t"] += 3.0
+view._tick()
+VT["t"] += 3.0
+view._tick()
+check("tail-hold: a starved hold waits silently (no rewind)",
+      view._chase_hold is not None
+      and not [c for c in view.vlc.commanded
+               if c[0] in ("play_at", "set_time")],
+      f"hold={view._chase_hold} cmd={view.vlc.commanded}")
+
+# the burst lands: 53 s of data ahead of the freeze point -> resume AT the
+# freeze point (forward, no rewind)
+view._cc_head_pcr = (500.0, VT["t"])   # content head 402 vs freeze 349
+view.vlc.commanded.clear()
+VT["t"] += 0.4
+view._tick()
+pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
+check("tail-hold: data past the freeze point resumes AT it (forward)",
+      view._chase_hold is None and len(pas) == 1
+      and abs(pas[0][1] - 349.0) < 0.5,
+      f"play_at={pas} hold={view._chase_hold}")
+check("tail-hold: the pill clears on resume",
+      not view._dvr_status.isVisible(), f"visible={view._dvr_status.isVisible()}")
+
+# a user transport during the hold clears it (rewind/LIVE/play win)
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = [349.0, VT["t"]]
+view._chase_fail_count = 0
+view.vlc.state = "ended"
+view.vlc.commanded.clear()
+view._chase_seek(100.0)
+check("tail-hold: a user seek cancels the hold",
+      view._chase_hold is None
+      and any(c[0] == "play_at" for c in view.vlc.commanded),
+      f"hold={view._chase_hold}")
+
+# no data for _HOLD_GIVE_UP_S: give up to the plain-live fallback ladder
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = [349.0, VT["t"] - _HOLD_GIVE_UP_S - 1.0]
+view._chase_fail_count = 0
+view._cc_head_pcr = (350.0, VT["t"] - 10.0)   # starved again (no burst)
+view.vlc.state = "ended"
+view.vlc.commanded.clear()
+view._chase_hold_tick(VT["t"])
+check("tail-hold: no data within the give-up window -> plain-live fallback",
+      view._chase_hold is None and view._mode == "live" and view.dvr is None
+      and any(c[0] == "play" for c in view.vlc.commanded),
+      f"mode={view._mode} dvr={view.dvr} cmd={view.vlc.commanded}")
+
+# a paused hold must not resume under the user
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = [349.0, VT["t"]]
+view._chase_paused = True
+view._cc_head_pcr = (500.0, VT["t"])
+view._chase_hold_tick(VT["t"])
+check("tail-hold: paused outranks the hold (no resume under the user)",
+      view._chase_hold is not None,
+      f"hold={view._chase_hold}")
+view._chase_paused = False
+
+# ----------------------------------------------------------------------------
+# axis-divergence poisoning (2026-10-11 15:03 incident): a lone garbage
+# get_time spike (transient during a reopen) captured div=+1495 — every
+# later play_at start-time doubled (seeking past the write head: instant
+# end, rescue storm) and a pause/play revive converted raw 0 through the
+# poisoned div into a NEGATIVE content position, replaying the game from
+# 0:00. A renumber is now only trusted after a ~1:1 continuation, and a
+# transport seed voids the old div entirely.
+# ----------------------------------------------------------------------------
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._rate = 1.0
+view._chase_paused = False
+view._trickle_hold = False
+view._seek_verify = None
+view.vlc.state = "playing"
+view.vlc.paused = False
+
+
+def clock_seed(pos):
+    view._cap_clock_s = pos
+    view._cap_raw_s = pos
+    view._cap_raw_clock = pos
+    view._cap_wall = VT["t"]
+    view._cap_raw_wall = VT["t"]
+    view._cap_div_s = 0.0
+    view._cap_div_ok = False
+    view._cap_renum_pend = None
+    view.vlc.t = pos
+
+
+# spike while PLAYING, then the old axis resumes: no div may be captured
+clock_seed(100.0)
+VT["t"] += 0.4
+view.vlc.t = 2992.0                     # the garbage spike
+view._caption_clock_s()
+VT["t"] += 0.4
+view.vlc.t = 100.8                      # old axis continues (spike was a lie)
+view._caption_clock_s()
+check("div: an unconfirmed raw spike never poisons the axis",
+      not view._cap_div_ok and abs(view._cap_vlc_time_for(150.0)
+                                   - 150.0) < 1e-9,
+      f"div_ok={view._cap_div_ok} div={view._cap_div_s}")
+
+# spike while NOT playing (ended/opening get_time lies): never even pending
+clock_seed(100.0)
+view.vlc.state = "ended"
+VT["t"] += 0.4
+view.vlc.t = 2992.0
+view._caption_clock_s()
+check("div: a jump while not playing is never axis evidence",
+      view._cap_renum_pend is None and not view._cap_div_ok,
+      f"pend={view._cap_renum_pend} div_ok={view._cap_div_ok}")
+view.vlc.state = "playing"
+
+# a REAL renumber (jump, then ~1:1 continuation) is confirmed and converts
+clock_seed(100.0)
+VT["t"] += 0.4
+view.vlc.t = 2592.0                     # the jump
+view._caption_clock_s()
+VT["t"] += 0.4
+view.vlc.t = 2592.4                     # continues 1:1 from the new number
+view._caption_clock_s()
+check("div: a confirmed renumber captures the axis offset",
+      view._cap_div_ok and abs(view._cap_div_s - 2492.0) < 1.0,
+      f"div_ok={view._cap_div_ok} div={view._cap_div_s}")
+check("div: seeks convert through a confirmed offset",
+      abs(view._cap_vlc_time_for(150.0) - (150.0 + view._cap_div_s))
+      < 1e-9, "")
+
+# a transport seed voids even a previously captured div (the open lands
+# raw at the commanded number; a stale div must not double the next
+# play_at start-time: live-seen 1495 -> 2991 past the write head)
+view._cap_seed_transport(50.0)
+check("div: a transport seed voids the stale axis divergence",
+      not view._cap_div_ok and view._cap_div_s == 0.0
+      and view._cap_renum_pend is None,
+      f"div_ok={view._cap_div_ok} div={view._cap_div_s} "
+      f"pend={view._cap_renum_pend}")
+
+# the pause/play revive on an ended player converts raw 0 through whatever
+# div exists: it must clamp to the buffer start (>= 0), never negative
+view._cap_div_s = 1495.7                # worst case: div poisoned anyway
+view._cap_div_ok = True
+view.vlc.state = "ended"
+view.vlc.t = 0.0
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = None
+view._chase_fail_count = 0
+view.vlc.commanded.clear()
+view._toggle_pause()                    # ended -> play revives via seek
+pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
+check("div: the ended-player play revive never seeks negative",
+      len(pas) == 1 and pas[0][1] >= 0.0,
+      f"play_at={pas}")
+
+# ----------------------------------------------------------------------------
+# dead-open rescue (2026-10-11 15:05:36: a reopen landed past the write
+# head and ENDED instantly — never a playing tick, so _chase_started
+# stayed False and the stall rescue (which requires it) was structurally
+# disarmed: the screen sat dead in silence, "stopped for no reason")
+# ----------------------------------------------------------------------------
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = None
+view._chase_started = False         # the open never played a tick
+view._chase_paused = False
+view._stall_ticks = 0
+view._seek_verify = None
+view._reopen_repeats = 0
+view._reopen_last_at = -1e9
+view._reopen_last_t = 0.0
+view._last_reopen = VT["t"] - _CHASE_OPEN_DEAD_S - 1.0
+view._vid_s = 200.0
+view._cap_clock_s = 200.0
+view._cap_wall = VT["t"]
+view._cap_div_s = 0.0
+view._cap_div_ok = False
+view._cap_renum_pend = None
+view._dvr_first_data = VT["t"] - 300.0
+view._dvr_content_s = 40.0
+view._dvr_base = 300.0
+view._dvr_size = os.path.getsize(bufpath)
+view._dvr_last_growth = VT["t"]
+view._cc_head_pcr = None
+view.vlc.state = "ended"
+view.vlc.t = 0.0
+view._tick_t = None
+view._last_raw = None
+view._raw_change_wall = 0.0
+view._raw_win = []
+view._trickle_hold = False
+view.vlc.commanded.clear()
+VT["t"] += 1.0
+view._tick()
+pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
+check("dead-open: an open that never plays gets rescued",
+      len(pas) == 1 and abs(pas[0][1] - 200.0) < 1.0,
+      f"play_at={pas}")
+
+# a FRESH open still inside the dead-open window must not be disturbed
+view._chase_started = False
+view._last_reopen = VT["t"] - 3.0
+view.vlc.commanded.clear()
+VT["t"] += 0.4
+view._tick()
+pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
+check("dead-open: a fresh open within the window is left alone",
+      not pas, f"play_at={pas}")
 
 # ----------------------------------------------------------------------------
 try:

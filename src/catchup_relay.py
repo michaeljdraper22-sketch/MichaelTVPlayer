@@ -20,6 +20,7 @@ to the provider URL directly (plays fine, just without the scrub bar).
 
 import logging
 import re
+import socket
 import threading
 import time
 import urllib.request
@@ -58,6 +59,11 @@ class CatchupRelay:
         self._alive = False
         self._streams = set()          # open provider responses
         self._streams_lock = threading.Lock()
+        # VLC-facing client sockets (see VodRelay.kick): killing them gives
+        # a VLC input thread parked on a silent relay read an immediate EOF
+        # instead of waiting out a dead provider's timeout chain.
+        self._client_lock = threading.Lock()
+        self._client_socks = set()
 
     # ---- lifecycle ----
     def start(self, url: str, ua: str = "MichaelTVPlayer/1.0") -> str:
@@ -93,8 +99,24 @@ class CatchupRelay:
             pass
         return f"http://127.0.0.1:{self._server.server_address[1]}/c.ts"
 
+    def kick(self):
+        """Force-close every VLC-facing client socket right now (see
+        VodRelay.kick). Never raises; safe to call twice."""
+        with self._client_lock:
+            socks, self._client_socks = self._client_socks, set()
+        for sk in socks:
+            try:
+                sk.shutdown(socket.SHUT_RDWR)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                sk.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     def stop(self):
         self._alive = False
+        self.kick()
         if self._server is not None:
             try:
                 self._server.shutdown()
@@ -184,6 +206,18 @@ class CatchupRelay:
 
             def log_message(self, *_a):
                 pass
+
+            def handle(self):
+                # register the client socket so kick()/stop() can reach it
+                # even while this thread is blocked mid-serve
+                sock = self.connection
+                with relay._client_lock:
+                    relay._client_socks.add(sock)
+                try:
+                    super().handle()
+                finally:
+                    with relay._client_lock:
+                        relay._client_socks.discard(sock)
 
             def do_GET(self):
                 if not relay._alive:

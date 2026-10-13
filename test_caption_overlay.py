@@ -570,6 +570,12 @@ check("raw deltas that agree with wall fold into the clock",
 fake.times["t"] += 30_000                   # PTS renumbering: numbers jump,
 view._caption_tick()                        # frames keep playing 1:1
 after_renum = view._cap_clock_s
+time.sleep(0.12)
+fake.times["t"] += 120                      # the numbers CONTINUE 1:1 from
+view._caption_tick()                        # the jumped base: renumber
+#                                            # CONFIRMED (a lone spike never
+#                                            # becomes axis evidence — the
+#                                            # 2026-10-11 div poisoning)
 check("renumbered raw cannot yank the clock (divergence recorded)",
       after_renum - before < 1.0 and view._cap_div_ok
       and abs(view._cap_div_s

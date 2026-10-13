@@ -27,6 +27,7 @@ src.mp4_subs instead.
 
 import logging
 import os
+import socket
 import tempfile
 import threading
 import time
@@ -229,6 +230,15 @@ class VodRelay(QtCore.QObject):
         self._server = None
         self._parser = None
         self._alive = False
+        # VLC-facing client sockets, live while a handler serves them.
+        # kick() force-closes them: a VLC input thread blocked on a silent
+        # relay read (dead provider upstream) then gets an immediate
+        # EOF/reset instead of hanging until a provider timeout chain
+        # unwedges it — which used to wedge the display stop for minutes
+        # (live-seen 2026-10-06 17:15: 76 s, forcing a player swap whose
+        # fresh vout lost the shared video surface).
+        self._client_lock = threading.Lock()
+        self._client_socks = set()
         self._prefer = "eng"        # preferred subtitle language (tap)
         self._tap_restart = False   # re-select the tap's track on the
         #                            # next loop pass (set_prefer_language)
@@ -431,6 +441,8 @@ class VodRelay(QtCore.QObject):
     def stop(self):
         self._alive = False
         self._ready.set()        # un-block any handler still waiting
+        self.kick()              # VLC's reads must EOF now, not on a
+        #                        # handler thread's own provider timeout
         if self._server is not None:
             try:
                 self._server.shutdown()
@@ -1065,6 +1077,26 @@ class VodRelay(QtCore.QObject):
     def _kill_ffmpeg(self):
         self._parser = None
 
+    def kick(self):
+        """Force-close every VLC-facing client socket right now.
+
+        The unblock lever for a wedged display stop: VLC's input thread
+        may be parked on a read from THIS relay (its provider upstream
+        went silent long ago), and libvlc's stop() joins that thread —
+        it cannot return until the read does. Killing the sockets makes
+        the read fail immediately. Never raises; safe to call twice."""
+        with self._client_lock:
+            socks, self._client_socks = self._client_socks, set()
+        for sk in socks:
+            try:
+                sk.shutdown(socket.SHUT_RDWR)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                sk.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     # ---- HTTP relay ----
     def _make_handler(self):
         relay = self
@@ -1074,6 +1106,18 @@ class VodRelay(QtCore.QObject):
 
             def log_message(self, *args):      # silence
                 pass
+
+            def handle(self):
+                # register the client socket so kick()/stop() can reach
+                # it even while this thread is blocked mid-serve
+                sock = self.connection
+                with relay._client_lock:
+                    relay._client_socks.add(sock)
+                try:
+                    super().handle()
+                finally:
+                    with relay._client_lock:
+                        relay._client_socks.discard(sock)
 
             def _headers(self, code, length, rng=None):
                 self.send_response(code)
