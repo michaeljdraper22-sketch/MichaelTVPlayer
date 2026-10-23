@@ -210,6 +210,19 @@ _RESOLVE_BASE_RE = re.compile(
     r"^(?P<base>https?://[^/]+/resolve/[a-zA-Z0-9]+/[^/]+/)",
     re.IGNORECASE)
 
+# debridio's own play links are a resolve pipeline too — the addon's
+# host, the debrid provider, the addonId and the user key are all fixed
+# per handoff; only the info hash / file name change per stream:
+#   /play/{series|movie}/{provider}/{addonId}/{userKey}/{infoHash}/{fileName}
+# The lookahead pins the next path segment as a 40-hex info hash so the
+# three loose segment classes cannot slide (live shape seen 2026-10-13:
+# addon.debridio.com/play/series/torbox/<32-hex addonId>/<uuid userKey>/
+# <40-hex>/<file>.mkv).
+_DEBRID_PLAY_BASE_RE = re.compile(
+    r"^(?P<base>https?://[^/]+/play/(?:series|movie)/[a-zA-Z0-9]+/"
+    r"[a-zA-Z0-9]+/[a-zA-Z0-9-]+/)(?=[0-9a-fA-F]{40}(?:/|$))",
+    re.IGNORECASE)
+
 
 def resolve_base(url: str) -> str:
     """``scheme://host/resolve/{provider}/{userKey}/`` when ``url`` is a
@@ -220,10 +233,17 @@ def resolve_base(url: str) -> str:
     addons list (live-verified 2026-09-19: a built link for a different
     torrent of the episode resolved 302 -> debrid CDN 206). Provider-
     agnostic — torbox, premiumize, realdebrid ... all ride the same
-    /resolve/{provider}/{key}/ shape. Non-torrentio debrid links (e.g.
-    debridio's /play/... which needs its addonId) return "" and keep the
-    old drop-torrent-candidates behavior."""
-    m = _RESOLVE_BASE_RE.match(str(url or ""))
+    /resolve/{provider}/{key}/ shape. debridio play links
+    (/play/{type}/{provider}/{addonId}/{userKey}/) are the same idea and
+    return their prefix too (live-verified 2026-10-13: a built link for
+    the next episode resolved 302 -> torbox CDN 206) — without this,
+    every handoff from a debridio-configured Stremio dead-ended
+    autoplay at "no resolve pipeline" and dropped ALL candidates."""
+    u = str(url or "")
+    m = _RESOLVE_BASE_RE.match(u)
+    if m:
+        return m.group("base")
+    m = _DEBRID_PLAY_BASE_RE.match(u)
     return m.group("base") if m else ""
 
 
@@ -245,13 +265,20 @@ def _resolve_file_name(stream: dict) -> str:
 
 def build_resolve_url(base: str, info_hash: str, file_name: str,
                       file_idx) -> str:
-    """A fresh torrentio resolve link for ``info_hash`` through the
-    debrid pipeline ``base`` (see resolve_base): the same
+    """A fresh resolve link for ``info_hash`` through the debrid pipeline
+    ``base`` (see resolve_base). Torrentio keeps the
     /{hash}/{fileName}/{fileIdx}/{fileName} shape the Stremio handoff
-    carries, so parse_resolve_url recovers the identity — the dead-chain
-    exclusion and the next press's skip-match keep working."""
+    carries; a debridio play base carries no file-index segment —
+    /{hash}/{fileName}, the file NAME doing the selection (episode
+    releases are single-file; _resolve_file_name supplies the exact
+    in-torrent name). Either way parse_resolve_url recovers the identity
+    — the dead-chain exclusion and the next press's skip-match keep
+    working."""
     from urllib.parse import quote
     name = quote(str(file_name or "video.mkv").strip() or "video.mkv")
+    base = str(base or "")
+    if "/resolve/" not in base and "/play/" in base:
+        return "%s%s/%s" % (base, str(info_hash).lower(), name)
     return "%s%s/%s/%d/%s" % (base, str(info_hash).lower(), name,
                               int(file_idx or 0), name)
 
@@ -390,6 +417,14 @@ _SE_RES = [
 _ABS_EP_RE = re.compile(
     r"\b(?:episode|ep)[\s._\-]*[\(\[]?(?P<ep>\d{1,4})[\)\]]?\s*$",
     re.IGNORECASE)
+
+# classic-series packs name files by production code: '207 - Enter -
+# The Fly.mkv', '105 - Shredder & Splintered.mkv'. A leading 2-4 digit
+# code followed by a SPACED title — dot-separated release heads
+# ('1917.2019.1080p…') never match — marks an episode of a pack, not a
+# movie whose title happens to start with a number.
+_PROD_CODE_RE = re.compile(
+    r"^\s*(?P<code>\d{2,4})\s*[-\u2013_.]?\s+(?=\S)")
 
 
 def parse_abs_episode(text: str):
@@ -844,10 +879,24 @@ _SHORT_SIG = {"uk", "us", "usa", "au", "nz", "ca", "jp", "kr", "za",
               "it", "pl", "tr"}
 
 
+def _fold_apostrophes(text) -> str:
+    """Apostrophes OUT before tokenizing: a release head and the catalog
+    title spell the same word oppositely ('Hells Kitchen' vs "Hell's
+    Kitchen"), and \\W+ splits the apostrophe form into 'hell'+'s' — so
+    the release token 'hells' never matched the title token 'hell', the
+    60% floor failed on a two-word name (no trim rung below it), and
+    identity/autoplay/subtitles all died on that release (live-seen
+    2026-10-16 12:08: 'Hells Kitchen (2005) S13E01' -> 'catalog search
+    found no show'). Folding joins both sides to 'hells'."""
+    return re.sub(r"[\u0027\u2018\u2019\u02BC`]", "",
+                  str(text or ""))
+
+
 def _sig_words(text) -> set:
     """Matching word set: words >2 chars plus the short variant
-    markers above (lowercased)."""
-    return {w for w in re.split(r"\W+", str(text or "").lower())
+    markers above (lowercased), apostrophes folded first (see
+    _fold_apostrophes)."""
+    return {w for w in re.split(r"\W+", _fold_apostrophes(text).lower())
             if len(w) > 2 or w in _SHORT_SIG}
 
 
@@ -892,6 +941,9 @@ def _find_catalog(search, name: str, year: str = ""):
     if not name:
         return None
     year = str(year or "").strip()
+    # apostrophe-folded once, up front: the word loop, the sig-word
+    # scoring and the short-word fallback must all see the same text
+    name = _fold_apostrophes(name)
     # original order kept: the progressive trim peels LEADING words
     # (release-group prefix spam), so sorting here would break it
     words, seen = [], set()
@@ -914,7 +966,8 @@ def _find_catalog(search, name: str, year: str = ""):
             return None
         for cand in search(name):
             t = re.sub(r"[^\w]+", " ",
-                       str(cand.get("name") or "")).strip().lower()
+                       _fold_apostrophes(
+                           str(cand.get("name") or ""))).strip().lower()
             if q in t or (t and t in q):
                 return cand
         return None
@@ -970,11 +1023,87 @@ def find_movie(name: str, year: str = ""):
 
 
 # ---------------------------------------------------------------------------
-# online subtitle fetch (keyless OpenSubtitles stremio addon)
+# online subtitle fetch (the user's Stremio subtitle addons, keyless
+# OpenSubtitles as the always-there fallback)
 
 _OSHASH_CHUNK = 65536          # the moviehash reads 64 KB per end
 _SUB_MAX_BYTES = 2 << 20       # a text subtitle > 2 MB is not text
 _SUB_CANDIDATES = 6            # ranked candidates handed to the player
+_SUB_SOURCE_TIMEOUT = 8.0      # one addon's /subtitles round trip; the
+#                              # merge waits only for the slowest base,
+#                              # so this is also the hunt's worst-case
+#                              # latency (live: healthy addons answer
+#                              # in ~1-2 s)
+_SUB_ADDON_TTL = 300.0         # the leveldb profile read is not free
+
+_sub_addon_cache = None        # ([base, ...], monotonic stamp)
+
+
+def subtitle_addon_bases() -> list:
+    """Subtitle addon bases to query, best first: the user's own
+    installed Stremio subtitle addons in profile order (what Stremio's
+    own subtitle panel shows), then the keyless OpenSubtitles addon as
+    the always-there fallback when the profile doesn't already carry it.
+    Cached for _SUB_ADDON_TTL — the WebView2 leveldb read costs more
+    than the hunt itself and installs are rare."""
+    global _sub_addon_cache
+    now = time.monotonic()
+    if _sub_addon_cache is not None \
+            and now - _sub_addon_cache[1] < _SUB_ADDON_TTL:
+        return list(_sub_addon_cache[0])
+    bases = []
+    try:
+        from . import stremio_profile
+        found = stremio_profile.discover_subtitle_addons()
+        if found:
+            bases.extend(str(b) for b in found if str(b or "").strip())
+    except Exception:  # noqa: BLE001 - profile is optional
+        pass
+    if OPENSUBS_ADDON.rstrip("/") not in \
+            {b.rstrip("/") for b in bases}:
+        bases.append(OPENSUBS_ADDON)
+    _sub_addon_cache = (bases, now)
+    return list(bases)
+
+
+def _query_subtitle_base(base: str, path: str, video_hash: str):
+    """One addon's subtitle entries for the resource path. The list on
+    HTTP 200, None when the SOURCE failed (timeout / http / parse) — a
+    broken addon must contribute nothing without stalling the merge,
+    but a retryable failure stays distinguishable from an honest
+    empty answer."""
+    url = "%s/subtitles/%s" % (base.rstrip("/"), path)
+    if video_hash:
+        url += "?videoHash=%s" % video_hash
+    try:
+        resp = _session.get(url, timeout=_SUB_SOURCE_TIMEOUT)
+        if resp.status_code != 200:
+            raise ValueError("http %d" % resp.status_code)
+        subs = ((resp.json() or {}).get("subtitles")) or []
+        return subs if isinstance(subs, list) else []
+    except Exception as exc:  # noqa: BLE001 - addon blips are quiet
+        try:
+            host = base.split("//", 1)[-1].split("/", 1)[0]
+            log.info("stremio: subtitles addon %s failed: %r", host, exc)
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+
+def _query_subtitle_bases(bases: list, path: str, video_hash: str) -> dict:
+    """{base: entries | None} — every base queried in parallel (the old
+    single-source hunt was serial: one slow addon was the whole wait;
+    now the merge waits only as long as the SLOWEST source)."""
+    if not bases:
+        return {}
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(
+            max_workers=min(6, len(bases))) as pool:
+        futs = {pool.submit(_query_subtitle_base, b, path, video_hash): b
+                for b in bases}
+        for fut in concurrent.futures.as_completed(futs):
+            out[futs[fut]] = fut.result()
+    return out
 
 
 def opensubs_hash(head_bytes: bytes, tail_bytes: bytes, total_size: int) -> int:
@@ -998,21 +1127,164 @@ def opensubs_hash(head_bytes: bytes, tail_bytes: bytes, total_size: int) -> int:
     return h
 
 
+def _ebml_vint(buf: bytes, pos: int, keep_marker: bool):
+    """(value, header_len) of the EBML vint at ``pos``. ID-shaped vints
+    keep their marker bit; size-shaped drop it. None when malformed or
+    truncated."""
+    if pos >= len(buf):
+        return None
+    b = buf[pos]
+    length = 1
+    mask = 0x80
+    while not (b & mask):
+        mask >>= 1
+        length += 1
+        if length > 8:
+            return None
+    if pos + length > len(buf):
+        return None
+    val = b if keep_marker else (b & (mask - 1))
+    for k in range(1, length):
+        val = (val << 8) | buf[pos + k]
+    return val, length
+
+
+def mkv_head_duration_s(head_bytes: bytes) -> float:
+    """Media duration in SECONDS off an MKV head's Info element — Duration
+    (a float in TimecodeScale units) × TimecodeScale (ns, default 1e6) /
+    1e9. 0.0 when the head carries no readable Duration. The online-sub
+    candidate check uses it to skip a different release's timing (a
+    mismatched SRT parses fine but mutes in the wrong spots — span ratio
+    is the one cheap tell)."""
+    buf = bytes(head_bytes or b"")
+    # walk top level: EBML header, then Segment's children, to Info
+    _SEGMENT, _INFO = 0x18538067, 0x1549A966
+    _DURATION, _TC_SCALE = 0x4489, 0x2AD7B1
+    pos, end = 0, len(buf)
+    info_at = None
+    while pos < end - 2:
+        rid = _ebml_vint(buf, pos, True)
+        if not rid:
+            break
+        eid, hlen = rid
+        rsize = _ebml_vint(buf, pos + hlen, False)
+        if not rsize:
+            break
+        size, slen = rsize
+        body = pos + hlen + slen
+        if size >= 0xFFFFFFFF or body + size > end:
+            size = end - body          # unknown/overlong: extends to buf end
+        if eid == _SEGMENT:
+            pos, end = body, body + size
+            continue
+        if eid == _INFO:
+            info_at = (body, body + size)
+            break
+        pos = body + size
+    if info_at is None:
+        return 0.0
+    pos, end = info_at
+    duration = None
+    scale_ns = 1_000_000
+    while pos < end - 2:
+        rid = _ebml_vint(buf, pos, True)
+        if not rid:
+            break
+        eid, hlen = rid
+        rsize = _ebml_vint(buf, pos + hlen, False)
+        if not rsize:
+            break
+        size, slen = rsize
+        body = pos + hlen + slen
+        if body + size > end:
+            break
+        if eid == _DURATION and size in (4, 8):
+            try:
+                duration = struct.unpack(">f" if size == 4 else ">d",
+                                         buf[body:body + size])[0]
+            except struct.error:
+                return 0.0
+        elif eid == _TC_SCALE and 0 < size <= 8:
+            scale_ns = int.from_bytes(buf[body:body + size], "big") \
+                or 1_000_000
+        pos = body + size
+    if not duration or duration <= 0:
+        return 0.0
+    try:
+        secs = duration * scale_ns / 1e9
+    except (OverflowError, ValueError):
+        return 0.0
+    return secs if 0.0 < secs < 24 * 3600 else 0.0
+
+
+def mp4_head_duration_s(head_bytes: bytes, tail_bytes: bytes = b"") -> float:
+    """Media duration in SECONDS off an MP4's mvhd box — head bytes
+    first (faststart files park moov up front), then the prefetched
+    tail (moov-at-end, where the relay's tail prefetch already holds
+    it). 0.0 when neither slice carries a readable mvhd. Same consumer
+    as mkv_head_duration_s: the online-sub SYNC gate — which was MKV-
+    only, so it never fired on the MP4 WEBDL rips Stremio actually
+    hands off (live-seen 2026-10-16: both Hell's Kitchen files were
+    .mp4)."""
+    for buf in (bytes(head_bytes or b""), bytes(tail_bytes or b"")):
+        pos = buf.find(b"mvhd")
+        while pos >= 0:
+            start = pos - 4
+            if pos < 4:
+                pos = buf.find(b"mvhd", pos + 1)
+                continue
+            size = int.from_bytes(buf[start:start + 4], "big")
+            if size < 32 or start + size > len(buf):
+                pos = buf.find(b"mvhd", pos + 1)
+                continue
+            # box layout: size@0, 'mvhd'@4, version+flags@8, then v0
+            # ctime(4)/mtime(4)/timescale(4)/duration(4) or v1
+            # ctime(8)/mtime(8)/timescale(4)/duration(8) — offsets
+            # relative to 'mvhd'
+            ver = buf[pos + 4]
+            try:
+                if ver == 1:
+                    ts = int.from_bytes(buf[pos + 24:pos + 28], "big")
+                    dur = int.from_bytes(buf[pos + 28:pos + 36], "big")
+                else:
+                    ts = int.from_bytes(buf[pos + 16:pos + 20], "big")
+                    dur = int.from_bytes(buf[pos + 20:pos + 24], "big")
+            except Exception:  # noqa: BLE001 - slice guarded already
+                return 0.0
+            if 0 < ts <= 1_000_000_000 and dur > 0:
+                secs = dur / float(ts)
+                if 0.0 < secs < 24 * 3600:
+                    return secs
+            pos = buf.find(b"mvhd", pos + 1)
+    return 0.0
+
+
 def search_online_subtitles(kind: str, imdb: str, season: int = 0,
                             episode: int = 0, want_lang: str = "eng",
                             file_hint: str = "", video_hash: str = "") -> list:
-    """Ranked TEXT-subtitle candidates from the keyless OpenSubtitles
-    stremio addon (same addon protocol as Cinemeta), best first, ≤ 6:
-    [{id, url, lang, name, release, hash_match}].
+    """Ranked TEXT-subtitle candidates from the user's installed Stremio
+    subtitle addons (profile order) plus the keyless OpenSubtitles
+    fallback, best first, ≤ 6: [{id, url, lang, name, release,
+    hash_match}].
 
-    Series requests name the exact episode; entries whose OWN season/
-    episode fields disagree are dropped (measured live: an S08E02 file
-    listed under 1:1), and an SxxExx marker in the entry's file name must
-    not contradict the request either. Ranking: a hash match outranks
-    everything, then token overlap of the entry's file/release names with
-    the playing file's name (file_hint), then the addon's own stable
-    order. video_hash is best-effort — ranking survives the addon
-    ignoring the parameter."""
+    Multi-source is the point (live-seen 2026-10-16: the keyless
+    OpenSubtitles addon carries ZERO subtitles for Hell's Kitchen's
+    middle seasons — every fetch died 'none found' — while the user's
+    SubSense addon had five English SRTs for the exact episode). All
+    bases answer the same addon-protocol query in parallel; a failed
+    base gets ONE quiet retry round only when nothing usable came back
+    at all.
+
+    Series requests name the exact episode; an SxxEyy marker in an
+    entry's OWN file/release name must agree (measured live: an S08E02
+    file listed under 1:1) — but entries whose shapes carry NO episode
+    evidence at all (SubSense-style label/releaseName-only entries)
+    are trusted: the query itself was episode-scoped. Ranking: a hash
+    match outranks everything, then token overlap of the entry's
+    name-ish fields with the playing file's name (file_hint), then the
+    source's profile order (the user's arrangement), then the addon's
+    own stable order. video_hash is best-effort — ranking survives the
+    addon ignoring the parameter."""
     imdb = (imdb or "").strip()
     if not imdb:
         return []
@@ -1022,70 +1294,137 @@ def search_online_subtitles(kind: str, imdb: str, season: int = 0,
     else:
         path = "series/%s:%d:%d.json" % (
             imdb, int(season or 0), int(episode or 0))
-    url = "%s/subtitles/%s" % (OPENSUBS_ADDON, path)
-    if video_hash:
-        url += "?videoHash=%s" % video_hash
-    subs = []
-    for attempt in (0, 1):
-        try:
-            resp = _session.get(url, timeout=20)
-            if resp.status_code != 200:
-                raise ValueError("http %d" % resp.status_code)
-            subs = ((resp.json() or {}).get("subtitles")) or []
-            break
-        except Exception as exc:  # noqa: BLE001 - addon blips are quiet
-            if not attempt:
-                time.sleep(1.0)
-                continue
-            log.info("stremio: opensubs %s failed: %r", path, exc)
+    bases = subtitle_addon_bases()
+    answered = _query_subtitle_bases(bases, path, video_hash)
+    if not any(answered.values()):
+        # nothing usable from anywhere: one quiet retry of the bases
+        # that FAILED (network blips) — an honest empty answer is final
+        retry = [b for b, v in answered.items() if v is None]
+        if retry:
+            answered.update(_query_subtitle_bases(retry, path, video_hash))
     want = (want_lang or "eng").strip().lower()
-    hint_words = {w for w in re.split(r"\W+", (file_hint or "").lower())
+    hint_words = {w for w in re.split(r"\W+",
+                                      _fold_apostrophes(file_hint).lower())
                   if len(w) > 2}
     ranked = []
-    for idx, s in enumerate(subs):
-        if not s or not s.get("url"):
+    for source_rank, base in enumerate(bases):
+        subs = answered.get(base)
+        if not subs:
             continue
-        if str(s.get("lang") or "").strip().lower() != want:
-            continue
-        fname = str(s.get("subtitleFileName") or "")
-        if not movie:
-            want_se = (int(season or 0), int(episode or 0))
-            fname_se = parse_se(fname)
-            if fname_se is not None:
-                # the file name is ground truth: the listing's own S/E
-                # fields lie sometimes (live-measured: an S08E02 file
-                # listed under 1:1) — trust the marker over the fields
-                if fname_se != want_se:
-                    continue      # the FILE itself is another episode
-            else:
-                try:
-                    got = (int(s.get("season") or 0),
-                           int(s.get("episode") or 0))
-                except (TypeError, ValueError):
-                    continue
-                if got != want_se:
-                    continue      # wrong-episode listing, no marker to
-                                  # overrule it
-        entry_words = set(re.split(
-            r"\W+", ("%s %s" % (fname, s.get("movieReleaseName") or "")).lower()))
-        overlap = len(hint_words & entry_words)
-        hash_match = bool(video_hash) and str(
-            s.get("matchedByHash") or s.get("hash") or "").strip().lower() \
-            not in ("", "0", "false", "none")
-        ranked.append((1 if hash_match else 0, overlap, -idx, s))
-    ranked.sort(key=lambda t: (-t[0], -t[1], -t[2]))
+        for idx, s in enumerate(subs):
+            if not s or not s.get("url"):
+                continue
+            if str(s.get("lang") or "").strip().lower() != want:
+                continue
+            fname = str(s.get("subtitleFileName") or "")
+            release = str(s.get("movieReleaseName")
+                          or s.get("releaseName") or "")
+            label = str(s.get("label") or "")
+            if not movie:
+                want_se = (int(season or 0), int(episode or 0))
+                fname_se = parse_se(fname) or parse_se(release)
+                if fname_se is not None:
+                    # the entry's own name is ground truth: a listing's
+                    # S/E fields lie sometimes (live-measured: an S08E02
+                    # file listed under 1:1) — trust the marker
+                    if fname_se != want_se:
+                        continue      # the FILE itself is another episode
+                elif s.get("season") is not None \
+                        and s.get("episode") is not None:
+                    # listing fields present: they must agree; ABSENT
+                    # fields are no evidence (SubSense-style entries
+                    # carry none — the episode-scoped query is their
+                    # only scoping, and trusting it is correct)
+                    try:
+                        got = (int(s.get("season") or 0),
+                               int(s.get("episode") or 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if got != want_se:
+                        continue
+            entry_words = set(re.split(
+                r"\W+",
+                _fold_apostrophes(
+                    "%s %s %s" % (fname, release, label)).lower()))
+            overlap = len(hint_words & entry_words)
+            hash_match = bool(video_hash) and str(
+                s.get("matchedByHash") or s.get("hash") or "").strip().lower() \
+                not in ("", "0", "false", "none")
+            ranked.append((1 if hash_match else 0, overlap, source_rank,
+                           -idx, s))
+    ranked.sort(key=lambda t: (-t[0], -t[1], t[2], -t[3]))
     out = []
-    for boost, overlap, _neg_idx, s in ranked[:_SUB_CANDIDATES]:
+    for boost, overlap, _sr, _ni, s in ranked[:_SUB_CANDIDATES]:
         out.append({
             "id": str(s.get("id") or ""),
             "url": str(s.get("url") or ""),
             "lang": str(s.get("lang") or ""),
             "name": str(s.get("subtitleFileName")
+                        or s.get("releaseName")
+                        or s.get("label")
                         or s.get("movieReleaseName") or ""),
-            "release": str(s.get("movieReleaseName") or ""),
+            "release": str(s.get("movieReleaseName")
+                           or s.get("releaseName") or ""),
             "hash_match": bool(boost),
         })
     return out
+
+
+_SUB_CREDIT_RE = re.compile(
+    r"(addic7ed|opensubtitles?|subscene|podnapisi|titlovi|subtitrat|"
+    r"titrari|napisy|\bnapis|subs\s+by|subtitles\s+by|"
+    r"sync(ed)?\s*(&|and)?\s*corrected|resync(ed)?|"
+    r"synchronization|www\.|\.com\b|\.net\b|\.org\b|"
+    r"rate this subtitle|subtitulos|sottotitoli|untertitle|untertexte)",
+    re.IGNORECASE)
+
+
+def content_cue_end(cues) -> float:
+    """Last CONTENT cue end (0.0 when none): trailing credit/signature
+    lines and symbol-only junk are excluded, so the online-sub SYNC gate
+    and the retime scale measure real dialog, not a fansub signature
+    (live-measured 2026-10-16: a 2515 s broadcast sub whose final cue is
+    the 'Synced & Corrected … addic7ed.com' credit while dialog ends at
+    2510 s — the signature inflated the span by its whole length).
+    Mid-file credit lines are harmless here: only the MAX surviving end
+    matters."""
+    end = 0.0
+    for _s, e, t in cues or ():
+        text = str(t or "")
+        if _SUB_CREDIT_RE.search(text):
+            continue
+        if len(re.findall(r"\w", text)) < 2:   # musical notes, symbols
+            continue
+        if e > end:
+            end = float(e)
+    return end
+
+
+def write_srt_cues(cues, dest_path: str) -> bool:
+    """Cue tuples [(start_s, end_s, text)] written as a plain SRT — the
+    online-sub sync fallback RETIMES a different cut's subtitle to the
+    played media, and the whole engage path re-parses files from disk,
+    so the retimed cues must land as a real file."""
+    def _ts(t):
+        ms = max(0, int(round(float(t) * 1000.0)))
+        h, ms = divmod(ms, 3600000)
+        m, ms = divmod(ms, 60000)
+        s, ms = divmod(ms, 1000)
+        return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+    try:
+        d = os.path.dirname(dest_path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        with open(dest_path, "w", encoding="utf-8",
+                  newline="\r\n") as f:
+            for i, (start, end, text) in enumerate(cues, 1):
+                f.write("%d\r\n%s --> %s\r\n%s\r\n\r\n"
+                        % (i, _ts(start), _ts(end),
+                           str(text or "").strip()))
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        log.info("stremio: write_srt_cues %r failed: %r", dest_path, exc)
+        return False
 
 
 def subtitle_cache_path(imdb: str, sub_id: str) -> str:
@@ -1585,6 +1924,30 @@ def resolve_identity(url: str, server: StreamingServer):
         # identity used to die here, leaving the banner at "could not
         # identify"). Resolve it against the movie catalog instead.
         ident = _movie_identity(file_name, torrent_name)
+        # production-code pack veto: classic-series packs name files by
+        # production code — '207 - Enter - The Fly.mkv' is TMNT 1987
+        # S02E07 — and the word-overlap scorer matched that tail to the
+        # MOVIE 'The Fly (1986)', retitling the stream and pointing
+        # subtitles/next-stream at the wrong title page (live-seen
+        # 2026-10-22 18:42, an episode of a pack served as a Cronenberg
+        # film). A leading 2-4 digit code followed by a spaced title is
+        # pack naming; a movie hit survives only when its own title
+        # begins with those same digits ('2001: A Space Odyssey', '1917'
+        # — dot-separated release heads never trip the regex at all).
+        m = _PROD_CODE_RE.match(str(file_name or ""))
+        if m and ident and ident.get("movie_name") \
+                and not str(ident["movie_name"]).lower().startswith(
+                    m.group("code")):
+            log.info("stremio: %r looks like a production-coded pack "
+                     "file — vetoing the movie match %r",
+                     str(file_name)[:60], ident.get("movie_name"))
+            tail = _PROD_CODE_RE.sub(" ", str(file_name))
+            cleaned = clean_movie_name(tail)
+            if cleaned and re.search(r"[A-Za-z]{4,}", cleaned):
+                return {"movie": True, "display_name": cleaned,
+                        "torrent_name": torrent_name,
+                        "file_name": file_name}
+            return None
         if not ident:
             log.info("stremio: no season/episode marker and no usable "
                      "movie name in %r / %r",
@@ -1891,7 +2254,93 @@ def _adjacent_playable(config, cur: dict, step: int):
     return nxt_playable
 
 
-def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None):
+def _click_context_reanchor(config, cur: dict):
+    """Which same-named series' episode page actually LISTS the stream the
+    user clicked? Franchise torrents get cross-listed across same-named
+    series: torrentio pinned 'Teenage Mutant Ninja Turtles (2012) S01E12'
+    onto the 1987 series' ABSOLUTE episode 12 (S02E07 'Enter: The Fly') —
+    the user clicked the stream on THAT page, the resolve link died, and
+    the file-name identity then walked 2012-series candidates, so the
+    auto-advance played a different series' episode (live-seen
+    2026-10-22 18:41). Recovery, for the never-played auto-advance only:
+    map the resolved (season, episode) to its ABSOLUTE position on the
+    identity's own episode map, then check every same-named series
+    candidate's page at that same absolute position (and at the literal
+    S/E slot) for THIS torrent hash — same fileIdx required when both
+    sides carry one, so a different file of the pack doesn't hijack the
+    match. First listing wins: it is where the click happened. Returns
+    the re-anchored identity fields, or None (keep the file-name
+    identity — nothing contradicts it)."""
+    imdb = str(cur.get("stremio_imdb") or "")
+    dead_hash = str(cur.get("info_hash") or "").lower()
+    series_name = str(cur.get("series_name") or "")
+    if not imdb or not dead_hash or not series_name or cur.get("movie"):
+        return None
+    try:
+        season = int(cur.get("season") or 0)
+        episode = int(cur.get("episode") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not season or not episode:
+        return None
+    try:
+        file_idx = int(cur["file_idx"]) if cur.get("file_idx") is not None \
+            else None
+    except (TypeError, ValueError):
+        file_idx = None
+    own = series_meta(imdb)
+    ordered = _ordered_episodes(own, season) if own.get("videos") else []
+    try:
+        abs_pos = ordered.index((season, episode)) + 1
+    except ValueError:
+        return None
+    for cand in search_series(
+            clean_show_name(series_name, strip_year=True))[:6]:
+        cid = str(cand.get("id") or "")
+        cname = str(cand.get("name") or "")
+        if not cid or cid == imdb:
+            continue
+        # exact-name collisions only (the franchise class this exists
+        # for): a differently-named show sharing a word is a different
+        # show, whatever the scorer ranked it
+        if _norm_name(cname).strip() != _norm_name(series_name).strip():
+            continue
+        cmeta = series_meta(cid)
+        cordered = _ordered_episodes(cmeta, 1) \
+            if cmeta.get("videos") else []
+        if not cordered:
+            continue
+        targets = []
+        if 1 <= abs_pos <= len(cordered):
+            targets.append(cordered[abs_pos - 1])
+        if (season, episode) in cordered \
+                and (season, episode) not in targets:
+            targets.append((season, episode))
+        for cseason, cepisode in targets:
+            for s in addon_streams(config, cid, cseason, cepisode):
+                if str(s.get("infoHash") or "").lower() != dead_hash:
+                    continue
+                s_idx = s.get("fileIdx")
+                if file_idx is not None and s_idx is not None \
+                        and int(s_idx) != file_idx:
+                    continue    # this page maps the pack to another file
+                log.info(
+                    "stremio: click-context recovered — stream %s is listed "
+                    "under %r (%s) S%02dE%02d, not the file-name identity "
+                    "%s; the fallback walks THAT episode",
+                    dead_hash[:12], cname, cid, cseason, cepisode, imdb)
+                return {
+                    "stremio_imdb": cid,
+                    "series_name": cname,
+                    "season": cseason,
+                    "episode": cepisode,
+                    "episode_name": _episode_title(cmeta, cseason, cepisode),
+                }
+    return None
+
+
+def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
+                         reanchor_click=False):
     """Worker-thread backend of the NEXT-STREAM button: the SAME episode
     (or movie) on the stream listed AFTER the one now playing, walking
     the ADDON's own list order — the exact order Stremio displays — top
@@ -1923,7 +2372,16 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None):
     to a torrent would connect it straight into the swarm, which is
     never wanted from such a context. A local-server URL keeps engine
     rights (that torrent was the user's own pick; non-debrid setups
-    have nothing else)."""
+    have nothing else).
+    ``reanchor_click`` (dead-debrid auto-advance only — the stream died
+    before playing a second) asks _click_context_reanchor where the
+    user's addons actually LIST the dead stream: franchise torrents
+    cross-listed onto a same-named series' page mean the file-name
+    identity can name a DIFFERENT series' episode than the one the user
+    clicked, and the walk then replaces the dead link with another
+    wrong-series stream (the 2026-10-22 TMNT incident). The manual
+    S-button keeps it off: there the content is playing, so the
+    file-name identity IS what 'same episode' means."""
     if debrid_only is None:
         debrid_only = _wants_debrid_only(cur)
     server = StreamingServer(
@@ -1973,6 +2431,39 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None):
     for i, s in enumerate(walk):
         if is_cur(s):
             cur_idx = i
+    if cur_idx < 0 and reanchor_click:
+        # the identity's own list doesn't carry the dead stream — the
+        # strongest signal there is that the identity itself is the
+        # file-name guess and the click happened elsewhere (a
+        # cross-listed franchise page). Try to recover the clicked
+        # episode; a hit re-anchors cur's identity AND rebuilds the
+        # walk in that episode's list (where the dead hash now MATCHES
+        # and is stepped past like any dead current stream).
+        try:
+            anchor = _click_context_reanchor(config, cur)
+        except Exception as exc:  # noqa: BLE001
+            log.info("stremio: click-context recovery failed: %r", exc)
+            anchor = None
+        if anchor:
+            cur.update(anchor)
+            imdb = cur["stremio_imdb"]
+            cur["fav_key"] = "stremio:%s:%d:%d" % (
+                imdb, int(cur.get("season") or 0),
+                int(cur.get("episode") or 0))
+            title = "%s \u2014 S%02dE%02d" % (
+                cur.get("series_name") or "Series",
+                int(cur.get("season") or 0), int(cur.get("episode") or 0))
+            if cur.get("episode_name"):
+                title += " %s" % cur["episode_name"]
+            cur["title"] = title
+            streams = addon_streams(config, imdb,
+                                    int(cur.get("season") or 0),
+                                    int(cur.get("episode") or 0))
+            walk = [s for s in streams if _stream_usable(s)]
+            cur_idx = -1
+            for i, s in enumerate(walk):
+                if is_cur(s):
+                    cur_idx = i
     if cur_idx < 0:
         # nothing matched: the handoff came from elsewhere (Stremio's own
         # pick, an addon set that changed since) — the list's top IS the

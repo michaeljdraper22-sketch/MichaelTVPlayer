@@ -327,6 +327,27 @@ class MainWindow(QtWidgets.QMainWindow):
         # player too (zen/fullscreen), like VLC's Ctrl+O
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+O"), self,
                             activated=self.open_video_file)
+        # subtitle delay nudge (VLC's own key family), FIXED steps so
+        # every press moves the same amount: G/Shift+G = 0.5 s,
+        # Ctrl+G/Ctrl+Shift+G = 2 s for gross offsets. On an external
+        # subtitle each press RE-ANCHORS the sync from the current
+        # moment forward (persisted per stream+subtitle); Ctrl+0 clears
+        # all saved sync for the stream. Other subtitle sources keep
+        # the classic constant delay.
+        QtWidgets.QShortcut(QtGui.QKeySequence("G"), self,
+                            activated=lambda:
+                                self.player_view.sub_delay_hot(0.5))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+G"), self,
+                            activated=lambda:
+                                self.player_view.sub_delay_hot(-0.5))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+G"), self,
+                            activated=lambda:
+                                self.player_view.sub_delay_hot(2.0))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+G"), self,
+                            activated=lambda:
+                                self.player_view.sub_delay_hot(-2.0))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+0"), self,
+                            activated=self.player_view.sub_sync_reset)
 
     def _build_menu(self):
         menu_bar = self.menuBar()

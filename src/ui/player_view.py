@@ -163,6 +163,47 @@ _HOLD_GIVE_UP_S = 45.0
 # then escalates if it keeps failing).
 _CHASE_OPEN_DEAD_S = 10.0
 
+# ---- 2026-10-19 field cluster (issues #12/#13: the missed game ending) ----
+# Lag governor: every bridged provider cut freezes the decoder 1-3 s while
+# the write head advances; over a flappy evening (164 cuts that night) the
+# display drifted 86 s behind with the controller never reclaiming it.
+# Whenever REAL content confirmed ahead of the viewer exceeds the chase
+# delay by this much, jump FORWARD to (head - chase_delay) — a skip over
+# backlogged content the viewer already missed, never a replay.
+_LAG_GOV_TRIGGER_S = 10.0
+_LAG_GOV_COOLDOWN_S = 20.0
+# Collapsed-edge guard: a rescue that re-seeded the caption clock near 0
+# leaves the dead-reckoned edge minutes below CONFIRMED buffer data, and
+# jump-to-live then replays the whole evening (2026-10-19 23:22:53:
+# target=46.6 s against frontier=2412 s). While the edge is NOT pinned on
+# a live PCR probe, this much frontier-over-edge means the frontier wins.
+# (With live PCR pins the PCR edge legitimately sits BELOW the wall-
+# credited frontier on splice nights — the broadcast clock skips the cut
+# gaps — so pins must always override this guard.)
+_EDGE_COLLAPSE_S = 30.0
+# Recorder stall watchdog: a provider cut can end the recorder's input
+# quietly (VLC 'plays' a dead socket, the buffer stops growing, the
+# frontier freezes and every rescue reopens against data that never
+# arrives — the 75 s dead-air gap of 2026-10-19 22:41). No buffer growth
+# for this long restarts the recorder on the SAME buffer (append), with a
+# growing backoff; resumed growth resets the backoff.
+# The threshold must sit ABOVE real provider weather: 30 s stall-then-
+# burst cadences are measured, legitimate nights (2026-08-21; the sync
+# harness's scenario d), and a deliberate 60 s stall precedes every
+# landed burst in its scenario h — a twitchier watchdog restarts the
+# recorder MID-STALL and cuts data the old connection delivers a moment
+# later (self-inflicted stutter, seen live in the harness: restart at
+# 13 s into a scripted 30 s stall). 65 s: quiet through the worst
+# modeled weather, still well inside the 75 s incident.
+_REC_STALL_RESTART_S = 65.0
+_REC_RESTART_MIN_GAP_S = 20.0
+_REC_RESTART_MAX_GAP_S = 60.0
+# Rescue reopen nudge: a play_at lands on the nearest PRIOR keyframe, so
+# reopening AT the stall point replays the damaged GOP the viewer just
+# watched ("time looping", once per cut on 2026-10-19). Nudge the anchor
+# forward past it whenever the head leaves comfortable room.
+_RESCUE_GOP_NUDGE_S = 3.0
+
 # Live-CC pipeline lag FALLBACK (buffer-tail poll + CCExtractor processing
 # + SRT harvest) for when the tail-PCR probe cannot measure the real lag
 # (no PCR in the buffer yet, probe failure). Stage 2 measures L live and
@@ -648,6 +689,12 @@ class PlayerView(QtWidgets.QWidget):
         self._dvr_last_growth = None  # wall clock of the last growth sighting
         self._stall_ticks = 0      # consecutive not-playing ticks (watchdog)
         self._last_reopen = 0.0    # cooldown for frontier reopens
+        self._lag_gov_last = 0.0   # last lag-governor jump (cooldown)
+        self._lag_user_seek = False  # user deliberately sits behind live
+        #                            # (rewind/slider/begin) — the lag
+        #                            # governor must never override them
+        self._rec_restart_t = 0.0  # last recorder-stall restart (watchdog)
+        self._rec_restart_gap = _REC_RESTART_MIN_GAP_S  # its backoff
         self._chase_started = False  # chase playback actually began once
         self._chase_fail_count = 0   # give-ups this channel (retry budget)
         self._chase_hold = None    # tail-hold at the write head:
@@ -741,6 +788,14 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_cues = CueStore()   # every cue, both sources
         self._stremio_sub_cues = []   # the Stremio handoff's sub file, parsed
         self._stremio_sub_path = ""   # the file those cues came from
+        self._sub_dialog_delay_ms = 0  # last delay the dialog applied
+        #                               # THROUGH the anchor map (file
+        #                               # subs): the delta between calls
+        #                               # is the nudge
+        self._relay_cues_seen = False # the relay/file tap delivered ANY cue
+        #                              # this media — MP4s expose no track
+        #                              # list, so cue arrival is the only
+        #                              # "text exists here" evidence they get
         self._cap_store_ext = False   # the handoff file owns _cap_cues
         #                              # (relay cues then feed the FILTER
         #                              # only — no double-painted lines)
@@ -819,6 +874,10 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_lag = None           # EWMA of the measured CCX lag L
         self._cc_head_pcr = None      # (pcr_s, wall) of the last throttled
         #                              # tail-PCR probe of the write head
+        self._cc_head_adv_t = 0.0     # wall time the head PCR VALUE last
+        #                              # ADVANCED (provider delivering); a
+        #                              # fresh probe stamp with a frozen
+        #                              # value means a stalled stream
         self._cc_join_byte = 0        # buffer byte CCExtractor joined at
         self._cc_join_app_s = 0.0     # content-axis position of that byte
         #                              # (refined from PCR+bytes for
@@ -1947,6 +2006,12 @@ class PlayerView(QtWidgets.QWidget):
                 pass
             return
         self.current = playable
+        # the never-started watchdog's probe dials the PROVIDER when the
+        # display watches the local DVR buffer (see VLCPlayer.play_at)
+        try:
+            self.vlc.source_url_hint = str(playable.get("url", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
         self._session += 1   # invalidate any deferred DVR callbacks
         # orphan any online-subtitle state from the previous media: a
         # search it kicked may still be running, but its arm/pending/fail
@@ -2020,6 +2085,8 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_store_ext = False
         self._stremio_sub_cues = []
         self._stremio_sub_path = ""
+        self._sub_dialog_delay_ms = 0
+        self._relay_cues_seen = False
         # any in-flight online-subtitle job belongs to the OLD media: its
         # callback drops on the generation guard, and the dead-end state
         # that armed it is gone with the old cur
@@ -2041,6 +2108,7 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_stash = []
         self._cc_lag = None
         self._cc_head_pcr = None
+        self._cc_head_adv_t = 0.0
         self._cc_join_byte = 0
         self._cc_join_app_s = 0.0
         self._cc_last_arrival = 0.0
@@ -2088,6 +2156,9 @@ class PlayerView(QtWidgets.QWidget):
         # bump at the top of play_media)
         self._chase_fail_count = 0
         self._seek_verify = None
+        self._lag_user_seek = False
+        self._lag_gov_last = 0.0
+        self._rec_restart_gap = _REC_RESTART_MIN_GAP_S
         self._seek_esc_strikes = 0
         self._seek_esc_ok_at = 0.0
         self._seek_esc_clean = 0.0
@@ -2587,7 +2658,7 @@ class PlayerView(QtWidgets.QWidget):
             try:
                 return base, stremio.next_stream_playable(
                     self.config, cur, exclude=set(self._stremio_dead),
-                    debrid_only=True)
+                    debrid_only=True, reanchor_click=True)
             except Exception as exc:  # noqa: BLE001
                 try:
                     log.warning("stremio next-stream lookup failed: %r",
@@ -3308,6 +3379,14 @@ class PlayerView(QtWidgets.QWidget):
             else:
                 self._sync_transport("pause")
                 self._chase_paused = True
+                # deliberate off-live: after resume the viewer sits the
+                # pause's worth behind the head and must WATCH it (DVR
+                # semantics), not be skipped forward — the lag governor
+                # stays off until they drift back near live / jump to it
+                # (the decay in _tick re-arms it). Without this, the
+                # governor read the pause backlog as provider-cut lag and
+                # force-skipped the content the user paused on.
+                self._lag_user_seek = True
                 self.vlc.pause()
             return
         # Live / VOD: remember the paused state so the LIVE button can be
@@ -3397,8 +3476,22 @@ class PlayerView(QtWidgets.QWidget):
                             self._sync_capped_s, self._frontier_s())
                 self._dvr_content_s += credit
             self._dvr_last_growth = now
+            # data flows again — the recorder-stall watchdog's backoff
+            # ladder resets with it (see the watchdog in _tick)
+            self._rec_restart_gap = _REC_RESTART_MIN_GAP_S
         self._dvr_size = size
         self._dvr_tick_t = now
+
+    def _edge_pcr_live(self, now: float) -> bool:
+        """True when the PCR head was probed recently — the edge estimate
+        is then anchored on the stream's own clock (the only axis that
+        survives PTS renumbering and splice gaps) and must override the
+        frontier-based collapse guard in _safe_seek_target/_chase_seek."""
+        try:
+            return (self._cc_head_pcr is not None
+                    and now - self._cc_head_pcr[1] <= 3.0)
+        except Exception:  # noqa: BLE001
+            return False
 
     def _head_ahead_s(self, current: float):
         """WP2 (b): REAL content ahead of the viewer, for the wedge
@@ -3494,8 +3587,14 @@ class PlayerView(QtWidgets.QWidget):
         """Pin the PCR at CCExtractor's join byte — the zero point of CCX's
         own cue axis. Retried a few times (a just-created buffer may not
         have flushed a PCR past the join byte yet). Stage 2 needs this on
-        EVERY run (L is measured live), not only with sync logging."""
-        if self._closing or self._cc_source is None:
+        EVERY run (L is measured live), not only with sync logging.
+
+        2026-10-19 (issue #13): also runs WITHOUT the CC pipeline — a
+        byte-0 pin anchors the PTS axis for the edge calibration and the
+        rescue/lag math even when captions and the filter are off (that
+        night the whole PCR machinery was dark and the edge dead-reckoned
+        itself into nonsense)."""
+        if self._closing or not (self._mode == "chase" and self.dvr):
             return
         buf = None
         try:
@@ -3584,7 +3683,19 @@ class PlayerView(QtWidgets.QWidget):
         # which is what made the wedge repeat the same few seconds
         # forever. The frontier only ever confirms bytes that exist, so
         # it is the safe floor while the edge is stale.
-        if edge < frontier and now_s() - self._cap_wall > 5.0:
+        # 2026-10-19 addition — COLLAPSED edge: a rescue that re-seeded
+        # the clock near 0 leaves the edge far below confirmed data with
+        # a fresh _cap_wall (the guard above never fired; jump-to-live
+        # computed 46 s against frontier 2412 s). While the PCR pins are
+        # not live, that much frontier-over-edge means the frontier wins.
+        # (Live PCR pins legitimately sit below the wall-credited frontier
+        # on splice nights — the broadcast clock skips the cut gaps — and
+        # are exempt.)
+        now = now_s()
+        if edge < frontier and (
+                now - self._cap_wall > 5.0
+                or (frontier - edge > _EDGE_COLLAPSE_S
+                    and not self._edge_pcr_live(now))):
             edge = frontier
         limit = min(edge, frontier + 60.0) - _CHASE_SAFETY_S
         return max(0.0, min(max(0.0, target), limit))
@@ -3676,6 +3787,14 @@ class PlayerView(QtWidgets.QWidget):
             return None
         _pid, pcr = probe_tail_pcr(buf)
         if pcr is not None:
+            prev = self._cc_head_pcr
+            if prev is not None and pcr > prev[0] + 0.001:
+                # the head VALUE moved — the provider is delivering. A
+                # fresh probe TIMESTAMP alone proves nothing on a stalled
+                # stream (the buffer tail still carries its last PCR), and
+                # the lag governor must never treat a frozen head as
+                # content waiting ahead (see its gate in _tick).
+                self._cc_head_adv_t = now
             self._cc_head_pcr = (pcr, now)
         return pcr
 
@@ -3752,9 +3871,14 @@ class PlayerView(QtWidgets.QWidget):
 
     def _cc_edge_probe_tick(self):
         """2 s: re-probe the write head and pull the live edge onto it
-        (see _cc_calibrate_edge — the head bursts, the wall clock lies)."""
-        if self._closing or self._cc_source is None \
-                or not (self._mode == "chase" and self.dvr):
+        (see _cc_calibrate_edge — the head bursts, the wall clock lies).
+
+        Runs in EVERY chase session, not only with the CC pipeline live:
+        the edge (and with it jump-to-live, the rescue head math and the
+        lag governor) must be anchored on the stream's own PTS/PCR clock
+        regardless of caption settings — 2026-10-19, captions off, the
+        dead-reckoned edge collapsed 80+ minutes below the frontier."""
+        if self._closing or not (self._mode == "chase" and self.dvr):
             return
         head_pcr = self._cc_probe_head_pcr()
         if head_pcr is None or self._sync_pcr_join is None:
@@ -3771,6 +3895,7 @@ class PlayerView(QtWidgets.QWidget):
             # frozen-clock bug sent Rewind 60 straight to the beginning).
             base = max(self._cap_clock_s, self._vid_s) \
                 if self._cap_clock_s > 0.0 else self._vid_s
+            self._lag_user_seek = True   # deliberate transport: governor off
             self._chase_seek(base + ms / 1000.0)
             return
         if self._is_catchup():
@@ -3790,6 +3915,7 @@ class PlayerView(QtWidgets.QWidget):
         the DVR buffer (or of the movie)."""
         if self._mode == "chase" and self.dvr:
             self._set_rate(1.0)
+            self._lag_user_seek = True   # deliberate: governor stays off
             self._sync_transport("jump_begin", 0.0)
             self._chase_seek(0.0, resume=True)
         elif self._is_catchup():
@@ -3847,7 +3973,18 @@ class PlayerView(QtWidgets.QWidget):
         target_s = float(target_s)
         if jump_live:
             back = _chase_jump_back_s(self._cc_lag)
-            target = max(0.0, min(self._cap_edge_s() - back,
+            edge = self._cap_edge_s()
+            # Collapsed-edge guard (same rule as _safe_seek_target): a
+            # re-seeded clock can leave the dead-reckoned edge far below
+            # CONFIRMED data — jumping there replayed the whole evening
+            # (2026-10-19 23:22:53). Live PCR pins override: on splice
+            # nights the PCR edge correctly runs below the wall-credited
+            # frontier.
+            now = now_s()
+            if (edge < self._frontier_s() - _EDGE_COLLAPSE_S
+                    and not self._edge_pcr_live(now)):
+                edge = self._frontier_s()
+            target = max(0.0, min(edge - back,
                                   self._frontier_s() + 120.0))
         else:
             target = self._safe_seek_target(target_s)
@@ -3886,11 +4023,23 @@ class PlayerView(QtWidgets.QWidget):
                            "chase_seek" if not jump_live else "jump_live")
 
     def _arm_seek_verify(self, target: float, vlc_t: float,
-                         raw_pre: float):
-        """(a) Arm the set_time verification: raw must reach the target
+                         raw_pre: float, fix_tried: bool = False,
+                         from_open: bool = False):
+        """Arm the set_time verification: raw must reach the target
         (content axis) by the deadline — target-proportional, since VLC
         may legally take >1.5 s on a big demux jump. Last-wins: a newer
-        seek supersedes a pending verify (user intent = latest)."""
+        seek supersedes a pending verify (user intent = latest).
+
+        Also armed after play_at reopens (rescue / revive / tail-hold
+        resume): a FRESH demuxer opening a long growing TS file cannot
+        always honor :start-time — the swapped-in player opened at 0.0 on
+        2026-10-19 and replayed the fourth quarter. ``fix_tried`` marks
+        that the one corrective set_time was already issued (the demuxer
+        is parsed by then; a second failure escalates to the revive).
+        ``from_open`` marks verities armed by a play_at OPEN (vs a set_time
+        seek): an autonomous rescue racing a pending SEEK must honor the
+        seeker's target exactly, while a retry of a failed OPEN keeps the
+        GOP-nudged anchor (the damaged-GOP replay the nudge exists for)."""
         if not (self._mode == "chase" and self.dvr):
             self._seek_verify = None
             return
@@ -3899,20 +4048,22 @@ class PlayerView(QtWidgets.QWidget):
         deadline = now + min(_SEEK_VERIFY_MAX_S,
                              _SEEK_VERIFY_BASE_S
                              + _SEEK_VERIFY_PROP_S * jump)
-        self._seek_verify = (float(target), float(vlc_t), deadline, now)
+        self._seek_verify = (float(target), float(vlc_t), deadline, now,
+                             float(raw_pre), bool(fix_tried),
+                             bool(from_open))
 
     def _verify_seek(self, now: float, raw: float):
-        """(a) Verify the armed set_time landed; escalate to the play_at
-        revive on a confirmed no-op. Escalations are backoff-gated (a
-        flaky verify must never reopen-loop) and share the reopen
-        cooldown. Clean verifies decay the strike ladder."""
+        """Verify the armed set_time/play_at landed; escalate on a
+        confirmed miss. Escalations are backoff-gated (a flaky verify must
+        never reopen-loop) and share the reopen cooldown. Clean verifies
+        decay the strike ladder."""
         v = self._seek_verify
         if v is None:
             if self._seek_esc_strikes \
                     and now - self._seek_esc_clean > _SEEK_ESC_DECAY_S:
                 self._seek_esc_strikes = 0
             return
-        target, vlc_t, deadline, armed_at = v
+        target, vlc_t, deadline, armed_at, raw_pre, fix_tried, from_open = v
         if raw >= 0.0 and abs(self._cap_content_for_raw(raw)
                               - target) <= _SEEK_VERIFY_TOL_S:
             self._seek_verify = None
@@ -3921,6 +4072,23 @@ class PlayerView(QtWidgets.QWidget):
         if now < deadline or self._chase_paused:
             return
         self._seek_verify = None
+        # Landing miss on a play_at reopen: raw is ADVANCING from the
+        # wrong spot (below target and moving), i.e. the player is live
+        # and merely opened at the wrong position — the demuxer has the
+        # file parsed by now, so ONE direct set_time lands it. A wedged
+        # player (raw parked at raw_pre) skips this and takes the revive.
+        if (not fix_tried and raw >= 0.0 and raw < target - _SEEK_VERIFY_TOL_S
+                and raw > raw_pre + 0.5):
+            try:
+                log.warning("seek verify: play_at landed at %.1fs, not "
+                            "%.1fs — correcting with set_time",
+                            raw, target)
+            except Exception:
+                pass
+            self.vlc.set_time(int(vlc_t * 1000))
+            self._cap_seed_transport(target)
+            self._arm_seek_verify(target, vlc_t, raw, fix_tried=True)
+            return
         if now < self._seek_esc_ok_at \
                 or now - self._last_reopen < _REOPEN_COOLDOWN_S:
             return
@@ -3954,9 +4122,13 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._last_reopen = now_s()
         self._vid_s = target
-        self._seek_verify = None
         self._cap_seed_transport(target)
         self.vlc.play_at(buf, vlc_t)
+        # Verify the OPEN landed at the target: a fresh demuxer on the
+        # long growing buffer cannot always honor :start-time (it opened
+        # at 0.0 on 2026-10-19 — the rescue itself became the outage).
+        # _verify_seek corrects with one set_time once the file is parsed.
+        self._arm_seek_verify(target, vlc_t, -1.0, from_open=True)
         self._poke_audio()
         self._poke_rate()
         return True
@@ -4146,7 +4318,9 @@ class PlayerView(QtWidgets.QWidget):
                 # never let a slider drag land on/past the write position
                 # (_chase_seek clamps and revives a stalled player); the
                 # slider speaks VLC's raw-axis numbers — convert to the
-                # content axis before clamping
+                # content axis before clamping. A deliberate drag also
+                # exempts the viewer from the lag governor.
+                self._lag_user_seek = True
                 self._chase_seek(
                     self._cap_content_for_raw(self.slider.value() / 1000.0))
             elif self._is_catchup():
@@ -4310,8 +4484,14 @@ class PlayerView(QtWidgets.QWidget):
             self._last_reopen = now_s()
             # a (re)open AT a position is a transport event: it seeds the
             # caption clock and the live-edge backlog by construction
+            # (voiding the axis divergence — vlc_t is target itself)
             self._cap_seed_transport(target)
-            self.vlc.play_at(buf, self._cap_vlc_time_for(target))
+            vlc_t = self._cap_vlc_time_for(target)
+            self.vlc.play_at(buf, vlc_t)
+            # ...and it is verified like every other transport (see
+            # _chase_revive): an :start-time miss on the growing file
+            # gets corrected within seconds instead of replaying.
+            self._arm_seek_verify(target, vlc_t, -1.0, from_open=True)
             self._vid_s = target
             self._poke_audio()
             self._poke_rate()
@@ -4476,6 +4656,18 @@ class PlayerView(QtWidgets.QWidget):
             self._start_cc_when_buffer(tries_left=25)
         if self._cap_want and not self._cap_fail:
             self._set_cap_on(True)
+        # PTS anchor for the edge/rescue/lag math runs in EVERY chase
+        # session (issue #13): pin the buffer's first PCR (byte 0) unless
+        # the CC pipeline already pinned its join byte, and keep probing
+        # the write head on the 2 s timer. Without this — captions and
+        # filter off — the live edge was pure dead-reckoning and collapsed
+        # after the first bad rescue reseed.
+        if self._sync_pcr_join is None:
+            self._sync_probe_join_at(0)
+        try:
+            self._cc_edge_timer.start()
+        except Exception:  # noqa: BLE001
+            pass
         delay = self.config.chase_delay
         target = self._safe_seek_target(self._frontier_s() - delay)
         try:
@@ -4510,6 +4702,28 @@ class PlayerView(QtWidgets.QWidget):
         # _vid_s always advanced while frames played, and a stale caption
         # clock can then never drag playback backwards.
         at = max(self._cap_clock_s, self._vid_s)
+        # A SEEK is in flight (a user seek's set_time under verification,
+        # or a governor jump): its target IS the position the viewer asked
+        # for — the rescue just implements it, exactly, no GOP nudge.
+        # Racing it with the autonomous anchor + nudge landed a user's
+        # -60 s seek 4.5 s past intent (harness h-starved: reopen at 39.0
+        # against want 35.0). A pending OPEN landing check (from_open)
+        # does NOT count — retrying a failed open keeps the nudged anchor
+        # (the damaged-GOP replay the nudge exists to skip).
+        pending = self._seek_verify
+        if pending is not None and not pending[6]:
+            at = float(pending[0])
+        else:
+            # 2026-10-19 (#12): a play_at lands on the nearest PRIOR
+            # keyframe — reopening AT the stall point replays the damaged
+            # GOP the viewer just watched, once per provider cut ("time
+            # looping"). Nudge the anchor forward PAST that GOP whenever
+            # the head leaves room; never backward, never past the normal
+            # chase distance from head.
+            headroom = self._head_ahead_s(at)
+            if headroom is not None \
+                    and headroom > _CHASE_SAFETY_S + _RESCUE_GOP_NUDGE_S:
+                at = at + _RESCUE_GOP_NUDGE_S
         # Loop-breaker: repeated rescues at (nearly) the same anchor mean
         # the player wedges the instant it lands there — after 3 in a row,
         # jump to fresh data near the live edge instead of reopening at
@@ -5393,6 +5607,37 @@ class PlayerView(QtWidgets.QWidget):
             now = now_s()
             dt = 0.4 if self._tick_t is None else min(1.0, now - self._tick_t)
             self._tick_t = now
+            # ---- recorder stall watchdog (2026-10-19 22:41, issue #13) ----
+            # A provider cut can end the recorder's input quietly: VLC
+            # 'plays' a dead socket, the buffer stops growing, the frontier
+            # freezes — and every rescue below reopens against data that
+            # will never arrive (75 s of dead air; the tail-hold's own
+            # give-up only reaches plain live, it never re-dials). Restart
+            # the recorder on the SAME buffer (append) once the stall is
+            # confirmed, with growing backoff; resumed growth resets it.
+            if (self.dvr.running and self._dvr_first_data is not None
+                    and self._dvr_last_growth is not None
+                    and now - self._dvr_last_growth
+                    > _REC_STALL_RESTART_S
+                    and now - self._rec_restart_t
+                    > self._rec_restart_gap):
+                self._rec_restart_t = now
+                self._rec_restart_gap = min(
+                    _REC_RESTART_MAX_GAP_S, self._rec_restart_gap * 1.5)
+                try:
+                    log.warning("recorder watchdog: no buffer growth for "
+                                "%.1fs — restarting recorder on the same "
+                                "buffer (next retry in %.0fs)",
+                                now - self._dvr_last_growth,
+                                self._rec_restart_gap)
+                except Exception:
+                    pass
+                try:
+                    from .. import feedback
+                    feedback.stat("recorder_restarts")
+                except Exception:
+                    pass
+                self._restart_recorder(record=self.btn_rec.isChecked())
             if playing:
                 self._chase_started = True   # arm the watchdog from now on
             # ---- tracked playback position ----
@@ -5532,6 +5777,69 @@ class PlayerView(QtWidgets.QWidget):
                 return
             # (a) verify the last set_time landed; escalate on a no-op
             self._verify_seek(now, raw)
+            # ---- lag governor (2026-10-19, issue #13) ----
+            # Every bridged provider cut freezes the decoder 1-3 s while
+            # the write head advances; over a flappy evening (164 cuts)
+            # that accumulated to 86 s behind with nothing ever reclaiming
+            # it — the "super stuttery" evening that ended with the user
+            # 64+ s behind at the two-minute warning. Whenever confirmed
+            # content runs this far past the chase distance ahead of the
+            # viewer, jump FORWARD to (head - chase_delay): a skip over
+            # backlogged content they already missed, never a replay.
+            # NEVER against a deliberate rewind: user-commanded transports
+            # (_seek_ms / slider / jump-to-begin) set _lag_user_seek, and
+            # only returning near the live distance clears it — otherwise
+            # the governor would yank a viewer watching a replay to live.
+            # Frozen out while a transport is in flight (verify pending),
+            # while trickling (the edge IS the delivery rate there), and
+            # while the user deliberately sits behind live (pause).
+            # And while the head is not ADVANCING: on a stalled provider
+            # the tail probe still returns the buffer's last PCR with a
+            # fresh timestamp, and "ahead of the viewer" then counts
+            # content that was never written — the governor would jump at
+            # data that does not exist and land straight into a stall
+            # (harness h's starved phase: 35 s "ahead" against frontier
+            # 25 s). _cc_head_adv_t is the last time the PCR VALUE moved.
+            if (playing and not self._chase_paused and not self._seeking
+                    and self._seek_verify is None and self._chase_hold is None
+                    and not self._trickle_hold and not self._lag_user_seek
+                    and self._rate <= 1.0
+                    and 0.0 < now - self._cc_head_adv_t <= 10.0):
+                if self._cc_head_pcr is None \
+                        or now - self._cc_head_pcr[1] > 1.0:
+                    self._cc_probe_head_pcr()   # ~20 ms, throttled 4/s
+                ahead = self._head_ahead_s(current)
+                if ahead is not None:
+                    if ahead <= self.config.chase_delay \
+                            + _LAG_GOV_TRIGGER_S / 2:
+                        # back near the live distance — the exemption
+                        # from the last deliberate rewind is spent
+                        self._lag_user_seek = False
+                    elif (ahead - self.config.chase_delay
+                              > _LAG_GOV_TRIGGER_S
+                          and now - self._lag_gov_last
+                          > _LAG_GOV_COOLDOWN_S):
+                        self._lag_gov_last = now
+                        target = max(0.0, current + ahead
+                                     - self.config.chase_delay)
+                        try:
+                            log.warning("lag governor: %.1fs behind the "
+                                        "head (frontier=%.1fs pos=%.1fs) "
+                                        "— jumping forward to %.1fs",
+                                        ahead, frontier, current, target)
+                        except Exception:
+                            pass
+                        try:
+                            from .. import feedback
+                            feedback.stat("lag_gov_jumps")
+                        except Exception:
+                            pass
+                        self._chase_note(
+                            "Catching up to live \u2014 skipped %d s"
+                            % max(0, int(ahead - self.config.chase_delay)),
+                            clear_after_ms=2500)
+                        self._chase_seek(target)
+                        return
             if not self._seeking:
                 self._set_scrub(int(frontier * 1000), int(current * 1000))
             # Self-heal: while chasing, every mode-gated control must be
@@ -6312,11 +6620,45 @@ class PlayerView(QtWidgets.QWidget):
                     pass
             self._stremio_sub_cues = cues
             self._stremio_sub_path = path
+            # the wrong-cut rescue file ("-sync.srt", written by the
+            # online-sub retime/shift): mark it on the playable so the
+            # engage note offers the re-sync keys; G/Shift+G works on
+            # ANY external sub regardless. A NEW sub file invalidates
+            # this media's in-session anchors — but the pair (stream
+            # cut, sub timeline) may have saved anchors on disk from a
+            # previous session/handoff, which ride back in here so the
+            # user's manual sync SURVIVES Stremio re-handoffs and app
+            # restarts (their standard flow: re-open the same stream
+            # from Stremio days later).
+            cur["_sub_retimed"] = path.lower().endswith("-sync.srt")
+            cur.pop("_sub_anchors", None)
+            stored = self._sub_anchors_load(cur)
+            if stored:
+                cur["_sub_anchors"] = stored
+                try:
+                    log.info("sub sync: %d saved anchors restored for "
+                             "%s", len(stored), os.path.basename(path))
+                except Exception:  # noqa: BLE001
+                    pass
             try:
                 log.info("stremio subs: %d cues from %s", len(cues), path)
             except Exception:  # noqa: BLE001
                 pass
         return self._stremio_sub_cues
+
+    def _mapped_handoff_cues(self) -> list:
+        """Handoff cues with the media's sync anchors applied (the
+        G/Shift+G piecewise map, restored from disk on re-handoff).
+        BOTH caption consumers — the overlay's CueStore and the filter's
+        mute windows — must see the same mapped times or the mutes fire
+        off the painted text."""
+        cues = self._stremio_handoff_cues()
+        anchors = (self.current or {}).get("_sub_anchors") or []
+        if not cues or not anchors:
+            return cues
+        return [(max(0.0, s + self._anchor_offset(anchors, s)),
+                 max(0.0, e + self._anchor_offset(anchors, e)), t)
+                for s, e, t in cues]
 
     def _engage_stremio_external(self):
         """Overlay renders the handoff's sub file with the app's ONE
@@ -6337,7 +6679,7 @@ class PlayerView(QtWidgets.QWidget):
         # (the flip alone only guarded the first takeover).
         self._cap_store_ext = True
         self._cap_cues.clear()
-        for start, end, text in cues:
+        for start, end, text in self._mapped_handoff_cues():
             self._cap_cues.add(start, end, text)
         self._cap_fail = False       # the file just parsed: source alive
         self._set_cap_on(True)       # and VLC's own spu goes OFF
@@ -6608,6 +6950,13 @@ class PlayerView(QtWidgets.QWidget):
             # (config.py's wording, the +/- tooltip, VLC's spu delay via
             # video_set_spu_delay): query the store delay seconds in the
             # PAST, which holds each cue back by the delay.
+            # An external FILE's store is excluded: its timing is the
+            # ANCHOR map (G/Shift+G + the dialog, routed through
+            # _apply_sub_delay) — layering the config delay on top
+            # double-applies and makes every press's on-screen effect
+            # differ from the pill (the "erratic" 2026-10-16 report).
+            if self._cap_store_ext:
+                delay_ms = 0
             lines = self._cap_cues.text_at(t - delay_ms / 1000.0)
             if lines and _SYNC_ON:
                 blank = now_s() - (self._sync_last_show_t
@@ -6972,11 +7321,16 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1
         self._spu_name = "%s (online)" % lang
         self._load_stremio_sub_cues()
-        self._cap_note("Subtitles: %s (found online)" % lang)
+        if cur.get("_sub_retimed"):
+            self._cap_note("Subtitles: %s (online, timing adjusted \u2014 "
+                           "G/Shift+G re-syncs)" % lang)
+        else:
+            self._cap_note("Subtitles: %s (found online)" % lang)
         self._refresh_spu_button()
         return True
 
-    def _arm_online_sub_fetch(self, fail_fn, manual: bool = False) -> bool:
+    def _arm_online_sub_fetch(self, fail_fn, manual: bool = False,
+                              for_filter: bool = False) -> bool:
         """A caption dead-end (bitmap-only, no track metadata, wrong
         language, no matching-language track) on stremio/vod/series: arm
         the online TEXT-subtitle search instead of latching failure.
@@ -6985,10 +7339,14 @@ class PlayerView(QtWidgets.QWidget):
         verbatim if the fetch finds nothing. manual=True (the subs card
         row) bypasses the _cap_want/config gates — explicit user intent —
         and pairs with fail_fn=None (failure just notes, latches
-        nothing)."""
+        nothing). for_filter=True (the filter's own hunt,
+        _filter_sub_check) bypasses only the _cap_want gate — captions
+        may be off while the filter still needs text — but keeps
+        honoring the fetch_online_subs setting, and likewise pairs with
+        fail_fn=None: nothing caption-side was dead-ended."""
         cur = self.current or {}
         if (self._closing or self._sub_fetching or self._sub_fetch_pending
-                or (not manual and not self._cap_want)
+                or (not manual and not for_filter and not self._cap_want)
                 or cur.get("kind") not in ("stremio", "vod", "series")
                 or (not manual and
                     not getattr(self.config, "fetch_online_subs", True))):
@@ -6998,7 +7356,9 @@ class PlayerView(QtWidgets.QWidget):
         self._sub_fetch_lang_name = (hint or "english").capitalize()
         self._sub_fetch_fail = fail_fn
         self._sub_fetch_pending = True
-        self._cap_note("Subtitles: searching online\u2026")
+        self._cap_note("Profanity filter: searching subtitles online\u2026"
+                       if for_filter
+                       else "Subtitles: searching online\u2026")
         self._kick_online_sub_fetch()
         return True
 
@@ -7040,6 +7400,18 @@ class PlayerView(QtWidgets.QWidget):
         file_hint = " ".join(str(cur_snap.get(k) or "")
                              for k in ("file_name", "torrent_name",
                                        "title")).strip()
+        # VLC's own parsed length, read on the GUI thread (libvlc calls
+        # stay off the worker): the sync gate's third duration source
+        # for files whose container hides its clock from both relay
+        # slices (fragmented MP4s and exotic muxes — live-seen
+        # 2026-10-16: the 350MB Hell's Kitchen PDTV rip has no moov in
+        # head OR tail). 0.0 when not parsed yet — the gate stays open,
+        # exactly the old behavior.
+        len_hint_s = 0.0
+        try:
+            len_hint_s = max(0, self.vlc.get_length()) / 1000.0
+        except Exception:  # noqa: BLE001 - hint is best-effort
+            len_hint_s = 0.0
 
         def _work():
             from .. import stremio
@@ -7065,6 +7437,7 @@ class PlayerView(QtWidgets.QWidget):
                 # relay is up by construction on this path; resume sessions
                 # carry no head, and a missing hash only degrades ranking
                 vhash = ""
+                media_len_s = 0.0
                 try:
                     relay = self._vod_relay
                     if (relay is not None
@@ -7073,22 +7446,120 @@ class PlayerView(QtWidgets.QWidget):
                             and len(getattr(relay, "_tail", b"") or b"") >= 65536):
                         vhash = "%016x" % stremio.opensubs_hash(
                             relay._head[:65536], relay._tail, relay.total)
+                    if relay is not None:
+                        # media duration off the cached MKV head or the
+                        # MP4's mvhd (head, else the prefetched tail) —
+                        # the candidate SYNC gate below needs it (0.0 =
+                        # neither container offered one: gate stays open)
+                        media_len_s = (
+                            stremio.mkv_head_duration_s(
+                                getattr(relay, "_head", b"") or b"")
+                            or stremio.mp4_head_duration_s(
+                                getattr(relay, "_head", b"") or b"",
+                                getattr(relay, "_tail", b"") or b""))
                 except Exception:  # noqa: BLE001 - hash is best-effort
                     vhash = ""
+                if media_len_s <= 0.0:
+                    media_len_s = len_hint_s
                 cands = stremio.search_online_subtitles(
                     "movie" if my_movie else "series", my_imdb,
                     season=my_season, episode=my_episode,
                     want_lang=lang, file_hint=file_hint, video_hash=vhash)
+                fallback = None   # (dest, name, cues, last_s): parsed
+                #                  # fine but the span says a different
+                #                  # CUT — the retime fallback when no
+                #                  # candidate passes the gate clean
                 for cand in cands[:3]:
                     dest = stremio.subtitle_cache_path(my_imdb, cand["id"])
                     if not stremio.download_online_subtitle(cand["url"], dest):
                         continue
                     text = prof_mod.read_subtitle_text(dest)
                     cues = prof_mod.parse_subtitle_cues(text) if text else []
+                    if cues and media_len_s > 60.0:
+                        # SYNC GATE: a candidate whose cues end off the
+                        # media's own duration is a different CUT — it
+                        # parses fine but its windows sit on the wrong
+                        # speech. Band: ±max(8 s, 0.6%) plus the gross
+                        # 0.55 floor. The old ±1.5% band (±37 s on a
+                        # 40-min episode) engaged a 26.5 s-mismatched
+                        # broadcast sub RAW on the 2484 s PDTV rip
+                        # (live-seen 2026-10-16 15:41: unsynced from
+                        # the FIRST second — that trim sits at the
+                        # head). A same-airing sub matches within a
+                        # couple of seconds; 8 s is already generous.
+                        # Content end, not the file end: trailing
+                        # fansub credit lines inflate the span by their
+                        # own length (see stremio.content_cue_end).
+                        last_s = stremio.content_cue_end(cues)
+                        tol = max(8.0, media_len_s * 0.006)
+                        if (last_s - media_len_s > tol
+                                or media_len_s - last_s > tol
+                                or last_s < 0.55 * media_len_s):
+                            try:
+                                log.info("online subs: skipped %r — cues "
+                                         "end %.0f s of %.0f s media "
+                                         "(%.0f%%): wrong cut timing",
+                                         cand.get("name") or cand.get("id"),
+                                         last_s, media_len_s,
+                                         last_s / media_len_s * 100.0)
+                            except Exception:  # noqa: BLE001
+                                pass
+                            if fallback is None and \
+                                    0.9 <= last_s / media_len_s <= 1.15:
+                                # plausibly the SAME episode on a
+                                # different cut (broadcast vs WEBDL):
+                                # remember it for the retime fallback
+                                fallback = (
+                                    dest,
+                                    (cand.get("name")
+                                     or cand.get("release")
+                                     or "subtitle"),
+                                    cues, last_s)
+                            continue
                     if cues:
                         return (job, gen, "ok", (dest, (cand.get("name")
                                                    or cand.get("release")
                                                    or "subtitle")))
+                if fallback is not None and media_len_s > 60.0:
+                    # every candidate failed the sync gate but one is a
+                    # sane same-episode span: NOTHING passes clean when
+                    # the only subs in existence are timed to a
+                    # different cut — refusing all of them restores the
+                    # original "no captions at all" failure. Fit the
+                    # span mismatch with the model its SIZE implies
+                    # (both live-measured 2026-10-16 on this episode):
+                    # |diff| <= 45 s is one contiguous cut — almost
+                    # always the head recap a PDTV/eztv rip removes —
+                    # so a CONSTANT shift is exact everywhere; bigger
+                    # differences are DISTRIBUTED ad-break teases
+                    # (~104 s on the WEBDL), where the linear scale
+                    # the user confirmed started synced is right. A
+                    # wrong-model error is bounded by |diff| — never
+                    # worse than the raw engage the old loose gate let
+                    # through, and G/Shift+G corrects what's left.
+                    dest, name, cues, last_s = fallback
+                    diff = media_len_s - float(last_s)
+                    if abs(diff) <= 45.0:
+                        fixed = [(max(0.0, s + diff), max(0.0, e + diff),
+                                  t) for s, e, t in cues]
+                        model = "shifted %+.1f s" % diff
+                    else:
+                        k = media_len_s / float(last_s)
+                        fixed = [(max(0.0, s * k), max(0.0, e * k), t)
+                                 for s, e, t in cues]
+                        model = "retimed %.1f%%" % ((k - 1.0) * 100.0)
+                    sync_path = dest[:-4] + "-sync.srt" \
+                        if dest.lower().endswith(".srt") \
+                        else dest + "-sync.srt"
+                    if stremio.write_srt_cues(fixed, sync_path):
+                        try:
+                            log.info("online subs: %r %s (%.0f s cues on "
+                                     "%.0f s media) — approximate", name,
+                                     model, last_s, media_len_s)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        return (job, gen, "ok", (
+                            sync_path, "%s (timing adjusted)" % name))
                 return (job, gen, "ok", None)
             except Exception as exc:  # noqa: BLE001 - surfaced to the UI
                 return (job, gen, "err", str(exc))
@@ -7143,6 +7614,8 @@ class PlayerView(QtWidgets.QWidget):
                     cur["sub_file"] = path
                 else:
                     cur["_fetched_sub"] = path
+                cur["_fetched_lang"] = \
+                    self._sub_fetch_lang_name or "English"
                 self._load_stremio_sub_cues()
             return
         if ok != "ok" or not val:
@@ -7187,8 +7660,15 @@ class PlayerView(QtWidgets.QWidget):
         self._spu_want = -1      # engage turned VLC's own spu OFF
         self._spu_name = "%s (online)" % cur["_fetched_lang"]
         self._load_stremio_sub_cues()   # profanity mute windows get cues
-        self._cap_note("Subtitles: %s (found online)"
-                       % cur["_fetched_lang"])
+        if cur.get("_sub_retimed"):
+            # the retimed rescue track drifts with the cut difference —
+            # tell the user the fix key instead of leaving them to
+            # discover the delay dialog
+            self._cap_note("Subtitles: %s (online, timing adjusted \u2014 "
+                           "G/Shift+G re-syncs)" % cur["_fetched_lang"])
+        else:
+            self._cap_note("Subtitles: %s (found online)"
+                           % cur["_fetched_lang"])
         self._refresh_spu_button()
 
     def _run_sub_fetch_fail(self):
@@ -7476,7 +7956,31 @@ class PlayerView(QtWidgets.QWidget):
 
     def _apply_sub_delay(self, ms: int):
         """Delay is the one subtitle setting with a live runtime API —
-        applied instantly (and re-applied on player swaps by VLCPlayer)."""
+        applied instantly (and re-applied on player swaps by VLCPlayer).
+        When the OVERLAY renders an external file sub, VLC's spu clock
+        is not in play — the dialog's delay delta routes through the
+        ANCHOR map instead (one sync mechanism per media; the overlay
+        ignores the config delay for file-owned stores), and a dialog
+        reset to 0.00 s clears the anchors outright."""
+        try:
+            ms = int(ms)
+        except (TypeError, ValueError):
+            return
+        cur = self.current or {}
+        if self._cap_store_ext and (cur.get("sub_file")
+                                    or cur.get("_fetched_sub")):
+            if ms == 0:
+                self._sub_dialog_delay_ms = 0
+                if cur.get("_sub_anchors"):
+                    self.sub_sync_reset()
+                return
+            prev = self._sub_dialog_delay_ms
+            self._sub_dialog_delay_ms = ms
+            if ms != prev \
+                    and self._nudge_sub_anchor((ms - prev) / 1000.0):
+                return
+            # no parseable cues: nothing to anchor — the classic call
+            # below is harmless (VLC's spu is off for file subs anyway)
         try:
             self.vlc.set_spu_delay(int(ms))
         except Exception:  # noqa: BLE001
@@ -7739,12 +8243,27 @@ class PlayerView(QtWidgets.QWidget):
 
     def apply_profanity_settings(self):
         """The settings dialog saved: re-apply; engage on the current
-        channel if it qualifies (live TV -> DVR + caption reader)."""
+        channel if it qualifies (live TV -> DVR + caption reader). The
+        re-apply is IMMEDIATE for already-loaded subtitle text (the
+        cues re-feed with the new word list — no stream refresh needed),
+        and says so on the pill: the 2026-10-16 report refreshed the
+        stream out of pure uncertainty ("added the word … hit refresh"),
+        and the refresh itself cost the sync state."""
         self._apply_profanity_config()
         if not self._filter_engine.enabled or self._closing:
             self._stop_profanity()
             return
         self._on_media_for_profanity((self.current or {}).get("kind"))
+        try:
+            self._set_dvr_status(
+                "Filter updated \u2014 %d mute windows armed"
+                % len(self._filter_engine.windows))
+            QtCore.QTimer.singleShot(
+                2000, lambda: self._set_dvr_status("")
+                if self._dvr_status.text().startswith("Filter updated")
+                else None)
+        except Exception:  # noqa: BLE001 - the pill is cosmetic
+            pass
 
     def _effective_url(self, url: str, kind: str) -> str:
         """Playback URL.  Catch-up goes through the local RANGE relay (the
@@ -7951,6 +8470,10 @@ class PlayerView(QtWidgets.QWidget):
     def _on_vod_cue(self, start: float, end: float, text: str):
         if self._closing or not self._cap_relay_live():
             return
+        # MP4s expose no track list to the UI — a delivered cue is the
+        # only "text exists on this stream" evidence they ever get (the
+        # filter dot + the filter's own online-sub hunt key off it)
+        self._relay_cues_seen = True
         # VOD subtitle tracks are pre-timed — no caption-lag lead, but the
         # measured ~0.5 s late-mute trim applies (see _VOD_MUTE_LEAD_S)
         self._filter_engine.add_cue(start, end, text,
@@ -7987,6 +8510,19 @@ class PlayerView(QtWidgets.QWidget):
             # sidecar, or a VOD/series media whose captions were rescued
             # by a FETCHED file (re-fed here on re-open the same way).
             self._load_stremio_sub_cues()
+            if kind in ("stremio", "vod", "series") \
+                    and not self._stremio_sub_cues:
+                # nothing in hand yet: once the relay has had a moment to
+                # parse the head, decide whether the FILTER must fetch
+                # its own text online (captions off must not starve it)
+                QtCore.QTimer.singleShot(
+                    2500, lambda: self._filter_sub_check(tries_left=8))
+            return
+        if kind in ("vod", "series"):
+            # no fetched file: embedded relay text is the only in-file
+            # source — same delayed filter-side verdict
+            QtCore.QTimer.singleShot(
+                2500, lambda: self._filter_sub_check(tries_left=8))
             return
         if kind != "live" or not self._is_dvrable():
             return
@@ -8000,6 +8536,58 @@ class PlayerView(QtWidgets.QWidget):
         if self._mode == "chase" and self._cc_source is None:
             self._start_cc_when_buffer(tries_left=75)
 
+    def _filter_sub_check(self, tries_left: int = 0):
+        """The filter's own text hunt (scheduled by _on_media_for_profanity):
+        the filter is ON but this media has offered no text yet — no
+        handoff sub file, no fetched rescue. Captions being OFF must not
+        starve the filter (the 2026-10-13 report: subtitle-less BluRay
+        rips left the dot red forever): once the relay's head parse has
+        settled — or provably never will (no relay, startup failed, no
+        text tracks) — arm the online subtitle search on the FILTER's
+        behalf. The fetched file then feeds the filter exactly like a
+        handoff's --sub-file (captions stay off; _on_subs_fetched's
+        captions-off branch stores it and arms the windows). Retry
+        ladder: a big file's relay startup (tail prefetch) can outlast
+        any fixed delay, and MP4s give no track verdict at all — only
+        cue arrival, watched over a few passes."""
+        if self._closing or not self._filter_engine.enabled:
+            return
+        cur = self.current or {}
+        if cur.get("kind") not in ("stremio", "vod", "series"):
+            return
+        if (self._stremio_sub_cues or cur.get("sub_file")
+                or cur.get("_fetched_sub")
+                or self._sub_fetch_pending or self._sub_fetching):
+            return          # text in hand, or a hunt already running
+        relay = self._vod_relay
+        if relay is None or getattr(relay, "_startup_failed", False):
+            # direct playback (relay refused / failed): no in-file text
+            # can ever reach the app — the online hunt is the only
+            # source left
+            self._arm_online_sub_fetch(None, for_filter=True)
+            return
+        if hasattr(relay, "_ready") and not relay._ready.is_set() \
+                and getattr(relay, "_alive", False):
+            QtCore.QTimer.singleShot(
+                3000, lambda: self._filter_sub_check(tries_left))
+            return
+        tracks = getattr(relay, "parser_tracks", None) or {}
+        if any(is_text_codec(c) for c in tracks.values()) \
+                or self._relay_cues_seen:
+            return          # embedded text feeds the tap; cues incoming
+        if getattr(relay, "tracks_verdict_ready", False):
+            # MKV head parse FINISHED with no text track: nothing in
+            # this file can ever feed the filter — hunt online
+            self._arm_online_sub_fetch(None, for_filter=True)
+            return
+        # no verdict yet (MP4 / parse still pending): cues may still
+        # arrive off the tap — give them a few more passes first
+        if tries_left > 0:
+            QtCore.QTimer.singleShot(
+                2000, lambda: self._filter_sub_check(tries_left - 1))
+        else:
+            self._arm_online_sub_fetch(None, for_filter=True)
+
     def _load_stremio_sub_cues(self):
         """Feed the media's EXTERNAL subtitle file's cues (a Stremio
         handoff's --sub-file, or a fetched-online rescue on any kind) to
@@ -8008,7 +8596,7 @@ class PlayerView(QtWidgets.QWidget):
         measured mute lead applies. Safe to re-run when the user toggles
         the filter mid-stream: identical windows merge. The parse itself
         is shared with the caption overlay (see _stremio_sub_cues)."""
-        cues = self._stremio_handoff_cues()
+        cues = self._mapped_handoff_cues()
         if self._closing or not cues:
             return
         for start, end, line in cues:
@@ -8048,6 +8636,260 @@ class PlayerView(QtWidgets.QWidget):
                              "%.0f s of %.0f s media", last_s, length_s)
         except Exception:  # noqa: BLE001
             pass
+
+    # ---- external-sub sync anchors (G / Shift+G, persisted) ----
+
+    _SUB_ANCHOR_MERGE_S = 5.0   # presses this close refine ONE anchor
+    _SUB_ANCHOR_STORE_MAX = 300  # FIFO cap on persisted (stream, sub) pairs
+
+    @staticmethod
+    def _anchor_offset(anchors, t: float) -> float:
+        """STEP-function sync correction at video time ``t``: the most
+        recent anchor at or before ``t`` holds; 0 before the first
+        anchor. Cut trims ARE steps (~20 s lumps at ad breaks), so a
+        press must shift the track from that moment FORWARD only — the
+        earlier piecewise-LINEAR interpolation re-skewed everything
+        between anchors on every press (live-seen 2026-10-16 16:46-
+        16:50: a press storm bred 7 anchors between +30 and -15 s and
+        each new press moved subtitles the user had already synced)."""
+        off = 0.0
+        for at, ao in anchors or ():
+            if at <= t:
+                off = float(ao)
+            else:
+                break
+        return off
+
+    @staticmethod
+    def _sub_anchor_key(cur: dict) -> str:
+        """Stable key for a (stream, subtitle) pair: the handoff URL
+        identifies the CUT, the sub file name the timeline — anchors
+        only mean anything for the pair together."""
+        import hashlib
+        url = str((cur or {}).get("url") or "")
+        sub = os.path.basename(str((cur or {}).get("sub_file")
+                                   or (cur or {}).get("_fetched_sub")
+                                   or ""))
+        if not url or not sub:
+            return ""
+        digest = hashlib.md5(url.encode("utf-8", "replace")).hexdigest()
+        return "%s|%s" % (digest[:16], sub)
+
+    def _sub_anchor_store_path(self) -> str:
+        return os.path.join(tempfile.gettempdir(), "MichaelTVPlayer",
+                            "subs", "sync-anchors.json")
+
+    def _sub_anchors_load(self, cur: dict) -> list:
+        """Saved anchors for this (stream, sub) pair, [] when none. The
+        store is what makes a manual sync SURVIVE Stremio re-handoffs
+        and app restarts — a fresh playable dict otherwise starts
+        anchor-less every single time."""
+        key = self._sub_anchor_key(cur)
+        if not key:
+            return []
+        try:
+            import json
+            with open(self._sub_anchor_store_path(), "r",
+                      encoding="utf-8") as f:
+                store = json.load(f)
+            raw = store.get(key) or []
+            out = []
+            for pair in raw:
+                try:
+                    t, off = float(pair[0]), float(pair[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                out.append((t, off))
+            out.sort()
+            return out
+        except Exception:  # noqa: BLE001 - a corrupt store reads empty
+            return []
+
+    def _sub_anchors_save(self, cur: dict, anchors: list):
+        """Persist this pair's anchors (write-through on every nudge —
+        cheap, and a crash never loses the user's sync work)."""
+        key = self._sub_anchor_key(cur)
+        if not key:
+            return
+        try:
+            import json
+            path = self._sub_anchor_store_path()
+            store = {}
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    store = json.load(f)
+                if not isinstance(store, dict):
+                    store = {}
+            except Exception:  # noqa: BLE001 - first write / corrupt
+                store = {}
+            store.pop(key, None)
+            if anchors:
+                store[key] = [[round(t, 3), round(off, 3)]
+                              for t, off in anchors]
+            while len(store) > self._SUB_ANCHOR_STORE_MAX:
+                store.pop(next(iter(store)))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".part"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(store, f)
+            os.replace(tmp, path)
+        except Exception:  # noqa: BLE001 - persistence is best-effort
+            pass
+
+    def _apply_sub_anchor_map(self, anchors) -> bool:
+        """Rebuild the overlay's CueStore AND the profanity windows from
+        the base file cues through the anchor map (see
+        _mapped_handoff_cues for why both must move together). False
+        when the file isn't the sole window source (relay text also
+        feeds windows — a rebuild would drop theirs)."""
+        if self._closing:
+            return False
+        cues = self._stremio_handoff_cues()
+        if not cues:
+            return False
+        relay = self._vod_relay or self._file_tap
+        tracks = getattr(relay, "parser_tracks", None) or {}
+        if any(is_text_codec(c) for c in tracks.values()) \
+                or self._relay_cues_seen:
+            return False
+        self.current["_sub_anchors"] = list(anchors or [])
+        mapped = self._mapped_handoff_cues()
+        self._cap_store_ext = True
+        self._cap_cues.clear()
+        for s, e, t in mapped:
+            self._cap_cues.add(s, e, t)
+        self._filter_engine.clear()
+        for s, e, t in mapped:
+            self._filter_engine.add_cue(s, e, t, lead_s=_VOD_MUTE_LEAD_S)
+        self._filter_timer.start()
+        self._update_filter_dot()
+        return True
+
+    def _nudge_sub_anchor(self, delta_s: float) -> bool:
+        """A subtitle-delay nudge on ANY external file sub: RE-ANCHOR the
+        piecewise sync map at the current position instead of chasing
+        drift with a constant delay. A wrong-cut track's error is a step
+        function (webdl teases, head recaps), so a constant delay is
+        wrong within minutes while an anchor — "here, the subtitles are
+        now exactly +0.75 s off" — stays correct until the NEXT trim,
+        and the next press extends the map. Anchors persist to disk per
+        (stream, sub) pair, so the manual sync survives re-handoffs and
+        restarts. False when no external file sub owns this media's
+        captions (caller falls back to the classic constant delay)."""
+        cur = self.current or {}
+        if (self._closing
+                or cur.get("kind") not in ("stremio", "vod", "series",
+                                           "file")
+                or not (cur.get("sub_file") or cur.get("_fetched_sub"))):
+            return False
+        if not self._stremio_handoff_cues():
+            return False
+        try:
+            t_now = max(0.0, self._caption_clock_s())
+        except Exception:  # noqa: BLE001 - clock is best-effort
+            return False
+        anchors = [tuple(a) for a in (cur.get("_sub_anchors") or [])]
+        off = self._anchor_offset(anchors, t_now) + float(delta_s)
+        merged = False
+        for i, (at, _ao) in enumerate(anchors):
+            if abs(at - t_now) <= self._SUB_ANCHOR_MERGE_S:
+                anchors[i] = (t_now, off)   # rapid presses refine ONE point
+                merged = True
+                break
+        if not merged:
+            anchors.append((t_now, off))
+            anchors.sort()
+        if not self._apply_sub_anchor_map(anchors):
+            return False
+        self._sub_anchors_save(cur, anchors)
+        try:
+            log.info("sub sync: re-anchored at %.1f s -> %+.2f s (%d "
+                     "anchors, %d windows)", t_now, off, len(anchors),
+                     len(self._filter_engine.windows))
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_dvr_status(
+            "Subtitles %+.2f s \u2014 holds from here (Ctrl+0 clears)"
+            % off)
+        QtCore.QTimer.singleShot(
+            2000, lambda: self._set_dvr_status("")
+            if self._dvr_status.text().startswith("Subtitles ")
+            else None)
+        return True
+
+    def sub_delay_hot(self, step_s: float):
+        """G / Shift+G — VLC's subtitle-delay keys, FIXED steps (0.5 s;
+        Ctrl+G / Ctrl+Shift+G = 2 s): the adaptive escalation tried to
+        be clever and read as erratic (live-seen 2026-10-16 16:48: a
+        press run snowballed to 4 s jumps and +30 s of offset in ten
+        presses). On an external file sub the press re-anchors the sync
+        from the current moment FORWARD (_nudge_sub_anchor, persisted
+        per stream+sub); media without one get the classic constant
+        delay (VLC's live spu API + config)."""
+        if self._closing:
+            return
+        cur = self.current or {}
+        if self._nudge_sub_anchor(float(step_s)):
+            return
+        if cur.get("sub_file") or cur.get("_fetched_sub"):
+            # an external sub EXISTS but its cues aren't parseable
+            # right now (or the relay also feeds windows): writing the
+            # GLOBAL config delay here would pollute every other media
+            # while doing nothing visible for this one — refuse loudly
+            self._set_dvr_status("Subtitles not ready \u2014 nothing "
+                                 "changed")
+            QtCore.QTimer.singleShot(
+                1400, lambda: self._set_dvr_status("")
+                if self._dvr_status.text().startswith(
+                    "Subtitles not ready") else None)
+            return
+        # classic constant delay: read-modify-SET (the appearance
+        # property hands out a merged copy — a plain key write on it
+        # would vanish), persist like the dialog does
+        try:
+            appearance = dict(self.config.subtitle_appearance)
+            ms = int(appearance.get("delay_ms", 0) or 0)
+        except Exception:  # noqa: BLE001
+            appearance, ms = {}, 0
+        ms = max(-30000, min(30000, ms + int(round(step_s * 1000.0))))
+        try:
+            appearance["delay_ms"] = ms
+            self.config.subtitle_appearance = appearance
+            self.config.save()
+        except Exception:  # noqa: BLE001 - cosmetic persistence
+            pass
+        self._apply_sub_delay(ms)
+        try:
+            log.info("sub delay: classic %+.2f s (config)", ms / 1000.0)
+        except Exception:  # noqa: BLE001
+            pass
+        self._set_dvr_status("Subtitle delay %+.2f s" % (ms / 1000.0))
+        QtCore.QTimer.singleShot(
+            1400, lambda: self._set_dvr_status("")
+            if self._dvr_status.text().startswith("Subtitle delay")
+            else None)
+
+    def sub_sync_reset(self):
+        """Ctrl+0: drop EVERY sync anchor for this stream+sub pair —
+        back to the engaged file's own timing (the automatic fit), in
+        the store too, so a press storm's garbage never survives."""
+        if self._closing:
+            return
+        cur = self.current or {}
+        had = bool(cur.get("_sub_anchors"))
+        cur.pop("_sub_anchors", None)
+        self._sub_anchors_save(cur, [])
+        self._sub_dialog_delay_ms = 0
+        if self._apply_sub_anchor_map([]) or had:
+            try:
+                log.info("sub sync: all anchors cleared")
+            except Exception:  # noqa: BLE001
+                pass
+            self._set_dvr_status("Subtitles sync reset")
+            QtCore.QTimer.singleShot(
+                1400, lambda: self._set_dvr_status("")
+                if self._dvr_status.text().startswith(
+                    "Subtitles sync reset") else None)
 
     def _start_cc_when_buffer(self, tries_left: int = 75):
         """Wait for the DVR buffer to hold data, then start the caption
@@ -8450,7 +9292,11 @@ class PlayerView(QtWidgets.QWidget):
         relay = self._vod_relay or self._file_tap
         if relay is not None:
             tracks = getattr(relay, "parser_tracks", None) or {}
-            if any(is_text_codec(c) for c in tracks.values()):
+            if any(is_text_codec(c) for c in tracks.values()) \
+                    or self._relay_cues_seen:
+                # (an MP4's tap exposes no track list — it proves its
+                # text by DELIVERING a cue; _relay_cues_seen is that
+                # evidence)
                 return (True, "embedded subtitle track "
                         "(%d mute windows armed)"
                         % len(self._filter_engine.windows))
@@ -8458,8 +9304,17 @@ class PlayerView(QtWidgets.QWidget):
                 if self._sub_fetch_pending or self._sub_fetching:
                     return (False, "no text track — searching online\u2026")
                 return (False, "no text subtitle track on this stream")
-            # head not parsed yet (or the relay never offered tracks):
-            # pending, not a verdict
+            if self._sub_fetch_pending or self._sub_fetching:
+                return (False, "no text on this file — searching "
+                        "subtitles online\u2026")
+            if getattr(relay, "tracks_verdict_ready", False):
+                # the MKV head parse FINISHED: {} is final, this file
+                # carries no subtitle tracks at all — a verdict, not
+                # "still checking" (the 2026-10-13 report sat on the
+                # transient message forever)
+                return (False, "no subtitle tracks on this file")
+            # head not parsed yet (MP4 never offers tracks; MKV still
+            # riding): pending, not a verdict
             return (False, "checking this stream for subtitles\u2026")
         if self._sub_fetch_pending or self._sub_fetching:
             return (False, "searching online subtitles\u2026")

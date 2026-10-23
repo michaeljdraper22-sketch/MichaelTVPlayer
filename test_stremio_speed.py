@@ -285,9 +285,11 @@ def main():
     nsp_calls = []
     real_nsp = stremio.next_stream_playable
     stremio.next_stream_playable = (
-        lambda cfg, cur, exclude=None, debrid_only=None:
+        lambda cfg, cur, exclude=None, debrid_only=None,
+        reanchor_click=False:
         nsp_calls.append({"debrid_only": debrid_only,
-                          "exclude": set(exclude or ())}) or {
+                          "exclude": set(exclude or ()),
+                          "reanchor_click": reanchor_click}) or {
             "kind": "stremio", "title": "T",
             "fav_key": "stremio:abc:0",
             "url": "https://debrid.example/next.mkv"})
@@ -320,6 +322,9 @@ def main():
         check("advance chain asks debrid-only with the dead hash excluded",
               nsp_calls and nsp_calls[0]["debrid_only"] is True
               and "a" * 40 in nsp_calls[0]["exclude"])
+        check("advance chain asks for the click-context re-anchor "
+              "(never-played stream: recover what page was clicked)",
+              bool(nsp_calls) and nsp_calls[0]["reanchor_click"] is True)
     finally:
         stremio.next_stream_playable = real_nsp
         view.play_media = real_play
@@ -376,6 +381,45 @@ def main():
         "The Terminator 1984")
     check("movie matcher picks the right title word-set",
           movie_hit and movie_hit["id"] == "tt0086")
+
+    # ---- the 2026-10-16 apostrophe incident: release heads spell the
+    # title without the apostrophe ('Hells Kitchen (2005) S13E01') while
+    # the catalog keeps it ("Hell's Kitchen") — \W+ split the catalog
+    # title into 'hell'+'s', the release token 'hells' never matched
+    # 'hell', the 60% floor failed on a 2-word name (no trim rung below
+    # 2 words), and identity/autoplay/subtitles all died with 'catalog
+    # search found no show' (player.log 12:08 and 12:21, twice the same
+    # night). Both spellings must now resolve to the same show.
+    hk_metas = [
+        {"id": "tt0437005", "name": "Hell's Kitchen",
+         "releaseInfo": "2005-"},
+        {"id": "tt0412137", "name": "Hell's Kitchen",
+         "releaseInfo": "2004-2009"},
+        {"id": "tt29432151", "name": "Hell's Kitchen Famosos",
+         "releaseInfo": "2023-"},
+        {"id": "tt1626459", "name": "My Kitchen Rules",
+         "releaseInfo": "2010-"},
+        {"id": "tt3475084", "name": "The Kitchen",
+         "releaseInfo": "2014-"},
+    ]
+    hk_release = ("Hells Kitchen (2005) S13E01 - Hollywood Premiere "
+                  "Shocks New Chefs - WEBDL-1080p.mp4")
+    hit = stremio._find_catalog(search(hk_metas), "Hells Kitchen")
+    check("apostrophe-less release matches the apostrophe title",
+          hit and hit["id"] == "tt0437005")
+    hit = stremio._find_catalog(search(hk_metas), "Hell's Kitchen US")
+    check("apostrophe release still matches (no regression)",
+          hit and hit["id"] == "tt0437005")
+    hit = stremio._find_catalog(
+        search(hk_metas), stremio.clean_show_name(hk_release,
+                                                  strip_year=True))
+    check("the incident's exact release name resolves (clean+match)",
+          hit and hit["id"] == "tt0437005")
+    hit = stremio._find_catalog(
+        search([{"id": "tt9", "name": "Hell or High Water"}]),
+        "Hells Kitchen")
+    check("folding does not blur DIFFERENT words (hells != hell)",
+          hit is None)
 
     # ---- the 2026-09-04 field regression: _JUNK_RES's codec alternation
     # had no word boundaries, so the 'DV' token ate the middle of
@@ -1015,7 +1059,16 @@ def main():
         check("resolve_base: torrentio resolve prefix extracted",
               stremio.resolve_base(RU) ==
               "https://torrentio.strem.fun/resolve/torbox/key-1234/")
-        check("resolve_base: server/debridio/direct urls -> \"\"",
+        # live debridio shape (2026-10-13): /play/{type}/{provider}/
+        # {addonId}/{userKey}/{40-hex}/{file} — a reusable pipeline now
+        DB = ("https://addon.debridio.com/play/series/torbox/"
+              "0889be7cbed8417f47e58540afea55c0/"
+              "1f7be332-5fea-4aa8-8814-46eabea63736/")
+        check("resolve_base: debridio play prefix extracted",
+              stremio.resolve_base(DB + H["c"] + "/Some.Show.S01E01.mkv")
+              == DB)
+        check("resolve_base: server/direct urls and a hash-less debridio "
+              "stub -> \"\"",
               stremio.resolve_base("http://127.0.0.1:11470/%s/2" % H["g"])
               == "" and stremio.resolve_base(
                   "https://addon.debridio.com/play/series/premiumize/"
@@ -1027,10 +1080,555 @@ def main():
         check("build_resolve_url: parse_resolve_url recovers the "
               "identity (dead-chain exclusion keeps working)",
               stremio.parse_resolve_url(built) == (H["c"], 3))
+        dbuilt = stremio.build_resolve_url(
+            stremio.resolve_base(DB + H["c"] + "/x.mkv"), H["b"],
+            "Adventure.Time.S05E42.1080p.BluRay.x264-DEiMOS.mkv", 0)
+        check("build_resolve_url: debridio shape /{hash}/{name}, "
+              "identity recoverable",
+              dbuilt == DB + H["b"] + "/Adventure.Time.S05E42.1080p."
+              "BluRay.x264-DEiMOS.mkv"
+              and stremio.parse_resolve_url(dbuilt) == (H["b"], 0))
+
+        # ALL FOUR of the user's live debrid pipelines (2026-10-13 sweep
+        # of player.log: debridio pm/tb movie+series, torrentio pm/tb —
+        # real key shapes, fake hashes) must carry a resolve pipeline or
+        # autoplay dead-ends at "no resolve pipeline, engine never
+        # engages" on that whole addon family.
+        import struct as _struct
+        PM = "tdgs5gcukfk2fcc3"           # premiumize key (live shape)
+        TBK = "1f7be332-5fea-4aa8-8814-46eabea63736"   # torbox uuid
+        AID = "0889be7cbed8417f47e58540afea55c0"       # debridio addonId
+        shapes = {
+            "torrentio pm": "https://torrentio.strem.fun/resolve/"
+                            "premiumize/%s/" % PM,
+            "torrentio tb": "https://torrentio.strem.fun/resolve/"
+                            "torbox/%s/" % TBK,
+            "debridio pm movie": "https://addon.debridio.com/play/movie/"
+                                 "premiumize/%s/%s/" % (AID, PM),
+            "debridio pm series": "https://addon.debridio.com/play/series/"
+                                  "premiumize/%s/%s/" % (AID, PM),
+            "debridio tb movie": "https://addon.debridio.com/play/movie/"
+                                 "torbox/%s/%s/" % (AID, TBK),
+            "debridio tb series": "https://addon.debridio.com/play/series/"
+                                  "torbox/%s/%s/" % (AID, TBK),
+        }
+        for name, base in shapes.items():
+            url = base + H["a"] + "/Some.Show.S02E03.1080p.mkv"
+            b = stremio.resolve_base(url)
+            r = stremio.build_resolve_url(
+                b, H["b"], "Some.Show.S02E03.1080p.mkv", 5)
+            want_idx = 0 if "/play/" in b else 5
+            check("resolve pipeline: %s armed (base+build+identity)" % name,
+                  b == base
+                  and stremio.parse_resolve_url(r) == (H["b"], want_idx))
+
+        # ---- mkv_head_duration_s: the online-sub SYNC gate's clock ----
+        def _vid(v):
+            L = (v.bit_length() + 5) // 7
+            return (v | (1 << (7 * L))).to_bytes(L, "big")
+
+        def _vsz(v):
+            L = max(1, (v.bit_length() + 6) // 7)
+            return (v | (1 << (7 * L))).to_bytes(L, "big")
+
+        def _el(eid, payload):
+            return _vid(eid) + _vsz(len(payload)) + payload
+
+        _EBML, _SEG, _INF, _DUR, _TCS = (0x1A45DFA3, 0x18538067,
+                                         0x1549A966, 0x4489, 0x2AD7B1)
+        _ebmlh = _el(_EBML, b"\x00" * 8)
+        _mkv = lambda info: _ebmlh + _el(_SEG, _el(_INF, info))
+        check("mkv_head_duration_s: default scale float8",
+              stremio.mkv_head_duration_s(
+                  _mkv(_el(_DUR, _struct.pack(">d", 725000.0)))) == 725.0)
+        check("mkv_head_duration_s: non-default scale float4",
+              stremio.mkv_head_duration_s(
+                  _mkv(_el(_TCS, (100000).to_bytes(3, "big"))
+                       + _el(_DUR, _struct.pack(">f", 7250000.0)))) == 725.0)
+        check("mkv_head_duration_s: garbage/no-Info/absurd -> 0.0",
+              stremio.mkv_head_duration_s(b"\xab" * 64) == 0.0
+              and stremio.mkv_head_duration_s(_ebmlh) == 0.0
+              and stremio.mkv_head_duration_s(
+                  _mkv(_el(_DUR, _struct.pack(">d", 1e12)))) == 0.0)
+
+        # ---- mp4_head_duration_s: the SYNC gate's clock for the MP4
+        # WEBDL rips Stremio actually hands off (the 2026-10-16 Hell's
+        # Kitchen files were both .mp4 — the MKV-only gate never fired).
+        # mvhd v0: timescale u32 at +16, duration u32 at +20.
+        def _mvhd_v0(ts, dur):
+            body = (b"\x00" * 4 + b"\x00" * 8
+                    + ts.to_bytes(4, "big") + dur.to_bytes(4, "big")
+                    + b"\x00" * 80)
+            return ((8 + len(body)).to_bytes(4, "big") + b"mvhd"
+                    + body)
+
+        # mvhd v1: timescale u32 at +20, duration u64 at +24.
+        def _mvhd_v1(ts, dur):
+            body = (b"\x01" + b"\x00" * 3 + b"\x00" * 16
+                    + ts.to_bytes(4, "big") + dur.to_bytes(8, "big"))
+            return ((8 + len(body)).to_bytes(4, "big") + b"mvhd"
+                    + body)
+
+        check("mp4_head_duration_s: v0 in head (faststart)",
+              stremio.mp4_head_duration_s(
+                  b"\x00" * 64 + _mvhd_v0(1000, 2515 * 1000)) == 2515.0)
+        check("mp4_head_duration_s: v1 in tail (moov-at-end)",
+              stremio.mp4_head_duration_s(
+                  b"", b"\x00" * 64 + _mvhd_v1(90000, 2515 * 90000))
+              == 2515.0)
+        check("mp4_head_duration_s: head wins over tail",
+              stremio.mp4_head_duration_s(
+                  _mvhd_v0(1000, 600_000), _mvhd_v0(1000, 100))
+              == 600.0)
+        check("mp4_head_duration_s: garbage/absurd/absent -> 0.0",
+              stremio.mp4_head_duration_s(b"mvhd" * 40) == 0.0
+              and stremio.mp4_head_duration_s(
+                  b"", _mvhd_v0(1, 0xFFFFFFFF)) == 0.0
+              and stremio.mp4_head_duration_s(b"", b"") == 0.0)
         check("_resolve_file_name: title line 2 is the file name",
               stremio._resolve_file_name(
                   {"title": "Torrent Name\nFile.Name.S01E01.mkv\n"
                             "\U0001F464 5"}) == "File.Name.S01E01.mkv")
+
+        # ---- search_online_subtitles: multi-source (the 2026-10-16
+        # Hell's Kitchen night: the keyless OpenSubtitles addon returned
+        # ZERO subs for the show's middle seasons — three 'none found'
+        # fetches while the user's own SubSense addon carried five
+        # English SRTs for the exact episode). The user's installed
+        # subtitle addons are queried FIRST, in parallel; the keyless
+        # fallback stays when the profile has none.
+        class _FakeResp:
+            def __init__(self, status, payload):
+                self.status_code = status
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        class _FakeSession:
+            def __init__(self, table):
+                self.table = table      # url prefix -> resp | exc | list
+                self.hits = []
+
+            def get(self, url, timeout=10):
+                self.hits.append(url)
+                for prefix, actions in self.table.items():
+                    if not url.startswith(prefix):
+                        continue
+                    if isinstance(actions, list):
+                        # sequential answers: earlier ones pop, the
+                        # last repeats forever
+                        action = actions.pop(0) if len(actions) > 1 \
+                            else actions[0]
+                    else:
+                        action = actions
+                    if isinstance(action, Exception):
+                        raise action
+                    return action
+                return _FakeResp(200, {"subtitles": []})
+
+        SUBSENSE = "https://subsense.example"
+        KEYLESS = "https://opensubtitles-v3.strem.io"
+        saved_session, saved_bases = (stremio._session,
+                                      stremio.subtitle_addon_bases)
+        try:
+            fake = _FakeSession({
+                KEYLESS: _FakeResp(200, {"subtitles": []}),
+                SUBSENSE: _FakeResp(200, {"subtitles": [
+                    # SubSense shapes: label/releaseName, NO season/
+                    # episode fields — must be trusted (episode-scoped
+                    # query), not dropped as (0,0) mismatch
+                    {"id": "subsense-srt-gestdown-eng-1",
+                     "url": "https://subsense.example/dl/1",
+                     "lang": "eng", "label": "Gestdown · [SRT] · LOL",
+                     "releaseName": "LOL"},
+                    {"id": "subsense-srt-subsource-eng-0",
+                     "url": "https://subsense.example/dl/0",
+                     "lang": "eng",
+                     "label": "Subsource · [SRT]",
+                     "releaseName":
+                         "Hells Kitchen US S13E01 PDTV x264"},
+                    {"id": "subsense-srt-x-ger",
+                     "url": "https://subsense.example/dl/9",
+                     "lang": "ger", "label": "German"},
+                ]}),
+            })
+            stremio._session = fake
+            stremio.subtitle_addon_bases = lambda: [SUBSENSE, KEYLESS]
+            cands = stremio.search_online_subtitles(
+                "series", "tt0437005", season=13, episode=1,
+                file_hint="Hells Kitchen (2005) S13E01 - WEBDL-1080p")
+            check("multi-source: user's addon answers where the keyless "
+                  "one is empty",
+                  len(cands) == 2
+                  and {c["id"] for c in cands} ==
+                  {"subsense-srt-subsource-eng-0",
+                   "subsense-srt-gestdown-eng-1"})
+            check("multi-source: overlap ranks the named release first",
+                  cands[0]["id"] == "subsense-srt-subsource-eng-0")
+            check("multi-source: non-wanted language filtered",
+                  all(c["lang"] == "eng" for c in cands))
+            check("multi-source: both bases actually queried",
+                  any(u.startswith(SUBSENSE) for u in fake.hits)
+                  and any(u.startswith(KEYLESS) for u in fake.hits))
+
+            # episode evidence: the opensubtitles shape (fields always
+            # present) still drops a wrong-episode listing, and a
+            # contradicting SxxEyy marker in the entry's own name
+            # overrules agreeing fields
+            fake = _FakeSession({
+                KEYLESS: _FakeResp(200, {"subtitles": [
+                    {"id": "ok-fields", "url": "https://x/dl1",
+                     "lang": "eng", "subtitleFileName": "e1.srt",
+                     "season": 13, "episode": 1},
+                    {"id": "wrong-fields", "url": "https://x/dl2",
+                     "lang": "eng", "subtitleFileName": "e2.srt",
+                     "season": 1, "episode": 1},
+                    {"id": "wrong-marker", "url": "https://x/dl3",
+                     "lang": "eng",
+                     "subtitleFileName": "Hells.Kitchen.S08E02.srt",
+                     "season": 13, "episode": 1},
+                ]}),
+            })
+            stremio._session = fake
+            stremio.subtitle_addon_bases = lambda: [KEYLESS]
+            cands = stremio.search_online_subtitles(
+                "series", "tt0437005", season=13, episode=1,
+                file_hint="Hells Kitchen S13E01")
+            check("episode evidence: agreeing fields kept, disagreeing "
+                  "fields and lying markers dropped",
+                  [c["id"] for c in cands] == ["ok-fields"])
+
+            # a failed base gets exactly one retry round, and only when
+            # nothing usable came back
+            fake = _FakeSession({
+                SUBSENSE: ConnectionError("down"),
+                KEYLESS: _FakeResp(200, {"subtitles": [
+                    {"id": "keyless-hit", "url": "https://x/dl1",
+                     "lang": "eng", "season": 13, "episode": 1},
+                ]}),
+            })
+            stremio._session = fake
+            stremio.subtitle_addon_bases = lambda: [SUBSENSE, KEYLESS]
+            cands = stremio.search_online_subtitles(
+                "series", "tt0437005", season=13, episode=1)
+            check("failed base: no retry while another source answered "
+                  "(one hit per base)",
+                  sum(u.startswith(SUBSENSE) for u in fake.hits) == 1
+                  and [c["id"] for c in cands] == ["keyless-hit"])
+
+            fake = _FakeSession({
+                SUBSENSE: [ConnectionError("down"),
+                           _FakeResp(200, {"subtitles": [
+                               {"id": "retry-hit", "url": "https://x/dl1",
+                                "lang": "eng"}]})],
+            })
+            stremio._session = fake
+            stremio.subtitle_addon_bases = lambda: [SUBSENSE]
+            cands = stremio.search_online_subtitles(
+                "series", "tt0437005", season=13, episode=1)
+            check("failed base: retried once when nothing else answered",
+                  sum(u.startswith(SUBSENSE) for u in fake.hits) == 2
+                  and [c["id"] for c in cands] == ["retry-hit"])
+        finally:
+            stremio._session = saved_session
+            stremio.subtitle_addon_bases = saved_bases
+
+        # ---- the fetch WORKER's sync decision (2026-10-16 Hell's
+        # Kitchen evidence: the WEBDL runs 2407 s, every English SRT on
+        # every source is the 2515 s broadcast timing — the old 1.05
+        # ceiling waved that through as ~108 s of end drift, the
+        # user's "out of sync on Stremio" exactly). The worker must:
+        # pass a matching span untouched, SKIP a wrong-cut span, and
+        # when nothing passes but one span is a plausible same-episode
+        # cut (0.9-1.15), RETIME it to the media and hand back a real
+        # retimed file. Driven synchronously by capturing the runner's
+        # callable — asserts on the worker's own decision tuple.
+        import tempfile as _tf
+        from types import SimpleNamespace as _NS
+        import src.profanity as _prof
+        wv = PlayerView(Config({}, None))
+        wv.current = {"kind": "stremio", "fav_key": "stremio:tt0437005",
+                      "stremio_imdb": "tt0437005", "season": 13,
+                      "episode": 1, "file_name":
+                      "Hells Kitchen (2005) S13E01 WEBDL-1080p.mp4"}
+        wv.vlc = _NS(get_length=lambda: 0)
+        media_head = (b"\x00" * 64 + _mvhd_v0(1000, 2407306)
+                      + b"\x00" * 66000)
+        wv._vod_relay = _NS(total=750647726, _head=media_head,
+                            _tail=b"", parser_tracks={})
+        captured = []
+        wv._subfetch_runner.run = \
+            lambda fn, *a, **k: captured.append(fn())
+        _tmpdir = _tf.mkdtemp(prefix="mtp_subsync_")
+
+        def _ts_srt(t):
+            ms = int(round(float(t) * 1000.0))
+            h, ms = divmod(ms, 3600000)
+            m, ms = divmod(ms, 60000)
+            s, ms2 = divmod(ms, 1000)
+            return "%02d:%02d:%02d,%03d" % (h, m, s, ms2)
+
+        def _srt_cues_text(last_s):
+            return ("1\r\n%s --> %s\r\nhi\r\n\r\n"
+                    "2\r\n%s --> %s\r\nbye\r\n"
+                    % (_ts_srt(1.0), _ts_srt(4.0),
+                       _ts_srt(max(5.0, last_s - 3.0)),
+                       _ts_srt(last_s)))
+
+        def _run_with(sub_last_s, cand_name="HK"):
+            src_cues = _prof.parse_subtitle_cues(
+                _srt_cues_text(sub_last_s))
+            dest = os.path.join(_tmpdir, "cand-%d.srt" % sub_last_s)
+            saved_dl = stremio.download_online_subtitle
+            saved_cp = stremio.subtitle_cache_path
+            saved_search = stremio.search_online_subtitles
+            try:
+                stremio.subtitle_cache_path = \
+                    lambda imdb, sid: dest
+                stremio.download_online_subtitle = \
+                    lambda url, path: stremio.write_srt_cues(
+                        src_cues, path)
+                stremio.search_online_subtitles = \
+                    lambda *a, **k: [{"id": "x", "url": "u",
+                                      "name": cand_name}]
+                wv._sub_fetching = False
+                wv._sub_fetch_pending = False
+                captured.clear()
+                wv._arm_online_sub_fetch(None, manual=True)
+            finally:
+                stremio.download_online_subtitle = saved_dl
+                stremio.subtitle_cache_path = saved_cp
+                stremio.search_online_subtitles = saved_search
+            return captured[0] if captured else None
+
+        res = _run_with(2407)      # exact-cut span: passes the gate
+        check("worker sync: matching span engaged untouched",
+              res and res[2] == "ok" and res[3]
+              and res[3][0].endswith(".srt")
+              and not res[3][0].endswith("-sync.srt"))
+        res = _run_with(2515)      # broadcast cut on the WEBDL media
+        check("worker sync: wrong cut skipped, best candidate retimed",
+              res and res[2] == "ok" and res[3]
+              and res[3][0].endswith("-sync.srt")
+              and "timing adjusted" in res[3][1])
+        _sync_text = _prof.read_subtitle_text(res[3][0])
+        _sync_cues = _prof.parse_subtitle_cues(_sync_text) \
+            if _sync_text else []
+        _sync_last = max((e for _s, e, _t in _sync_cues), default=0)
+        check("worker sync: the retimed file really ends at the media "
+              "duration (%.0f s of 2407 s)" % _sync_last,
+              2390.0 < _sync_last <= 2407.5)
+
+        # ---- the 15:41 PDTV incident: 2484 s media, 2510.5 s sub —
+        # the old ±1.5% band engaged this RAW (unsynced from the first
+        # second). The tight ±max(8, 0.6%) gate must SKIP it, and the
+        # |diff| <= 45 s fallback fits a CONSTANT shift (head trim).
+        media_head2 = (b"\x00" * 64 + _mvhd_v0(1000, 2484306)
+                       + b"\x00" * 66000)
+        wv._vod_relay = _NS(total=349591771, _head=media_head2,
+                            _tail=b"", parser_tracks={})
+        res = _run_with(2510.5)
+        check("worker sync: 26.5 s head-trim skipped and SHIFT-fitted",
+              res and res[2] == "ok" and res[3]
+              and res[3][0].endswith("-sync.srt"))
+        _sh_text = _prof.read_subtitle_text(res[3][0])
+        _sh_cues = _prof.parse_subtitle_cues(_sh_text) if _sh_text else []
+        _sh_first = min((s for s, _e, _t in _sh_cues), default=-1)
+        _sh_last = max((e for _s, e, _t in _sh_cues), default=0)
+        check("worker sync: shift model moves EVERY cue by the same "
+              "-26.2 s (constant, not scaled)",
+              abs(_sh_first - 0.0) < 0.01
+              and abs(_sh_last - 2484.3) < 0.05)
+        res = _run_with(2486)      # a true same-airing match (1.7 s off)
+        check("worker sync: same-cut span (±1.7 s) engaged untouched",
+              res and res[2] == "ok" and res[3]
+              and not res[3][0].endswith("-sync.srt"))
+        res = _run_with(4000)      # a recap movie: nothing salvageable
+        check("worker sync: gross span (4000 s on 2484 s) refused "
+              "with no retime",
+              res and res[2] == "ok" and res[3] is None)
+        import shutil as _shutil
+        _shutil.rmtree(_tmpdir, ignore_errors=True)
+
+        # ---- [9] retimed-sub drift re-anchor: G/Shift+G (VLC's
+        # subtitle-delay keys) turn a press into a PERMANENT piecewise
+        # correction (the 2026-10-16 report: "subtitles went ahead of
+        # the audio and I could not get them to sync back up
+        # automatically" — a wrong-cut retimed track drifts in steps no
+        # constant delay can chase). Anchors ride the cur dict, so a
+        # stream reload keeps them; the overlay store AND the filter
+        # windows re-map together.
+        print("[9] external-sub sync anchors: G/Shift+G fixed steps, "
+              "step-function map, Ctrl+0 reset (the 2026-10-16 16:46-"
+              "16:50 press storm: adaptive steps snowballed to 4 s "
+              "jumps and linear interpolation re-skewed already-synced "
+              "regions on every press)")
+        sync_dir = _tf.mkdtemp(prefix="mtp_anchor_")
+        sync_path = os.path.join(sync_dir, "tt-test-subsource-eng-0"
+                                          "-sync.srt")
+        base_cues = [(10.0, 13.0, "hello"), (100.0, 104.0,
+                                             "Holy [Bleep]."),
+                     (200.0, 205.0, "mid"), (400.0, 406.0, "late")]
+        stremio.write_srt_cues(base_cues, sync_path)
+        stream_url = ("https://torrentio.strem.fun/resolve/torbox/"
+                      "key/aaaa/tt-test/Hells.Kitchen.S13E01.mp4")
+        nv = PlayerView(Config({}, None))
+        nv.current = {"kind": "stremio", "fav_key": "stremio:x",
+                      "url": stream_url,
+                      "stremio_imdb": "tt0437005", "season": 13,
+                      "episode": 1, "sub_file": sync_path}
+        nv._filter_engine.words = ["bleep"]
+        check("the '-sync.srt' path auto-flags the playable as retimed",
+              nv._stremio_handoff_cues() == base_cues
+              and nv.current["_sub_retimed"] is True)
+        nv._load_stremio_sub_cues()
+        base_windows = [tuple(w) for w in nv._filter_engine.windows]
+        check("filter armed from the retimed file before any nudge",
+              len(base_windows) == 1)
+        clock = {"t": 300.0}
+        nv._caption_clock_s = lambda: clock["t"]
+        # isolate the anchor store BEFORE any press (nudges write
+        # through) — never the real user's sync-anchors.json
+        _store_file = os.path.join(sync_dir, "sync-anchors.json")
+        nv._sub_anchor_store_path = lambda: _store_file
+
+        def _store_times():
+            return {str(t): (float(s), float(e))
+                    for s, e, t in nv._cap_cues.cues}
+
+        from src.profanity import windows_from_cues as _wfc
+
+        def windows_from_cues_exp(_view, cues, words):
+            wins = _wfc(cues, words)
+            return [(max(0.0, ws - 0.4), max(0.0, we - 0.4))
+                    for ws, we in wins]
+
+        # press 1: FIXED 0.5 s at t=300 — cues BEFORE the anchor never
+        # move (step function, not interpolation)
+        nv.sub_delay_hot(0.5)
+        check("nudge 1 anchors (300, +0.5) — fixed step",
+              nv.current.get("_sub_anchors") == [(300.0, 0.5)])
+        times = _store_times()
+        check("cue at 400 s (after the anchor) moves the full +0.5",
+              abs(times["late"][0] - 400.5) < 0.01)
+        check("cue at 10 s (before the anchor) is UNTOUCHED",
+              times["hello"][0] == 10.0 and times["mid"][0] == 200.0)
+        _exp = windows_from_cues_exp(nv, base_cues[:3]
+                                     + [(400.5, 406.5, "late")],
+                                     ["bleep"])
+        check("filter window (cue 100 < anchor) re-mapped unchanged",
+              _exp and len(nv._filter_engine.windows) == 1
+              and abs(nv._filter_engine.windows[0][0] - _exp[0][0])
+              < 0.01)
+        nv.sub_delay_hot(0.5)      # press 2 at the same spot: 1.0 now
+        check("nudge 2 (same spot) refines the SAME anchor to +1.0",
+              nv.current.get("_sub_anchors") == [(300.0, 1.0)]
+              and abs(_store_times()["late"][0] - 401.0) < 0.01)
+        clock["t"] = 450.0
+        nv.sub_delay_hot(-0.25)    # press 3 later: a second anchor
+        check("nudge 3 adds (450, +0.75) — map ((300,+1.0),(450,+0.75))",
+              nv.current.get("_sub_anchors") == [(300.0, 1.0),
+                                                 (450.0, 0.75)])
+        times = _store_times()
+        check("cue at 400 s keeps the PREVIOUS anchor's +1.0 (steps, "
+              "no interpolation)",
+              abs(times["late"][0] - 401.0) < 0.01)
+        check("cue at 200 s still untouched",
+              times["mid"][0] == 200.0)
+
+        # ---- anchors persist per (stream, sub) pair: a fresh playable
+        # (the Stremio re-handoff / app restart case) restores them and
+        # the engage applies the map with them
+        import json as _json
+        check("anchors written to the persistent store",
+              os.path.isfile(_store_file)
+              and nv._sub_anchor_key(nv.current) in
+              _json.load(open(_store_file, encoding="utf-8")))
+        nv2 = PlayerView(Config({}, None))
+        nv2._sub_anchor_store_path = lambda: _store_file
+        nv2.current = {"kind": "stremio", "fav_key": "stremio:x",
+                       "url": stream_url, "stremio_imdb": "tt0437005",
+                       "season": 13, "episode": 1,
+                       "sub_file": sync_path}
+        check("fresh playable restores saved anchors on cue parse",
+              nv2._stremio_handoff_cues() == base_cues
+              and nv2.current.get("_sub_anchors") == [(300.0, 1.0),
+                                                      (450.0, 0.75)])
+        nv2._engage_stremio_external()
+        t2 = {str(t): (float(s), float(e)) for s, e, t in
+              nv2._cap_cues.cues}
+        check("engage applies the restored map (late cue at 401.0)",
+              abs(t2["late"][0] - 401.0) < 0.01)
+
+        # the settings dialog's delay routes through the SAME map for
+        # file-owned subs: +1.5 s from the dialog = an anchor press
+        nv2._caption_clock_s = lambda: 120.0
+        nv2._apply_sub_delay(1500)
+        check("dialog delay delta lands as an anchor (120, +1.5)",
+              nv2.current.get("_sub_anchors") == [(120.0, 1.5),
+                                                  (300.0, 1.0),
+                                                  (450.0, 0.75)])
+        nv2._apply_sub_delay(0)     # the dialog's reset clears all
+        check("dialog reset (0.00 s) clears every anchor",
+              not nv2.current.get("_sub_anchors")
+              and {str(t): (float(s), float(e)) for s, e, t in
+                   nv2._cap_cues.cues}["late"][0] == 400.0)
+
+        # Ctrl+0 reset: same wipe, store included
+        nv.sub_sync_reset()
+        check("sub_sync_reset clears anchors AND the persisted pair",
+              not nv.current.get("_sub_anchors")
+              and _store_times()["late"][0] == 400.0
+              and nv._sub_anchor_key(nv.current) not in
+              _json.load(open(_store_file, encoding="utf-8")))
+
+        # an unparseable sub file: the press must NOT leak into the
+        # global config delay (the refusal branch)
+        nv.current["sub_file"] = os.path.join(sync_dir, "missing.srt")
+        nv._stremio_sub_path = ""
+        nv._stremio_sub_cues = []
+        nv.config.subtitle_appearance["delay_ms"] = 0
+        nv.sub_delay_hot(0.5)
+        check("external sub that cannot parse -> press refused, global "
+              "delay untouched",
+              int(nv.config.subtitle_appearance.get("delay_ms", 0))
+              == 0)
+
+        # classic fallthrough: no external sub on this media -> the
+        # constant config delay path
+        nv.current.pop("sub_file", None)
+        nv.current["_sub_retimed"] = False
+        nv._stremio_sub_cues = []
+        nv._stremio_sub_path = ""
+        nv.config.subtitle_appearance["delay_ms"] = 0
+        nv.sub_delay_hot(0.25)
+        check("media without an external sub falls back to the classic "
+              "constant delay (config +0.25 s)",
+              int(nv.config.subtitle_appearance.get("delay_ms", 0))
+              == 250)
+
+        # ---- content_cue_end: the retime scale measures dialog, not
+        # the fansub signature
+        check("content_cue_end strips the trailing credit line",
+              stremio.content_cue_end(
+                  [(0.0, 4.0, "hello"), (2510.0, 2515.0,
+                   "Synced & Corrected by Seppuku17\nwww.addic7ed.com")]
+              ) == 4.0)
+        check("content_cue_end ignores symbol-only tails",
+              stremio.content_cue_end(
+                  [(0.0, 4.0, "hello"), (2512.0, 2514.0, "\u2663 \u25c8")])
+              == 4.0)
+        check("content_cue_end keeps real dialog ends (mid credits "
+              "harmless)",
+              stremio.content_cue_end(
+                  [(0.0, 4.0, "www.example.com is down"),
+                   (2506.0, 2510.5, "Unfortunately, JP stayed there.")])
+              == 2510.5)
+        check("content_cue_end: all-credit cues -> 0.0",
+              stremio.content_cue_end(
+                  [(1.0, 2.0, "addic7ed")]) == 0.0)
+        _shutil.rmtree(sync_dir, ignore_errors=True)
 
         # the morning's exact shape: torrent-only candidates only, cur
         # handed off as a (dead) resolve link -> the walk re-resolves

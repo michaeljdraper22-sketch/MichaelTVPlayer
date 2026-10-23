@@ -32,6 +32,7 @@ from .config import APP_VERSION
 
 REPO = "michaeljdraper22-sketch/MichaelTVPlayer"
 API_LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
+API_RELEASES = f"https://api.github.com/repos/{REPO}/releases?per_page=15"
 
 
 def _ver_tuple(v):
@@ -46,37 +47,57 @@ def is_newer(remote, local=APP_VERSION):
 
 
 def fetch_latest(timeout=15):
-    """Return (version, notes, asset_url, sha256_url) for the latest
-    GitHub release.  sha256_url is None when the release carries no
-    checksum asset (all releases before it existed) — verification is
-    strictly verify-when-present and never blocks an update.
+    """Return (version, notes, asset_url, sha256_url) for the newest
+    GitHub release that actually ships a WINDOWS build.  sha256_url is
+    None when the release carries no checksum asset (all releases before
+    it existed) — verification is strictly verify-when-present and never
+    blocks an update.
+
+    Walks the release LIST (not /releases/latest): the newest release is
+    sometimes Android-only (APK asset only), and the latest-lookup then
+    died with "release has no MichaelTV zip asset" while every Windows
+    install was actually current (2026-10-19 field report, issue #12).
 
     Raises on any network/parse problem — the caller shows a plain message.
     """
     req = urllib.request.Request(
-        API_LATEST, headers={"User-Agent": "MichaelTVPlayer-updater"})
+        API_RELEASES, headers={"User-Agent": "MichaelTVPlayer-updater"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         data = json.loads(r.read().decode("utf-8", "replace"))
-    tag = (data.get("tag_name") or "").strip().lstrip("vV")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError("no releases found")
+
+    def _win_zip(rel):
+        for a in rel.get("assets") or []:
+            name = (a.get("name") or "").lower()
+            if name.endswith(".zip") and "michaeltv" in name:
+                return a.get("browser_download_url")
+        return None
+
+    rel = None
     asset_url = None
-    for a in data.get("assets") or []:
-        name = (a.get("name") or "").lower()
-        if name.endswith(".zip") and "michaeltv" in name:
-            asset_url = a.get("browser_download_url")
+    for cand in data:
+        asset_url = _win_zip(cand)
+        if asset_url:
+            rel = cand
             break
-    if asset_url is None:
-        for a in data.get("assets") or []:
+    if rel is None:
+        # legacy fallback: any zip at all in the newest release
+        for a in data[0].get("assets") or []:
             if (a.get("name") or "").lower().endswith(".zip"):
-                asset_url = a.get("browser_download_url")
+                rel, asset_url = data[0], a.get("browser_download_url")
                 break
+    if rel is None or not asset_url:
+        raise RuntimeError("release has no MichaelTV zip asset")
+    tag = (rel.get("tag_name") or "").strip().lstrip("vV")
     sha256_url = None
-    for a in data.get("assets") or []:
+    for a in rel.get("assets") or []:
         if (a.get("name") or "").lower().endswith(".sha256"):
             sha256_url = a.get("browser_download_url")
             break
-    if not tag or not asset_url:
+    if not tag:
         raise RuntimeError("release has no MichaelTV zip asset")
-    notes = (data.get("body") or "").strip()
+    notes = (rel.get("body") or "").strip()
     return tag, notes, asset_url, sha256_url
 
 

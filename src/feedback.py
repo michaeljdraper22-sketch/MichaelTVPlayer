@@ -192,7 +192,11 @@ def start_ui_watchdog(check_s: float = 30.0, stale_s: float = 60.0,
 def probe_url(url: str, timeout: float = 6.0) -> str:
     """Best-effort HTTP probe of a stream URL — status + content type only,
     returned as a short string for logs/reports. Never raises; the first
-    kilobyte is read (some panels answer HEAD with a lie)."""
+    kilobyte is read (some panels answer HEAD with a lie). Local paths are
+    declined up front — requests raises InvalidSchema on them and the
+    noise drowned the signal in the 2026-10-19 field logs (issue #12)."""
+    if not str(url).startswith(("http://", "https://")):
+        return "not probed (local file path)"
     try:
         import requests
         r = requests.get(url, stream=True, timeout=timeout,

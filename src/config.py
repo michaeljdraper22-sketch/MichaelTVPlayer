@@ -8,7 +8,11 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-APP_VERSION = "2.1.4"
+# 2.1.5: live-TV hardening after the 2026-10-19 field night (issues
+# #12/#13) — lag governor, recorder-restart watchdog, landing-verified
+# rescues, PCR-anchored live edge, jump-to-live collapse guard, GOP-nudged
+# rescue reopens, no deblocking skip (color smear), stray-vout re-parent.
+APP_VERSION = "2.1.5"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC

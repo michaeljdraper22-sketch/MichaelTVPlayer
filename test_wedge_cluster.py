@@ -178,6 +178,7 @@ class FakeVLC:
 class FakeDVR:
     def __init__(self, path):
         self.file_path = path
+        self.running = False   # no real recorder: the stall watchdog skips
 
     def buffer_file(self):
         return self.file_path
@@ -217,7 +218,8 @@ def esc_ladder():
     for k in range(4):
         VT["t"] += 30.0                       # far past every cooldown
         view._seek_verify = (50.0 + k, 50.0 + k,
-                             VT["t"] - 1.0, VT["t"] - 10.0)
+                             VT["t"] - 1.0, VT["t"] - 10.0,
+                             -1.0, True, False)
         view._verify_seek(VT["t"], 999.0)     # raw nowhere near target
         pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
         if pas:
@@ -243,11 +245,11 @@ view._seek_esc_strikes = 0
 view._seek_esc_ok_at = 0.0
 view.vlc.commanded.clear()
 VT["t"] += 100.0
-view._seek_verify = (10.0, 10.0, VT["t"] - 1.0, VT["t"] - 10.0)
+view._seek_verify = (10.0, 10.0, VT["t"] - 1.0, VT["t"] - 10.0, -1.0, True, False)
 view._verify_seek(VT["t"], 999.0)             # strike 1 -> play_at
 n_after_1 = len([c for c in view.vlc.commanded if c[0] == "play_at"])
 VT["t"] += 3.0                                # inside the 5 s reopen cd
-view._seek_verify = (20.0, 20.0, VT["t"] - 1.0, VT["t"] - 10.0)
+view._seek_verify = (20.0, 20.0, VT["t"] - 1.0, VT["t"] - 10.0, -1.0, True, False)
 view._verify_seek(VT["t"], 999.0)
 n_after_2 = len([c for c in view.vlc.commanded if c[0] == "play_at"])
 check("(a): escalation respects the reopen cooldown (no burst)",
@@ -601,8 +603,10 @@ view.vlc.commanded.clear()
 VT["t"] += 1.0
 view._tick()
 pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
-check("dead-open: an open that never plays gets rescued",
-      len(pas) == 1 and abs(pas[0][1] - 200.0) < 1.0,
+# 2026-10-19: the reopen anchor is nudged _RESCUE_GOP_NUDGE_S forward
+# past the damaged GOP (issue #12's replay-per-cut) — never backward
+check("dead-open: an open that never plays gets rescued (nudged past the GOP)",
+      len(pas) == 1 and abs(pas[0][1] - 203.0) < 1.0,
       f"play_at={pas}")
 
 # a FRESH open still inside the dead-open window must not be disturbed

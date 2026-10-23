@@ -67,6 +67,7 @@ class FakeVLC:
 class FakeDVR:
     def __init__(self, path):
         self.file_path = path
+        self.running = False   # no real recorder: the stall watchdog skips
 
     def buffer_file(self):
         return self.file_path

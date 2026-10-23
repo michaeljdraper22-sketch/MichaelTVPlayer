@@ -372,6 +372,22 @@ def _has_stream_resource(manifest: dict) -> bool:
     return False
 
 
+def _has_resource(manifest: dict, want: str) -> bool:
+    """Same shape walk as _has_stream_resource, for any resource name
+    (kept separate so the stream one's callers stay byte-identical)."""
+    res = manifest.get("resources")
+    if isinstance(res, dict):
+        return want in res
+    if isinstance(res, list):
+        for item in res:
+            if item == want or (
+                    isinstance(item, dict)
+                    and str(item.get("name") or item.get("id") or "")
+                    == want):
+                return True
+    return False
+
+
 def provider_from_url(url: str) -> str:
     """Which debrid service an addon instance is bound to, parsed from
     its URL: Torrentio carries it as a path parameter (…|torbox=KEY/),
@@ -503,5 +519,47 @@ def discover_stream_addons():
                 "provider": provider,
                 "manifest_name": str(manifest.get("name") or ""),
             })
+        return out                    # first readable profile decides
+    return None
+
+
+def discover_subtitle_addons():
+    """The SUBTITLE addons installed in the desktop Stremio on this
+    machine: [base_url, ...] in profile order (loopback hosts and the
+    local addon excluded, same as the stream walk).
+
+    The online-subtitle hunt queries these FIRST — Stremio's own subtitle
+    panel shows exactly what they serve, so whatever the user sees in
+    Stremio is reachable here too. The keyless OpenSubtitles addon is
+    the always-there fallback, NOT the only source (live-seen
+    2026-10-16: it carries ZERO subtitles for Hell's Kitchen's middle
+    seasons while the user's SubSense addon had five English SRTs for
+    the exact episode Stremio was playing).
+
+    None = no readable Stremio profile; [] = read fine, no subtitle
+    addons installed — either way the caller still has its fallback.
+    """
+    for leveldb in _leveldb_dirs():
+        profile = _decode_profile(_profile_bytes(leveldb))
+        if profile is None:
+            continue
+        out, seen = [], set()
+        for entry in profile.get("addons") or []:
+            if not isinstance(entry, dict):
+                continue
+            manifest = entry.get("manifest") or {}
+            if not isinstance(manifest, dict) \
+                    or not _has_resource(manifest, "subtitles"):
+                continue
+            base = normalize_base(str(entry.get("transportUrl") or ""))
+            if not base:
+                continue
+            host = urlparse(base).hostname or ""
+            if host in ("127.0.0.1", "localhost", "::1"):
+                continue
+            if base in seen:
+                continue
+            seen.add(base)
+            out.append(base)
         return out                    # first readable profile decides
     return None

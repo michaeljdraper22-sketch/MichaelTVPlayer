@@ -95,7 +95,7 @@ class VLCPlayer:
 
     def __init__(self, timeshift: bool = True, volume: int = 100,
                  network_caching: int = 1500, sub_args: list = None,
-                 spu_delay_ms: int = 0):
+                 spu_delay_ms: int = 0, extra_args: list = None):
         nc = max(0, min(50000, int(network_caching)))
         args = [
             # never read/write the user's shared %APPDATA%\vlc config — the
@@ -114,10 +114,19 @@ class VLCPlayer:
             f"--live-caching={nc}",
             "--file-caching=1000",
             "--disc-caching=1000",
-            "--avcodec-skiploopfilter=1",
+            # NO --avcodec-skiploopfilter here, ever: skipping the H.264
+            # deblocking filter smears fast motion (sports) into visible
+            # macroblock blur — field-reported as "color blurring" on
+            # 2026-10-19. VLC's default (full deblocking) is what we want;
+            # the CPU cost is fine on anything that decodes 1080i at all.
         ]
         # subtitle appearance (freetype options are instance-level only)
         args.extend([str(a) for a in (sub_args or [])])
+        # test-only escape hatch (headless runs pass ["--vout=dummy"] so a
+        # real-VLC test never pops a visible window / steals focus); the
+        # app itself never sets it. A bad option can only make the args
+        # Instance None, and the plain-instance fallback below covers it.
+        args.extend([str(a) for a in (extra_args or [])])
         self.timeshift = timeshift
         # A few caching/display options. Some VLC builds reject unknown options
         # and return None, so fall back to a plain instance if that happens.
@@ -134,6 +143,10 @@ class VLCPlayer:
         self._scale_last = None       # (mode, w, h) last sent to a player
         self._ems = []                # keep event-manager refs alive (GC segfault)
         self._window_id = None   # last HWND/XID handed to set_window()
+        # Source stream URL when the player is watching a LOCAL DVR buffer
+        # file: the never-started watchdog's probe must dial the PROVIDER,
+        # not requests-get a C:\ path (InvalidSchema noise, issue #12).
+        self.source_url_hint = ""
         # Set by the UI (player_view): force-kills whatever local source the
         # wedged player's input thread is blocked reading from (relay client
         # sockets), so a hung stop can finish instead of forcing a swap.
@@ -175,9 +188,20 @@ class VLCPlayer:
                 pass
 
     def _on_playing_event(self, _event) -> None:
-        """VLC thread context: only thread-safe libvlc audio calls, no Qt."""
+        """VLC thread context: only thread-safe libvlc calls, no Qt."""
         try:
             self._start_ok = True   # playback-start watchdog clears here
+        except Exception:
+            pass
+        try:
+            # The vout is created around NOW. If it came up detached (the
+            # binding raced a wedge-swap player replacement, or the wedged
+            # co-player's late teardown invalidated this vout), libVLC is
+            # already painting into its OWN top-level window — the stray
+            # "pop-out video with no controls" the user cannot close.
+            # Re-asserting the HWND here re-parents it onto our surface;
+            # set_hwnd is thread-safe and a no-op when already parented.
+            self._bind_window(self.player)
         except Exception:
             pass
         try:
@@ -374,6 +398,24 @@ class VLCPlayer:
             self._bind_window(self.player)
         self.player.set_media(self.media)
         self.player.play()
+        # The vout can also appear detached a beat AFTER play() (wedge-swap
+        # races): the Playing-event rebind covers the usual case, this short
+        # ladder covers a vout that materializes late. Bound (4 calls) so it
+        # can never flicker a healthy, already-parented vout.
+        if self._window_id is not None:
+            try:
+                for delay in (0.5, 1.5, 3.5):
+
+                    def _reassert_after_play(pl=self.player):
+                        if pl is self.player:
+                            try:
+                                self._bind_window(pl)
+                            except Exception:  # noqa: BLE001
+                                pass
+
+                    threading.Timer(delay, _reassert_after_play).start()
+            except Exception:  # noqa: BLE001
+                pass
         self._watch_playback_start(url, wait_s=start_wait_s)
 
     def _watch_playback_start(self, url: str, wait_s: float = 20.0) -> None:
@@ -412,9 +454,16 @@ class VLCPlayer:
 
             def _probe():
                 try:
-                    res = feedback.probe_url(url)
+                    # probe the PROVIDER when the player watches the local
+                    # DVR buffer — requests cannot fetch a C:\ path
+                    # (issue #12)
+                    target = url
+                    if not target.startswith(("http://", "https://")) \
+                            and self.source_url_hint:
+                        target = self.source_url_hint
+                    res = feedback.probe_url(target)
                     log.error("stream probe: %s — url=%s", res,
-                              feedback.redact_url(url))
+                              feedback.redact_url(target))
                 except Exception:
                     pass
             threading.Thread(target=_probe, name="mtp-probe",
@@ -524,7 +573,7 @@ class VLCPlayer:
                     pass
                 try:
                     rebind = self.player
-                    for delay in (0.4, 1.2, 2.5):
+                    for delay in (0.4, 1.2, 2.5, 5.0, 9.0):
 
                         def _reassert(pl=rebind):
                             if pl is self.player:

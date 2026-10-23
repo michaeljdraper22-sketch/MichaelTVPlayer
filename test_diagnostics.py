@@ -150,9 +150,21 @@ def test_rewind_fixes():
     # a FRESH clock with backlog 5 keeps the normal edge clamp
     view._cap_wall = time.time() - 0.1     # fresh (tick just ran)
     view._cap_clock_s = 900.0
+    view._cc_head_pcr = None               # no live PCR pin ...
     target2 = view._safe_seek_target(998.0)
-    check("fresh edge still clamps past-EOF targets",
-          target2 < 995.0 and target2 >= 0.0)
+    # 2026-10-19 collapse guard: a dead-reckoned edge 95 s BELOW confirmed
+    # frontier data (no PCR pins) is a poisoned axis — the frontier bounds
+    # the clamp at frontier - safety (still never past EOF), instead of
+    # vetoing every seek back to the collapsed edge.
+    check("fresh-but-collapsed edge (no pins): frontier bounds the clamp",
+          990.0 <= target2 <= 995.0 and target2 < 998.0)
+    # ... but a LIVE PCR pin is exempt: the PCR edge wins even below the
+    # frontier (splice nights legitimately run it there)
+    view._cc_head_pcr = (1234.5, time.time())
+    target3 = view._safe_seek_target(998.0)
+    check("live PCR pin: edge respected below the frontier",
+          898.0 <= target3 <= 905.0)
+    view._cc_head_pcr = None
 
     # (a) the content clock must advance from _tick even with captions off
     view._cap_on = False

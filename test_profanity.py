@@ -675,6 +675,28 @@ def main():
     check("cancel at the LEVEL prompt still discards",
           dlg5.table.rowCount() == n0 + 2)
 
+    print("[10] censor-marker words: one plain 'bleep' covers every "
+          "wrapper spelling (the 2026-10-16 Hell's Kitchen sub said "
+          "'[Bleep]' 94 times; the user asked whether all bracket/paren "
+          "variants need separate entries — they do not)")
+    for form in ("Holy [Bleep].", "Oh (bleep) no.", "what the bleep",
+                 "B[bleep]ed it", "[BLEEP]!"):
+        spans = find_matches(form, ["bleep"])
+        check("plain 'bleep' matches %r" % form, bool(spans))
+    check("exact level still ignores 'bleeped' (whole word only)",
+          not find_matches("it got bleeped out", ["bleep"]))
+    wins = windows_from_cues(
+        [(2486.4, 2487.7, "Holy [Bleep].")], ["bleep"])
+    check("windows arm on a [Bleep] cue with words=['bleep']",
+          len(wins) == 1 and 2486.4 <= wins[0][0] < 2487.7
+          and wins[0][1] <= 2487.7)
+    eng = ProfanityEngine(None)
+    eng.words = ["bleep"]
+    eng.add_cue(10.0, 12.0, "You and I, we got to do this [Bleep].",
+                lead_s=0.0)
+    check("engine arms a window from a bracketed censor marker",
+          len(eng.windows) == 1)
+
     print()
     if FAIL:
         print(f"FAILED {len(FAIL)}: {FAIL}")

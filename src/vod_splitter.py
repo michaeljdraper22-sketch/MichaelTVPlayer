@@ -107,6 +107,15 @@ VOD_SPLITTER_READY = True
 _REOPEN_FAIL_BUDGET = 3
 _REOPEN_BACKOFF_S = 0.5
 
+# Serve-side caption gate: a handler holds each chunk the few
+# milliseconds the tap needs to parse it (see wait_tap_parsed). The
+# bound keeps playback immune to a wedged or crashed tap — past it the
+# bytes flow ungated (the pre-gate behavior), never a stall. A tap that
+# times out this many chunks in a row is wedged (not merely behind):
+# the gate opens for the rest of the session.
+_TAP_GATE_TIMEOUT_S = 1.5
+_TAP_GATE_STALL_LIMIT = 5
+
 
 def _snap_cluster(buf: bytes) -> int:
     """Offset of the first plausibly-real Cluster header in ``buf``:
@@ -247,9 +256,31 @@ class VodRelay(QtCore.QObject):
         #                               # are text the parser can flatten
         self.parser_tracks_meta = {}   # full {number: {codec,lang,name}}
         self.parser_selected = None
+        self.tracks_verdict_ready = False   # MKV head parse FINISHED —
+        #                               # parser_tracks is now the COMPLETE
+        #                               # subtitle-track list, so {} means
+        #                               # "no subtitle tracks at all", not
+        #                               # "not parsed yet". Stays False for
+        #                               # MP4 (no MKV track introspection:
+        #                               # cue arrival is the only evidence).
         self.parser_scale_ns = 1_000_000   # Info TimecodeScale seen by the
         #                                      # tap (seeds mid-stream parsers)
         self._tail_harvested = False  # one-shot tail-region parse ran
+        # Parse-before-serve gate: the tap publishes the file offset it
+        # has parsed through; serving handlers wait on it (bounded) so
+        # VLC cannot receive bytes before every cue inside them has been
+        # emitted. The provider chunk used to go to VLC the instant it
+        # landed in the cache — the tap's poll+parse then armed mute
+        # windows only AFTER VLC had played the words whenever the
+        # provider rode near realtime and localhost VLC held almost no
+        # buffer (live-seen 2026-10-22: two S-words played clean; the
+        # rewind replay muted, because by then the windows existed).
+        self._tap_gate = threading.Condition()
+        self._tap_parsed = -1     # high-water file offset the tap parsed
+        self._tap_started = False  # _start_ffmpeg_tap ran (gates serving)
+        self._tap_open = False    # tap gone (crashed/stopped): don't gate
+        self._gate_stalls = 0     # consecutive full-timeout chunks (wedge
+        #                           # detector — see wait_tap_parsed)
         # startup/off the UI thread: start() returns after the probe; the
         # head fetch + tail prefetch + main acquire happen on a thread and
         # handlers wait for _ready (bounded) so playback simply buffers
@@ -290,6 +321,13 @@ class VodRelay(QtCore.QObject):
         self._prefer = (prefer_language or "eng").lower() or "eng"
         self._tap_restart = False
         self._tail_harvested = False
+        # re-arm the serve gate (stop() above latched it open; a fresh
+        # session must gate on its OWN tap)
+        with self._tap_gate:
+            self._tap_parsed = -1
+            self._tap_started = False
+            self._tap_open = False
+            self._gate_stalls = 0
         self.parser_scale_ns = 1_000_000
         self._start_offset = max(0, int(start_offset))
         try:
@@ -429,17 +467,20 @@ class VodRelay(QtCore.QObject):
             if parser is not None:
                 parser.feed(bytes(data))
         self._head = bytes(buf)
-        if parser is not None and parser._track_meta:
-            self.parser_tracks_meta = dict(parser._track_meta)
-            self.parser_tracks = {num: m["codec"]
-                                  for num, m in parser._track_meta.items()}
-            self.parser_selected = parser._selected
-            self.parser_scale_ns = parser._tc_scale_ns
+        if parser is not None:
+            if parser._track_meta:
+                self.parser_tracks_meta = dict(parser._track_meta)
+                self.parser_tracks = {num: m["codec"]
+                                      for num, m in parser._track_meta.items()}
+                self.parser_selected = parser._selected
+                self.parser_scale_ns = parser._tc_scale_ns
+            self.tracks_verdict_ready = True
         tlog("head ride: %d bytes, %d tracks, selected=%r",
              len(buf), len(self.parser_tracks), self.parser_selected)
 
     def stop(self):
         self._alive = False
+        self._tap_flush_open()   # un-gate any handler mid-wait
         self._ready.set()        # un-block any handler still waiting
         self.kick()              # VLC's reads must EOF now, not on a
         #                        # handler thread's own provider timeout
@@ -698,6 +739,75 @@ class VodRelay(QtCore.QObject):
                 return False
             time.sleep(0.05)
 
+    def _tap_seen(self, end_abs: int):
+        """Tap parsed through ``end_abs`` (monotonic high-water): wake any
+        handler the serve gate is holding."""
+        with self._tap_gate:
+            if end_abs > self._tap_parsed:
+                self._tap_parsed = end_abs
+            self._tap_gate.notify_all()
+
+    def _tap_flush_open(self):
+        """The tap is gone (crashed / relay stopping): open the gate for
+        good so serving never waits on it again."""
+        with self._tap_gate:
+            self._tap_open = True
+            self._tap_gate.notify_all()
+
+    def _tap_wake(self):
+        """Cache grew (or teardown): wake the tap's poll now — fresh bytes
+        parse in the same breath they land, not on the next 0.25 s tick.
+        Best-effort: this runs on the provider DATA path, so it must
+        never sit waiting on the gate (the tap's own 0.25 s timeout
+        covers a missed nudge)."""
+        try:
+            if not self._tap_gate.acquire(timeout=0.05):
+                return
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            self._tap_gate.notify_all()
+        finally:
+            self._tap_gate.release()
+
+    def wait_tap_parsed(self, end_abs: int) -> None:
+        """Serve gate: hold a chunk back until the tap has parsed through
+        its last byte, so the filter's mute windows are armed BEFORE VLC
+        can even receive the audio they cover. Bounded by
+        _TAP_GATE_TIMEOUT_S — over it the bytes serve ungated (playback
+        outranks captions), never a stall. No gate without a tap: a
+        hand-built relay (or a failed startup) can serve with none. A tap
+        that misses this many chunks IN A ROW is wedged, not behind: the
+        gate opens for the rest of the session rather than taxing every
+        chunk."""
+        if (not self._tap_started or self._tap_open
+                or end_abs is None or end_abs < 0):
+            return
+        deadline = time.monotonic() + _TAP_GATE_TIMEOUT_S
+        with self._tap_gate:
+            while (self._alive and not self._tap_open
+                   and self._tap_parsed < end_abs):
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                self._tap_gate.wait(left)
+            if self._tap_parsed >= end_abs:
+                self._gate_stalls = 0     # tap keeping up again
+                return
+            self._gate_stalls += 1
+            if self._gate_stalls >= _TAP_GATE_STALL_LIMIT \
+                    and not self._tap_open:
+                self._tap_open = True
+                try:
+                    log.warning(
+                        "vod splitter: subtitle tap stayed behind %d "
+                        "chunks in a row — serve gate opened for the "
+                        "rest of this session (playback outranks "
+                        "captions)", self._gate_stalls)
+                except Exception:
+                    pass
+                self._tap_gate.notify_all()
+
     def _release(self, st, owner):
         """Handler teardown: drop stream ownership under the slot lock, so
         a concurrent _acquire reuses the live stream instead of paying a
@@ -730,6 +840,7 @@ class VodRelay(QtCore.QObject):
                 self._cache.write(data)
                 self._cache.flush()
                 self.cache_size += len(data)
+            self._tap_wake()
         except Exception:  # noqa: BLE001
             pass
 
@@ -783,6 +894,7 @@ class VodRelay(QtCore.QObject):
         cluster-resync mode with the head-fetched track metadata injected —
         used when the cache window begins past byte 0 (resume / mid-movie
         subtitle engage), where no Tracks element will ever pass by."""
+        self._tap_started = True
         if self._container == "mp4":
             self._parser = Mp4SubParser(prefer_language=self._prefer)
             threading.Thread(target=self._tap_cache_mp4, daemon=True,
@@ -915,7 +1027,10 @@ class VodRelay(QtCore.QObject):
                     args=(self._prefer, meta, self.parser_scale_ns),
                     daemon=True, name="mtp-tap-tail").start()
             if pos < self.cache_size:
-                data = self.read_cache(self.cache_base + pos, _CHUNK)
+                wbase = self.cache_base   # captured pre-read: a rebase
+                #                           # mid-chunk must not inflate the
+                #                           # published high-water mark
+                data = self.read_cache(wbase + pos, _CHUNK)
                 if data:
                     pos += len(data)
                     try:
@@ -929,10 +1044,15 @@ class VodRelay(QtCore.QObject):
                         tlog("tap cue @%.1f-%.1f %r", cue[0], cue[1],
                              cue[2][:30])
                         self.cue.emit(*cue)
+                    # publish BEFORE any of these bytes can be served:
+                    # the serve gate keys off this high-water mark
+                    self._tap_seen(wbase + pos)
                     continue
             elif not self._alive:
                 break
-            time.sleep(0.25)
+            with self._tap_gate:
+                self._tap_gate.wait(0.25)
+        self._tap_flush_open()   # a dead/exited tap must never gate serves
         tlog("tap thread exit: alive=%r pos=%d cache_size=%d "
              "selected=%r track_meta=%d", self._alive, pos,
              self.cache_size, getattr(parser, "_selected", None),
@@ -968,6 +1088,8 @@ class VodRelay(QtCore.QObject):
                 return
             for cue in made:
                 self.cue.emit(*cue)
+            # cues for this range are emitted: it counts as served-safe
+            self._tap_seen(base + pos)
         tlog("tap backfill done: %d bytes @%d", pos, base)
 
     def _tap_tail_harvest(self, prefer: str, meta, scale_ns: int):
@@ -1051,10 +1173,10 @@ class VodRelay(QtCore.QObject):
                 self.parser_tracks = {n: m["codec"]
                                       for n, m in parser._track_meta.items()}
                 self.parser_selected = parser._selected
+            base_now, size_now = self.cache_base, self.cache_size
             try:
-                made = parser.extract(self._tap_read, self.cache_base,
-                                      self.cache_size, self._tail_base,
-                                      len(self._tail))
+                made = parser.extract(self._tap_read, base_now, size_now,
+                                      self._tail_base, len(self._tail))
             except Exception as exc:  # noqa: BLE001
                 # a dead tap loses captions, never playback — the UI
                 # falls back to VLC's own rendering
@@ -1062,7 +1184,12 @@ class VodRelay(QtCore.QObject):
                 break
             for cue in made:
                 self.cue.emit(*cue)
-            time.sleep(0.25)
+            # one extract pass covered the whole captured window: every
+            # cue whose samples live in it has been emitted
+            self._tap_seen(base_now + size_now)
+            with self._tap_gate:
+                self._tap_gate.wait(0.25)
+        self._tap_flush_open()   # a dead/exited tap must never gate serves
         # death drain: pull whatever the final window holds
         if parser.have_index:
             try:
@@ -1222,6 +1349,9 @@ class VodRelay(QtCore.QObject):
                             if not data:
                                 why = "cache-miss"
                                 break
+                            # parse-before-serve: the filter sees every
+                            # cue in these bytes before VLC gets them
+                            relay.wait_tap_parsed(pos + len(data))
                             if src != "cache":
                                 tlog("serve @%d -> cache [%d +%d)",
                                      pos, relay.cache_base, relay.cache_size)
@@ -1334,6 +1464,12 @@ class VodRelay(QtCore.QObject):
                             continue    # the dead-branch above decides:
                                         # natural EOF, reopen, or cut
                         served = True
+                        if st.appendable:
+                            # fresh-cached bytes: give the tap the same
+                            # few ms to parse them before VLC sees them
+                            # (a passthrough stream's bytes never enter
+                            # the cache — nothing to wait for)
+                            relay.wait_tap_parsed(pos + len(data))
                         self.wfile.write(data)
                         pos += len(data)
                 except Exception as exc:  # noqa: BLE001
