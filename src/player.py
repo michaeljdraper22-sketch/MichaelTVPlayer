@@ -1,6 +1,7 @@
 """Thin wrapper around libvlc with timeshift (pause/rewind/back-to-live) support."""
 
 import logging
+import math
 import os
 import sys
 import threading
@@ -21,6 +22,30 @@ _UNBLOCK_GRACE_S = 2.0
 # (e.g. this account's) reject unknown/default agent strings with 520 while
 # serving this exact one — and it is what the app's API session already uses.
 USER_AGENT = "MichaelTVPlayer/1.0"
+
+
+def _slider_to_vlc_volume(slider: int) -> int:
+    """Perceptual (dB-linear) volume taper: bar position 0..100 -> VLC
+    percent. VLC 3's WASAPI output maps its percent onto the Windows
+    session scalar CUBED (mmdevice.c: "vol = vol * vol * vol"), so feeding
+    it a straight percent parks half the bar's travel below -18 dB and
+    crams every usable listening level into the top sliver — the "quiet
+    for 80% of the bar, then everything at once" feel. This maps each 10%
+    of bar travel to the same ~6 dB loudness step (-60 dB .. 0 dB):
+    vlc = 100 * 10^((bar-100)/100), with bar 0 a true mute."""
+    s = max(0, min(100, int(slider)))
+    if s <= 0:
+        return 0
+    return max(1, min(100, round(100.0 * 10.0 ** ((s - 100.0) / 100.0))))
+
+
+def _vlc_to_slider_volume(vlc_pct: int) -> int:
+    """Inverse of _slider_to_vlc_volume: VLC percent -> bar position 0..100
+    (for read-back only; rounding makes it approximate at the edges)."""
+    v = max(0, min(100, int(vlc_pct)))
+    if v <= 0:
+        return 0
+    return max(0, min(100, round(100.0 + 100.0 * math.log10(v / 100.0))))
 
 
 def _rgb_int(hex_color: str, fallback: int) -> int:
@@ -826,22 +851,29 @@ class VLCPlayer:
 
     # ---- audio ----
     def _apply_volume(self, player) -> None:
-        """Best-effort volume on one specific player object (never raises)."""
+        """Best-effort volume on one specific player object (never raises).
+        The stored value is the 0..100 BAR position — the perceptual taper
+        below converts it to VLC percent at the libvlc boundary."""
         try:
-            player.audio_set_volume(self._volume)
+            player.audio_set_volume(_slider_to_vlc_volume(self._volume))
         except Exception:
             pass
 
     def set_volume(self, value: int) -> None:
-        """Store + apply. Safe at any moment — always targets the CURRENT
-        player: during a DVR handoff, while the previous player stops on a
-        daemon thread, and after a hung-stop player swap."""
+        """Store + apply the 0..100 BAR position. Safe at any moment —
+        always targets the CURRENT player: during a DVR handoff, while the
+        previous player stops on a daemon thread, and after a hung-stop
+        player swap."""
         self._volume = max(0, min(100, int(value)))
         self._apply_volume(self.player)
 
     def get_volume(self) -> int:
+        """The current BAR position (inverse-mapped from VLC's percent)."""
         try:
-            return self.player.audio_get_volume()
+            vlc_pct = self.player.audio_get_volume()
+            if vlc_pct is None or int(vlc_pct) < 0:
+                return self._volume
+            return _vlc_to_slider_volume(int(vlc_pct))
         except Exception:
             return self._volume
 

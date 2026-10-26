@@ -1,6 +1,7 @@
 """Persistent settings storage (saved as JSON under %APPDATA%/MichaelTVPlayer)."""
 
 import json
+import math
 import os
 import uuid
 from pathlib import Path
@@ -8,11 +9,15 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
-# 2.1.5: live-TV hardening after the 2026-10-19 field night (issues
-# #12/#13) — lag governor, recorder-restart watchdog, landing-verified
-# rescues, PCR-anchored live edge, jump-to-live collapse guard, GOP-nudged
-# rescue reopens, no deblocking skip (color smear), stray-vout re-parent.
-APP_VERSION = "2.1.5"
+# 2.1.6: click-to-pause actually works on the playing video — VLC's vout
+# child HWNDs were swallowing every physical click before Qt saw it (the
+# on-video overlay window now carries the video's mouse layer via an
+# invisible hit plate; wheel-volume and double-click-fullscreen over the
+# bare video were equally dead and come back with it). Plus: perceptual
+# (dB-linear) volume taper so the bar isn't silent for 80% of its travel
+# (stored volume migrated to the same curve), and quiet background
+# subtitle hunts + moviehash-wait for the online sub search.
+APP_VERSION = "2.1.6"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -224,6 +229,23 @@ class Config:
             prof.setdefault("default_substitution", DEFAULT_SUBSTITUTION)
             data["profanity"] = prof
             data["_apf_words_migrated"] = True
+        # one-time migration: the volume bar's meaning changed from VLC's
+        # raw percent to a perceptual (dB-linear) taper (player.
+        # _slider_to_vlc_volume). Remap the stored value through the same
+        # curve so playback resumes at the SAME loudness it left off at
+        # (raw 70 becomes bar 85) instead of suddenly quieter.
+        if not data.get("_volume_taper_migrated"):
+            old = data.get("volume", 100)
+            try:
+                old = int(old)
+            except (TypeError, ValueError):
+                old = 100
+            if old <= 0:
+                data["volume"] = 0
+            else:
+                new = round(100.0 + 100.0 * math.log10(max(old, 1) / 100.0))
+                data["volume"] = max(1, min(100, int(new)))
+            data["_volume_taper_migrated"] = True
         return cls(data, path)
 
     def save(self) -> None:

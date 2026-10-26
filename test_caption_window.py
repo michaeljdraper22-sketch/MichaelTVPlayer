@@ -15,8 +15,13 @@ hides the window at all — it is transparent, click-through and paints
 nothing between cues, so keeping it up costs nothing and makes the
 stranding class structurally impossible.  _ensure_cap_window stays as the
 rescue for the other hiders (minimized-restore leftover, suppression
-aftermath).  VLC-rendered mode (overlay disengaged) keeps the classic
-hide.
+aftermath).
+
+Cut 3 (2026-10-26, v2.1.6 click-to-pause fix): the overlay became a
+VideoInputOverlay — an invisible full-surface hit plate that carries the
+video's mouse input (VLC's vout child HWNDs swallow every physical click
+on the playing video). The disengaged/VLC-rendered case therefore ALSO
+keeps the window up now; only focus loss and minimize hide it.
 
 Also: while the Subtitle settings dialog previews on the video, VLC's own
 spu renderer must be muted — an unparseable handoff file (or a bitmap
@@ -160,8 +165,11 @@ check("suppressed: the cue does NOT re-show the window",
       view.overlay.isHidden())
 view._overlay_suppressed = False
 
-print("[4] VLC-rendered subtitles (overlay disengaged): the classic "
-      "window hide at a sleep is preserved")
+print("[4] VLC-rendered subtitles (overlay disengaged): since 2.1.6 the "
+      "window STAYS UP at a sleep — the overlay is the video's mouse "
+      "layer (VLC's vout child HWNDs swallow physical clicks on the "
+      "playing video), so a bare window must not hide (focus loss and "
+      "minimize still do)")
 view4, fake4 = make_view()
 view4._set_cap_on(False)                 # VLC owns rendering
 fake4.times["t"] = 20000
@@ -169,7 +177,11 @@ view4._caption_tick()                    # tick no-ops (renderer off)
 view4.set_fullscreen_mode(True)
 view4._wake()
 view4._sleep()
-check("disengaged: sleep hides the window as before",
+check("disengaged: sleep keeps the window (mouse layer)",
+      view4.overlay.isVisible())
+view4.overlay.hide()                      # the OTHER hiders still apply
+view4._sleep()
+check("disengaged: sleep never re-shows it either",
       view4.overlay.isHidden())
 
 print("[5] windowed mode: the corner buttons never sleep, so the window "

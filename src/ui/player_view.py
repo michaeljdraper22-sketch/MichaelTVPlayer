@@ -607,6 +607,75 @@ class VideoSurface(QtWidgets.QWidget):
         super().mouseMoveEvent(event)
 
 
+class VideoInputOverlay(QtWidgets.QWidget):
+    """The translucent top-level that floats ALL on-video chrome (corner
+    buttons, control bar, captions, pills) — and the video's MOUSE LAYER.
+
+    Why this window must carry the video's clicks: the surface is a
+    native window and libvlc renders through its OWN child HWNDs
+    ("VLC video main" / "VLC video output"); WindowFromPoint over a
+    PLAYING surface returns those at every pixel, never the Qt widget
+    (probe_clickpause_live.py, 2026-10-26). Physical clicks, wheel and
+    hover on the bare video therefore never reached Qt — the v1.4.5
+    click-to-pause / double-click-fullscreen / wheel-volume wiring on
+    VideoSurface only ever worked offscreen, where QTest injects events
+    straight into the widget. This window already sits ABOVE the vout
+    children in z-order (the corner buttons prove it), so an invisible
+    full-surface hit plate here routes every video click back through
+    Qt. Bare-video clicks land on the plate (the widget itself) and get
+    the same single/double-click disambiguation the surface has; clicks
+    on real chrome go to the child widgets, which accept them first.
+
+    The plate is rgba(63,63,63,2), premultiplied to (0,0,0,2) — the
+    exact spell the corner-button hit plates use (see the QSS NOTE
+    above): invisible over black, at most a 2-step dip on pure white,
+    while the nonzero alpha keeps every pixel clickable.
+    """
+
+    single_clicked = QtCore.pyqtSignal()
+    double_clicked = QtCore.pyqtSignal()
+    wheel_changed = QtCore.pyqtSignal(int)
+    hovered = QtCore.pyqtSignal()
+
+    _PLATE = QtGui.QColor(63, 63, 63, 2)
+
+    def __init__(self, parent=None, flags=QtCore.Qt.Widget):
+        super().__init__(parent, flags)
+        self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        self.setMouseTracking(True)
+        # Single vs double click told apart BEFORE acting — the same
+        # contract as VideoSurface: the interval IS the OS double-click
+        # window, so a double-click cancels the pending single and only
+        # the fullscreen toggle runs.
+        self._click_timer = QtCore.QTimer(self)
+        self._click_timer.setSingleShot(True)
+        self._click_timer.setInterval(
+            QtWidgets.QApplication.doubleClickInterval())
+        self._click_timer.timeout.connect(self.single_clicked.emit)
+
+    def paintEvent(self, _ev):
+        p = QtGui.QPainter(self)
+        p.fillRect(self.rect(), self._PLATE)
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.LeftButton:
+            self._click_timer.start()
+            ev.accept()
+            return
+        super().mousePressEvent(ev)
+
+    def mouseDoubleClickEvent(self, _event):
+        self._click_timer.stop()
+        self.double_clicked.emit()
+
+    def wheelEvent(self, event):
+        self.wheel_changed.emit(event.angleDelta().y())
+
+    def mouseMoveEvent(self, event):
+        self.hovered.emit()
+        super().mouseMoveEvent(event)
+
+
 class InfoOverlay(QtWidgets.QWidget):
     """Semi-transparent now/next overlay shown over the video."""
 
@@ -833,6 +902,9 @@ class PlayerView(QtWidgets.QWidget):
         self._sub_fetch_lang = "eng"
         self._sub_fetch_lang_name = "English"
         self._sub_fetch_fail = None
+        self._sub_fetch_manual = False   # armed by an explicit ask: its
+        #                              # failure earns a note; background
+        #                              # hunts fail quietly (log only)
         self._cap_clock_s = 0.0       # caption timing clock (VLC display
         #                              # position; see _caption_clock_s)
         self._cap_raw_s = None        # last raw get_time() seen by the
@@ -1022,8 +1094,11 @@ class PlayerView(QtWidgets.QWidget):
         # controls.  True per-pixel alpha also means fully transparent
         # areas let clicks fall through to the video (so double-click
         # fullscreen keeps working everywhere except on the controls).
-        self.overlay = QtWidgets.QWidget(self, _OVERLAY_WIN_FLAGS)
-        self.overlay.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
+        # Since 2.1.6 it is a VideoInputOverlay: an invisible full-surface
+        # hit plate makes the window the video's MOUSE LAYER too, because
+        # VLC's vout child HWNDs swallow every physical click on the
+        # playing video before Qt can see them (see that class).
+        self.overlay = VideoInputOverlay(self, _OVERLAY_WIN_FLAGS)
         self.overlay.setAttribute(QtCore.Qt.WA_ShowWithoutActivating, True)
         self.overlay.setFocusPolicy(QtCore.Qt.NoFocus)
 
@@ -1335,6 +1410,12 @@ class PlayerView(QtWidgets.QWidget):
         self.surface.single_clicked.connect(self._on_surface_clicked)
         self.surface.wheel_changed.connect(self._on_wheel)
         self.surface.hovered.connect(self._on_hover)
+        # the overlay is the REAL mouse layer while video renders (VLC's
+        # child HWNDs eat clicks on the surface itself) — same handlers
+        self.overlay.double_clicked.connect(self.request_fullscreen.emit)
+        self.overlay.single_clicked.connect(self._on_surface_clicked)
+        self.overlay.wheel_changed.connect(self._on_wheel)
+        self.overlay.hovered.connect(self._on_hover)
 
         # timers
         self.hide_timer = QtCore.QTimer(self)
@@ -5356,6 +5437,7 @@ class PlayerView(QtWidgets.QWidget):
             self._overlay_suppressed = False
             self._overlay_was_visible = False
         self.unsetCursor()
+        self.overlay.unsetCursor()
         if not self.cursor_timer.isActive():
             self.cursor_timer.start()   # self-heal: stop() halts the poll
         shown = False
@@ -5398,9 +5480,11 @@ class PlayerView(QtWidgets.QWidget):
 
         In normal windowed mode the zen/fullscreen corner buttons stay put
         (sharing the auto-hide cycle made them "randomly disappear"); in
-        fullscreen/zen everything hides — cursor included — and any cursor
-        movement brings it all back. Never hides mid-interaction (scrub
-        drag, open popup, cursor resting on one of the controls)."""
+        fullscreen/zen everything VISIBLE hides — cursor included — and
+        any cursor movement brings it all back. The overlay window itself
+        stays up as the invisible mouse layer (see below). Never hides
+        mid-interaction (scrub drag, open popup, cursor resting on one of
+        the controls)."""
         if self._closing:
             return
         if not force and (self._seeking or self._popup_open
@@ -5423,33 +5507,18 @@ class PlayerView(QtWidgets.QWidget):
             self._btn_ovfs.hide()
             self._btn_reload.hide()
             self.setCursor(QtCore.Qt.BlankCursor)
-        if not any(w.isVisible() for w in (
-                self._btn_panel, self._btn_ovfs, self._btn_reload,
-                self._btn_showpanel, self.info_overlay, self._dvr_status,
-                self._cap_wid)) and not self._cap_on:
-            self.overlay.hide()   # nothing left to show over the video
-        elif not any(w.isVisible() for w in (
-                self._btn_panel, self._btn_ovfs, self._btn_reload,
-                self._btn_showpanel, self.info_overlay,
-                self._dvr_status)) and self._cap_on:
-            # While the caption overlay is the ACTIVE renderer the window
-            # stays up, full stop.  The first cut of the vanish fix only
-            # re-opened it when the next cue arrived (_ensure_cap_window)
-            # — correct in offscreen tests, yet a live 2026-09-03 series
-            # session (relay MKV, SDH-English pick) still lost captions
-            # with every control sleep, so some native show/hide
-            # subtlety of the layered window defeats the re-show.  A
-            # transparent, click-through, idle-painting-nothing window
-            # costs nothing to keep — never hiding it makes the whole
-            # stranding class impossible rather than hard to hit.  This
-            # line is the tripwire: it marks every sleep that KEEPS the
-            # window for captions (a hidden window below this state
-            # would be the invariant broken).
-            try:
-                log.info("captions: controls slept in a cue gap — "
-                         "overlay window kept (renderer active)")
-            except Exception:  # noqa: BLE001
-                pass
+            # the overlay is a separate native window — the view's blank
+            # cursor never applied there, and its hit plate now covers
+            # the whole video (zen keeps click-to-pause working)
+            self.overlay.setCursor(QtCore.Qt.BlankCursor)
+        # The overlay window itself STAYS UP even with nothing on it:
+        # since 2.1.6 it is the video's mouse layer — hiding it would
+        # hand every click back to VLC's vout child HWNDs (which swallow
+        # them) and pause/wheel/double-click would only work during the
+        # 4 s the controls are awake. An idle plate costs nothing (the
+        # caption path already kept the window up round-the-clock for
+        # the same reason; see _ensure_cap_window). Focus loss and
+        # minimize still hide it (_on_focus_changed / _poll_cursor).
         # captions may sit lower now that the control bar is gone
         self._layout_overlays()
 
@@ -7355,10 +7424,14 @@ class PlayerView(QtWidgets.QWidget):
         self._sub_fetch_lang = lang_token(hint) if hint else "eng"
         self._sub_fetch_lang_name = (hint or "english").capitalize()
         self._sub_fetch_fail = fail_fn
+        self._sub_fetch_manual = bool(manual)
         self._sub_fetch_pending = True
-        self._cap_note("Profanity filter: searching subtitles online\u2026"
-                       if for_filter
-                       else "Subtitles: searching online\u2026")
+        if manual:
+            # explicit ask: say so. Background hunts (the caption dead-end
+            # rescue, the filter's own) stay QUIET — a "searching online…"
+            # banner on nearly every stream start was noise; the outcome
+            # notes below and player.log carry the story instead.
+            self._cap_note("Subtitles: searching online\u2026")
         self._kick_online_sub_fetch()
         return True
 
@@ -7435,17 +7508,37 @@ class PlayerView(QtWidgets.QWidget):
                         pass
                 # moviehash from the running relay's cached head/tail — the
                 # relay is up by construction on this path; resume sessions
-                # carry no head, and a missing hash only degrades ranking
+                # carry no head, and a missing hash only degrades ranking.
+                # But a caption dead-end kicks within seconds of open, when
+                # the head is still filling and the tail not prefetched —
+                # and the hashless search is the live-seen "auto found
+                # nothing, manual press found five" gap (the addons rank —
+                # and some only match — on the hash). Wait a bounded moment
+                # for the material instead of searching blind: a relay that
+                # died or failed startup, or the ~13.5 s budget expiring,
+                # searches anyway — exactly the old behavior.
                 vhash = ""
                 media_len_s = 0.0
                 try:
                     relay = self._vod_relay
-                    if (relay is not None
-                            and getattr(relay, "total", 0) > 131072
-                            and len(getattr(relay, "_head", b"") or b"") >= 65536
-                            and len(getattr(relay, "_tail", b"") or b"") >= 65536):
-                        vhash = "%016x" % stremio.opensubs_hash(
-                            relay._head[:65536], relay._tail, relay.total)
+                    if relay is not None:
+                        for _ in range(9):
+                            if getattr(relay, "total", 0) <= 131072:
+                                break   # can never hash (same bound as the
+                                #          # hash itself); also covers fake
+                                #          # relays with no total attribute
+                            if (len(getattr(relay, "_head", b"") or b"") >= 65536
+                                    and len(getattr(relay, "_tail", b"") or b"") >= 65536):
+                                break
+                            if not getattr(relay, "_alive", True) \
+                                    or getattr(relay, "_startup_failed", False):
+                                break
+                            time.sleep(1.5)
+                        if (getattr(relay, "total", 0) > 131072
+                                and len(getattr(relay, "_head", b"") or b"") >= 65536
+                                and len(getattr(relay, "_tail", b"") or b"") >= 65536):
+                            vhash = "%016x" % stremio.opensubs_hash(
+                                relay._head[:65536], relay._tail, relay.total)
                     if relay is not None:
                         # media duration off the cached MKV head or the
                         # MP4's mvhd (head, else the prefetched tail) —
@@ -7675,13 +7768,18 @@ class PlayerView(QtWidgets.QWidget):
         """Finish an armed/pending fetch with failure: run the arming
         dead-end's classic body verbatim (today's behavior restored
         exactly). A MANUAL fetch armed no dead-end — note only, whatever
-        VLC was rendering keeps rendering."""
+        VLC was rendering keeps rendering. A BACKGROUND hunt (the filter's
+        own, for_filter with no fail_fn) fails silently: it never promised
+        anything on screen, and "none found online" flashing on most
+        stream starts is exactly the noise the quiet-hunt change removed
+        (the outcome is already in player.log)."""
         self._sub_fetch_pending = False
         fn, self._sub_fetch_fail = self._sub_fetch_fail, None
         if fn:
             fn()
-        else:
+        elif self._sub_fetch_manual:
             self._cap_note("Subtitles: none found online")
+        # else: background hunt found nothing — silent (already logged)
 
     def _manual_fetch_online_sub(self):
         """The subs card's "Find subtitles online…" row (stremio/vod/
