@@ -122,7 +122,11 @@ app = QtWidgets.QApplication(sys.argv)
 
 
 def fresh_cfg():
-    return Config({}, None)
+    # minimal account: _reload_categories gates on has_account() since
+    # the account-less mode landed — an account-less stub config would
+    # (by design) never load the stub channels
+    return Config({"server_url": "http://probe", "username": "u",
+                   "password": "p"}, None)
 
 
 def main():

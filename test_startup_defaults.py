@@ -84,8 +84,12 @@ app = QtWidgets.QApplication(sys.argv)
 
 def fresh_cfg():
     """Isolated config (NOT Config.load()) so the user's real country
-    filters can't filter the stub categories/items out."""
-    return Config({}, None)
+    filters can't filter the stub categories/items out. Carries a minimal
+    account: _reload_categories gates on has_account() since the
+    account-less mode landed, and an account-less stub config would
+    (by design) never load the stub categories at all."""
+    return Config({"server_url": "http://probe", "username": "u",
+                   "password": "p"}, None)
 
 
 def main():

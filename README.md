@@ -1,6 +1,6 @@
 # MichaelTV
 
-**Current release: v2.1.3** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1.6** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
 An **Android APK** of the same app is published alongside it — see
@@ -56,6 +56,11 @@ through a single VLC connection.
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
   `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ≋ · ⤢ · ⏱ | 🔊 ▁▁▁`
+  - **Click anywhere on the video to pause, click again to resume**
+    (double-click for fullscreen, scroll wheel for volume). Since v2.1.6:
+    VLC's own render windows used to swallow those clicks before the app
+    ever saw them — the on-video layer now carries the video's mouse
+    input, so all three gestures work everywhere on the picture.
   - The row **compacts automatically** in half/quarter-screen windows
     (tighter spacing → no separators → shorter volume bar), and **clicking
     anywhere on the volume bar jumps the volume there**.
