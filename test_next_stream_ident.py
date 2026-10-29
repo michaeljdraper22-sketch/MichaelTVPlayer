@@ -230,6 +230,10 @@ def main():
     from src.config import Config
     saved_ri, saved_as = (stremio.resolve_identity,
                           stremio.addon_streams)
+    # the walk probes each http candidate before serving it (2026-10-29);
+    # these synthetic resolve urls must stay offline
+    saved_probe = stremio.probe_debrid
+    stremio.probe_debrid = lambda u, timeout_s=3.0, report=None: True
     try:
         stremio.resolve_identity = lambda url, server: {
             "stremio_imdb": "tt0247902",
@@ -261,11 +265,14 @@ def main():
     finally:
         stremio.resolve_identity, stremio.addon_streams = \
             saved_ri, saved_as
+        stremio.probe_debrid = saved_probe
 
     print("[7] next_stream_playable: the walk follows the ADDON's list "
           "order, not the rank order")
     saved_ri, saved_as = (stremio.resolve_identity,
                           stremio.addon_streams)
+    saved_probe = stremio.probe_debrid
+    stremio.probe_debrid = lambda u, timeout_s=3.0, report=None: True
     try:
         ident = {"stremio_imdb": "tt4803766",
                  "series_name": "Alone", "season": 13, "episode": 11,
@@ -338,6 +345,7 @@ def main():
     finally:
         stremio.resolve_identity, stremio.addon_streams = \
             saved_ri, saved_as
+        stremio.probe_debrid = saved_probe
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

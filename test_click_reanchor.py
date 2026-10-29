@@ -109,7 +109,7 @@ CUR = {
 def _install():
     """Patch every network touchpoint with the incident's world."""
     saved = (stremio.series_meta, stremio.search_series,
-             stremio.addon_streams)
+             stremio.addon_streams, stremio.probe_debrid)
 
     def fake_series_meta(imdb):
         return {"tt1877889": META_2012, "tt0131613": META_1987}.get(
@@ -137,6 +137,9 @@ def _install():
     stremio.series_meta = fake_series_meta
     stremio.search_series = fake_search_series
     stremio.addon_streams = fake_addon_streams
+    # the walk probes each http candidate (2026-10-29); keep the
+    # synthetic resolve urls offline
+    stremio.probe_debrid = lambda u, timeout_s=3.0, report=None: True
     return saved
 
 
@@ -186,7 +189,7 @@ try:
           anchor is None)
 finally:
     (stremio.series_meta, stremio.search_series,
-     stremio.addon_streams) = saved
+     stremio.addon_streams, stremio.probe_debrid) = saved
 
 print("[2] production-code movie veto ('The Fly (1986)' retitling)")
 saved_fm = stremio.find_movie

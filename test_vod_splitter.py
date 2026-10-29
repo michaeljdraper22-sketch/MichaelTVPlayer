@@ -865,6 +865,48 @@ def main():
     check("mp4 relay keeps the one-connection discipline",
           relay_m.provider_opens - opens_m <= 2)
 
+    print("[5c] the 2026-10-29 failure-video gate: a ~120 KB '200' from "
+          "a debrid resolve is refused, localhost is exempt")
+    class _FakeResp:
+        def __init__(self, total):
+            self.headers = {"Content-Range": "bytes 0-11/%d" % total}
+
+        def read(self, n=-1):
+            return b"\x00\x00\x00\x20ftypisom"[:max(0, n) or 12]
+
+        def geturl(self):
+            return "https://tdir.co/files/error.mp4"
+
+        def close(self):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    def _gate(total, url):
+        relay = VodRelay()
+        relay.url = url
+        saved_open = VodRelay._provider_urlopen
+        VodRelay._provider_urlopen = \
+            lambda self, rng, timeout: _FakeResp(total)
+        try:
+            return relay._probe_head()
+        finally:
+            VodRelay._provider_urlopen = saved_open
+
+    check("118,743-byte 'video' on a debrid URL -> refused",
+          _gate(118743, "https://torrentio.strem.fun/resolve/torbox/"
+                        "key/abc/f.mp4/0/f.mp4") is False)
+    check("same size from localhost (engine/fixtures) -> accepted",
+          _gate(118743, "http://127.0.0.1:11470/" + "a" * 40 + "/0")
+          is True)
+    check("a real-sized total passes anywhere",
+          _gate(2507970224, "https://torrentio.strem.fun/resolve/torbox/"
+                            "key/abc/f.mp4/0/f.mp4") is True)
+
     print("[5b] unit: tx3g decode + re-parse dedupe")
     from src.mkv_subs import is_text_codec
     from src.mp4_subs import Mp4SubParser, decode_tx3g

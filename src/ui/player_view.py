@@ -1042,6 +1042,13 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_guard.timeout.connect(self._stremio_guard_tick)
         self._stremio_nextstream_done = False
         self._stremio_guard_t0 = 0.0
+        # a 429 probe verdict on the CURRENT handoff: torrentio is
+        # rate-limiting this IP, so a slow/no start is probably the
+        # throttle, not a dead link — the guard window widens (see
+        # _stremio_guard_tick) instead of advancing at 10 s off a
+        # healthy stream (live-seen 2026-10-29 12:43: the 429'd pick
+        # played fine 54 s later after two app restarts).
+        self._stremio_throttled = False
         # auto-advance chain guards: streams already tried dead in this
         # chain (lowercased infoHash + exact URL) and a hard cap on
         # consecutive dead advances with zero frames played between
@@ -2358,6 +2365,7 @@ class PlayerView(QtWidgets.QWidget):
                 if (playable.get("info_hash")
                         and not _st.parse_server_url(url)):
                     self._stremio_nextstream_done = False
+                    self._stremio_throttled = False
                     self._stremio_guard_t0 = now_s()
                     self._stremio_guard.start()
                     self._kick_stremio_probe(url)
@@ -2583,15 +2591,35 @@ class PlayerView(QtWidgets.QWidget):
         that shape entirely; live-seen 2026-09-02 16:01, 55 s dead screen
         until a manual reload). The probe sees the 502/hang directly and
         switches after ~1-3 s; a healthy link answers fast and changes
-        nothing (the guard stays armed as the backstop)."""
+        nothing (the guard stays armed as the backstop). A 429 verdict
+        only flags the throttle for the guard's window."""
         base = (self.current or {}).get("fav_key")
         t0 = now_s()
 
         def _work():
             from .. import stremio
-            return base, stremio.probe_debrid(url, timeout_s=3.0), \
-                now_s() - t0
+            rep = {}
+            alive = stremio.probe_debrid(url, timeout_s=3.0, report=rep)
+            return base, alive, now_s() - t0, rep
         self._probe_runner.run(_work)
+
+    def _stremio_relay_serving(self) -> bool:
+        """Ground truth for a 'dead' verdict: a VOD relay on THIS url
+        that is alive with a settled content length (its own head probe
+        got a 206 seconds ago) or cached provider bytes is READING the
+        same debrid link successfully — the verdict is then a false
+        alarm (live-seen 2026-09-29 16:12: a 0.0 s probe verdict killed
+        a handoff whose splitter had a 1.28 GB total and a 2.6 MB tail
+        prefetch in flight)."""
+        try:
+            relay = self._vod_relay
+            url = str((self.current or {}).get("url") or "")
+            return bool(relay is not None and url and relay.url == url
+                        and getattr(relay, "_alive", False)
+                        and (getattr(relay, "cache_size", 0) > 0
+                             or getattr(relay, "total", 0) > 0))
+        except Exception:  # noqa: BLE001
+            return False
 
     def _stremio_chain_reset(self):
         """A stream genuinely played — the auto-advance chain is broken,
@@ -2604,51 +2632,49 @@ class PlayerView(QtWidgets.QWidget):
         ok, val = result
         if ok != "ok" or self._closing:
             return
-        base, alive, took_s = val if isinstance(val, tuple) \
-            else (None, True, 0.0)
+        if isinstance(val, tuple) and len(val) == 4:
+            base, alive, took_s, rep = val
+        elif isinstance(val, tuple):
+            base, alive, took_s = val
+            rep = {}
+        else:
+            base, alive, took_s, rep = None, True, 0.0, {}
         cur = self.current or {}
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the probe ran
+        if rep.get("status") == "throttled":
+            # 429: torrentio is rate-limiting this IP. The link is
+            # unproven, not dead — widen the guard window and let VLC
+            # keep trying rather than advancing off (possibly) a
+            # healthy stream at 10 s.
+            self._stremio_throttled = True
+            return
         if alive:
             self._stremio_chain_reset()
-            return          # link healthy — the 10 s guard stays the backstop
+            return          # link healthy — the guard stays the backstop
         if self._stremio_nextstream_done:
             return          # already advancing this handoff
         # The probe saw no bytes, but a fast debrid start can still beat
         # it home: only switch when VLC shows no real playback either
         # (same alive rule the guard uses).
-        try:
-            state = self.vlc.state_name() or ""
-            if state in ("playing", "paused") or self._vid_s > 5.0:
-                return
-        except Exception:  # noqa: BLE001
-            pass
+        if self._stremio_alive():
+            return
         # Ground truth beats the probe: a VOD relay on THIS url that is
-        # alive with a settled content length (its own head probe got a
-        # 206 seconds ago) or cached provider bytes is READING the same
-        # debrid link successfully — the probe's "dead" is then a false
-        # alarm and must not murder a healthy start (live-seen
-        # 2026-09-29 16:12: a 0.0 s probe verdict killed a handoff whose
-        # splitter had a 1.28 GB total and a 2.6 MB tail prefetch in
-        # flight; the auto-advance then landed on a dead replacement and
-        # the user got a 60 s stall on a stream Stremio web played fine).
+        # alive with a settled content length or cached provider bytes
+        # is reading the same debrid link fine — the probe's "dead" is
+        # then a false alarm and must not murder a healthy start.
         # VLC sits in 'opening' through the async relay startup, so the
         # state check above cannot catch this shape — the relay can.
-        try:
-            relay = self._vod_relay
-            url = str(cur.get("url") or "")
-            if relay is not None and url and relay.url == url \
-                    and getattr(relay, "_alive", False) \
-                    and (getattr(relay, "cache_size", 0) > 0
-                         or getattr(relay, "total", 0) > 0):
+        if self._stremio_relay_serving():
+            try:
                 log.info("stremio: probe dead verdict ignored — the VOD "
                          "relay is serving this link (total=%d "
-                         "cached=%d); the 10 s guard stays armed",
-                         int(getattr(relay, "total", 0) or 0),
-                         int(getattr(relay, "cache_size", 0) or 0))
-                return
-        except Exception:  # noqa: BLE001
-            pass
+                         "cached=%d); the start guard stays armed",
+                         int(getattr(self._vod_relay, "total", 0) or 0),
+                         int(getattr(self._vod_relay, "cache_size", 0) or 0))
+            except Exception:
+                pass
+            return
         try:
             log.info("stremio: debrid probe dead after %.1fs — advancing "
                      "to the next stream down the list early", took_s)
@@ -2657,40 +2683,68 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_guard.stop()
         self._begin_stremio_nextstream()
 
+    def _stremio_alive(self) -> bool:
+        """REAL playback, not a parked open. is_playing() also reads
+        True while VLC is merely OPENING a dead link (live-seen
+        2026-09-02 16:01: the guard disarmed itself on the first tick
+        and the hung open ran 55 s until a manual reload), and a starved
+        debrid open parks VLC in 'paused' with the clock at ZERO
+        (live-seen 2026-10-29 12:15: a relay-served 588 MB stream sat
+        paused-at-0 past the 60 s watchdog; 'paused' alone kept the
+        guard disarmed and the screen froze for 28 min). So: playing, a
+        tracked clock over 5 s, or paused WITH a clock — a user's early
+        pause still counts, a never-rendered frame does not. A stream
+        that played >5 s and then stalled/ended is alive by this rule
+        too — restarting it from zero is the end-of-media / stall
+        paths' territory, never the start guard's."""
+        try:
+            state = self.vlc.state_name() or ""
+            if state == "playing":
+                return True
+            if self._vid_s > 5.0:
+                return True
+            return state == "paused" and self._vid_s >= 1.0
+        except Exception:  # noqa: BLE001
+            return False
+
     def _stremio_guard_tick(self):
         """Every 2 s after a debrid handoff opens: if VLC still hasn't
-        started after ~10 s the debrid link is dead (live-seen: transient
-        502s from torrentio's resolve endpoint) — advance to the
-        NEXT stream down the list for the same episode/movie (never the
-        local Stremio server's torrent engine; the user runs debrid
-        services). Server-URL handoffs never arm this guard (fresh
-        torrents legitimately take minutes; the 60 s start watchdog
-        covers those)."""
+        started after the guard window the debrid link is dead
+        (live-seen: transient 502s from torrentio's resolve endpoint)
+        — advance to the NEXT stream down the list for the same
+        episode/movie (never the local Stremio server's torrent engine;
+        the user runs debrid services). Server-URL handoffs never arm
+        this guard (fresh torrents legitimately take minutes; the 60 s
+        start watchdog covers those).
+
+        The window is 10 s normally, 30 s when the IP is being
+        rate-limited (a 429 probe verdict) or the VOD relay is provably
+        reading the link — both mean 'slow, not dead', and advancing at
+        10 s walked the user off a healthy stream that Stremio web
+        played fine (live-seen 2026-10-29 12:43)."""
         cur = self.current or {}
         if self._closing or cur.get("kind") != "stremio":
             self._stremio_guard.stop()
             return
-        try:
-            # alive needs REAL playback: state playing/paused, or the
-            # tracked video clock advanced. is_playing() used to sit in
-            # this test too, but it also reads True while VLC is merely
-            # OPENING a dead link (live-seen 2026-09-02 16:01: the guard
-            # disarmed itself on the first tick and the hung open ran
-            # 55 s until a manual reload). A stream that played >5 s and
-            # then stalled/ended is alive by this rule too — restarting
-            # it from zero is the end-of-media / stall paths' territory,
-            # never this guard's.
-            state = self.vlc.state_name() or ""
-            alive = state in ("playing", "paused") or self._vid_s > 5.0
-        except Exception:  # noqa: BLE001
-            alive = False
-        if alive:
+        if self._stremio_alive():
             self._stremio_guard.stop()
             self._stremio_chain_reset()
             return
-        if now_s() - self._stremio_guard_t0 < 10.0:
+        window = 10.0
+        why = ""
+        if self._stremio_throttled:
+            window, why = 30.0, "probe saw HTTP 429 (throttled)"
+        elif self._stremio_relay_serving():
+            window, why = 30.0, "VOD relay is serving the link"
+        if now_s() - self._stremio_guard_t0 < window:
             return
         self._stremio_guard.stop()
+        if why:
+            try:
+                log.info("stremio: start guard extended window expired "
+                         "(%s) — treating the link as dead", why)
+            except Exception:
+                pass
         if self._stremio_nextstream_done:
             log.warning("stremio: stream never started, no switch "
                         "left — %r", cur.get("title", ""))
@@ -2949,10 +3003,15 @@ class PlayerView(QtWidgets.QWidget):
     def _fetch_next_stream(self, cur):
         """Worker-thread: the next stream down the addon's list for the
         SAME episode or movie (identity resolved on demand inside the
-        backend)."""
+        backend). wrap=True: the manual press cycles back to the top of
+        the list instead of dead-ending at its end — the head is usually
+        the user's own Stremio pick, which a rate-limit blip may have
+        made the guard abandon (live-seen 2026-10-29, 1000-lb Roomies
+        S01E04: 'last usable one of 5' while the healthy #1 needed an
+        app restart to ever play again)."""
         try:
             from .. import stremio
-            return stremio.next_stream_playable(self.config, cur)
+            return stremio.next_stream_playable(self.config, cur, wrap=True)
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("stremio next-stream lookup failed: %r", exc)
@@ -3378,6 +3437,21 @@ class PlayerView(QtWidgets.QWidget):
             except Exception:
                 pass
         if not self.btn_auto.isChecked():
+            return
+        if cur.get("kind") == "stremio" and 0 < length_ms <= 90_000:
+            # The ended item was a ~30 s provider FAILURE VIDEO, not the
+            # episode (dead debrid resolve masked as a 200; no real
+            # Stremio item is this short — see the tick's unmask). Never
+            # roll into the NEXT EPISODE off the back of one: switch the
+            # stream of THIS episode instead (live-seen 2026-10-29: the
+            # overnight autoplay skipped three episodes of 1000-lb
+            # Roomies this way, S01E03/S01E06/S02E06). This gate is the
+            # backstop — the tick usually unmasks it ~8 s in.
+            if not self._stremio_nextstream_done:
+                self._pn_log("playnext: ended item was a failure video "
+                             "(len=%dms) — switching stream, not episode",
+                             length_ms)
+                self._begin_stremio_nextstream()
             return
         if state == "ended" and self._live_paused:
             # An ENDED media cannot be paused — the latch is a toggle
@@ -5968,6 +6042,28 @@ class PlayerView(QtWidgets.QWidget):
             # else") instead of collapsing to a live-style bar.
             length = self._last_vod_len_ms
         vod = length > 0
+        # ---- stremio failure-video unmask ----
+        # A dead debrid resolve sometimes arrives as a ~120 KB, ~30 s
+        # provider error clip wearing a plain 200 — the splitter's size
+        # gate refuses the ones it can see, but a direct-served clip
+        # reaches VLC, which happily 'plays' it: the start guard
+        # disarms, the S-button burns a slot on it, and at end-of-media
+        # autoplay reads it as a WATCHED EPISODE and skips ahead
+        # (live-seen 2026-10-29: three of five streams on 1000-lb
+        # Roomies S01E04 were this clip; the overnight binge skipped
+        # S01E03, S01E06 and S02E06 to it). No real Stremio item is this
+        # short — catch it a few seconds in and switch the STREAM.
+        if ((self.current or {}).get("kind") == "stremio"
+                and 0 < length <= 90_000 and self._vid_s >= 8.0
+                and not self._stremio_nextstream_done):
+            try:
+                log.warning("stremio: %.1fs 'playback' is a provider "
+                            "failure video (len=%dms) — switching the "
+                            "stream, not the episode",
+                            self._vid_s, length)
+            except Exception:
+                pass
+            self._begin_stremio_nextstream()
         if vod != self._scrub_on:
             self._scrub_on = vod
             # stremio counts as vod here (a seekable FILE): speed joins the

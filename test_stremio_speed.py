@@ -107,10 +107,23 @@ def main():
             seen["range"] = self.headers.get("Range")
             if self.path.startswith("/ok206"):
                 self.send_response(206)
-                self.send_header("Content-Range", "bytes 0-0/1000")
+                self.send_header("Content-Range",
+                                 "bytes 0-0/2147483648")
                 self.send_header("Content-Length", "1")
                 self.end_headers()
                 self.wfile.write(b"x")
+            elif self.path.startswith("/failvidsize"):
+                # 2026-10-29 shape: dead debrid resolve masked as a 206
+                # whose total is the ~118 KB provider error clip
+                self.send_response(206)
+                self.send_header("Content-Range", "bytes 0-0/118743")
+                self.send_header("Content-Length", "1")
+                self.end_headers()
+                self.wfile.write(b"x")
+            elif self.path.startswith("/throttle429"):
+                self.send_response(429)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             elif self.path.startswith("/ok200"):
                 body = b"y" * 10          # range ignored: full 200 answer
                 self.send_response(200)
@@ -159,6 +172,16 @@ def main():
           stremio.probe_debrid(base + "/ok206", timeout_s=3.0) is True)
     check("probe asks for exactly one byte (Range: bytes=0-0)",
           seen.get("range") == "bytes=0-0")
+    rep = {}
+    check("failure-video SIZE (206 total=118743) -> dead",
+          stremio.probe_debrid(base + "/failvidsize", timeout_s=3.0,
+                               report=rep) is False
+          and rep.get("status") == "failvid")
+    rep = {}
+    check("429 -> alive AND reported as throttled (guard widens)",
+          stremio.probe_debrid(base + "/throttle429", timeout_s=3.0,
+                               report=rep) is True
+          and rep.get("status") == "throttled")
     check("200 full answer (range ignored) -> alive",
           stremio.probe_debrid(base + "/ok200", timeout_s=3.0) is True)
     check("redirect followed -> alive",
@@ -184,7 +207,8 @@ def main():
     print("[2] guard alive rule: real playback or nothing")
     view = PlayerView(Config({}, None))
 
-    def arm(state_name, playing, vid_s, age_s=11.0, done=False):
+    def arm(state_name, playing, vid_s, age_s=11.0, done=False,
+            throttled=False, relay=None):
         """One guard tick against a faked VLC; returns how many times the
         dead-stream advance began."""
         fired = []
@@ -193,6 +217,8 @@ def main():
         view._closing = False
         view._vid_s = vid_s
         view._stremio_nextstream_done = done
+        view._stremio_throttled = throttled
+        view._vod_relay = relay
         view._stremio_guard_t0 = pv_mod.now_s() - age_s
         view.vlc.state_name = lambda: state_name
         view.vlc.is_playing = lambda: playing
@@ -207,8 +233,15 @@ def main():
           len(arm("opening", True, 0.0, age_s=4.0)) == 0)
     check("playing -> alive, no advance",
           len(arm("playing", True, 600.0)) == 0)
-    check("paused -> alive, no advance",
+    check("paused WITH a clock -> alive, no advance",
           len(arm("paused", False, 600.0)) == 0)
+    # 2026-10-29 12:14 wedge: VLC parked 'paused' at clock ZERO on a
+    # relay-served 588 MB stream — 'paused' alone kept the guard
+    # disarmed and the screen froze for 28 min.
+    check("paused at clock 0 (starved open) -> advance fires",
+          len(arm("paused", False, 0.0)) == 1)
+    check("paused with 2 s on the clock (user's early pause) -> alive",
+          len(arm("paused", False, 2.0)) == 0)
     check("502 shape (ended, 0 s played) -> advance fires",
           len(arm("ended", False, 0.0)) == 1)
     check("played >5 s then ended -> alive (EOF paths own it)",
@@ -217,8 +250,12 @@ def main():
           len(arm("buffering", True, 120.0)) == 0)
     check("advance already spent -> nothing left to try",
           len(arm("ended", False, 0.0, done=True)) == 0)
-
-    print("[3] probe result handler")
+    # 2026-10-29 12:43 incident: torrentio 429'd the IP; the healthy
+    # user pick just needed longer — the window widens to 30 s.
+    check("throttled: 11 s in -> still waiting (window widened)",
+          len(arm("opening", True, 0.0, age_s=11.0, throttled=True)) == 0)
+    check("throttled: 31 s in with no start -> advance fires",
+          len(arm("opening", True, 0.0, age_s=31.0, throttled=True)) == 1)
 
     class _FakeRelay:
         def __init__(self, url, alive=True, total=0, cached=0):
@@ -227,20 +264,32 @@ def main():
             self.total = total
             self.cache_size = cached
 
+    check("relay serving the link: 11 s in -> still waiting",
+          len(arm("opening", True, 0.0, age_s=11.0,
+                  relay=_FakeRelay(base + "/ok206", total=588996568))) == 0)
+    check("relay serving: 31 s with no start -> advance fires",
+          len(arm("opening", True, 0.0, age_s=31.0,
+                  relay=_FakeRelay(base + "/ok206", total=588996568))) == 1)
+
+    print("[3] probe result handler")
+
     def probe_case(alive, state_name="opening", fav="stremio:abc:0",
-                   done=False, vid_s=0.0, relay=None):
+                   done=False, vid_s=0.0, relay=None, rep=None):
         fired = []
         view.current = {"kind": "stremio", "fav_key": fav,
                         "title": "T", "url": base + "/ok206"}
         view._closing = False
         view._vid_s = vid_s
         view._stremio_nextstream_done = done
+        view._stremio_throttled = False
         view._vod_relay = relay
         view.vlc.state_name = lambda: state_name
         view.vlc.is_playing = lambda: False
         view._begin_stremio_nextstream = lambda: fired.append(1)
         view._stremio_guard.start()
-        view._on_stremio_probe(("ok", ("stremio:abc:0", alive, 1.5)))
+        payload = ("stremio:abc:0", alive, 1.5, rep) if rep is not None \
+            else ("stremio:abc:0", alive, 1.5)
+        view._on_stremio_probe(("ok", payload))
         app.processEvents()
         return fired, view._stremio_guard.isActive()
 
@@ -276,6 +325,11 @@ def main():
     fired, _ = probe_case(
         False, relay=_FakeRelay(base + "/ok206", alive=False, total=999))
     check("dead relay proves nothing -> advance fires", len(fired) == 1)
+    fired, guard_on = probe_case(
+        True, rep={"status": "throttled"})
+    check("throttled report -> no advance, guard armed, flag latched",
+          len(fired) == 0 and guard_on is True
+          and view._stremio_throttled is True)
 
     print("[3b] dead-debrid advance chain (guard -> lookup -> switch)")
     # The full wiring the probe/guard fire: _begin_stremio_nextstream
@@ -805,8 +859,8 @@ def main():
     check("play_media arm block kicks the probe",
           "self._kick_stremio_probe(url)" in src_pm)
     src_probe = inspect.getsource(pv_mod.PlayerView._kick_stremio_probe)
-    check("probe asks for a 3 s verdict",
-          "probe_debrid(url, timeout_s=3.0)" in src_probe)
+    check("probe asks for a 3 s verdict (report dict carried for 429s)",
+          "probe_debrid(url, timeout_s=3.0, report=rep)" in src_probe)
     check("probe_debrid lives in src/stremio.py with a range GET",
           callable(stremio.probe_debrid))
 
@@ -854,6 +908,15 @@ def main():
 
     saved_qa, saved_ab = stremio._query_addon, stremio._addon_bases
     saved_srv = stremio.StreamingServer
+    # the walk now PROBES each http candidate (2026-10-29: three dead
+    # torbox resolves played as 30 s error clips because nothing checked
+    # them before VLC). The synthetic .invalid urls below have no
+    # server; stub the probe alive so the walk-shape checks below stay
+    # about the WALK. The probe itself is covered live in [1] and in
+    # the probe-skip block further down.
+    saved_probe = stremio.probe_debrid
+    stremio.probe_debrid = \
+        lambda url, timeout_s=3.0, report=None: True
     stremio._streams_cache.clear()
     bases = ("http://addon.invalid",)
     stremio._addon_bases = lambda cfg: bases
@@ -924,6 +987,11 @@ def main():
               nxt3 and nxt3["url"] == D["url"])
         check("from the last stream -> None (button says 'no other')",
               stremio.next_stream_playable(cfg2, cur_of(D)) is None)
+        check("wrap=True cycles the last stream back to the list's top "
+              "(the user's healthy Stremio pick stays reachable — "
+              "2026-10-29 'last usable one of 5' dead end)",
+              (lambda w: bool(w) and w["url"] == A["url"])(
+                  stremio.next_stream_playable(cfg2, cur_of(D), wrap=True)))
 
         # the same torrent on two addons is the SAME release: the walk
         # must not re-serve it under the second addon's URL
@@ -944,6 +1012,35 @@ def main():
         nxt = stremio.next_stream_playable(cfg2, outsider)
         check("unmatched current -> the best ranked stream",
               nxt and nxt["url"] == A["url"])
+
+        # ---- 2026-10-29 12:43 (1000-lb Roomies S01E04): the walk handed
+        # VLC streams that were already dead — a ~118 KB / 30 s provider
+        # error clip with a plain 200. The walk now PROBES each http
+        # candidate and never serves one the probe calls dead.
+        stremio._streams_cache.clear()
+        stremio._query_addon = fake_qa
+        probed = []
+
+        def fake_probe(url, timeout_s=3.0, report=None):
+            probed.append(url)
+            return url != B["url"]      # B is today's dead torbox resolve
+        stremio.probe_debrid = fake_probe
+        nxt = stremio.next_stream_playable(cfg2, cur_of(A))
+        check("probe-dead candidate (B) is skipped, never handed to VLC",
+              nxt and nxt["url"] == D["url"])
+        check("the walk actually probed (A's successors, not the current)",
+              A["url"] not in probed and B["url"] in probed)
+
+        # a THROTTLED probe (429) proves nothing: the candidate goes
+        # through unproven and the throttle-aware guard owns it
+        stremio._streams_cache.clear()
+        stremio.probe_debrid = \
+            lambda url, timeout_s=3.0, report=None: True
+        nxt = stremio.next_stream_playable(cfg2, cur_of(A))
+        check("throttle-shaped probe verdict is not a skip",
+              nxt and nxt["url"] == B["url"])
+        stremio.probe_debrid = \
+            lambda url, timeout_s=3.0, report=None: True
 
         # the 2026-09-08 11:34 incident (Alone Australia S04E05): the
         # local streaming server, busy serving the very stream being
@@ -1721,6 +1818,7 @@ def main():
         stremio._query_addon = saved_qa
         stremio._addon_bases = saved_ab
         stremio.StreamingServer = saved_srv
+        stremio.probe_debrid = saved_probe
 
     print("[7] next-stream UI: button, resume position, staleness, "
           "coalescing, S shortcut")
@@ -1759,7 +1857,8 @@ def main():
     v.vlc.get_time = lambda: 313000          # 5:13 into the episode
     v.vlc.get_length = lambda: 705000
     stremio.next_stream_playable = \
-        lambda cfg, cur: dict(e42_cur, url=B["url"], info_hash=H["b"])
+        lambda cfg, cur, wrap=False, **kw: dict(
+            e42_cur, url=B["url"], info_hash=H["b"])
     try:
         check("button visible + enabled on a Stremio episode",
               not v.btn_stream.isHidden() and v.btn_stream.isEnabled())
@@ -1786,7 +1885,8 @@ def main():
         v, rec = mk_view(cur_of(A))
         notes = []
         v.show_info = lambda text, **kw: notes.append(text)
-        stremio.next_stream_playable = lambda cfg, cur: None
+        stremio.next_stream_playable = \
+            lambda cfg, cur, wrap=False, **kw: None
         v.btn_stream.click()
         check("'no other stream' banner shown",
               wait_for(lambda: any("No other stream" in t for t in notes)))

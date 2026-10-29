@@ -209,6 +209,17 @@ class _ProviderStream:
             pass
 
 
+def _failvid_max_bytes() -> int:
+    """The failure-video ceiling, shared with stremio.probe_debrid (lazy
+    import: stremio is heavier than this module and not needed at import
+    time). Falls back to 1 MB if the import ever breaks."""
+    try:
+        from . import stremio
+        return int(stremio._FAILVID_MAX_BYTES)
+    except Exception:  # noqa: BLE001
+        return 1_000_000
+
+
 class VodRelay(QtCore.QObject):
     """Owns the single provider connection + the local relay server."""
 
@@ -555,11 +566,30 @@ class VodRelay(QtCore.QObject):
             # torrents both 'played' a 136,909-byte failed_unexpected_v3
             # mp4 while VLC sat stalled for 60 s) — that redirect is a
             # DEAD LINK wearing a 200, refuse it here so the caller falls
-            # back and the stremio advance chain moves on
+            # back and the stremio advance chain moves on.
+            # 2026-10-29 12:43: the redirect target no longer says
+            # /videos/failed (three dead torbox resolves served a plain
+            # 200 of a 118,743-byte error clip that RELAYED and
+            # 'played'), so also refuse anything failure-video sized —
+            # no real episode or movie is under 1 MB.
             if "/videos/failed" in final:
                 try:
                     log.info("vod splitter: debrid resolve failed (provider "
                              "failure-video redirect) — %s", final[:80])
+                except Exception:
+                    pass
+                return False
+            # localhost is exempt from the size gate: that is the local
+            # streaming engine (and the offline fixtures), never a
+            # masked debrid resolve.
+            if 0 < self.total < _failvid_max_bytes() and not (
+                    "//127.0.0.1" in (self.url or "")
+                    or "//localhost" in (self.url or "")):
+                try:
+                    log.info("vod splitter: debrid resolve failed (provider "
+                             "failure video, total=%d bytes < %d) — %s",
+                             self.total, _failvid_max_bytes(),
+                             final[:80] or str(self.url)[:80])
                 except Exception:
                     pass
                 return False

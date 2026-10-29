@@ -349,7 +349,26 @@ def _file_is_other_episode(file_name, meta: dict, season: int,
     return len(others) == 1
 
 
-def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
+# The failure-video ceiling: no real episode/movie is under 1 MB, while
+# every masked dead-debrid placeholder seen live is ~120-140 KB
+# (136,909 on 2026-09-29, 118,743 on 2026-10-29). Both sides of the
+# relay/probe use it to refuse a 200 that only LOOKS playable.
+_FAILVID_MAX_BYTES = 1_000_000
+
+
+def _content_range_total(cr: str) -> int:
+    """Total size from a Content-Range header ('bytes 0-0/118743' ->
+    118743); 0 when absent or unparseable."""
+    if not cr or "/" not in cr:
+        return 0
+    try:
+        return int(cr.rsplit("/", 1)[1].strip())
+    except (ValueError, IndexError):
+        return 0
+
+
+def probe_debrid(url: str, timeout_s: float = 3.0,
+                 report: dict = None) -> bool:
     """Cheap liveness check for a handed-off debrid link: a 1-byte range
     GET that must produce ANY 2xx within ``timeout_s`` (redirects
     followed, body never read — headers only). True = the link serves;
@@ -376,27 +395,63 @@ def probe_debrid(url: str, timeout_s: float = 3.0) -> bool:
     handoffs (live-seen 2026-10-06 12:07/12:08, Adventure Time S04E11:
     both user-picked links probed 429 within ~2 s, both got silently
     replaced, and the replacement landed on a mislabeled season-pack
-    file that plays a DIFFERENT episode)."""
+    file that plays a DIFFERENT episode).
+
+    A 2xx whose Content-Range total is FAILURE-VIDEO SIZED (under
+    _FAILVID_MAX_BYTES) is dead too: torrentio/torbox mask a failed
+    debrid resolve as a ~120 KB 30 s error mp4 served with a plain 200
+    — the /videos/failed URL check misses the variant that redirects
+    elsewhere, and the splitter then happily relayed it while VLC
+    "played" a 30-second placeholder (live-seen 2026-10-29 12:43,
+    1000-lb Roomies S01E04: three of five listed streams answered
+    total=118743; every one was a dead torbox resolve, one burned the
+    auto-advance, two ate manual S-button clicks, and the overnight
+    binge skipped three whole EPISODES because autoplay read the ended
+    error clip as a watched episode).
+
+    ``report`` (optional dict) lets the caller distinguish the 429
+    shape from a clean alive — the start guard extends its window
+    instead of advancing at 10 s (a throttled link is usually healthy,
+    live-seen 2026-10-29 12:43: the 429'd pick played fine 54 s later)."""
+    if report is not None:
+        report["status"] = "alive"
     try:
         resp = _session.get(url, timeout=timeout_s, stream=True,
                             headers={"Range": "bytes=0-0"})
         try:
             if resp.status_code == 429:
+                if report is not None:
+                    report["status"] = "throttled"
                 log.info("stremio: debrid probe throttled (HTTP 429) — "
-                         "not dead, the 10 s start guard stays armed")
+                         "not dead, the start guard stays armed")
                 return True
             if not 200 <= resp.status_code < 300:
+                if report is not None:
+                    report["status"] = "dead"
                 log.info("stremio: debrid probe dead: HTTP %d — %s",
                          resp.status_code, str(url)[:70])
                 return False
             if "/videos/failed" in str(resp.url or ""):
+                if report is not None:
+                    report["status"] = "failvid"
                 log.info("stremio: debrid probe dead: provider failure "
                          "video redirect — %s", str(resp.url)[:70])
+                return False
+            total = _content_range_total(
+                resp.headers.get("Content-Range") or "")
+            if 0 < total < _FAILVID_MAX_BYTES:
+                if report is not None:
+                    report["status"] = "failvid"
+                log.info("stremio: debrid probe dead: provider failure "
+                         "video size (total=%d bytes) — %s",
+                         total, str(url)[:70])
                 return False
             return True
         finally:
             resp.close()
     except requests.RequestException as exc:
+        if report is not None:
+            report["status"] = "dead"
         log.info("stremio: debrid probe dead: %r", exc)
         return False
 
@@ -2340,7 +2395,7 @@ def _click_context_reanchor(config, cur: dict):
 
 
 def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
-                         reanchor_click=False):
+                         reanchor_click=False, wrap=False):
     """Worker-thread backend of the NEXT-STREAM button: the SAME episode
     (or movie) on the stream listed AFTER the one now playing, walking
     the ADDON's own list order — the exact order Stremio displays — top
@@ -2381,7 +2436,23 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
     clicked, and the walk then replaces the dead link with another
     wrong-series stream (the 2026-10-22 TMNT incident). The manual
     S-button keeps it off: there the content is playing, so the
-    file-name identity IS what 'same episode' means."""
+    file-name identity IS what 'same episode' means.
+    ``wrap`` (manual S-button only): when the walk falls off the END of
+    the list, start again from the TOP instead of dead-ending. The list
+    is short and its head is usually the pick the USER chose in Stremio
+    — the one a rate-limit blip may have made the guard abandon even
+    though it serves fine (live-seen 2026-10-29 12:43, 1000-lb Roomies
+    S01E04: three dead resolve slots walked the button to 'last usable
+    one of 5' with the healthy #1 unreachable except by an app restart;
+    the wrap hands it back on the next click).
+    Each http(s) candidate is PROBED (one 1-byte range GET) before it
+    is returned: a dead resolve — 502 or the ~120 KB failure-video 200
+    — is skipped on the spot instead of being handed to VLC, where the
+    30 s error clip disarms the start guard and reads as 'playing'
+    (live-seen 2026-10-29: three of five slots were exactly that). A
+    429-throttled probe is NOT a skip — under rate limiting no candidate
+    can prove itself, so it is returned unproven and the throttle-aware
+    guard owns it."""
     if debrid_only is None:
         debrid_only = _wants_debrid_only(cur)
     server = StreamingServer(
@@ -2492,89 +2563,135 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
         except Exception:  # noqa: BLE001
             meta = {}
     server_ok = True
-    for nxt in candidates:
-        if is_cur(nxt):
-            continue    # the not-in-list walk still never re-serves it
-        if not movie and _file_is_other_episode(
-                _resolve_file_name(nxt), meta,
-                int(cur.get("season") or 0), int(cur.get("episode") or 0),
-                str(cur.get("series_name") or meta.get("name") or "")):
-            log.info("stremio: next-stream — skipping a candidate whose "
-                     "pack file is titled as a DIFFERENT episode: %s",
-                     _resolve_file_name(nxt)[:70])
-            continue
-        if exclude:
-            ex_hash = str(nxt.get("infoHash") or "").lower()
-            ex_url = str(nxt.get("url") or "")
-            if not ex_hash and ex_url:
-                resolved_ex = parse_resolve_url(ex_url)
-                if resolved_ex:
-                    ex_hash = resolved_ex[0]
-            if (ex_hash and ex_hash in exclude) \
-                    or (ex_url and ex_url in exclude):
-                continue    # already tried dead in this chain
-        if nxt.get("url"):
-            url = nxt["url"]
-            # keep the torrent identity for the NEXT press's skip-match
-            # (and the dead-debrid advance): the addon's own infoHash
-            # first — torrentio debrid entries carry it alongside the
-            # url — then the hash parsed out of a resolve link
-            info_hash = str(nxt.get("infoHash") or "").lower()
-            file_idx = nxt.get("fileIdx")
-            if not info_hash:
-                resolved = parse_resolve_url(url)
-                if resolved:
-                    info_hash, file_idx = resolved
-            if info_hash and file_idx is None:
-                file_idx = 0
-        else:
-            if debrid_only and not rbase:
-                continue    # never auto-advance onto the local engine
-            info_hash = str(nxt["infoHash"]).lower()
-            file_idx = int(nxt.get("fileIdx") or 0)
-            if debrid_only:
-                # debrid context + a proven resolve pipeline: play this
-                # listed torrent through the user's debrid provider —
-                # still a direct link, the machine never joins the
-                # swarm. Without this, a plain-torrentio addon list
-                # (EVERY candidate torrent-only) dead-ended the walk at
-                # "no other stream" while dozens sat listed (live-seen
-                # 2026-09-19 10:06, Adventure Time S07E03 — 19
-                # candidates, 0 served).
-                url = build_resolve_url(rbase, info_hash,
-                                        _resolve_file_name(nxt), file_idx)
-                log.info("stremio: next-stream — re-resolving %s through "
-                         "the debrid provider", info_hash[:12])
+
+    # bounded probing: the walk verifies at most this many http candidates
+    # per press — enough to step past a dead head of the list without
+    # turning one button press into a scan of every addon entry
+    probes_left = [6]
+
+    def _probe_walk_url(u):
+        """False = provably dead (never hand it to VLC); True = serve it
+        (alive, unprovable-throttled, non-http, or the cap is spent)."""
+        if not u or not u.startswith(("http://", "https://")):
+            return True
+        if "//127.0.0.1" in u or "//localhost" in u:
+            return True     # the local streaming engine serves its own
+        if probes_left[0] <= 0:
+            return True
+        probes_left[0] -= 1
+        try:
+            return bool(probe_debrid(u, timeout_s=3.0))
+        except Exception:  # noqa: BLE001
+            return True
+
+    def _try(cands):
+        nonlocal server_ok
+        for nxt in cands:
+            if is_cur(nxt):
+                continue    # the not-in-list walk still never re-serves it
+            if not movie and _file_is_other_episode(
+                    _resolve_file_name(nxt), meta,
+                    int(cur.get("season") or 0),
+                    int(cur.get("episode") or 0),
+                    str(cur.get("series_name") or meta.get("name") or "")):
+                log.info("stremio: next-stream — skipping a candidate whose "
+                         "pack file is titled as a DIFFERENT episode: %s",
+                         _resolve_file_name(nxt)[:70])
+                continue
+            if exclude:
+                ex_hash = str(nxt.get("infoHash") or "").lower()
+                ex_url = str(nxt.get("url") or "")
+                if not ex_hash and ex_url:
+                    resolved_ex = parse_resolve_url(ex_url)
+                    if resolved_ex:
+                        ex_hash = resolved_ex[0]
+                if (ex_hash and ex_hash in exclude) \
+                        or (ex_url and ex_url in exclude):
+                    continue    # already tried dead in this chain
+            if nxt.get("url"):
+                url = nxt["url"]
+                # keep the torrent identity for the NEXT press's skip-match
+                # (and the dead-debrid advance): the addon's own infoHash
+                # first — torrentio debrid entries carry it alongside the
+                # url — then the hash parsed out of a resolve link
+                info_hash = str(nxt.get("infoHash") or "").lower()
+                file_idx = nxt.get("fileIdx")
+                if not info_hash:
+                    resolved = parse_resolve_url(url)
+                    if resolved:
+                        info_hash, file_idx = resolved
+                if info_hash and file_idx is None:
+                    file_idx = 0
             else:
-                if not server_ok:
-                    continue
-                if not server.create(info_hash):
-                    log.warning("stremio: streaming server refused create for "
-                                "%s — skipping to the next candidate",
-                                info_hash[:12])
-                    server_ok = False
-                    continue
-                url = server.play_url(info_hash, file_idx)
+                if debrid_only and not rbase:
+                    continue    # never auto-advance onto the local engine
+                info_hash = str(nxt["infoHash"]).lower()
+                file_idx = int(nxt.get("fileIdx") or 0)
+                if debrid_only:
+                    # debrid context + a proven resolve pipeline: play this
+                    # listed torrent through the user's debrid provider —
+                    # still a direct link, the machine never joins the
+                    # swarm. Without this, a plain-torrentio addon list
+                    # (EVERY candidate torrent-only) dead-ended the walk at
+                    # "no other stream" while dozens sat listed (live-seen
+                    # 2026-09-19 10:06, Adventure Time S07E03 — 19
+                    # candidates, 0 served).
+                    url = build_resolve_url(rbase, info_hash,
+                                            _resolve_file_name(nxt),
+                                            file_idx)
+                    log.info("stremio: next-stream — re-resolving %s through "
+                             "the debrid provider", info_hash[:12])
+                else:
+                    if not server_ok:
+                        continue
+                    if not server.create(info_hash):
+                        log.warning("stremio: streaming server refused "
+                                    "create for %s — skipping to the next "
+                                    "candidate", info_hash[:12])
+                        server_ok = False
+                        continue
+                    url = server.play_url(info_hash, file_idx)
 
-        nxt_playable = {
-            "kind": "stremio",
-            "title": cur.get("title") or "Stremio stream",
-            "url": url,
-            "fav_key": cur.get("fav_key")
-            or "stremio:%s:%d:%d" % (imdb, int(cur.get("season") or 0),
-                                     int(cur.get("episode") or 0)),
-            "icon": cur.get("icon") or "",
-            "stremio_imdb": imdb,
-        }
-        for key in ("movie", "movie_name", "year",
-                    "series_name", "season", "episode", "episode_name"):
-            if cur.get(key) is not None:
-                nxt_playable[key] = cur[key]
-        if info_hash:
-            nxt_playable["info_hash"] = info_hash
-            nxt_playable["file_idx"] = file_idx
-        return nxt_playable
+            if not _probe_walk_url(url):
+                log.info("stremio: next-stream — skipping %s: the debrid "
+                         "probe says the link is dead",
+                         (info_hash or str(url))[:60])
+                continue
 
+            nxt_playable = {
+                "kind": "stremio",
+                "title": cur.get("title") or "Stremio stream",
+                "url": url,
+                "fav_key": cur.get("fav_key")
+                or "stremio:%s:%d:%d" % (imdb, int(cur.get("season") or 0),
+                                         int(cur.get("episode") or 0)),
+                "icon": cur.get("icon") or "",
+                "stremio_imdb": imdb,
+            }
+            for key in ("movie", "movie_name", "year",
+                        "series_name", "season", "episode", "episode_name"):
+                if cur.get(key) is not None:
+                    nxt_playable[key] = cur[key]
+            if info_hash:
+                nxt_playable["info_hash"] = info_hash
+                nxt_playable["file_idx"] = file_idx
+            return nxt_playable
+        return None
+
+    picked = _try(candidates)
+    if picked is None and wrap and cur_idx >= 0 and walk:
+        # off the end of the list: the user asked for a switch, and the
+        # entries ABOVE the current one include the list's head — usually
+        # their own Stremio pick, possibly abandoned by a guard blip.
+        # Cycle back rather than dead-end (see docstring).
+        try:
+            log.info("stremio: next-stream — past the end of the %d-entry "
+                     "list, wrapping back to the top", len(walk))
+        except Exception:  # noqa: BLE001
+            pass
+        picked = _try(walk[:cur_idx])
+    if picked is not None:
+        return picked
     if cur_idx >= 0 and not candidates:
         log.info("stremio: next-stream — the current stream is the last "
                  "usable one of %d", len(walk))

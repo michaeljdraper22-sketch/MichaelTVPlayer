@@ -138,6 +138,10 @@ def main():
     good_hash = "982d331a0240" + "0" * 28
     rbase = "https://torrentio.strem.fun/resolve/torbox/key/"
     saved_sm, saved_as = stremio.series_meta, stremio.addon_streams
+    saved_probe = stremio.probe_debrid
+    # the walk probes each http candidate (2026-10-29); the synthetic
+    # resolve urls below must stay offline
+    stremio.probe_debrid = lambda u, timeout_s=3.0, report=None: True
     try:
         stremio.series_meta = lambda imdb: dict(META_AT) \
             if imdb == "tt1305826" else {}
@@ -180,7 +184,9 @@ def main():
               stremio.next_stream_playable(
                   Config({}, None), dict(cur)) is None)
     finally:
-        stremio.series_meta, stremio.addon_streams = saved_sm, saved_as
+        stremio.series_meta, stremio.addon_streams = \
+            saved_sm, saved_as
+        stremio.probe_debrid = saved_probe
 
     print("[5] _adjacent_playable: autoplay ranks only honest files")
     saved_sm, saved_as = stremio.series_meta, stremio.addon_streams
