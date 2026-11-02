@@ -23,13 +23,17 @@ means depends on the mode:
   python attaches a console window for the whole session).
 
 ### Dist mode / EXE + APK releases
-- If the machine is in dist mode (or the user asks for a release):
-  run `cmd //c build.bat` (takes ~3 min; PyInstaller + uninstaller +
-  VLC copy + release zip), then tell the user to relaunch.
+- Build ONLY when the user asks for it (a release, or a switch back to
+  dist mode): run `cmd //c build.bat` (takes ~3 min; PyInstaller +
+  uninstaller + VLC copy + release zip), then tell the user to
+  relaunch. NO periodic/preventive rebuilds — the user decided
+  2026-11-02 that a 3-minute build on demand beats keeping the exe
+  around (dist\MichaelTV.exe was deliberately deleted so taskbar search
+  can never launch it by accident; its absence is EXPECTED).
 - EXE and APK releases ship to GitHub ONLY when the user asks.
-- Keep the PyInstaller path from rotting while dev-driving: run
-  `cmd //c build.bat` at least once every few days of source-mode work
-  (and ALWAYS right before a release) and fix any breakage it surfaces.
+- Because builds are now rare, the first requested build after a long
+  dev stretch may surface PyInstaller rot — fixing that is part of
+  that build, not a reason to schedule builds.
 
 ### Always
 - If PyInstaller fails with `PermissionError ... dist\MichaelTV.exe`,
