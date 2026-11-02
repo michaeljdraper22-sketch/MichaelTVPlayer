@@ -100,7 +100,12 @@ $lnkPaths = @()
 # (Save() below writes a fresh .lnk for a staged shortcut).
 $lnkPaths += (Join-Path $DesktopDir "MichaelTV.lnk")
 
-# Start menu: repoint only entries that already exist (never creates).
+# Start menu: ensure a top-level "MichaelTV" entry (Start/taskbar
+# search finds it -- without one, search surfaces the raw
+# dist\MichaelTV.exe and a search-launch silently runs the OLD built
+# exe, re-pointing Stremio back at it), then repoint any other
+# existing entries (never creates extras).
+$lnkPaths += (Join-Path $StartMenuDir "MichaelTV.lnk")
 Get-ChildItem $StartMenuDir -Recurse -Filter *.lnk -EA SilentlyContinue | ForEach-Object {
     $s = $sh.CreateShortcut($_.FullName)
     if ((Test-MichaelTVShortcut $s) -and ($lnkPaths -notcontains $_.FullName)) { $lnkPaths += $_.FullName }
