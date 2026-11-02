@@ -55,3 +55,4 @@ build_pyinstaller/
 
 # Generated dev-mode Stremio handoff launcher (src/streampatch.py)
 /stremio-handoff-dev.cmd
+/stremio-handoff-dev.vbs

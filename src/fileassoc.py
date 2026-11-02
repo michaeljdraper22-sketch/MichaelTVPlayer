@@ -20,6 +20,8 @@ import logging
 import os
 import sys
 
+from . import devlaunch
+
 log = logging.getLogger("mtp.fileassoc")
 
 PROGID = "MichaelTVPlayer.Playlist"
@@ -40,12 +42,24 @@ def _video_exts():
 
 def _launch_command() -> str:
     """What Windows should run for a playlist: the built exe with the
-    file path as its argument (dev runs: python main.py <file>)."""
+    file path as its argument (dev runs: WINDOWLESS pythonw running
+    main.py — console python would attach a console window for the
+    whole session)."""
     if getattr(sys, "frozen", False):
         return '"%s" "%%1"' % sys.executable
-    main_py = os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "main.py")
-    return '"%s" "%s" "%%1"' % (sys.executable, main_py)
+    return '"%s" "%s" "%%1"' % (devlaunch.pythonw_exe(),
+                                devlaunch.main_py_path())
+
+
+def _icon_value() -> str:
+    """ProgId DefaultIcon: the app icon for source runs (pythonw.exe
+    carries no icon of its own — every "Open with" menu would show
+    Python's feather); the exe's embedded icon when frozen."""
+    if not getattr(sys, "frozen", False):
+        ico = os.path.join(devlaunch.repo_root(), "assets", "icon.ico")
+        if os.path.isfile(ico):
+            return ico
+    return sys.executable + ",0"
 
 
 def register() -> None:
@@ -66,7 +80,7 @@ def register() -> None:
                                 r"Software\Classes\%s\DefaultIcon"
                                 % PROGID) as k:
             winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
-                              sys.executable + ",0")
+                              _icon_value())
         with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
                                 r"Software\Classes\%s\shell\open\command"
                                 % PROGID) as k:
@@ -96,7 +110,7 @@ def register() -> None:
                                     r"Software\Classes\%s\DefaultIcon"
                                     % VIDEO_PROGID) as k:
                 winreg.SetValueEx(k, None, 0, winreg.REG_SZ,
-                                  sys.executable + ",0")
+                                  _icon_value())
             with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER,
                                     r"Software\Classes\%s\shell\open"
                                     r"\command" % VIDEO_PROGID) as k:
