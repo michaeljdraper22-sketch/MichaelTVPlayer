@@ -9,6 +9,39 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
+# 2.1.8: multi-episode Stremio files ('Paw Patrol S05E26E27') are episodes
+# again, not movies — the S/E parser's word-boundary choked on the E26E27
+# chain, the identity fell to the movie path, and the next-episode button,
+# lookahead and autoplay all vanished (live-seen 2026-10-31 13:42).
+# Autoplay now also resumes AFTER the range end, so an S05E26E27 file
+# advances to E28, never replays E27.
+# Live-TV stall hold (NFL RedZone 2026-11-01 16:24): the tail-hold now
+# resumes the moment data returns even when the frontier axis sits below
+# the freeze point (burst-cap under-credit / recorder-restart rebase left
+# "data ahead" negative forever — the stream was back and the hold still
+# sat to the 45 s give-up until a manual refresh), and the "Signal
+# stalled" pill clears on every hold exit instead of outliving playback.
+# Forced-track subtitle fix (Love Is Blind S11E03-E05 night 2026-11-01):
+# Netflix WEB-DL MKVs lay English out as 'English (forced)' / 'English'
+# / 'English (SDH)' with the FORCED track first — the MKV tap's
+# language-keyed selection took the first match, the near-empty forced
+# track, so the overlay rendered nothing and the profanity filter armed
+# ~zero windows while its dot stayed green (and because text tracks
+# existed, the filter's own online hunt never fired). Selection now
+# skips forced tracks (FlagForced element or 'forced' in the name,
+# falling back to a forced pick only when it's the only track in the
+# language); CC-menu picks re-target the tap at the exact track (name-
+# mapped — 'Track N', 'SDH', 'Forced' rows each render their own track
+# now); and a tap that streams 60 s without meaningful cues makes the
+# filter quietly hunt online after all.
+# 2.1.7: Stremio next-stream hardening after the 1000-lb Roomies S01E04
+# night (failure-video-sized debrid bodies detected dead, 30 s start-guard
+# window for throttled/relay links, autoplay switches the STREAM never the
+# episode, S-button wraps back to the list top). And live-TV: the lag
+# governor is now a distant safety valve — 60 s behind before it fires and
+# it lands 20 s behind the head (was 10 s / landed at chase_delay=5), after
+# the 2026-10-29 Fox NFL night where it skip/freeze-cycled a burst-gap leg;
+# the viewer prefers sitting a few seconds behind over any skip.
 # 2.1.6: click-to-pause actually works on the playing video — VLC's vout
 # child HWNDs were swallowing every physical click before Qt saw it (the
 # on-video overlay window now carries the video's mouse layer via an
@@ -17,7 +50,7 @@ APP_NAME = "MichaelTVPlayer"
 # (dB-linear) volume taper so the bar isn't silent for 80% of its travel
 # (stored volume migrated to the same curve), and quiet background
 # subtitle hunts + moviehash-wait for the online sub search.
-APP_VERSION = "2.1.6"
+APP_VERSION = "2.1.8"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC

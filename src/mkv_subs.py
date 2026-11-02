@@ -40,6 +40,10 @@ _CODEC_ID = 0x86
 _LANGUAGE = 0x22B59C
 _LANGUAGE_IETF = 0x22B59D
 _NAME = 0x536E
+_FLAG_FORCED = 0x55AA        # TrackEntry child: this track is a forced
+#                            # track (foreign-audio portions only)
+_FLAG_DEFAULT = 0x88         # parsed for the track dumper; selection
+#                            # ignores it (VLC applies its own default)
 _VOID = 0xEC
 
 _CTX_ROOT, _CTX_SEG, _CTX_CLUSTER, _CTX_TRACKS, _CTX_TRACK, _CTX_BLOCKGROUP = range(6)
@@ -167,6 +171,27 @@ def is_text_codec(codec: str) -> bool:
                          "S_TEXT/WEBVTT")) or c in ("S_UTF8", "S_ASS",
                                                     "S_SSA", "TX3G",
                                                     "MOV_TEXT", "TEXT")
+
+
+_FORCED_NAME_RE = re.compile(r"\bforced\b", re.IGNORECASE)
+
+
+def track_is_forced(meta: dict) -> bool:
+    """True when a subtitle track is a FORCED track — muxers mark it
+    with the FlagForced element, rippers often only name it ('Forced',
+    'English (forced)'). A forced track carries just the foreign-audio
+    portions of its own language: on a show SPOKEN in that language it
+    is near-empty, and auto-selecting it starves the caption overlay and
+    the profanity filter (live-seen 2026-11-01: the Netflix WEB-DL track
+    set 'English (forced)'/'English'/'English (SDH)' selected the forced
+    track first — zero cues across 80+ MB of playback while the user
+    cycled every English row and nothing showed)."""
+    if not isinstance(meta, dict):
+        return False
+    if meta.get("forced"):
+        return True
+    name = (meta.get("name") or "").strip()
+    return bool(name) and bool(_FORCED_NAME_RE.search(name))
 
 
 # bidi embedding/isolate controls (U+202A-202E, U+2066-2069). Middle-East
@@ -514,6 +539,8 @@ class MkvSubParser:
                 meta["lang"] = chunk.decode("ascii", "replace").lower()
             elif eid == _NAME:
                 meta["name"] = chunk.decode("utf-8", "replace")
+            elif eid == _FLAG_FORCED:
+                meta["forced"] = bool(int.from_bytes(chunk, "big"))
             pos += header + size
         if number is not None and meta.get("type") == 0x11:
             self._track_meta[number] = meta
@@ -529,21 +556,39 @@ class MkvSubParser:
             # files to VLC's own renderer.
             return
         if self.prefer_language:
-            for n in sorted(text_tracks):
-                m = text_tracks[n]
-                if lang_matches(self.prefer_language, m["lang"], m["name"]):
+            # forced tracks come LAST in each pass: on a show spoken in
+            # the wanted language a forced track is near-empty (see
+            # track_is_forced), and the Netflix WEB-DL layout puts it
+            # FIRST — 'first language match' selected it verbatim.
+            matching = [n for n in sorted(text_tracks)
+                        if lang_matches(self.prefer_language,
+                                        text_tracks[n]["lang"],
+                                        text_tracks[n]["name"])]
+            for n in matching:
+                if not track_is_forced(text_tracks[n]):
                     self._selected = n
                     return
+            if matching:
+                # every matching track is forced (a foreign-audio film
+                # whose only wanted-language track is forced): it still
+                # beats leaving the language
+                self._selected = matching[0]
+                return
         # English-default policy: a track with NO language evidence is
         # assumed to carry the default-language (English) subs — pick the
-        # lowest such track. A file whose text tracks are ALL labeled
-        # non-English selects nothing (the old min() fallback across all
-        # tracks is what showed a foreign track by default).
-        for n in sorted(text_tracks):
-            m = text_tracks[n]
-            if not track_language_evidence(m["lang"], m["name"]):
+        # lowest such track, non-forced first. A file whose text tracks
+        # are ALL labeled non-English selects nothing (the old min()
+        # fallback across all tracks is what showed a foreign track by
+        # default).
+        plain = [n for n in sorted(text_tracks)
+                 if not track_language_evidence(text_tracks[n]["lang"],
+                                                text_tracks[n]["name"])]
+        for n in plain:
+            if not track_is_forced(text_tracks[n]):
                 self._selected = n
                 return
+        if plain:
+            self._selected = plain[0]
 
     def _parse_block(self, header, size, duration_s=None):
         """Block at buf[0] (SimpleBlock or Block). Returns a cue list

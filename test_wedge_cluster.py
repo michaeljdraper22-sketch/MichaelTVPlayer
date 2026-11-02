@@ -440,6 +440,55 @@ check("tail-hold: a user seek cancels the hold",
       and any(c[0] == "play_at" for c in view.vlc.commanded),
       f"hold={view._chase_hold}")
 
+# 2026-11-01 RedZone 16:25: a superseding transport (the seek-verify revive
+# after the user's LIVE press) resumed playback while the stall note stayed
+# on the pill for two more minutes, until a manual stream refresh. The
+# note must die with the hold.
+view._mode = "chase"
+view.dvr = FakeDVR(bufpath)
+view._chase_hold = [349.0, VT["t"], 340.0]
+view._chase_fail_count = 0
+view.vlc.state = "ended"
+view.vlc.commanded.clear()
+view._chase_note("Signal stalled \u2014 holding picture until the stream "
+                 "catches up", clear_after_ms=0)
+view._chase_seek(100.0)
+check("tail-hold: a superseding transport clears the stall note",
+      view._chase_hold is None and not view._dvr_status.isVisible(),
+      f"hold={view._chase_hold} visible={view._dvr_status.isVisible()}")
+
+# the 16:24 incident's core: the frontier sat 31 s BELOW the freeze point
+# (burst-cap under-credit + a recorder-watchdog rebase), so "data ahead of
+# the freeze point" was permanently negative — the stream came back and
+# the hold still sat toward the 45 s give-up. Fresh frontier credit since
+# hold entry must resume just behind the write head (a near-live jump —
+# the gap content was never written — never a replay).
+view._chase_hold = [349.0, VT["t"], 340.0]
+view._cc_head_pcr = (350.0, VT["t"])   # PCR head ~252 -> ahead = -97
+view._dvr_base = 300.0
+view._dvr_content_s = 45.0             # frontier 345: 5 s grown >= margin
+view.vlc.commanded.clear()
+view._chase_note("Signal stalled \u2014 holding picture until the stream "
+                 "catches up", clear_after_ms=0)
+view._chase_hold_tick(VT["t"])
+pas = [c for c in view.vlc.commanded if c[0] == "play_at"]
+check("tail-hold: frontier growth resumes near the write head",
+      view._chase_hold is None and len(pas) == 1
+      and abs(pas[0][1] - 344.0) < 0.5
+      and not view._dvr_status.isVisible(),
+      f"play_at={pas} hold={view._chase_hold}")
+
+# ...but sub-margin growth on a diverged axis must keep holding — the old
+# negative-ahead deadlock must not turn into a resume with no data
+view._chase_hold = [349.0, VT["t"], 340.0]
+view._dvr_content_s = 42.0             # frontier 342: 2 s grown < margin
+view.vlc.commanded.clear()
+view._chase_hold_tick(VT["t"])
+check("tail-hold: sub-margin growth keeps holding",
+      view._chase_hold is not None
+      and not [c for c in view.vlc.commanded if c[0] == "play_at"],
+      f"hold={view._chase_hold} cmd={view.vlc.commanded}")
+
 # no data for _HOLD_GIVE_UP_S: give up to the plain-live fallback ladder
 view._mode = "chase"
 view.dvr = FakeDVR(bufpath)

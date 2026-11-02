@@ -133,6 +133,7 @@ class LocalSubTap(QtCore.QObject):
         self._alive = True
         self._restart = False
         self._prefer = "eng"
+        self._prefer_track = None    # explicit track pick (see relay)
         self._path = ""
         self._thread = None
         self._container = ""
@@ -176,6 +177,30 @@ class LocalSubTap(QtCore.QObject):
         if not prefer or prefer == self._prefer:
             return False
         self._prefer = prefer
+        self._prefer_track = None   # a language switch retires any
+        #                        # explicit track pick
+        th = self._thread
+        if th is not None and th.is_alive():
+            self._restart = True
+        else:
+            self._restart = False
+            self._thread = threading.Thread(
+                target=self._scan, args=(self._path,), daemon=True,
+                name="mtp-filetap")
+            self._thread.start()
+        return True
+
+    def set_selected_track(self, n) -> bool:
+        """CC-menu pick of a SPECIFIC embedded text track (same contract
+        as VodRelay.set_selected_track): re-scan pinned to that track.
+        MKV only — the MP4 parser has no track numbers to pin."""
+        if self._container != "mkv":
+            return False
+        if n is None or n == self._prefer_track:
+            return False
+        if n not in (self.parser_tracks or {}):
+            return False
+        self._prefer_track = n
         th = self._thread
         if th is not None and th.is_alive():
             self._restart = True
@@ -202,12 +227,18 @@ class LocalSubTap(QtCore.QObject):
     def _scan_mkv(self, path: str):
         with open(path, "rb") as f:
             parser = MkvSubParser(prefer_language=self._prefer)
+            if self._prefer_track is not None:
+                # explicit pick outranks every language policy (the
+                # assignment makes _select_track a no-op)
+                parser._selected = self._prefer_track
             self._snap(parser)
             while self._alive:
                 if self._restart:
                     self._restart = False
                     f.seek(0)
                     parser = MkvSubParser(prefer_language=self._prefer)
+                    if self._prefer_track is not None:
+                        parser._selected = self._prefer_track
                 chunk = f.read(_CHUNK)
                 if not chunk:
                     break

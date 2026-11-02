@@ -36,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from PyQt5 import QtCore
 
-from .mkv_subs import MkvSubParser, _vint_size
+from .mkv_subs import MkvSubParser, _vint_size, lang_token
 from .mp4_subs import Mp4SubParser
 
 log = logging.getLogger("mtp")
@@ -260,6 +260,9 @@ class VodRelay(QtCore.QObject):
         self._client_lock = threading.Lock()
         self._client_socks = set()
         self._prefer = "eng"        # preferred subtitle language (tap)
+        self._prefer_track = None   # an explicit track NUMBER the user
+        #                            # picked (outranks _prefer; see
+        #                            # set_selected_track)
         self._tap_restart = False   # re-select the tap's track on the
         #                            # next loop pass (set_prefer_language)
         self.parser_tracks = {}     # {mkv track number: codec id} — the
@@ -938,9 +941,20 @@ class VodRelay(QtCore.QObject):
                                   in self.parser_tracks_meta.items()}
             parser._select_track()
             parser._saw_tracks = True
+        self._apply_track_pick(parser)
         self._parser = parser
         threading.Thread(target=self._tap_cache, daemon=True,
                          name="mtp-tap").start()
+
+    def _apply_track_pick(self, parser):
+        """Pin a fresh parser to the explicitly picked track, if any
+        (set_selected_track). Assigning _selected also makes the coming
+        _select_track a no-op — the pick outranks every language
+        policy. Safe on a parser whose meta never lands: block
+        filtering keys on the track number alone."""
+        n = self._prefer_track
+        if n is not None:
+            parser._selected = n
 
     def set_prefer_language(self, prefer: str) -> bool:
         """User picked a different subtitle language in the CC menu: the
@@ -953,9 +967,32 @@ class VodRelay(QtCore.QObject):
         prefer = (prefer or "").lower()
         if prefer and prefer != self._prefer:
             self._prefer = prefer
+            self._prefer_track = None   # a language switch retires any
+            #                            # explicit track pick
             self._tap_restart = True
             return True
         return False
+
+    def set_selected_track(self, n) -> bool:
+        """User picked a SPECIFIC embedded text track in the CC menu:
+        re-target the tap's parser at that track number (same re-anchor
+        + backfill machinery as a language switch). The tap's selection
+        is otherwise language-keyed and one-per-language — on the
+        Netflix WEB-DL layout ('English (forced)', 'English', 'English
+        (SDH)') every English row would render the same near-empty
+        forced cues without this. Returns True when the target changed
+        (the caller drops the old track's cues from the store then)."""
+        if n is None or n == self._prefer_track:
+            return False
+        if n not in (self.parser_tracks or {}):
+            return False
+        self._prefer_track = n
+        meta = (self.parser_tracks_meta or {}).get(n) or {}
+        lang = lang_token(meta.get("lang") or "")
+        if lang:
+            self._prefer = lang   # future parsers stay in the family
+        self._tap_restart = True
+        return True
 
     def _tap_cache(self):
         """Thread: tail the cache from byte 0, feeding the streaming MKV
@@ -994,6 +1031,7 @@ class VodRelay(QtCore.QObject):
                                           for n, m in keep.items()}
                     parser._select_track()
                     parser._saw_tracks = True
+                self._apply_track_pick(parser)
                 # rewind coverage: re-parse the whole window from its
                 # start on a side thread (re-emitted cues dedupe
                 # downstream on (start, text))
@@ -1023,6 +1061,7 @@ class VodRelay(QtCore.QObject):
                     parser._saw_tracks = True
                     if keep_sel is not None:
                         parser._selected = keep_sel
+                self._apply_track_pick(parser)
             if parser._track_meta and (
                     len(parser._track_meta) != len(self.parser_tracks_meta)
                     or self.parser_selected != parser._selected):
@@ -1101,6 +1140,7 @@ class VodRelay(QtCore.QObject):
             parser._track_meta = {n: dict(m) for n, m in meta.items()}
             parser._select_track()
             parser._saw_tracks = True
+        self._apply_track_pick(parser)
         pos = 0
         gen = self.cache_gen
         while self._alive and pos < self.cache_size:
@@ -1134,6 +1174,7 @@ class VodRelay(QtCore.QObject):
             parser._track_meta = {n: dict(m) for n, m in meta.items()}
             parser._select_track()
             parser._saw_tracks = True
+        self._apply_track_pick(parser)
         pos = 0
         tail = self._tail
         start = _snap_cluster(tail)

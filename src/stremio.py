@@ -460,8 +460,14 @@ def probe_debrid(url: str, timeout_s: float = 3.0,
 # naming / season-episode parsing
 
 _SE_RES = [
-    re.compile(r"\bS(?P<s>\d{1,2})\s*E(?P<e>\d{1,3})\b", re.IGNORECASE),
-    re.compile(r"\b(?P<s>\d{1,2})x(?P<e>\d{2,3})\b"),
+    # the E-chain tail accepts multi-episode files ('S05E26E27',
+    # 'S01E01-E02'): without it the \b after the episode digits can't
+    # match before the next 'E' and the WHOLE name parses as a movie —
+    # Paw.Patrol.S05E26E27 lost its episode buttons, lookahead and
+    # autoplay to the movie fallback (live-seen 2026-10-31 13:42)
+    re.compile(r"\bS(?P<s>\d{1,2})\s*E(?P<e>\d{1,3})"
+               r"(?:\s*[-_.]?\s*E\d{1,3}){0,3}\b", re.IGNORECASE),
+    re.compile(r"\b(?P<s>\d{1,2})x(?P<e>\d{2,3})(?:x\d{2,3}){0,3}\b"),
 ]
 
 # anime/episode packs number files absolutely, no season marker:
@@ -495,20 +501,41 @@ def parse_abs_episode(text: str):
 
 def parse_se(text: str):
     """(season, episode) parsed from a torrent/file name, or None."""
+    rng = parse_se_range(text)
+    return (rng[0], rng[1]) if rng else None
+
+
+def parse_se_range(text: str):
+    """(season, first_episode, last_episode) of a name's S/E marker.
+    Multi-episode releases span a range ('S05E26E27' -> (5, 26, 27),
+    'S01E01-E02-E03' -> (1, 1, 3)); a single marker gives first == last.
+    None when the name carries no marker at all (movies, absolute
+    numbering)."""
     if not text:
         return None
     for rx in _SE_RES:
         m = rx.search(text)
         if m:
             s, e = int(m.group("s")), int(m.group("e"))
-            if 0 <= s <= 100 and 1 <= e <= 500:
-                return s, e
+            if not 0 <= s <= 100 or not 1 <= e <= 500:
+                continue
+            last = e
+            for tok in re.findall(r"E(\d{1,3})|x(\d{2,3})",
+                                  m.group(0), re.IGNORECASE):
+                for v in tok:
+                    if v and e <= int(v) <= 500:
+                        last = max(last, int(v))
+            return s, e, last
     return None
 
 
 _JUNK_RES = [
-    re.compile(r"\bS\d{1,2}\s*E\d{1,3}\b.*$", re.IGNORECASE),
-    re.compile(r"\b\d{1,2}x\d{2,3}\b.*$", re.IGNORECASE),
+    # chain-aware like _SE_RES: on 'S05E26E27…' the plain form's \b
+    # failed between '6' and 'E', the marker never stripped, and the
+    # catalog query carried the whole episode-title tail
+    re.compile(r"\bS\d{1,2}\s*E\d{1,3}(?:\s*[-_.]?\s*E\d{1,3})*\b.*$",
+               re.IGNORECASE),
+    re.compile(r"\b\d{1,2}x\d{2,3}(?:x\d{2,3})*\b.*$", re.IGNORECASE),
     # whole tokens only: an unbounded alternation ate 'DV' out of the
     # middle of 'Adventure' (-> 'A enture Time', a query no catalog title
     # can ever word-match) and 'MULTI' out of 'Multiverse' — the strict
@@ -1377,12 +1404,15 @@ def search_online_subtitles(kind: str, imdb: str, season: int = 0,
             label = str(s.get("label") or "")
             if not movie:
                 want_se = (int(season or 0), int(episode or 0))
-                fname_se = parse_se(fname) or parse_se(release)
-                if fname_se is not None:
+                fname_rng = parse_se_range(fname) or parse_se_range(release)
+                if fname_rng is not None:
                     # the entry's own name is ground truth: a listing's
                     # S/E fields lie sometimes (live-measured: an S08E02
-                    # file listed under 1:1) — trust the marker
-                    if fname_se != want_se:
+                    # file listed under 1:1) — trust the marker. A
+                    # multi-episode sub ('S05E26E27') covers every
+                    # episode in its span
+                    fs, fe0, fe1 = fname_rng
+                    if fs != want_se[0] or not fe0 <= want_se[1] <= fe1:
                         continue      # the FILE itself is another episode
                 elif s.get("season") is not None \
                         and s.get("episode") is not None:
@@ -1964,7 +1994,8 @@ def resolve_identity(url: str, server: StreamingServer):
             if disp and (parse_se(disp) or _opaque_tail(tail)):
                 file_name = disp
 
-    se = parse_se(file_name) or parse_se(torrent_name)
+    rng = parse_se_range(file_name) or parse_se_range(torrent_name)
+    se = (rng[0], rng[1]) if rng else None
     abs_ep = None
     if not se:
         # the played file carries no season marker, but an absolute
@@ -2090,12 +2121,18 @@ def resolve_identity(url: str, server: StreamingServer):
         episode_name = _episode_title(meta, season, episode)
     except Exception:  # noqa: BLE001
         pass
-    return {
+    ident = {
         "stremio_imdb": hit[0], "series_name": hit[1],
         "season": season, "episode": episode,
         "episode_name": episode_name,
         "torrent_name": torrent_name, "file_name": file_name,
     }
+    if rng and rng[2] > episode:
+        # a multi-episode file ('S05E26E27'): the viewer watched through
+        # rng[2] — autoplay/next must resume AFTER the range end, or the
+        # next click replays the second half of this very file
+        ident["episode_end"] = rng[2]
+    return ident
 
 
 def url_episode_seed(url: str) -> dict:
@@ -2118,10 +2155,13 @@ def url_episode_seed(url: str) -> dict:
         tail = unquote(tail)
     except Exception:  # noqa: BLE001
         pass
-    se = parse_se(tail)
+    se = parse_se_range(tail)
     if not se:
         return {}
-    return {"season": se[0], "episode": se[1], "file_name": tail}
+    seed = {"season": se[0], "episode": se[1], "file_name": tail}
+    if se[2] > se[1]:
+        seed["episode_end"] = se[2]
+    return seed
 
 
 def playable_from_url(url: str) -> dict:
@@ -2205,9 +2245,15 @@ def _adjacent_playable(config, cur: dict, step: int):
 
     season = int(cur.get("season") or 0)
     episode = int(cur.get("episode") or 0)
+    try:
+        ep_hi = int(cur.get("episode_end") or 0)
+    except (TypeError, ValueError):
+        ep_hi = 0
     meta = series_meta(imdb)
     if step > 0:
-        nxt = next_episode(meta, season, episode)
+        # a multi-episode file ('S05E26E27') already played through
+        # ep_hi — next resumes AFTER the range end, never inside it
+        nxt = next_episode(meta, season, max(episode, ep_hi))
     else:
         nxt = prev_episode(meta, season, episode)
     if not nxt:

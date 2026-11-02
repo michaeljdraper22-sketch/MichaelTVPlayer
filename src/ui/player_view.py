@@ -8,6 +8,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 from datetime import datetime
@@ -15,6 +16,7 @@ from datetime import datetime
 from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..dvr import VlcRecorder
+from ..gopindex import GopIndex
 from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
 from .. import profanity as prof_mod
 from ..catchup_relay import CatchupRelay
@@ -151,7 +153,17 @@ _CHASE_RETRY_DELAYS = (10.0, 30.0)
 # otherwise), then resume FORWARD from the freeze point — a freeze during
 # a provider lull, never a rewind. No data within the give-up window hands
 # over to the plain-live fallback ladder (which retries chase on backoff).
-_HOLD_RESUME_AHEAD_S = 6.0
+# 2026-11-01 (NFL RedZone 16:24-16:27): the frontier can sit tens of
+# seconds BELOW the freeze point — the 15 s burst-cap under-credits a flaky
+# evening, and a recorder-watchdog restart rebases the content clock — so
+# "data ahead of the freeze point" stayed negative forever while the
+# stream was already back; the hold sat out the whole 45 s give-up and the
+# user refreshed manually. The hold now ALSO resumes on fresh frontier
+# credit since it began (see _chase_hold_tick), and the margin itself came
+# down 6 -> 4: on a continuous-PCR feed the head jumps the outage length
+# the instant data returns, so the margin only gates the renumbered case —
+# 4 s still avoids a resume -> re-hold cycle on a trickle return.
+_HOLD_RESUME_AHEAD_S = 4.0
 _HOLD_GIVE_UP_S = 45.0
 # Dead-open rescue: a chase (re)open that ends WITHOUT ever reaching a
 # playing tick (e.g. a start-time past the file's write head) leaves
@@ -167,10 +179,16 @@ _CHASE_OPEN_DEAD_S = 10.0
 # Lag governor: every bridged provider cut freezes the decoder 1-3 s while
 # the write head advances; over a flappy evening (164 cuts that night) the
 # display drifted 86 s behind with the controller never reclaiming it.
-# Whenever REAL content confirmed ahead of the viewer exceeds the chase
-# delay by this much, jump FORWARD to (head - chase_delay) — a skip over
-# backlogged content the viewer already missed, never a replay.
-_LAG_GOV_TRIGGER_S = 10.0
+# Originally fired at 10 s behind, but on a burst-gap leg (2026-10-29 Fox,
+# ~30 s bursts with 6-12 s dead gaps) it yanked the viewer to head-5s and
+# every gap then became a skip->freeze cycle — the user's verdict: sitting
+# a few seconds behind is ALWAYS preferable to a skip. Now a distant
+# safety valve only: fire when REAL confirmed content ahead exceeds the
+# chase delay by this much, and land _LAG_GOV_LAND_BEHIND_S behind the
+# head, not chase_delay, so even a pathological evening (the 86 s drift)
+# recovers in gentle increments instead of one giant jump.
+_LAG_GOV_TRIGGER_S = 60.0
+_LAG_GOV_LAND_BEHIND_S = 20.0
 _LAG_GOV_COOLDOWN_S = 20.0
 # Collapsed-edge guard: a rescue that re-seeded the caption clock near 0
 # leaves the dead-reckoned edge minutes below CONFIRMED buffer data, and
@@ -334,6 +352,26 @@ _VOD_MUTE_LEAD_S = 0.4
 # Capped at 4x: VLC mutes the audio output entirely above ~4x playback
 # speed ("fast forward 5x goes silent").
 _SPEEDS = (0.125, 0.25, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 4.0)
+
+# ---- GOP-anchored seeks (2026-11-01 RedZone "blurry rewind" fix) ----
+# VLC 3's TS demuxer has no seek index: every set_time is a byte estimate
+# that can start the H.264 decoder MID-GOP, on P-frames whose reference
+# frames were never decoded. Measured on the real provider recording with
+# the bundled VLC 3.0.23 (tools/gop_pixel_probe.py): a mid-GOP set_time
+# blacked the picture out ~2.0 s (the "pause while it loads"), and a
+# mid-GOP :start-time reopen showed ~1 GOP of smeared, healing frames —
+# at 0.125x/0.25x slow-mo one damaged GOP (2.5 s content) stays on screen
+# 10-20 wall-seconds (the "blurry when I rewind / change the speed").
+# Anchoring the seek just BEFORE the previous IDR recovers in ~0.4 s with
+# a clean picture. src.gopindex.py builds the IDR list of the growing
+# buffer in the background; these knobs shape its use:
+_GOP_ANCHOR_GUARD_S = 0.35    # land this far before the IDR (set_time)
+_GOP_ANCHOR_GUARD_OPEN_S = 0.6    # reopens overshoot +0.2..0.7 late
+_GOP_MAX_BACK_S = 8.0         # anchor only within this distance below the
+#                              # target — beyond it the UX shift beats the
+#                              # GOP damage (long-GOP or torn-index night)
+_GOP_SCAN_PERIOD_S = 2.0      # background index cadence behind the head
+_SCRUB_PREVIEW_S = 0.35       # drag-preview seek throttle (slider moved)
 
 # ---- stage-1 live-caption sync diagnosis (measurement only) ----
 # Every timing-axis sample / decision lands on the "mtp.sync" logger
@@ -789,6 +827,13 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_esc_strikes = 0    # escalation backoff ladder position
         self._seek_esc_ok_at = 0.0    # earliest next escalation (now_s axis)
         self._seek_esc_clean = 0.0    # last clean verify (strike decay)
+        self._gop = None              # GopIndex over the chase buffer (see
+        #                              # _GOP_ANCHOR_GUARD_S block) — starts
+        #                              # with the buffer, dies with chase
+        self._gop_path = None         # buffer path the index belongs to
+        self._gop_stop = None         # threading.Event for the scan thread
+        self._gop_thread = None
+        self._scrub_prev_t = 0.0      # last drag-preview seek (slider)
         self._raw_win = []            # WP2 (c): rolling (now, raw) window
         self._trickle_hold = False    # frames trickling: clocks hold
         self._cap_raw_clock = None    # caption clock at raw's last CHANGE
@@ -862,6 +907,12 @@ class PlayerView(QtWidgets.QWidget):
         #                               # subs): the delta between calls
         #                               # is the nudge
         self._relay_cues_seen = False # the relay/file tap delivered ANY cue
+        self._relay_cue_count = 0     # ...and how many (a forced track on
+        #                              # a native-language show delivers
+        #                              # near-zero — count, not presence,
+        #                              # is the starvation evidence)
+        self._filter_tap_starved = False  # one-shot grace timer armed (see
+        #                              # _filter_sub_check)
         #                              # this media — MP4s expose no track
         #                              # list, so cue arrival is the only
         #                              # "text exists here" evidence they get
@@ -2175,6 +2226,8 @@ class PlayerView(QtWidgets.QWidget):
         self._stremio_sub_path = ""
         self._sub_dialog_delay_ms = 0
         self._relay_cues_seen = False
+        self._relay_cue_count = 0
+        self._filter_tap_starved = False
         # any in-flight online-subtitle job belongs to the OLD media: its
         # callback drops on the generation guard, and the dead-end state
         # that armed it is gone with the old cur
@@ -2477,6 +2530,10 @@ class PlayerView(QtWidgets.QWidget):
                 ident.get("series_name", "Series"),
                 int(ident.get("season") or 0),
                 int(ident.get("episode") or 0))
+            ep_hi = int(ident.get("episode_end") or 0)
+            if ep_hi > int(ident.get("episode") or 0):
+                # multi-episode file ('S05E26E27'): show the whole span
+                title += "\u2013E%02d" % ep_hi
             if ident.get("episode_name"):
                 title += " %s" % ident["episode_name"]
             # series identifications log like the movie branch does —
@@ -4097,6 +4154,82 @@ class PlayerView(QtWidgets.QWidget):
             self._vid_s = 0.0
             self._last_raw = None
 
+    # ---- GOP-anchored transports (see _GOP_ANCHOR_GUARD_S block) ----
+
+    def _gop_ensure(self):
+        """Keep the IDR index alive for the CURRENT chase buffer: start the
+        background scanner when chase engages (or the buffer file was
+        replaced), stop it everywhere else. Cheap enough for every tick —
+        the hot path is one string compare."""
+        want = None
+        if self._mode == "chase" and self.dvr is not None:
+            try:
+                p = self.dvr.file_path
+                if p and os.path.exists(p):
+                    want = p
+            except Exception:  # noqa: BLE001
+                want = None
+        if want == self._gop_path and (self._gop_thread is not None
+                                       or self._gop is not None):
+            return
+        self._gop_teardown()
+        if not want:
+            return
+        self._gop = GopIndex(want)
+        self._gop_path = want
+        self._gop_stop = threading.Event()
+        g, stop = self._gop, self._gop_stop
+
+        def _scan_loop():
+            while not stop.wait(_GOP_SCAN_PERIOD_S):
+                try:
+                    g.scan()
+                except Exception:  # noqa: BLE001
+                    pass               # next cadence retries; never crash
+
+        t = threading.Thread(target=_scan_loop, name="mtp-gop",
+                             daemon=True)
+        t.start()
+        self._gop_thread = t
+        try:
+            log.info("gop index: scanning %s", os.path.basename(want))
+        except Exception:
+            pass
+
+    def _gop_teardown(self):
+        if self._gop_stop is not None:
+            self._gop_stop.set()
+        self._gop_thread = None
+        self._gop_stop = None
+        if self._gop is not None:
+            try:
+                self._gop.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._gop = None
+        self._gop_path = None
+
+    def _gop_anchor_vlc(self, vlc_t: float,
+                        guard_s: float = _GOP_ANCHOR_GUARD_S):
+        """Snap a raw-axis seek target down to just before the IDR at/below
+        it (None = no usable anchor — early buffer, scan lag, or the target
+        is already near a keyframe's start). The caller falls back to the
+        exact target, which is what pre-2026-11 behavior did."""
+        g = self._gop
+        if g is None or vlc_t is None:
+            return None
+        try:
+            a = g.anchor_for(float(vlc_t), max_back_s=_GOP_MAX_BACK_S)
+        except Exception:  # noqa: BLE001
+            return None
+        if a is None:
+            return None
+        a -= guard_s
+        if a < 0.0 or not (0.0 < float(vlc_t) - a
+                           <= _GOP_MAX_BACK_S + guard_s):
+            return None
+        return a
+
     def _chase_seek(self, target_s: float, resume: bool = False,
                     jump_live: bool = False):
         """Seek within the chase buffer — and revive a dead player.
@@ -4125,6 +4258,7 @@ class PlayerView(QtWidgets.QWidget):
         if not (self._mode == "chase" and self.dvr):
             return
         self._chase_hold = None   # any transport supersedes a tail-hold
+        self._clear_stall_note()  # ...and must not leave its pill up
         target_s = float(target_s)
         if jump_live:
             back = _chase_jump_back_s(self._cc_lag)
@@ -4144,20 +4278,36 @@ class PlayerView(QtWidgets.QWidget):
         else:
             target = self._safe_seek_target(target_s)
         vlc_t = 0.0 if target <= 0.0 else self._cap_vlc_time_for(target)
+        # GOP-anchored landing: snap down to just before the IDR at/below
+        # the target so the decoder starts on a keyframe (see the
+        # _GOP_ANCHOR_GUARD_S block). The seek/verify/caption seed below
+        # all use the ANCHORED numbers — playback, the clock and the
+        # scrubber must agree on where the viewer actually landed.
+        gop = self._gop_anchor_vlc(vlc_t)
+        if gop is not None and target > 0.0:
+            log_anchor = gop
+            vlc_t = gop
+            target = self._cap_content_for_raw(vlc_t)
+        else:
+            log_anchor = None
         try:
             log.info("chase seek: target=%.1fs safe=%.1fs vlc=%.1fs "
-                     "frontier=%.1fs edge=%.1fs div=%s%s",
+                     "frontier=%.1fs edge=%.1fs div=%s%s%s",
                      target_s, target, vlc_t, self._frontier_s(),
                      self._cap_edge_s(),
                      "-" if not self._cap_div_ok
                      else "%.1f" % self._cap_div_s,
-                     " jump_live" if jump_live else "")
+                     " jump_live" if jump_live else "",
+                     "" if log_anchor is None
+                     else " gop=%.2f" % log_anchor)
         except Exception:
             pass
         self._sync_transport("chase_seek" if not jump_live else "jump_edge",
                              target_s,
-                             extra="safe=%.2f vlc=%.2f resume=%s"
-                             % (target, vlc_t, resume))
+                             extra="safe=%.2f vlc=%.2f resume=%s%s"
+                             % (target, vlc_t, resume,
+                                "" if log_anchor is None
+                                else " gop=%.2f" % log_anchor))
         try:
             down = self.vlc.state_name() in ("ended", "stopped", "error")
         except Exception:  # noqa: BLE001
@@ -4276,6 +4426,13 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_started = False   # re-armed by the first playing tick
         self._stall_ticks = 0
         self._last_reopen = now_s()
+        # GOP-anchor the reopen too: a fresh open at a mid-GOP :start-time
+        # shows a smeared GOP (see _GOP_ANCHOR_GUARD_OPEN_S) — reopens land
+        # +0.2..0.7 s past the requested time, so the deeper guard.
+        gop = self._gop_anchor_vlc(vlc_t, guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+        if gop is not None:
+            vlc_t = gop
+            target = self._cap_content_for_raw(vlc_t)
         self._vid_s = target
         self._cap_seed_transport(target)
         self.vlc.play_at(buf, vlc_t)
@@ -4465,6 +4622,47 @@ class PlayerView(QtWidgets.QWidget):
 
     def _on_slider_moved(self, _v):
         self._seeking = True
+        self._scrub_preview()
+
+    def _scrub_preview(self):
+        """Live drag preview: while the scrubber handle is being dragged,
+        seek the player there (throttled to _SCRUB_PREVIEW_S) so the PICTURE
+        follows the drag instead of freezing until release. Chase-mode
+        previews land on GOP anchors (keyframe thumbnails, like every
+        scrubber the user has used); VOD previews are plain set_time calls
+        (indexed containers already seek clean). The release handler
+        (_on_slider_released) still performs the authoritative seek and
+        owns the caption clock / seek-verify state — previews deliberately
+        skip both."""
+        if self._closing or getattr(self.slider, "_win_mode", False):
+            return
+        now = now_s()
+        if now - self._scrub_prev_t < _SCRUB_PREVIEW_S:
+            return
+        self._scrub_prev_t = now
+        val = self.slider.value()
+        if val <= 0:
+            return
+        try:
+            if self._mode == "chase" and self.dvr:
+                content = self._cap_content_for_raw(val / 1000.0)
+                vlc_t = self._cap_vlc_time_for(
+                    self._safe_seek_target(content))
+                if vlc_t <= 0.0:
+                    return
+                gop = self._gop_anchor_vlc(vlc_t)
+                if gop is not None:
+                    vlc_t = gop
+                # a preview supersedes any pending seek verification (the
+                # drag moved the target); the release re-arms it.
+                self._seek_verify = None
+                self.vlc.set_time(int(vlc_t * 1000))
+                self._vid_s = self._cap_content_for_raw(vlc_t)
+                self._last_raw = None
+            elif not self._is_catchup() and self.vlc.get_length() > 0:
+                self.vlc.set_time(val)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _on_slider_released(self):
         self._wake()
@@ -4492,6 +4690,7 @@ class PlayerView(QtWidgets.QWidget):
             # ALWAYS clear the drag flag — a stuck True froze the scrubber
             # timestamps until the next successful drag.
             self._seeking = False
+            self._scrub_prev_t = 0.0   # next drag previews immediately
 
     # ---- chase mode (single connection: the recorder owns the stream) ----
     def _engage_chase(self):
@@ -4546,6 +4745,7 @@ class PlayerView(QtWidgets.QWidget):
         does the display player dial the live URL again.
         """
         self._mode = "live"
+        self._gop_teardown()     # the buffer (and its IDR index) is going
         self._chase_paused = False
         self._dvr_t0 = None
         self._dvr_base = 0.0
@@ -4621,6 +4821,22 @@ class PlayerView(QtWidgets.QWidget):
                 lambda: self._set_dvr_status("")
                 if self._dvr_status.text() == text else None)
 
+    def _clear_stall_note(self):
+        """Hide the tail-hold pill once the hold it describes is over.
+
+        The stall note is shown with clear_after_ms=0 (it stays accurate
+        for as long as the hold lasts), so every path that ends a hold
+        without its own pill write must clear it here. On 2026-11-01
+        16:25 a superseding transport (_chase_seek revive) resumed
+        playback while the note stayed up for two more minutes, until a
+        manual stream refresh. Only the stall text is touched — a newer
+        note owns the pill."""
+        try:
+            if self._dvr_status.text().startswith("Signal stalled"):
+                self._set_dvr_status("")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _reopen_display(self, at: float = None) -> bool:
         """(Re)open whatever the display player should be showing right now —
         the DVR buffer in chase mode, otherwise the current URL — with the
@@ -4637,11 +4853,21 @@ class PlayerView(QtWidgets.QWidget):
             self._chase_started = False
             self._stall_ticks = 0
             self._last_reopen = now_s()
+            # GOP-anchored landing (deeper guard: :start-time reopens land
+            # +0.2..0.7 s past the request, so anchor further back) — see
+            # the _GOP_ANCHOR_GUARD_S block. The seed/verify below use the
+            # ANCHORED target: the clock must say where playback really
+            # starts, or the tick's verify reads a false miss.
+            vlc_t = self._cap_vlc_time_for(target)
+            gop = self._gop_anchor_vlc(vlc_t,
+                                       guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+            if gop is not None:
+                vlc_t = gop
+                target = self._cap_content_for_raw(vlc_t)
             # a (re)open AT a position is a transport event: it seeds the
             # caption clock and the live-edge backlog by construction
             # (voiding the axis divergence — vlc_t is target itself)
             self._cap_seed_transport(target)
-            vlc_t = self._cap_vlc_time_for(target)
             self.vlc.play_at(buf, vlc_t)
             # ...and it is verified like every other transport (see
             # _chase_revive): an :start-time miss on the growing file
@@ -4718,6 +4944,7 @@ class PlayerView(QtWidgets.QWidget):
                      self.dvr is not None, self.vlc.is_busy())
         except Exception:
             pass
+        self._gop_teardown()     # no buffer -> no IDR index to keep
         if self.dvr:
             d = self.dvr
             self.dvr = None
@@ -4927,10 +5154,13 @@ class PlayerView(QtWidgets.QWidget):
         if hold is None or self._closing \
                 or not (self._mode == "chase" and self.dvr):
             self._chase_hold = None
+            self._clear_stall_note()
             return
         if self._chase_paused:
             return      # a user pause outranks the hold; resume handles it
-        freeze, since = hold
+        freeze = hold[0]
+        since = hold[1]
+        entry_fr = hold[2] if len(hold) > 2 else self._frontier_s()
         if self._cc_head_pcr is None \
                 or now - self._cc_head_pcr[1] > 2.0:
             self._cc_probe_head_pcr()   # ~20 ms, throttled to ~2/s
@@ -4938,13 +5168,29 @@ class PlayerView(QtWidgets.QWidget):
         # hair behind): PCR head when the pins exist, confirmed frontier
         # otherwise. Both only ever count content that is really on disk.
         ahead = self._head_ahead_s(freeze)
-        if ahead is not None and ahead >= _HOLD_RESUME_AHEAD_S:
-            at = max(0.0, min(freeze, self._frontier_s() + 60.0))
+        # Axis-agnostic backup (2026-11-01 RedZone): the frontier can sit
+        # far BELOW the freeze point — the burst cap under-credits a flaky
+        # evening and a recorder-watchdog restart rebases the content
+        # clock — leaving "ahead" permanently negative while the stream
+        # was already back. Fresh frontier credit since the hold began
+        # proves data returned no matter how the axes drifted; landing
+        # just behind the write head is then a near-live jump (the content
+        # between freeze and here was never written), never a replay.
+        frontier = self._frontier_s()
+        grown = frontier - entry_fr
+        if (ahead is not None and ahead >= _HOLD_RESUME_AHEAD_S) \
+                or grown >= _HOLD_RESUME_AHEAD_S:
+            if ahead is not None and ahead >= _HOLD_RESUME_AHEAD_S:
+                at = max(0.0, min(freeze, frontier + 60.0))
+                why = ("%.1fs of data past the freeze point" % ahead)
+            else:
+                at = max(0.0, min(freeze, frontier - 1.0))
+                why = ("frontier advanced %.1fs though it sits %.1fs "
+                       "below the freeze point" % (grown, freeze - frontier))
             self._chase_hold = None
             try:
-                log.warning("chase tail-hold: %.1fs of data past the "
-                            "freeze point — resuming at %.1fs (held "
-                            "%.1fs)", ahead, at, now - since)
+                log.warning("chase tail-hold: %s — resuming at %.1fs "
+                            "(held %.1fs)", why, at, now - since)
             except Exception:
                 pass
             self._set_dvr_status("")
@@ -5745,6 +5991,7 @@ class PlayerView(QtWidgets.QWidget):
         if self._mode == "chase" and self.dvr:
             gen = self._session   # the watchdog reopen must respect it
             self._note_dvr_data()
+            self._gop_ensure()    # IDR index alive for anchored seeks
             frontier = self._frontier_s()
             raw = self.vlc.get_time() / 1000.0
             now = now_s()
@@ -5892,7 +6139,10 @@ class PlayerView(QtWidgets.QWidget):
                     # endless short loop (2026-10-11 14:44) — so hold the
                     # frame instead and wait for data to resume INTO.
                     freeze = max(self._cap_clock_s, self._vid_s)
-                    self._chase_hold = [freeze, now]
+                    # [freeze point, held since, frontier at entry] — the
+                    # third element feeds the axis-agnostic resume backup
+                    # in _chase_hold_tick
+                    self._chase_hold = [freeze, now, self._frontier_s()]
                     self._seek_verify = None   # stale beside the hold
                     try:
                         log.warning("chase tail-hold: player reached the "
@@ -5927,8 +6177,11 @@ class PlayerView(QtWidgets.QWidget):
             # it — the "super stuttery" evening that ended with the user
             # 64+ s behind at the two-minute warning. Whenever confirmed
             # content runs this far past the chase distance ahead of the
-            # viewer, jump FORWARD to (head - chase_delay): a skip over
-            # backlogged content they already missed, never a replay.
+            # viewer, jump FORWARD to (head - _LAG_GOV_LAND_BEHIND_S):
+            # a skip over backlogged content they already missed, never
+            # a replay. Distant valve by design (2026-10-29): near-live
+            # drift is the viewer's preferred state, not something to
+            # skip over — see the constants above.
             # NEVER against a deliberate rewind: user-commanded transports
             # (_seek_ms / slider / jump-to-begin) set _lag_user_seek, and
             # only returning near the live distance clears it — otherwise
@@ -5961,10 +6214,11 @@ class PlayerView(QtWidgets.QWidget):
                     elif (ahead - self.config.chase_delay
                               > _LAG_GOV_TRIGGER_S
                           and now - self._lag_gov_last
-                          > _LAG_GOV_COOLDOWN_S):
+                              > _LAG_GOV_COOLDOWN_S):
                         self._lag_gov_last = now
-                        target = max(0.0, current + ahead
-                                     - self.config.chase_delay)
+                        behind = max(self.config.chase_delay,
+                                     _LAG_GOV_LAND_BEHIND_S)
+                        target = max(0.0, current + ahead - behind)
                         try:
                             log.warning("lag governor: %.1fs behind the "
                                         "head (frontier=%.1fs pos=%.1fs) "
@@ -5979,7 +6233,7 @@ class PlayerView(QtWidgets.QWidget):
                             pass
                         self._chase_note(
                             "Catching up to live \u2014 skipped %d s"
-                            % max(0, int(ahead - self.config.chase_delay)),
+                            % max(0, int(ahead - behind)),
                             clear_after_ms=2500)
                         self._chase_seek(target)
                         return
@@ -6660,6 +6914,56 @@ class PlayerView(QtWidgets.QWidget):
                     hint = words[0]
         return hint
 
+    def _relay_track_for_pick(self, src):
+        """Map the picked VLC track NAME to the relay/tap parser's MKV
+        track number. VLC names embedded tracks '<MKV Name> - [lang]'
+        and falls back to 'Track N' for unnamed ones (N counts the
+        SUBTITLE tracks in MKV order) — both resolve against the
+        parser's track metadata. None when nothing matches (external
+        slave files, bitmap picks, metadata not parsed yet)."""
+        meta = getattr(src, "parser_tracks_meta", None) or {}
+        if not meta:
+            return None
+        name = (self._spu_name or "").strip()
+        m = re.match(r"^(.*?)\s*-\s*\[[^\]]*\]$", name)
+        base = m.group(1).strip() if m else name
+        if not base:
+            return None
+        for n in sorted(meta):
+            tn = (meta[n].get("name") or "").strip()
+            if tn and (tn == base or base in tn or tn in base):
+                return n
+        m = re.fullmatch(r"Track (\d+)", base)
+        if m:
+            nums = sorted(meta)
+            i = int(m.group(1)) - 1
+            if 0 <= i < len(nums):
+                return nums[i]
+        return None
+
+    def _relay_follow_pick(self, src):
+        """Point the relay/file-tap parser at the track the user
+        actually picked. The tap's own selection is language-keyed and
+        picks ONE track per language: on the Netflix WEB-DL layout
+        ('English (forced)', 'English', 'English (SDH)') every English
+        row used to render the same near-empty FORCED cues — the 2026-
+        11-01 Love Is Blind night, three episodes with a green filter
+        dot and nothing on screen. Resolution is by name; a name that
+        doesn't map falls back to the language preference."""
+        if src is None:
+            return
+        try:
+            n = self._relay_track_for_pick(src)
+            if n is not None and hasattr(src, "set_selected_track"):
+                if src.set_selected_track(n):
+                    self._cap_cues.clear()   # the old track's cues go
+                return
+            if src.set_prefer_language(
+                    self._cap_lang_hint(self._spu_name) or "eng"):
+                self._cap_cues.clear()
+        except Exception:  # noqa: BLE001 - captions must never break
+            pass
+
     def _engage_caption_overlay(self):
         """The user picked a text subtitle track: render it in the app
         overlay with ONE style. Live: CCSource tails the DVR buffer (zero
@@ -6698,6 +7002,7 @@ class PlayerView(QtWidgets.QWidget):
                 if self._cap_store_ext:
                     self._cap_cues.clear()
                     self._cap_store_ext = False
+                self._relay_follow_pick(self._vod_relay)
                 self._set_cap_on(True)
                 self._schedule_cap_vod_check()
             else:
@@ -6722,21 +7027,13 @@ class PlayerView(QtWidgets.QWidget):
                     # an embedded pick takes the store back from a sidecar
                     self._cap_cues.clear()
                     self._cap_store_ext = False
+                self._relay_follow_pick(self._file_tap)
                 self._set_cap_on(True)
-                if self._file_tap.set_prefer_language(
-                        self._cap_lang_hint(self._spu_name)):
-                    self._cap_cues.clear()
                 self._schedule_cap_vod_check()
         elif self._is_vod():
             if self._vod_relay is not None:
                 self._set_cap_on(True)
-                if self._vod_relay.set_prefer_language(
-                        self._cap_lang_hint(self._spu_name)):
-                    # different language: the old cues in the store are
-                    # the wrong language now — drop them (the tap
-                    # re-anchors at the frontier immediately and
-                    # backfills the window behind it)
-                    self._cap_cues.clear()
+                self._relay_follow_pick(self._vod_relay)
                 # late pick on an already-running relay: verify the tap
                 # really has a matching text track (a dead tap or a
                 # bitmap-only pick hands rendering back to VLC)
@@ -8668,6 +8965,7 @@ class PlayerView(QtWidgets.QWidget):
         # only "text exists on this stream" evidence they ever get (the
         # filter dot + the filter's own online-sub hunt key off it)
         self._relay_cues_seen = True
+        self._relay_cue_count += 1
         # VOD subtitle tracks are pre-timed — no caption-lag lead, but the
         # measured ~0.5 s late-mute trim applies (see _VOD_MUTE_LEAD_S)
         self._filter_engine.add_cue(start, end, text,
@@ -8766,9 +9064,26 @@ class PlayerView(QtWidgets.QWidget):
                 3000, lambda: self._filter_sub_check(tries_left))
             return
         tracks = getattr(relay, "parser_tracks", None) or {}
-        if any(is_text_codec(c) for c in tracks.values()) \
-                or self._relay_cues_seen:
-            return          # embedded text feeds the tap; cues incoming
+        if self._relay_cue_count >= 6:
+            return          # embedded text is really flowing; all good
+        if any(is_text_codec(c) for c in tracks.values()):
+            # Text tracks exist, so the tap SHOULD feed everything — but
+            # the selection can still starve: a forced-only English set
+            # on a native-language show, or a dead tap, streams for many
+            # minutes without meaningful cues (the 2026-11-01 Love Is
+            # Blind night: green filter dot, ~zero windows). ONE bounded
+            # grace pass ~1 min in; still starved then, and the filter
+            # quietly hunts online after all — the fetch feeds it
+            # exactly like a handoff file (and engages captions too when
+            # the user had picked a track).
+            if not self._filter_tap_starved:
+                self._filter_tap_starved = True
+                QtCore.QTimer.singleShot(
+                    60000, lambda: self._filter_sub_check(tries_left=0))
+                return
+            if tries_left > 0:
+                return      # grace pending — the timer owns the verdict
+            # starved past the grace window: fall through and hunt below
         if getattr(relay, "tracks_verdict_ready", False):
             # MKV head parse FINISHED with no text track: nothing in
             # this file can ever feed the filter — hunt online
@@ -9618,6 +9933,10 @@ class PlayerView(QtWidgets.QWidget):
                 log.warning("stop: timer shutdown failed: %r", exc)
             except Exception:
                 pass
+        try:
+            self._gop_teardown()   # daemon thread, but stop it anyway
+        except Exception:  # noqa: BLE001
+            pass
         # Profanity filter / caption overlay: release the overlay's claim
         # on the caption sources, then kill the ffmpeg extractor and clear
         # the filter mute BEFORE the player goes away (engine.clear()
