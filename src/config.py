@@ -34,6 +34,15 @@ APP_NAME = "MichaelTVPlayer"
 # mapped — 'Track N', 'SDH', 'Forced' rows each render their own track
 # now); and a tap that streams 60 s without meaningful cues makes the
 # filter quietly hunt online after all.
+# Scrub wedge fix (Love Is Blind S11E06, 2026-11-02 00:08): a seek (or a
+# provider body-death reopen) rebases the cache window to an arbitrary
+# mid-block byte and restarts the subtitle parser there; when the byte
+# after the garbage id decoded as 0x00 — which can NEVER begin a size
+# vint — the parser waited for "more bytes" forever (90+ MB buffered,
+# zero cues; subtitles and muting dead until a stream reload). Mid-stream
+# parsers now resync to a verified cluster header at entry, and an
+# already-buffered 0x00 size byte is treated as garbage, not a chunk
+# edge (test_rebase_wedge.py; verified live against the real E06 seek).
 # 2.1.7: Stremio next-stream hardening after the 1000-lb Roomies S01E04
 # night (failure-video-sized debrid bodies detected dead, 30 s start-guard
 # window for throttled/relay links, autoplay switches the STREAM never the

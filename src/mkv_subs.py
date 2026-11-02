@@ -272,6 +272,14 @@ class MkvSubParser:
         self._cluster_tc = 0       # in TimecodeScale units
         self._tc_scale_ns = int(timecode_scale_ns) or 1_000_000
         self._saw_tracks = False
+        self._entry_synced = not self._mid_stream
+        #                     # a mid-stream join (cache rebase after a
+        #                     # seek / provider reopen, language re-anchor,
+        #                     # tail harvest) starts at an ARBITRARY
+        #                     # mid-block byte: resync to a verified
+        #                     # cluster header before parsing anything —
+        #                     # walking garbage as consumable elements
+        #                     # works only until it doesn't
         if mid_stream:
             # joining mid-file: wait for the next Cluster header (cluster
             # Timecodes are absolute, so cue times stay on file time)
@@ -303,6 +311,15 @@ class MkvSubParser:
         del-per-branch design dropped bytes that way and misaligned)."""
         out = []
         while True:
+            if self._mid_stream and not self._entry_synced:
+                # first act of a mid-stream join: find a VERIFIED
+                # cluster header (see _entry_synced). False = nothing
+                # verifiable buffered yet — wait for data, like every
+                # other break here.
+                if not self._resync():
+                    break
+                self._entry_synced = True
+                continue
             eid, ilen = _vint_size(self.buf, 0, keep_marker=True)
             if eid is None:
                 if self.buf and self.buf[0] == 0                         and self._stack[-1] == _CTX_CLUSTER:
@@ -312,6 +329,22 @@ class MkvSubParser:
                 break
             size, slen = _vint_size(self.buf, ilen, keep_marker=False)
             if size is None:
+                if ilen < len(self.buf) and self.buf[ilen] == 0 \
+                        and self._stack[-1] == _CTX_CLUSTER:
+                    # A 0x00 size byte can NEVER begin a size vint
+                    # (>8-byte length = invalid) — unlike a size vint
+                    # straddling the chunk edge, waiting can never
+                    # resolve it. Garbage at a rebase boundary (a seek
+                    # restarts the window at an arbitrary mid-block
+                    # byte) hit exactly this: the parse broke on every
+                    # pass while the buffer ballooned past 90 MB and
+                    # zero cues came out — subtitles and muting stayed
+                    # dead until a stream reload (live-seen 2026-11-02,
+                    # Love Is Blind E06 scrub). Resync to the next real
+                    # cluster instead of waiting on garbage forever.
+                    if not self._resync():
+                        break
+                    continue
                 break
             header = ilen + slen
             avail = len(self.buf) - header
