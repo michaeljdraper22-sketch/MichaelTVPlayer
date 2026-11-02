@@ -6826,6 +6826,18 @@ class PlayerView(QtWidgets.QWidget):
             tracks = self.vlc.spu_tracks()
         except Exception:  # noqa: BLE001
             tracks = []
+        # offline-repro hook (same spirit as VLCPlayer's extra_args):
+        # MTP_SPU_PICK=<name substring> simulates the user's CC track pick
+        # once VLC lists tracks, so the embedded path (engage -> relay
+        # restart -> tap -> overlay) can be driven end-to-end without
+        # synthetic input.
+        _pick = os.environ.get("MTP_SPU_PICK")
+        if _pick and tracks and not getattr(self, "_env_spu_done", False):
+            for _tid, _name in tracks:
+                if _pick.lower() in (_name or "").lower():
+                    self._env_spu_done = True
+                    self._select_spu(_tid, _name)
+                    break
         enabled = bool(tracks) or self._cap_on
         on = self._spu_want != -1 or self._cap_on
         streaming = self.current is not None

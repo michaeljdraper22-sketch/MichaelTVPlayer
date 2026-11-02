@@ -634,6 +634,37 @@ class VodRelay(QtCore.QObject):
                          len(self._tail), self._tail_base)
             except Exception:
                 pass
+            if self._tail_base == 0 and self._container == "mkv":
+                # The WHOLE file fits in the tail prefetch (small files;
+                # live-seen 2026-11-02: a 2.5 MB Stremio-handoff MKV in
+                # resume mode). VLC's opening walk is then served from
+                # _tail, so consumed bytes never land in the cache — and
+                # the tap is a cache reader: no Tracks element ever
+                # passes by, track metadata stays empty, and the
+                # one-shot tail harvest (which parses the tail's
+                # clusters into cues) refuses to start without metadata.
+                # A precondition deadlock: embedded subs rendered as
+                # "relay tap produced no track metadata" and zero cues
+                # forever. Break it by parsing the head metadata
+                # straight out of the tail prefix — the harvest then
+                # covers the cues.
+                parser = None
+                try:
+                    parser = MkvSubParser(prefer_language=self._prefer)
+                    parser.feed(self._tail[:_HEAD_PARSE_BYTES])
+                except Exception as exc:  # noqa: BLE001
+                    tlog("tail-head parse failed (%r)", exc)
+                    parser = None
+                if parser is not None and parser._track_meta:
+                    self.parser_tracks_meta = dict(parser._track_meta)
+                    self.parser_tracks = {
+                        num: m["codec"] for num, m
+                        in parser._track_meta.items()}
+                    self.parser_selected = parser._selected
+                    self.parser_scale_ns = parser._tc_scale_ns
+                    self.tracks_verdict_ready = True
+                    tlog("tail covers byte 0: head parsed from tail "
+                         "(%d tracks)", len(self.parser_tracks))
         except Exception as exc:  # noqa: BLE001
             try:
                 log.debug("vod splitter: tail prefetch skipped (%r)", exc)
