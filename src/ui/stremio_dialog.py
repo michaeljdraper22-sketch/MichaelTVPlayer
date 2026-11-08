@@ -235,8 +235,10 @@ class StremioDialog(QtWidgets.QDialog):
     def _refresh_watch_status(self):
         from ..watchfolder import downloads_dir
         folder = downloads_dir()
-        running = bool(getattr(self.main_window, "_downloads_watcher",
-                               None))
+        # the watcher is process-global (app-parented — it must survive
+        # closing window #1 while other windows are open)
+        running = bool(getattr(
+            QtWidgets.QApplication.instance(), "_downloads_watcher", None))
         if not self.watch_chk.isChecked():
             self._set_status(self.watch_lbl, False,
                              "Off \u2014 playlist downloads are ignored")
@@ -471,22 +473,28 @@ class StremioDialog(QtWidgets.QDialog):
             self.watch_chk.isChecked()
         self.config.fetch_online_subs = self.subs_chk.isChecked()
         self.config.save()
-        # Apply the watcher change live when we can reach the running
-        # instance's watcher (the dialog's parent is the main window).
+        # Apply the watcher change live. The watcher is process-global and
+        # app-parented (one slot on the QApplication — see main.py), so it
+        # survives closing window #1 while other windows are open; its
+        # handoffs land on the most recently active window.
+        app = QtWidgets.QApplication.instance()
         win = self.main_window
-        if isinstance(win, QtWidgets.QWidget):
-            watcher = getattr(win, "_downloads_watcher", None)
-            try:
-                if self.watch_chk.isChecked():
-                    if watcher is None:
-                        from ..watchfolder import DownloadsWatcher
-                        watcher = DownloadsWatcher(parent=win)
-                        if watcher.start():
-                            watcher.handoff.connect(win.handle_handoff)
-                            win._downloads_watcher = watcher
-                elif watcher is not None:
-                    watcher.stop()
-                    win._downloads_watcher = None
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            watcher = getattr(app, "_downloads_watcher", None)
+            if self.watch_chk.isChecked():
+                if watcher is None:
+                    from ..watchfolder import DownloadsWatcher
+                    from .main_window import MainWindow
+                    watcher = DownloadsWatcher(parent=app)
+                    if watcher.start():
+                        watcher.handoff.connect(
+                            lambda args: (
+                                MainWindow.last_active() or win
+                            ).handle_handoff(args))
+                        app._downloads_watcher = watcher
+            elif watcher is not None:
+                watcher.stop()
+                app._downloads_watcher = None
+        except Exception:  # noqa: BLE001
+            pass
         super().accept()

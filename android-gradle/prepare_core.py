@@ -77,9 +77,33 @@ def read_app_version() -> str:
 
 
 def numeric_version(version: str) -> int:
-    """Digits of the version with dots stripped ("2.1" -> 21)."""
-    digits = re.sub(r"\D", "", version)
-    return int(digits) if digits else 1
+    """Monotonic Android versionCode from a dotted version.
+
+    Fixed 3-digit slots — major*10^6 + minor*10^4 + patch*10^2 + build —
+    so "2.1.9" -> 2010900 and "2.1.10" -> 2011000.  The old rule (all
+    digits, dots stripped) went BACKWARDS the moment the 4-part "2.1.3.1"
+    shipped: it produced 2131, while "2.1.9" would produce 219 — Android
+    refuses to install a versionCode below the installed one, so that APK
+    could never update a phone already on 2.1.3.1.
+    """
+    parts = []
+    for piece in str(version).strip().lstrip("vV").split("."):
+        digits = re.sub(r"\D", "", piece)
+        parts.append(int(digits) if digits else 0)
+    parts += [0, 0, 0, 0]
+    major, minor, patch, build = parts[:4]
+    return (major * 1_000_000 + minor * 10_000
+            + patch * 100 + build) or 1
+
+
+def current_gradle_version_code() -> int:
+    """The versionCode currently stamped in app/build.gradle (0 if none)."""
+    try:
+        text = APP_GRADLE.read_text(encoding="utf-8")
+    except OSError:
+        return 0
+    m = re.search(r"(?m)^\s*versionCode\s+(\d+).*MTP_VERSION_CODE", text)
+    return int(m.group(1)) if m else 0
 
 
 def copy_core_modules() -> list:
@@ -102,11 +126,22 @@ def write_init(version: str) -> Path:
 
 
 def rewrite_gradle_version(version: str, numeric: int) -> None:
-    """Update the MTP_VERSION_*-marked lines in app/build.gradle."""
+    """Update the MTP_VERSION_*-marked lines in app/build.gradle.
+
+    A versionCode below the one already stamped is a hard error: Android
+    refuses to install such an APK over the existing app, so letting the
+    build succeed would only produce an update nobody can install.
+    """
     try:
         text = APP_GRADLE.read_text(encoding="utf-8")
     except OSError as exc:
         fail("cannot read %s: %r" % (APP_GRADLE, exc))
+    previous = current_gradle_version_code()
+    if numeric < previous:
+        fail("versionCode would go BACKWARDS (%d -> %d for APP_VERSION %r): "
+             "Android refuses to install an APK whose versionCode is lower "
+             "than the installed one. Bump src/config.py APP_VERSION."
+             % (previous, numeric, version))
     code_line = ('%sversionCode %d  // MTP_VERSION_CODE '
                  '(managed by prepare_core.py — do not edit)')
     name_line = ('%sversionName "%s"  // MTP_VERSION_NAME '

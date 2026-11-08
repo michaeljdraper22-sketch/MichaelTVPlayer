@@ -67,14 +67,25 @@ allow "Install unknown apps", open. Same signing key (`michaeltv-release.jks`
 + `keystore.properties`, both git-ignored, generated on first build) means
 updates install over the old copy — **never lose those two files**.
 
-## Current release state (tag v2.1.3.1, published 2026-10-11)
+## Current release state (tag v2.1.9, published 2026-11-08)
 
-- `MichaelTV-2.1.3.1.apk` — versionCode 2131 (stamped from a WORKTREE-only
-  `src/config.py` bump to "2.1.3.1" — main's config.py is the parallel
-  session's 2.1.4 WIP; never commit that into an Android build), release-
-  signed with the same key as 2.1.1/2.1.2, core = committed HEAD (74e8433
-  era, i.e. desktop 2.1.3 + dead-debrid-advance v2, NOT the uncommitted
-  src/ WIP). sha256
+- `MichaelTV-2.1.9.apk` — versionName 2.1.9, versionCode **2010900**,
+  release-signed with the same key as 2.1.1–2.1.3.1, core = committed
+  HEAD (the desktop 2.1.9 tree). sha256
+  `98f983da2cd8d2db13f23bc561a5f3776a8b3edf9ebe1dbcf34068ac927455dc`.
+  **versionCode formula changed** in `prepare_core.py`: the old
+  "digits with dots stripped" rule produced 2131 for the 4-part
+  "2.1.3.1", so plain "2.1.9" would have computed **219** — lower than
+  the shipped 2131, and Android silently refuses to install a lower
+  versionCode over an existing app. It now uses fixed 3-digit slots
+  (major*10^6 + minor*10^4 + patch*10^2 + build), so 2.1.9 → 2010900 and
+  2.1.10 → 2011000, plus a hard failure if a build would go backwards.
+  Same release carries the Windows zip (the desktop updater ignores the
+  .apk; never upload an .apk.sha256 alongside it).
+- Prior state: tag **v2.1.3.1** (2026-10-11) — `MichaelTV-2.1.3.1.apk`,
+  versionCode 2131 (stamped from a WORKTREE-only `src/config.py` bump to
+  "2.1.3.1"), release-signed with the same key as 2.1.1/2.1.2, core =
+  committed HEAD (74e8433 era). sha256
   `2b33d095b89783911f637f9b40f75e799a304e0e8872ddc095616ee33530e499`.
   What it adds over 2.1.2: rpc errors surface on screen (Settings inline
   error + Retry, search inline, red "App engine error" boot banner) and
@@ -233,7 +244,8 @@ has needed ZERO src/ changes; keep it that way where possible.
   but never upload an `.apk.sha256` (it could be picked as the zip's
   checksum).
 - **Version flow:** `prepare_core.py` derives versionName/versionCode from
-  `src/config.py` APP_VERSION ("2.1.2" → 212). versionCode must only ever
+  `src/config.py` APP_VERSION ("2.1.9" → 2010900, fixed 3-digit slots —
+  see the 2.1.9 entry above). versionCode must only ever
   increase; a release page must never carry an APK with a versionCode
   lower than one already shipped (Android refuses downgrade installs —
   the stale MichaelTV-2.1.apk asset was removed for this reason).

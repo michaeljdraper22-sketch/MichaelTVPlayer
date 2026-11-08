@@ -135,7 +135,7 @@ view._caption_tick()
 view._sleep()                            # 4 s idle, gap at the instant
 check("gap sleep keeps the overlay window (renderer active)",
       view.overlay.isVisible())
-check("controls asleep", view.ctl.isHidden() and view._btn_panel.isHidden()
+check("controls asleep", view.ctl.isHidden() and view._btn_newwin.isHidden()
       and view._btn_ovfs.isHidden() and view._btn_reload.isHidden())
 fake.times["t"] = 11000                  # 11 s: cue active again
 view._caption_tick()
@@ -193,7 +193,7 @@ view2._caption_tick()
 view2._sleep()
 check("windowed: corner buttons keep the window up",
       view2.overlay.isVisible()
-      and view2._btn_panel.isVisible() and view2._btn_ovfs.isVisible())
+      and view2._btn_newwin.isVisible() and view2._btn_ovfs.isVisible())
 fake2.times["t"] = 11000
 view2._caption_tick()
 check("windowed: caption painted through the sleep",

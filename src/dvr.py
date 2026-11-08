@@ -44,9 +44,17 @@ class VlcRecorder:
               buffer_path: str = None) -> None:
         """Record ``url`` over ONE connection.
 
-        - ``buffer_path`` given: DVR chase buffer (temp file, deleted on final
-          stop). If the file already exists it is APPENDED to, so the timeline
-          stays continuous when the recorder is restarted mid-session.
+        - ``buffer_path`` given: DVR chase buffer (temp file, deleted on
+          final stop). If that file already exists a FRESH SIBLING is
+          started next to it instead: libVLC 3.0.20+ opens a reused
+          destination truncate-mode no matter how append is requested
+          (:sout-file-append as a media option or instance flag,
+          file{append} chain syntax — offline-verified 2026-11-02), which
+          destroyed a 770 MB chase buffer under the display player on
+          every recorder restart (manual reload + the stall watchdog).
+          The retired file stays readable until the temp dir is deleted;
+          timeline continuity across the restart comes from the content
+          clock freeze plus the stream's own PTS, not from file append.
         - ``output_path`` additionally given: dual output — the same single
           stream feeds both the DVR buffer and a kept recording file.
         """
@@ -57,6 +65,23 @@ class VlcRecorder:
         if buffer_path:
             self.file_path = buffer_path
             self._dir = os.path.dirname(buffer_path) or None
+            if reuse and self._dir:
+                # VLC cannot append (see docstring) — write a fresh
+                # sibling so the run the display may still be watching
+                # survives the restart.
+                n = 2
+                sibling = os.path.join(self._dir, "buffer_%d.ts" % n)
+                while os.path.exists(sibling):
+                    n += 1
+                    sibling = os.path.join(self._dir, "buffer_%d.ts" % n)
+                self.file_path = sibling
+                try:
+                    log.warning("dvr buffer rotation: %s exists — writing "
+                                "%s instead (VLC cannot append)",
+                                os.path.basename(buffer_path),
+                                os.path.basename(sibling))
+                except Exception:
+                    pass
         else:
             self._dir = tempfile.mkdtemp(prefix="mtp_dvr_")
             self.file_path = os.path.join(self._dir, "buffer.ts")
@@ -105,9 +130,6 @@ class VlcRecorder:
         else:
             sout = "#duplicate{{{}}}".format(",".join(branches))
         self._media.add_option(f":sout={sout}")
-        if reuse:
-            # continue an existing buffer instead of truncating it
-            self._media.add_option(":sout-file-append")
         self._player.set_media(self._media)
         self._player.play()
 
@@ -138,8 +160,8 @@ class VlcRecorder:
         return self.file_path if self._last_size > 50000 else None
 
     def stop(self, delete: bool = True):
-        """Stop recording. ``delete=False`` keeps the buffer file (used when the
-        recorder is about to be restarted onto the same buffer).
+        """Stop recording. ``delete=False`` keeps the buffer temp dir (used
+        when the recorder is about to be restarted onto a sibling buffer).
 
         Strict order (Windows crash notes): stop the headless player → detach
         its media → drop ALL python-vlc references → only then delete the temp

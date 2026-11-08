@@ -359,6 +359,21 @@ def panel_expand():
     return _icon("panel_expand", draw)
 
 
+def new_window():
+    """New window: two overlapping app frames — a back window offset
+    up-right behind the front one, the browser 'new window' glyph."""
+    def draw(p, c):
+        _pen(p, c, 2.2)
+        p.setBrush(QtCore.Qt.NoBrush)
+        # back window (taller, offset up-right)
+        p.drawRoundedRect(QtCore.QRectF(7.4, 3.4, 13.2, 12.2), 2.2, 2.2)
+        # front window, drawn over it
+        p.drawRoundedRect(QtCore.QRectF(3.6, 8.2, 13.2, 12.4), 2.2, 2.2)
+        # title-bar line on the front window
+        p.drawLine(_F(3.6, 12.0), _F(16.8, 12.0))
+    return _icon("new_window", draw)
+
+
 def download():
     """Download: an arrow dropping into a tray (VOD replacement for DVR)."""
     def draw(p, c):

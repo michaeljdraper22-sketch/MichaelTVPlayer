@@ -62,6 +62,12 @@ SRT_SAMPLE = "\r\n".join([
 
 
 def main():
+    global app   # must outlive main(): destroying the QApplication at
+    #                frame teardown takes every widget/video surface down
+    #                while libvlc threads are live — a native crash AFTER
+    #                the checks pass (reproduced 4/4 at HEAD 2026-11-07).
+    #                test_new_window et al. keep app at module level for
+    #                exactly this reason; os._exit then skips Qt teardown.
     app = QtWidgets.QApplication(sys.argv)
 
     print("[1] match levels — the user's exact examples")

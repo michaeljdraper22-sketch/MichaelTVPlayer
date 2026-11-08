@@ -170,7 +170,9 @@ class FakeVLC:
     def get_length(self):
         return 0
 
-    def play(self, url, timeshift=False):
+    def play(self, url, timeshift=False, http_referer=None):
+        # http_referer: the app grew the call signature for referer-locked
+        # CDNs (see test_always_chase's stub) — accepted and ignored here
         self.commanded.append(("play", url))
         self.state = "playing"
 

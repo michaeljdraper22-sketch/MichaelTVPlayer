@@ -109,6 +109,17 @@ def subtitle_instance_args(appearance: dict) -> list:
     return args
 
 
+# One vlc.Instance per PLAYER (= per window): multi-window demands totally
+# separate audio trees — volume/mute/opening a stream in one window must
+# never disturb the other, and a shared instance does not guarantee that.
+# Two instances coexisting in this process is field-proven by the
+# sub-style rebuild path (a second instance is constructed mid-playback,
+# then the old one goes idle; instances are never released — see
+# VLCPlayer.stop_and_release). The dvr.py rule still holds WITHIN a
+# window: the recorder always passes instance=<its player's instance>,
+# never creating another one while recording.
+
+
 class VLCPlayer:
     """Wraps a libvlc media player.
 
@@ -120,7 +131,8 @@ class VLCPlayer:
 
     def __init__(self, timeshift: bool = True, volume: int = 100,
                  network_caching: int = 1500, sub_args: list = None,
-                 spu_delay_ms: int = 0, extra_args: list = None):
+                 spu_delay_ms: int = 0, extra_args: list = None,
+                 instance=None):
         nc = max(0, min(50000, int(network_caching)))
         args = [
             # never read/write the user's shared %APPDATA%\vlc config — the
@@ -139,6 +151,15 @@ class VLCPlayer:
             f"--live-caching={nc}",
             "--file-caching=1000",
             "--disc-caching=1000",
+            # Multi-window audio divorce (2026-11-07): VLC's default
+            # Windows output (mmdevice) applies volume/mute to the PROCESS
+            # audio session scalar (see _slider_to_vlc_volume) — every
+            # player in the process shares it, so two windows' sliders
+            # dragged each other's audio around. DirectSound applies
+            # volume per audio BUFFER (per player), giving each window a
+            # truly independent volume/mute. Must be on EVERY instance:
+            # one mmdevice player would drag the shared session for all.
+            "--aout=directsound",
             # NO --avcodec-skiploopfilter here, ever: skipping the H.264
             # deblocking filter smears fast motion (sports) into visible
             # macroblock blur — field-reported as "color blurring" on
@@ -153,11 +174,12 @@ class VLCPlayer:
         # Instance None, and the plain-instance fallback below covers it.
         args.extend([str(a) for a in (extra_args or [])])
         self.timeshift = timeshift
-        # A few caching/display options. Some VLC builds reject unknown options
-        # and return None, so fall back to a plain instance if that happens.
-        self.instance = (
-            vlc.Instance(args) or vlc.Instance()
-        )
+        # A caller may hand us an explicit instance (the dvr.py recorder
+        # pattern); otherwise this player gets its OWN instance — one per
+        # window, full audio separation (see the note above). Some VLC
+        # builds reject unknown options and return None, so fall back to a
+        # plain instance.
+        self.instance = instance or (vlc.Instance(args) or vlc.Instance())
         self.player = self.instance.media_player_new()
         self._volume = max(0, min(100, int(volume)))
         self._spu_delay_ms = int(spu_delay_ms)   # desired sub delay (ms)
@@ -316,7 +338,8 @@ class VLCPlayer:
                 append: bool = False, timeshift: bool = None,
                 start_wait_s: float = 20.0,
                 sub_file: str = None,
-                network_caching_ms: int = 0) -> None:
+                network_caching_ms: int = 0,
+                http_referer: str = None) -> None:
         """Play ``url``, optionally starting at ``start_seconds``.
 
         ``:start-time=`` makes VLC open directly at the target position — no
@@ -349,6 +372,14 @@ class VLCPlayer:
             self.media.add_option(f"http-user-agent={USER_AGENT}")
         except Exception:
             pass
+        if http_referer:
+            try:
+                # Referer-locked CDNs (e.g. Bunny Stream embeds) 403 every
+                # request without the embedding page's referer — VLC 3's
+                # http-referrer sends it on the m3u8 AND its segments.
+                self.media.add_option(f"http-referrer={http_referer}")
+            except Exception:
+                pass
         if network_caching_ms > 0:
             try:
                 # Per-media read-ahead depth, overriding the instance-wide
@@ -503,10 +534,12 @@ class VLCPlayer:
 
     def play(self, url: str, timeshift: bool = None,
              start_seconds: float = 0.0, start_wait_s: float = 20.0,
-             sub_file: str = None, network_caching_ms: int = 0) -> None:
+             sub_file: str = None, network_caching_ms: int = 0,
+             http_referer: str = None) -> None:
         self.play_at(url, start_seconds, timeshift=timeshift,
                      start_wait_s=start_wait_s, sub_file=sub_file,
-                     network_caching_ms=network_caching_ms)
+                     network_caching_ms=network_caching_ms,
+                     http_referer=http_referer)
 
     def stop(self) -> None:
         """Stop playback. Never raises, never deadlocks the UI thread.

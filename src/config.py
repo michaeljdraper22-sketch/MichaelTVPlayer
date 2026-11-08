@@ -9,6 +9,17 @@ from pathlib import Path
 APP_NAME = "MichaelTVPlayer"
 # App version — bumped per release; the Settings ▸ Check for updates action
 # compares it against the latest GitHub release tag (see src/updater.py).
+# 2.1.9: multi-window (File > New Window / Ctrl+Shift+N / the overlay
+# button): a second window shares the provider client but gets its own
+# vlc.Instance and DirectSound output, so volume/mute are truly per-window;
+# Stremio handoffs never clobber a window that is already playing — they
+# open a new one. Plus --http-referrer=/--http-referer= handoffs (Bunny
+# Stream embeds 403 without the embedding page's referer) and the DVR
+# chase-buffer rotation fix (libVLC 3.0.20+ truncates a reused sout
+# destination no matter how append is requested, which destroyed a 770 MB
+# buffer on every recorder restart; restarts now write a fresh sibling and
+# the caption reader re-points, while a chase reload re-enters behind the
+# new write head instead of reopening into the retired file).
 # 2.1.8: multi-episode Stremio files ('Paw Patrol S05E26E27') are episodes
 # again, not movies — the S/E parser's word-boundary choked on the E26E27
 # chain, the identity fell to the movie path, and the next-episode button,
@@ -59,7 +70,7 @@ APP_NAME = "MichaelTVPlayer"
 # (dB-linear) volume taper so the bar isn't silent for 80% of its travel
 # (stored volume migrated to the same curve), and quiet background
 # subtitle hunts + moviehash-wait for the online sub search.
-APP_VERSION = "2.1.8"
+APP_VERSION = "2.1.9"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC

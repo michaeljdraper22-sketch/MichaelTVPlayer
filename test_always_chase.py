@@ -120,14 +120,16 @@ class FakeVLC:
 
     # playback
     def play(self, url, timeshift=None, start_seconds=0.0,
-             start_wait_s=20.0, sub_file=None, network_caching_ms=0):
-        # start_wait_s/sub_file/network_caching_ms: later versions grew
-        # the call signature (stremio open wait, external subs, the VOD
-        # read-ahead depth) — the stub accepts and ignores them
+             start_wait_s=20.0, sub_file=None, network_caching_ms=0,
+             http_referer=None):
+        # start_wait_s/sub_file/network_caching_ms/http_referer: later
+        # versions grew the call signature (stremio open wait, external
+        # subs, the VOD read-ahead depth, referer-locked CDNs) — the stub
+        # accepts and ignores them
         self.calls.append(("play", url, timeshift, start_seconds))
 
     def play_at(self, url, start_seconds=0.0, record_path=None,
-                append=False, timeshift=None):
+                append=False, timeshift=None, http_referer=None):
         self.calls.append(("play_at", url, start_seconds, timeshift))
 
     def stop_and_release(self):

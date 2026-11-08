@@ -120,15 +120,28 @@ class ChromeTabBar(QtWidgets.QTabBar):
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    def __init__(self, config: Config):
+    # Every live MainWindow (multi-window support). Window #1 is the
+    # "primary" (owns the persisted geometry/tab state); windows opened
+    # via the New Window button are secondaries that never write those
+    # keys. Also the handoff router: Stremio button / second launch /
+    # playlist.m3u events go to the most recently ACTIVE window.
+    _instances = []
+    _last_active = None      # most recently activated MainWindow, or None
+    _seq = 1                 # monotonic window number for secondary titles
+
+    def __init__(self, config: Config, client=None, secondary=False):
         super().__init__()
         self.config = config
+        self._secondary = secondary
+        if secondary:
+            MainWindow._seq += 1
+            self._win_no = MainWindow._seq
+        self._set_title("MichaelTV")
         # Which list the live-TV ⏭/⏮ buttons walk for the channel now
         # playing: "favorites" when it was launched from the ★ Favorites
         # tab (step through the favorites, wrapping), "live" for anything
         # launched anywhere else.  Set on every play().
         self._live_nav_source = "live"
-        self.setWindowTitle("MichaelTV")
         self.resize(1340, 820)
         # Must fit the splitter's children minimums (170 + 6 handle + 280):
         # a smaller window minimum made Qt's layout fight the splitter while
@@ -137,7 +150,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # local video files drop straight onto the window (VLC-style)
         self.setAcceptDrops(True)
 
-        self.client = XtreamClient(
+        # Second windows share the primary's client: one provider account
+        # session, one bulk-concurrency gate (a second client would double
+        # the provider load the gate exists to throttle — the 429 issue).
+        self.client = client or XtreamClient(
             # No account (setup skipped / handoff launch): XtreamClient
             # refuses to build without a server, and MainWindow needs one
             # to exist at all — an unreachable dummy keeps it alive in its
@@ -170,6 +186,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.player_view.request_toggle_channels.connect(self.toggle_channels)
         self.player_view.request_next_channel.connect(self.play_next_channel)
         self.player_view.request_prev_channel.connect(self.play_prev_channel)
+        self.player_view.request_new_window.connect(self.open_new_window)
 
         self.splitter.addWidget(self.tabs)
         self.splitter.addWidget(self.player_view)
@@ -198,7 +215,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.fav_tab, "★ Favorites")
         self.tabs.addTab(self.custom_tab, "➕ Custom")
 
-        # "hide channel list" button at the TOP-RIGHT of the channel bar
+        # "hide channel list" button at the TOP-RIGHT of the channel bar.
+        # (The New Window button lives on the video overlay next to the
+        # profanity dot — user-placed 2026-11-07; File > New Window and
+        # Ctrl+Shift+N work everywhere.)
         self._channels_hidden = False
         self.btn_hide_channels = QtWidgets.QToolButton(self)
         self.btn_hide_channels.setIcon(ic.panel_collapse())
@@ -238,10 +258,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.fav_tab.refresh()
         self._restore_state()
+        MainWindow._instances.append(self)
 
     def _on_tab_changed(self, idx):
-        self.config.last_tab = idx
-        self.config.save()
+        if not self._secondary:   # only the primary remembers the tab
+            self.config.last_tab = idx
+            self.config.save()
         try:
             from .. import feedback
             name = (self.tabs.tabText(idx) or "?").lower()
@@ -302,6 +324,8 @@ class MainWindow(QtWidgets.QMainWindow):
                             activated=self.toggle_fullscreen)
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+L"), self,
                             activated=self.toggle_channels)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+Shift+N"), self,
+                            activated=self.open_new_window)
         QtWidgets.QShortcut(QtGui.QKeySequence("Escape"), self,
                             activated=self._exit_fullscreen_only)
         QtWidgets.QShortcut(QtGui.QKeySequence("F5"), self,
@@ -355,13 +379,18 @@ class MainWindow(QtWidgets.QMainWindow):
         file_menu = menu_bar.addMenu("&File")
         act_open = QtWidgets.QAction("Open video…\tCtrl+O", self)
         act_open.triggered.connect(self.open_video_file)
+        act_newwin = QtWidgets.QAction("New Window\tCtrl+Shift+N", self)
+        act_newwin.triggered.connect(self.open_new_window)
         act_account = QtWidgets.QAction("Account…", self)
         act_account.triggered.connect(self.open_account)
         act_reload = QtWidgets.QAction("Reload all lists", self)
         act_reload.triggered.connect(self.reload_all)
+        # Quit closes EVERY window (the X closes just this one — the app
+        # exits when the last window closes)
         act_quit = QtWidgets.QAction("Quit", self)
-        act_quit.triggered.connect(self.close)
+        act_quit.triggered.connect(self.quit_app)
         file_menu.addAction(act_open)
+        file_menu.addAction(act_newwin)
         file_menu.addSeparator()
         file_menu.addAction(act_account)
         file_menu.addAction(act_reload)
@@ -519,7 +548,21 @@ class MainWindow(QtWidgets.QMainWindow):
                 playable = stremio.playable_from_url(url)
             if launch.get("sub_file"):
                 playable["sub_file"] = launch["sub_file"]
-            self.play(playable, launch.get("start_at") or 0.0)
+            if launch.get("http_referrer"):
+                # rides on the playable so reopens/recording keep it too
+                playable["http_referrer"] = launch["http_referrer"]
+            start_at = launch.get("start_at") or 0.0
+            if self._player_busy():
+                # Default multi-window behavior (user spec, 2026-11-07):
+                # an external stream NEVER interrupts what this window is
+                # watching — the football keeps playing and the Stremio
+                # stream opens in a NEW window.
+                win = self.open_new_window()
+                if win is not None:
+                    win.play(playable, start_at)
+                    return   # the new window is already up front
+                # window creation failed — fall through and play here
+            self.play(playable, start_at)
         else:
             real = [a for a in args if not a.startswith("-")]
             if real:
@@ -1246,6 +1289,69 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    # ---- multi-window ----
+    @classmethod
+    def last_active(cls):
+        """The window external handoffs (Stremio button, second launch,
+        playlist.m3u) should land on: the most recently activated window,
+        falling back to the oldest live one."""
+        alive = [w for w in cls._instances
+                 if not getattr(w, "_closing_window", False)]
+        if cls._last_active in alive:
+            return cls._last_active
+        return alive[0] if alive else None
+
+    def changeEvent(self, event):
+        # track focus for handoff routing (last_active above)
+        if event.type() == QtCore.QEvent.WindowActivate:
+            MainWindow._last_active = self
+        super().changeEvent(event)
+
+    def open_new_window(self):
+        """New Window button / Ctrl+Shift+N: a second full MainWindow in
+        THIS process — shares the config + provider client and (via the
+        process-wide AppUserModelID) the taskbar button, where Windows
+        shows each window its own thumbnail."""
+        try:
+            win = MainWindow(self.config, client=self.client,
+                             secondary=True)
+            win.show()
+            win.raise_()
+            win.activateWindow()
+            MainWindow._last_active = win   # deterministic handoff routing
+            return win
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.error("new window: failed to open: %r", exc)
+            except Exception:
+                pass
+            return None
+
+    def _player_busy(self) -> bool:
+        """True while this window has something loaded — playing, paused
+        or still buffering. External handoffs must not clobber it; they
+        open a new window instead (see handle_handoff)."""
+        try:
+            return bool(self.player_view.current) \
+                or self.player_view.vlc.is_busy()
+        except Exception:  # noqa: BLE001
+            return False
+
+    def quit_app(self):
+        """File > Quit: close EVERY window (plain close leaves the app
+        running while any other window is open)."""
+        for w in list(MainWindow._instances):
+            w.close()
+
+    def _set_title(self, base: str):
+        # taskbar thumbnails show the title: number the extra windows so
+        # the previews are distinguishable at a glance
+        if self._secondary:
+            head, sep, tail = base.partition(" — ")
+            self.setWindowTitle(f"{head} {self._win_no}{sep}{tail}")
+        else:
+            self.setWindowTitle(base)
+
     # ---- window state persistence ----
     def _restore_state(self):
         geo = self.config.window_geometry
@@ -1262,6 +1368,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tabs.setCurrentIndex(idx)
 
     def _save_state(self):
+        if self._secondary:
+            # geometry/state/splitter/last_tab are single-slot config keys
+            # shared by every window — only the primary writes them, or
+            # two windows would clobber each other's saved layout
+            return
         if self.isFullScreen():
             state = "normal"
             geo = self.config.window_geometry
@@ -1290,6 +1401,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Tearing down the window while libvlc/the recorder threads were
         # live caused exit crashes; the app must still exit quickly and
         # without a crash dialog even if a step fails.
+        self._closing_window = True   # handoffs route elsewhere from now on
+        try:
+            if self in MainWindow._instances:
+                MainWindow._instances.remove(self)
+            if MainWindow._last_active is self:
+                MainWindow._last_active = None
+        except Exception:
+            pass
         try:
             log.info("closeEvent: shutdown starting")
         except Exception:
@@ -1317,13 +1436,13 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_account(self, result):
         ok, val = result
         if ok == "ok":
-            self.setWindowTitle("MichaelTV")
+            self._set_title("MichaelTV")
         elif not self.config.has_account():
             # skipped setup / account-less mode: not an error, just a hint
-            self.setWindowTitle("MichaelTV — no IPTV (File > Account)")
+            self._set_title("MichaelTV — no IPTV (File > Account)")
         else:
             # No status bar / popup spam — a quiet hint in the title instead.
-            self.setWindowTitle("MichaelTV — account error (File > Account)")
+            self._set_title("MichaelTV — account error (File > Account)")
 
     def _show_help(self):
         QtWidgets.QMessageBox.information(

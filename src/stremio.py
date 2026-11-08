@@ -112,11 +112,12 @@ def parse_launch_args(args):
     Stremio streaming server invokes MichaelTV exactly like it invoked
     VLC: ``--start-time=<sec> --no-video-title-show [--sub-file=<srt>]
     "<url>"``; Windows .m3u association launches pass just the playlist
-    path). Returns ``{url, start_at, sub_file}`` or None if nothing
-    playable. Unknown dash-args are ignored (and their values are never
-    mistaken for the URL)."""
+    path). Returns ``{url, start_at, sub_file, http_referrer}`` or None
+    if nothing playable. Unknown dash-args are ignored (and their values
+    are never mistaken for the URL)."""
     start_at = 0.0
     sub_file = ""
+    http_referrer = ""
     url = ""
     args = [str(a).strip().strip('"') for a in (args or []) if str(a).strip()]
     i = 0
@@ -128,6 +129,10 @@ def parse_launch_args(args):
                 start_at = max(0.0, float(arg.split("=", 1)[1]))
             except ValueError:
                 pass
+        elif low.startswith("--http-referrer="):
+            # VLC 3's own flag name: referer-locked CDNs (Bunny Stream
+            # embeds and friends) 403 without the embedding page's URL.
+            http_referrer = arg.split("=", 1)[1]
         elif low.startswith("--sub-file="):
             # cmd.exe does not quote it; a path with spaces arrives glued
             # to the next flag — re-join up to the next " --" if needed
@@ -142,7 +147,8 @@ def parse_launch_args(args):
         i += 1
     if not url:
         return None
-    return {"url": url, "start_at": start_at, "sub_file": sub_file}
+    return {"url": url, "start_at": start_at, "sub_file": sub_file,
+            "http_referrer": http_referrer}
 
 
 _SERVER_URL_RE = re.compile(

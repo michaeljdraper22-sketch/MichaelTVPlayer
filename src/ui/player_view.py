@@ -203,7 +203,8 @@ _EDGE_COLLAPSE_S = 30.0
 # quietly (VLC 'plays' a dead socket, the buffer stops growing, the
 # frontier freezes and every rescue reopens against data that never
 # arrives — the 75 s dead-air gap of 2026-10-19 22:41). No buffer growth
-# for this long restarts the recorder on the SAME buffer (append), with a
+# for this long restarts the recorder in the SAME temp dir on a FRESH
+# sibling buffer file (VLC cannot append — VlcRecorder.start), with a
 # growing backoff; resumed growth resets the backoff.
 # The threshold must sit ABOVE real provider weather: 30 s stall-then-
 # burst cadences are measured, legitimate nights (2026-08-21; the sync
@@ -754,12 +755,22 @@ class PlayerView(QtWidgets.QWidget):
     request_next_channel = QtCore.pyqtSignal()
     # live TV "Play previous": the twin — the channel ABOVE in that list
     request_prev_channel = QtCore.pyqtSignal()
+    # overlay New Window button: PlayerView can't open windows — MainWindow
+    # owns the multi-window registry
+    request_new_window = QtCore.pyqtSignal()
+
+    # every live PlayerView (one per MainWindow — multi-window support):
+    # used to broadcast a subtitle-style change, which rebuilds the player
+    # because freetype args are baked into the vlc.Instance. Registered in
+    # __init__, removed in stop().
+    _views = []
 
     def __init__(self, config, parent=None):
         super().__init__(parent)
         self.config = config
         self.client = None
         self.current = None
+        PlayerView._views.append(self)
         # Paint the themed background on EVERY expose.  Without this the
         # widget paints nothing of its own (no styled background, no
         # autofill), so strips newly exposed by a splitter drag — where the
@@ -1132,7 +1143,10 @@ class PlayerView(QtWidgets.QWidget):
         self._apply_profanity_config()
 
         app = QtWidgets.QApplication.instance()
-        app.setStyleSheet(app.styleSheet() + _OVERLAY_QSS)
+        # one copy is enough — with several windows (one PlayerView each)
+        # the app stylesheet would otherwise grow a duplicate per window
+        if _OVERLAY_QSS not in (app.styleSheet() or ""):
+            app.setStyleSheet(app.styleSheet() + _OVERLAY_QSS)
 
         root = QtWidgets.QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -1168,10 +1182,17 @@ class PlayerView(QtWidgets.QWidget):
         self._cap_wid.bind_config(lambda: self.config.subtitle_appearance)
         self._btn_panel = QtWidgets.QPushButton(self.overlay)
         self._btn_ovfs = QtWidgets.QPushButton(self.overlay)
-        # reload/refresh stream — LEFT of the zen button (user-placed):
-        # reconnects whatever is playing at the same position
+        # reload/refresh stream — reconnects whatever is playing at the
+        # same position
         self._btn_reload = QtWidgets.QPushButton(self.overlay)
-        for b in (self._btn_panel, self._btn_ovfs, self._btn_reload):
+        # new window — the LEFTMOST corner button (user-placed
+        # 2026-11-07), with the green filter-status dot to ITS left.
+        # This is the new-window affordance that stays visible when the
+        # channel list is folded away (Stremio handoffs and local files
+        # auto-hide it, taking the tab-bar corner button with it)
+        self._btn_newwin = QtWidgets.QPushButton(self.overlay)
+        for b in (self._btn_panel, self._btn_ovfs, self._btn_reload,
+                  self._btn_newwin):
             b.setObjectName("ovButton")
             b.setFixedSize(34, 28)
             b.setCursor(QtCore.Qt.PointingHandCursor)
@@ -1184,10 +1205,14 @@ class PlayerView(QtWidgets.QWidget):
         self._btn_reload.setIcon(ic.refresh())
         self._btn_reload.setToolTip(
             "Reload stream (Ctrl+R) — reconnect at the same position")
+        self._btn_newwin.setIcon(ic.new_window())
+        self._btn_newwin.setToolTip(
+            "New window (Ctrl+Shift+N) — a second MichaelTV window")
         self._btn_reload.setEnabled(False)   # nothing playing yet
         self._btn_panel.clicked.connect(self.request_toggle_panel.emit)
         self._btn_ovfs.clicked.connect(self.request_fullscreen.emit)
         self._btn_reload.clicked.connect(self._reload_stream)
+        self._btn_newwin.clicked.connect(self.request_new_window.emit)
 
         # profanity-filter status dot — LEFT of the reload button, same
         # corner stack (user-placed, 2026-09-22): green = armed with a
@@ -1593,14 +1618,15 @@ class PlayerView(QtWidgets.QWidget):
         self.info_overlay.move(g.left() + m, g.top() + m)
         self.info_overlay.raise_()
         x = g.right() - m
-        # right-to-left order: fullscreen (rightmost), zen, reload — so the
-        # reload button sits LEFT of the zen button, per the user's spec
-        for b in (self._btn_ovfs, self._btn_panel, self._btn_reload):
+        # right-to-left order: fullscreen (rightmost), zen, reload, new
+        # window (leftmost button — the filter dot sits to ITS left)
+        for b in (self._btn_ovfs, self._btn_panel, self._btn_reload,
+                  self._btn_newwin):
             x -= (b.width() + 4)
             b.move(x, g.top() + m)
             b.raise_()
-        # filter status dot: LEFT of the reload button, vertically
-        # centered on the corner-button row
+        # filter status dot: LEFT of the new-window button (user-placed
+        # 2026-11-07), vertically centered on the corner-button row
         self._filter_dot.move(
             x - self._filter_dot.width() - 6,
             g.top() + m + ((self._btn_reload.height()
@@ -2019,7 +2045,10 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         try:
-            self.vlc.set_volume(self.config.volume)
+            # THIS view's slider, never config.volume — the config value is
+            # shared by every window (last writer wins) and would fling
+            # another window's volume at this player
+            self.vlc.set_volume(self.vol_slider.value())
         except Exception as exc:  # noqa: BLE001
             try:
                 log.warning("rebuild: applying runtime options failed: %r", exc)
@@ -2376,7 +2405,8 @@ class PlayerView(QtWidgets.QWidget):
                           timeshift=False, start_seconds=start_at,
                           start_wait_s=60.0 if kind == "stremio" else 20.0,
                           sub_file=playable.get("sub_file") or None,
-                          network_caching_ms=nc)
+                          network_caching_ms=nc,
+                          http_referer=playable.get("http_referrer") or None)
         self._poke_audio()
         self._poke_rate()
         self._wake()
@@ -4502,16 +4532,25 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         if self._mode == "chase" and self.dvr:
-            # the DISPLAYED content-axis position (same convention as
-            # _seek_ms: the caption clock when live, else the tracker)
-            pos = max(self._cap_clock_s, self._vid_s) \
-                if self._cap_clock_s > 0.0 else self._vid_s
-            pos = max(0.0, pos)
             self._restart_recorder(record=self.btn_rec.isChecked())
-            if not self._reopen_display(at=pos):
-                # recorder produced no buffer to return to — a from-scratch
-                # chase engagement (edge entry) beats a dead screen
-                self._engage_chase()
+            # The restart began a NEW buffer file (see VlcRecorder.start —
+            # VLC cannot append); the pre-reload position lives in the
+            # retired file, and the seek machinery maps only the ACTIVE
+            # buffer. Reopening AT the old position targets data the
+            # active buffer never held and wedges the verifier in a
+            # rescue loop (2026-11-02 ESPN: reopen at 1225.8 s -> 23 s of
+            # black before a revive remapped near the new write head).
+            # Re-enter chase the honest way: a fresh join behind the new
+            # head, same as a cold engagement but without re-dialing the
+            # recorder (it just restarted).
+            self._session += 1     # deferred chase callbacks go stale
+            self._dvr_t0 = now_s()
+            self._chase_hold = None
+            self._chase_started = False   # disarms the wedge rescue
+            self._stall_ticks = 0
+            self._last_reopen = 0.0
+            self._seek_verify = None
+            self._wait_and_enter_chase(self._session)
         elif kind == "live":
             self._reopen_display()
         else:
@@ -4881,18 +4920,24 @@ class PlayerView(QtWidgets.QWidget):
         if not url:
             return False
         live = (self.current or {}).get("kind") == "live"
+        referer = (self.current or {}).get("http_referrer") or None
         if rec:
-            self.vlc.play_at(url, record_path=rec, timeshift=live)
+            self.vlc.play_at(url, record_path=rec, timeshift=live,
+                             http_referer=referer)
         else:
-            self.vlc.play(url, timeshift=live)
+            self.vlc.play(url, timeshift=live, http_referer=referer)
         self._poke_audio()
         return True
 
     def _restart_recorder(self, record: bool):
         """(Re)start the single-connection recorder on the current buffer.
 
-        Reuses the existing buffer file with append so the timeline is
-        continuous; adds the recording file as a second output when requested.
+        A restart on an existing buffer begins a FRESH SIBLING file in the
+        same temp dir (VlcRecorder.start — VLC cannot append); the retired
+        file stays readable for the display player. Timeline continuity
+        across the stop → reconnect gap comes from the content-clock freeze
+        below plus the stream's own PTS. The recording file is added as a
+        second output when requested.
 
         A restart creates a gap in the data (stop → reconnect), so the
         content clock is frozen here: what the current run has written so far
@@ -4922,6 +4967,7 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         old_dir_keep = self.dvr._dir if self.dvr else None
+        old_buf_path = self.dvr.file_path if self.dvr else None
         if self.dvr:
             self.dvr.stop(delete=False)
             self.dvr = None
@@ -4934,6 +4980,23 @@ class PlayerView(QtWidgets.QWidget):
             self.dvr.start(url, output_path=rec_path)
         if old_dir_keep and not self.dvr._dir:
             self.dvr._dir = old_dir_keep
+        new_buf_path = self.dvr.file_path if self.dvr else None
+        if old_buf_path and new_buf_path \
+                and os.path.normcase(os.path.abspath(old_buf_path)) \
+                != os.path.normcase(os.path.abspath(new_buf_path)):
+            # The caption reader tails ONE file path; the restart moved
+            # the buffer to a sibling. Re-point it — the starter polls
+            # until the young sibling holds data, so this also bridges
+            # the recorder's reconnect gap.
+            self._stop_cc_source()
+            if not self._closing and (self._cap_want
+                                      or self._filter_engine.enabled):
+                self._start_cc_when_buffer()
+                try:
+                    log.info("cc source re-pointed after buffer rotation: "
+                             "%s", os.path.basename(new_buf_path))
+                except Exception:
+                    pass
 
     def _ensure_dvr_stopped(self):
         """Stop the DVR recorder if running. safe_stop() never raises and is
@@ -5067,8 +5130,9 @@ class PlayerView(QtWidgets.QWidget):
         so a stale tick can never call play_at. The classic trigger
         is the chase catching up with the file's write head — there the
         tracked position sits at the frontier anyway, so behavior matches
-        the old frontier reopen. But a mid-file stall (e.g. across a buffer
-        append gap) now stays WHERE IT WAS instead of jumping to live.
+        the old frontier reopen. But a mid-file stall (e.g. across a
+        recorder restart's data gap) now stays WHERE IT WAS instead of
+        jumping to live.
         """
         if gen != self._session:
             return
@@ -5253,7 +5317,8 @@ class PlayerView(QtWidgets.QWidget):
             if self.dvr and self.dvr.running:
                 # Recorder already owns the single connection (chase mode):
                 # restart it with the recording file as a second output
-                # (buffer keeps growing).
+                # (the chase pipeline keeps recording into a fresh
+                # sibling buffer).
                 self._restart_recorder(record=True)
             elif self.current.get("kind") == "live":
                 # Fallback direct-live mode (the recorder gave up earlier):
@@ -5267,7 +5332,9 @@ class PlayerView(QtWidgets.QWidget):
                 # and restarts from 0, so it must never run while the
                 # caption relay holds the provider connection.
                 self.vlc.play_at(self.current["url"],
-                                 record_path=self._rec_path)
+                                 record_path=self._rec_path,
+                                 http_referer=(self.current or {}).get(
+                                     "http_referrer") or None)
         else:
             self._stop_recording()
 
@@ -5282,8 +5349,9 @@ class PlayerView(QtWidgets.QWidget):
             return
         if self.dvr and self.dvr.running:
             # Chase needs the single-connection recorder regardless: drop
-            # only the recording output — the buffer keeps growing and the
-            # display player stays where it is. NEVER play the network URL
+            # only the recording output — the chase buffer keeps recording
+            # (into a fresh sibling) and the display player stays where it
+            # is. NEVER play the network URL
             # here: that would open a second connection.
             self._restart_recorder(record=False)
         elif self.current and self.current.get("url") and self._mode == "live":
@@ -5765,7 +5833,7 @@ class PlayerView(QtWidgets.QWidget):
             self.overlay.show()
             shown = True
         for w in (self._btn_panel, self._btn_ovfs, self._btn_reload,
-                  self.ctl):
+                  self._btn_newwin, self.ctl):
             if not w.isVisible():
                 w.show()
                 shown = True
@@ -5825,6 +5893,7 @@ class PlayerView(QtWidgets.QWidget):
         if self._immersive:
             self._btn_panel.hide()
             self._btn_ovfs.hide()
+            self._btn_newwin.hide()
             self._btn_reload.hide()
             self.setCursor(QtCore.Qt.BlankCursor)
             # the overlay is a separate native window — the view's blank
@@ -5871,7 +5940,7 @@ class PlayerView(QtWidgets.QWidget):
 
     def _cursor_on_controls(self) -> bool:
         for w in (self.ctl, self._btn_panel, self._btn_ovfs,
-                  self._btn_reload, self._btn_showpanel):
+                  self._btn_newwin, self._btn_reload, self._btn_showpanel):
             if w.isVisible() and w.underMouse():
                 return True
         return False
@@ -6003,7 +6072,8 @@ class PlayerView(QtWidgets.QWidget):
             # freezes — and every rescue below reopens against data that
             # will never arrive (75 s of dead air; the tail-hold's own
             # give-up only reaches plain live, it never re-dials). Restart
-            # the recorder on the SAME buffer (append) once the stall is
+            # the recorder in the SAME temp dir (a fresh sibling file —
+            # VLC cannot append, see VlcRecorder.start) once the stall is
             # confirmed, with growing backoff; resumed growth resets it.
             if (self.dvr.running and self._dvr_first_data is not None
                     and self._dvr_last_growth is not None
@@ -6016,8 +6086,8 @@ class PlayerView(QtWidgets.QWidget):
                     _REC_RESTART_MAX_GAP_S, self._rec_restart_gap * 1.5)
                 try:
                     log.warning("recorder watchdog: no buffer growth for "
-                                "%.1fs — restarting recorder on the same "
-                                "buffer (next retry in %.0fs)",
+                                "%.1fs — restarting recorder on a fresh "
+                                "sibling buffer (next retry in %.0fs)",
                                 now - self._dvr_last_growth,
                                 self._rec_restart_gap)
                 except Exception:
@@ -8374,6 +8444,21 @@ class PlayerView(QtWidgets.QWidget):
                 self._cap_wid.update()
             else:
                 self._reapply_sub_style()
+            # other windows share the config: restyle them too. Each view
+            # rebuilds onto its OWN new instance (per-window audio
+            # separation — see the note above VLCPlayer in src/player.py),
+            # keeping this view's slider volume, not the shared config's.
+            for other in list(PlayerView._views):
+                if other is self or other.config is not self.config:
+                    continue
+                try:
+                    other._reapply_sub_style()
+                except Exception as exc:  # noqa: BLE001
+                    try:
+                        log.warning("sub style: sibling rebuild failed: %r",
+                                    exc)
+                    except Exception:
+                        pass
 
     def _apply_sub_style_live(self, _appearance=None):
         """A style control changed inside the settings dialog: repaint the
@@ -8423,8 +8508,11 @@ class PlayerView(QtWidgets.QWidget):
             pass
         old = self.vlc
         try:
+            # volume comes from THIS view's slider (config.volume is shared
+            # by every window — using it here is what made a sub-style
+            # change in one window reset another window's audio)
             self.vlc = VLCPlayer(
-                volume=self.config.volume,
+                volume=self.vol_slider.value(),
                 network_caching=self.config.network_caching,
                 sub_args=self._sub_args_built,
                 spu_delay_ms=int(
@@ -9934,6 +10022,11 @@ class PlayerView(QtWidgets.QWidget):
             and accepts the close.
         """
         self._closing = True
+        try:
+            if self in PlayerView._views:
+                PlayerView._views.remove(self)
+        except Exception:
+            pass
         # (a) timers first — no _tick may observe a half-torn-down player.
         try:
             self.timer.stop()

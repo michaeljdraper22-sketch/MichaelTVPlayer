@@ -1,6 +1,6 @@
 # MichaelTV
 
-**Current release: v2.1.6** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1.9** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
 An **Android APK** of the same app is published alongside it — see

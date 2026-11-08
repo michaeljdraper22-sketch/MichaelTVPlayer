@@ -143,6 +143,23 @@ def main() -> int:
     except Exception:
         pass
 
+    # Stamp the running build into the log: the single-instance relay keeps
+    # an old process alive across "relaunches" (a handoff launch just
+    # forwards to it), and "which code was actually running?" should be
+    # answerable from player.log instead of guesswork (2026-11-07: a
+    # pre-fix build was blamed for a fix that was already on disk).
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        mtimes = [os.path.getmtime(os.path.join(here, "main.py"))]
+        for root, _dirs, files in os.walk(os.path.join(here, "src")):
+            mtimes.extend(
+                os.path.getmtime(os.path.join(root, f))
+                for f in files if f.endswith(".py"))
+        log.info("startup: code as of %s",
+                 time.asctime(time.localtime(max(mtimes))))
+    except Exception:
+        pass
+
     # Elevated one-shot helper (--apply-stremio-patch): the Stremio
     # settings dialog spawns this when server.js lives in an admin-owned
     # install (Stremio set up "for all users" under Program Files) that
@@ -300,11 +317,17 @@ def main() -> int:
 
     # External handoffs: args this instance was launched with, plus any
     # future second launches relayed over the single-instance socket.
+    # With File > New Window several MainWindows may exist — land the
+    # handoff on the most recently ACTIVE one.
+    def _route_handoff(args):
+        target = MainWindow.last_active() or win
+        target.handle_handoff(args)
+
     try:
-        inst.received.connect(win.handle_handoff)
+        inst.received.connect(_route_handoff)
         if forwarded:
             QtCore.QTimer.singleShot(
-                50, lambda: win.handle_handoff(sys.argv[1:]))
+                50, lambda: _route_handoff(sys.argv[1:]))
     except Exception:
         pass
 
@@ -316,7 +339,9 @@ def main() -> int:
     # a full MichaelTV restart).
     try:
         from src import streampatch
-        heal = QtCore.QTimer(win)
+        # parented to the APP, not the window: with multiple windows the
+        # first one may be closed while others keep the process alive
+        heal = QtCore.QTimer(app)
         heal.setInterval(5 * 60 * 1000)
         heal.timeout.connect(streampatch.patch_if_needed)
         heal.start()
@@ -331,10 +356,12 @@ def main() -> int:
     try:
         if config.stremio_watch_downloads:
             from src.watchfolder import DownloadsWatcher
-            _watcher = DownloadsWatcher(parent=win)
+            # parented to the APP (not the window) so closing window #1
+            # doesn't stop Downloads watching while other windows live on
+            _watcher = DownloadsWatcher(parent=app)
             if _watcher.start():
-                _watcher.handoff.connect(win.handle_handoff)
-                win._downloads_watcher = _watcher   # keep it alive
+                _watcher.handoff.connect(_route_handoff)
+                app._downloads_watcher = _watcher   # keep it alive
     except Exception:
         pass
 
