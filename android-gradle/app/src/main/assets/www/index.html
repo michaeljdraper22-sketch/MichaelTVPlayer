@@ -71,6 +71,23 @@
     flex: none; font-size: 11px; color: var(--dim); border: 1px solid var(--line);
     border-radius: 4px; padding: 2px 6px;
   }
+  .rowitem .star {
+    flex: none; background: none; border: none; padding: 6px 8px;
+    font-size: 22px; line-height: 1; color: #5b5b68; border-radius: 6px;
+    cursor: pointer;
+  }
+  .rowitem .star.on { color: var(--accent); }
+
+  /* Live TV: search box + country/category filters + Channels/★ row */
+  .live-filters { padding: 10px 14px 0; display: flex; flex-direction: column; gap: 8px; }
+  .live-filters .searchrow { padding: 0; }
+  .live-filters select { width: 100%; }
+  .livebar {
+    display: flex; gap: 8px; padding: 12px 14px;
+    border-bottom: 1px solid var(--line);
+  }
+  .livebar button { flex: 1; font-size: 14px; }
+  .livebar button.on { border-color: var(--accent); color: var(--accent); }
 
   .episode {
     display: flex; gap: 12px; align-items: center; padding: 12px 14px;
@@ -616,9 +633,21 @@ function playStream(i) {
 
 // ------------------------------------------------------------------
 // PLAYER
+//
+// In-app playback runs in the NATIVE player (PlayerActivity, ExoPlayer):
+// a WebView <video> element cannot decode what providers actually serve —
+// MPEG-TS/HLS live streams and MKV debrid files — which is why every
+// stream used to need VLC.  The WebView player below is only a fallback
+// for an APK whose bridge lacks playNative.
 
-function openPlayer(url, title) {
-  state.player = { url: url, title: title || "" };
+function openPlayer(url, title, altUrl) {
+  state.player = { url: url, title: title || "", altUrl: altUrl || "" };
+  if (window.py && window.py.playNative) {
+    try {
+      window.py.playNative(url, altUrl || "", title || "");
+      return;
+    } catch (e) { /* fall through to the WebView player */ }
+  }
   push("player", renderPlayer);
 }
 
@@ -749,9 +778,26 @@ function saveSettings() {
 
 // ------------------------------------------------------------------
 // LIVE TV (Xtream)
+//
+// Three ways to find a channel: browse by category, narrow by COUNTRY
+// (categories are named "USA | News" — the leading token is the country,
+// same rule as the desktop app), or type in the search box.  The search
+// only ever RENDERS RESULTS — pressing Enter must never start a stream;
+// playback happens solely by tapping a result row.  The ★ button on a row
+// saves it to Favorites (persisted by the Python bridge in settings.json).
+
+var LIVE_ROWS_CAP = 800;      // huge providers: render at most this many
 
 function enterLive() {
-  state.live = { authed: false, info: "", error: "", cats: [], cat: "", channels: null };
+  state.live = {
+    authed: false, info: "", error: "",
+    cats: [], country: "", cat: "",
+    channels: null, channelsTotal: 0,
+    mode: "browse",            // browse | favs
+    q: "", results: null, resultsTotal: 0,
+    favorites: [],
+    view: []                   // rows currently on screen (tap/★ indexes)
+  };
   push("livetv", renderLive);
   rpc("xt_auth", {}, function (out) {
     if (out.error || !out.ok) {
@@ -761,6 +807,7 @@ function enterLive() {
     }
     state.live.authed = true;
     state.live.info = out.info_summary || "";
+    state.live.favorites = out.favorites || [];
     rpc("xt_categories", {}, function (o2) {
       if (o2.error) { state.live.error = o2.error; rerender(); return; }
       state.live.cats = o2.categories || [];
@@ -774,15 +821,201 @@ function enterLive() {
   });
 }
 
+function liveCountries() {
+  var seen = {}, out = [];
+  for (var i = 0; i < state.live.cats.length; i++) {
+    var c = state.live.cats[i].country || "Other";
+    if (!seen[c]) { seen[c] = 1; out.push(c); }
+  }
+  return out;
+}
+
+function liveCatsFor(country) {
+  if (!country) return state.live.cats;
+  var out = [];
+  for (var i = 0; i < state.live.cats.length; i++) {
+    if ((state.live.cats[i].country || "Other") === country) {
+      out.push(state.live.cats[i]);
+    }
+  }
+  return out;
+}
+
 function loadChannels(catId) {
-  state.live.cat = catId;
-  state.live.channels = null;
+  var live = state.live;
+  live.mode = "browse";
+  live.q = "";                 // a category change leaves any search behind
+  live.results = null;
+  live.cat = catId ? String(catId) : "";
+  live.channels = null;
+  live.channelsTotal = 0;
   rerender();
-  rpc("xt_channels", { category_id: catId }, function (out) {
-    if (out.error) { state.live.error = out.error; rerender(); return; }
-    state.live.channels = out.channels || [];
+  rpc("xt_channels", { category_id: live.cat,
+                       country: live.country || "" }, function (out) {
+    if (out.error) { live.error = out.error; rerender(); return; }
+    live.channels = out.channels || [];
+    live.channelsTotal = out.total || live.channels.length;
     rerender();
   });
+}
+
+function liveCountryChanged(country) {
+  var live = state.live;
+  live.country = country || "";
+  // a different country starts a fresh browse: drop any active search
+  live.q = "";
+  live.results = null;
+  var cats = liveCatsFor(live.country);
+  if (cats.length) {
+    loadChannels(cats[0].id);
+  } else {
+    loadChannels("");          // no categories: the whole filtered list
+  }
+}
+
+function showBrowse() {
+  state.live.mode = "browse";
+  state.live.q = "";           // leave any search behind
+  state.live.results = null;
+  renderLive();
+}
+
+function showFavs() {
+  state.live.mode = "favs";
+  renderLive();
+}
+
+// Enter / Search button: fetch matches and render them.  There is no code
+// path from here to playback — a result must be tapped.
+function searchLive() {
+  var el = document.getElementById("live-q");
+  var q = el ? el.value.trim() : "";
+  var live = state.live;
+  if (!q) {                    // cleared field: back to the browse list
+    live.q = "";
+    live.results = null;
+    renderLive();
+    return;
+  }
+  live.q = q;
+  live.results = null;
+  live.mode = "browse";
+  renderLive();
+  rpc("xt_search_channels", { q: q, country: live.country || "" },
+      function (out) {
+    if (out.error) {
+      live.q = "";
+      toast(out.error);
+      renderLive();
+      return;
+    }
+    live.results = out.channels || [];
+    live.resultsTotal = out.total || 0;
+    renderLive();
+    var st = document.getElementById("live-status");
+    if (st) st.scrollIntoView({ block: "start" });
+  });
+}
+
+function isFav(streamId) {
+  var favs = state.live.favorites || [];
+  for (var i = 0; i < favs.length; i++) {
+    if (String(favs[i].stream_id) === String(streamId)) return true;
+  }
+  return false;
+}
+
+function liveRowHtml(c, idx) {
+  var fav = isFav(c.stream_id);
+  return '<div class="rowitem" onclick="playLiveAt(' + idx + ')">' +
+    (c.logo
+      ? '<img class="thumb" style="width:60px;height:40px" loading="lazy" src="' +
+        esc(c.logo) + '" onerror="this.style.display=\'none\'">'
+      : "") +
+    '<div class="meta"><div class="name">' + esc(c.name) + "</div>" +
+    (c.category ? '<div class="sub">' + esc(c.category) + "</div>" : "") +
+    "</div>" +
+    '<button class="star' + (fav ? " on" : "") + '" title="Favorite" ' +
+    'onclick="event.stopPropagation();favToggleAt(' + idx + ')">' +
+    (fav ? "\u2605" : "\u2606") + "</button></div>";
+}
+
+function liveChannelsHtml() {
+  var live = state.live;
+  if (!live.channels.length) return '<div class="empty">No channels here.</div>';
+  live.view = live.channels.slice(0, LIVE_ROWS_CAP);
+  var html = '<div class="subbar" id="live-status">' +
+    live.channels.length + " channel(s)" +
+    (live.channels.length > live.view.length
+      ? " \u00b7 showing first " + live.view.length + " \u2014 search to narrow"
+      : "") + "</div>";
+  for (var i = 0; i < live.view.length; i++) {
+    html += liveRowHtml(live.view[i], i);
+  }
+  return html;
+}
+
+function liveSearchHtml() {
+  var live = state.live;
+  var rs = live.results || [];
+  if (!rs.length) {
+    return '<div class="empty">No live channels match &ldquo;' +
+      esc(live.q) + "&rdquo;.</div>";
+  }
+  live.view = rs.slice();
+  var html = '<div class="subbar" id="live-status">' + live.resultsTotal +
+    " channel(s) match &ldquo;" + esc(live.q) + "&rdquo;" +
+    (live.resultsTotal > rs.length ? " \u00b7 showing first " + rs.length : "") +
+    "</div>";
+  for (var i = 0; i < live.view.length; i++) {
+    html += liveRowHtml(live.view[i], i);
+  }
+  return html;
+}
+
+function liveFavsHtml() {
+  var live = state.live;
+  if (!live.favorites.length) {
+    return '<div class="empty">No favorites yet.<br>' +
+      "Tap the \u2606 next to a channel to save it here.</div>";
+  }
+  live.view = live.favorites.slice();
+  var html = '<div class="subbar" id="live-status">' + live.view.length +
+    " favorite channel(s)</div>";
+  for (var i = 0; i < live.view.length; i++) {
+    html += liveRowHtml(live.view[i], i);
+  }
+  return html;
+}
+
+function countrySelectHtml() {
+  var live = state.live;
+  if (!live.cats.length) return "";
+  var cs = liveCountries();
+  var opts = '<option value="">All countries</option>';
+  for (var i = 0; i < cs.length; i++) {
+    opts += '<option value="' + esc(cs[i]) + '"' +
+      (cs[i] === live.country ? " selected" : "") + ">" + esc(cs[i]) +
+      "</option>";
+  }
+  return '<select id="live-country" onchange="liveCountryChanged(this.value)">' +
+    opts + "</select>";
+}
+
+function catSelectHtml() {
+  var live = state.live;
+  if (!live.cats.length) return "";
+  var cats = liveCatsFor(live.country);
+  var label = live.country ? "All channels in " + live.country : "All channels";
+  var opts = '<option value=""' + (live.cat === "" ? " selected" : "") + ">" +
+    esc(label) + "</option>";
+  for (var i = 0; i < cats.length; i++) {
+    opts += '<option value="' + esc(cats[i].id) + '"' +
+      (String(cats[i].id) === String(live.cat) ? " selected" : "") + ">" +
+      esc(cats[i].name || cats[i].id) + "</option>";
+  }
+  return '<select id="live-cat" onchange="loadChannels(this.value)">' +
+    opts + "</select>";
 }
 
 function renderLive() {
@@ -795,49 +1028,63 @@ function renderLive() {
     showScreen("livetv");
     return;
   }
-  if (live.error && live.authed) {
-    html += '<div class="subbar" style="color:var(--bad)">' + esc(live.error) + "</div>";
-    live.error = "";
-  }
   if (live.info) html += '<div class="subbar">' + esc(live.info) + "</div>";
-  if (live.cats.length) {
-    var opts = "";
-    for (var i = 0; i < live.cats.length; i++) {
-      opts += '<option value="' + esc(live.cats[i].id) + '"' +
-        (String(live.cats[i].id) === String(live.cat) ? " selected" : "") +
-        ">" + esc(live.cats[i].name || live.cats[i].id) + "</option>";
-    }
-    html += '<div class="content" style="padding-bottom:0"><select onchange="loadChannels(this.value)">' +
-      opts + "</select></div>";
+  if (live.error && live.authed) {
+    html += '<div class="subbar" style="color:var(--bad)">' + esc(live.error) +
+      "</div>";
   }
-  if (live.channels == null) {
-    html += '<div class="loading">Loading channels&hellip;</div>';
-  } else if (!live.channels.length) {
-    html += '<div class="empty">No channels in this category.</div>';
+  html += '<div class="live-filters">' +
+    '<div class="searchrow">' +
+    '<input id="live-q" type="search" enterkeyhint="search" autocomplete="off" ' +
+    'placeholder="Search live channels\u2026" value="' + esc(live.q) + '" ' +
+    'onkeydown="if(event.key===\'Enter\'){event.preventDefault();searchLive();}">' +
+    '<button class="accent" onclick="searchLive()">Search</button></div>' +
+    countrySelectHtml() + catSelectHtml() + "</div>" +
+    '<div class="livebar">' +
+    '<button class="' +
+    (live.mode === "browse" && live.results == null ? "on" : "") +
+    '" onclick="showBrowse()">Channels</button>' +
+    '<button class="' + (live.mode === "favs" ? "on" : "") +
+    '" onclick="showFavs()">\u2605 Favorites (' +
+    (live.favorites ? live.favorites.length : 0) + ")</button></div>";
+
+  if (live.mode === "favs") {
+    html += liveFavsHtml();
+  } else if (live.results != null) {
+    html += liveSearchHtml();
+  } else if (live.channels == null) {
+    html += live.error
+      ? '<div class="empty">' + esc(live.error) + "</div>"
+      : '<div class="loading">Loading channels&hellip;</div>';
   } else {
-    for (var j = 0; j < live.channels.length; j++) {
-      var c = live.channels[j];
-      html += '<div class="rowitem" onclick="playChannel(' + c.stream_id + ')">' +
-        (c.logo
-          ? '<img class="thumb" style="width:60px;height:40px" loading="lazy" src="' +
-            esc(c.logo) + '" onerror="this.style.display=\'none\'">'
-          : "") +
-        '<div class="meta"><div class="name">' + esc(c.name) + "</div></div>" +
-        '<div class="badge">LIVE</div></div>';
-    }
+    html += liveChannelsHtml();
   }
   el.innerHTML = html;
   showScreen("livetv");
 }
 
-function playChannel(streamId) {
-  rpc("xt_url", { stream_id: streamId }, function (out) {
+function playLiveAt(i) {
+  var c = (state.live.view || [])[i];
+  if (c) playChannel(c);
+}
+
+function favToggleAt(i) {
+  var c = (state.live.view || [])[i];
+  if (!c) return;
+  rpc("xt_fav_toggle", { stream_id: c.stream_id, name: c.name,
+                         logo: c.logo, category: c.category },
+      function (out) {
     if (out.error) { toast(out.error); return; }
-    var ch = null;
-    for (var i = 0; i < (state.live.channels || []).length; i++) {
-      if (state.live.channels[i].stream_id === streamId) ch = state.live.channels[i];
-    }
-    openPlayer(out.url, ch ? ch.name : "Live TV");
+    state.live.favorites = out.favorites || [];
+    toast(out.fav ? "Added to favorites" : "Removed from favorites", 1600);
+    renderLive();
+  });
+}
+
+function playChannel(c) {
+  rpc("xt_url", { stream_id: c.stream_id }, function (out) {
+    if (out.error) { toast(out.error); return; }
+    openPlayer(out.url, c.name, out.url_ts);
   });
 }
 

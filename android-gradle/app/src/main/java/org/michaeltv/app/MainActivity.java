@@ -135,6 +135,32 @@ public class MainActivity extends Activity {
         }
 
         /**
+         * In-app playback (the WebView cannot decode MPEG-TS/HLS/MKV):
+         * open the native ExoPlayer screen.  altUrl is the progressive .ts
+         * fallback for live channels; an empty string means none.
+         */
+        @JavascriptInterface
+        public void playNative(final String url, final String altUrl,
+                               final String title) {
+            if (url == null || url.isEmpty()) return;
+            runOnUiThread(new Runnable() {
+                @Override
+                public void run() {
+                    Intent i = new Intent(MainActivity.this,
+                            PlayerActivity.class);
+                    i.putExtra(PlayerActivity.EXTRA_URL, url);
+                    if (altUrl != null && !altUrl.isEmpty()) {
+                        i.putExtra(PlayerActivity.EXTRA_ALT_URL, altUrl);
+                    }
+                    if (title != null) {
+                        i.putExtra(PlayerActivity.EXTRA_TITLE, title);
+                    }
+                    startActivity(i);
+                }
+            });
+        }
+
+        /**
          * Open a plain web URL (the release page / APK download) in the
          * browser — used by the in-app update banner. Unlike
          * openExternal it sets no MIME type, so the browser (or the

@@ -117,8 +117,9 @@ class StremioDialog(QtWidgets.QDialog):
 
         pick_box.setToolTip(
             "Applies when MichaelTV picks the stream itself: "
-            "autoplay-next, the next/previous-episode buttons and the "
-            "P-key picker. The stream Stremio hands over plays as-is.")
+            "autoplay-next, the next/previous-episode buttons, the "
+            "S next-stream button and dead-stream recovery. "
+            "The stream Stremio hands over plays as-is.")
         addons_lbl = QtWidgets.QLabel(
             "Addon priority \u2014 one manifest URL per line "
             "(line 1 is preferred)")
@@ -178,6 +179,32 @@ class StremioDialog(QtWidgets.QDialog):
         self.res_combo.setCurrentIndex(idx if idx >= 0 else 4)
         form.addRow("Resolution", self.res_combo)
 
+        self._provider_bases = dict(config.stremio_provider_bases)
+        self._seed_provider_bases()
+        self.prov_combo = QtWidgets.QComboBox()
+        self.prov_combo.setToolTip(
+            "Debrid service MichaelTV resolves through when IT picks the "
+            "stream: autoplay-next, the next/previous-episode buttons, "
+            "the S next-stream button and dead-link recovery.\n"
+            "\u201cAuto\u201d follows the provider of the stream now "
+            "playing.\n\u201cKey found\u201d means that service\u2019s key "
+            "is already known; one without it follows the current stream "
+            "until you play one of its streams once (or use Import from "
+            "installed Stremio).\nThe stream Stremio hands over plays "
+            "as-is.")
+        self.prov_combo.addItem("Auto (follow the stream)", "auto")
+        try:
+            from ..stremio import PROVIDER_LABELS
+            for token, label in PROVIDER_LABELS.items():
+                if token in self._provider_bases:
+                    label += " \u2014 key found"
+                self.prov_combo.addItem(label, token)
+        except Exception:  # noqa: BLE001 - the label table is cosmetic
+            pass
+        idx = self.prov_combo.findData(config.stremio_provider_pref)
+        self.prov_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        form.addRow("Debrid provider", self.prov_combo)
+
         self.size_combo = QtWidgets.QComboBox()
         self.size_combo.setToolTip(
             "Streams larger than this rank lower \u2014 they are never "
@@ -229,6 +256,39 @@ class StremioDialog(QtWidgets.QDialog):
         lbl.setStyleSheet(
             "color:%s;" % (_GREEN if ok else _GRAY))
         lbl.setToolTip(tip)
+
+    # ---- debrid provider ----
+
+    def _seed_provider_bases(self):
+        """Every provider=key pair the installed Stremio profile's addon
+        URLs carry: ONE Torrentio instance can prove Premiumize AND
+        TorBox at once, while a handoff only ever reveals the provider
+        used for that click. Kept in memory until accept() persists it,
+        so Cancel changes nothing on disk."""
+        try:
+            from .. import stremio_profile
+            found = stremio_profile.discover_stream_addons()
+        except Exception:  # noqa: BLE001
+            return
+        if not found:
+            return
+        from urllib.parse import urlparse
+        merged = dict(self._provider_bases)
+        for entry in found:
+            url = str(entry.get("url") or "")
+            host = urlparse(url).hostname or ""
+            # /resolve/{provider}/{key}/ is Torrentio's shape; other addon
+            # hosts carry their keys differently (Debridio: base64)
+            if "torrentio" not in host:
+                continue
+            try:
+                pairs = stremio_profile.provider_keys_from_url(url)
+            except Exception:  # noqa: BLE001
+                continue
+            for prov, key in pairs.items():
+                merged[prov] = "https://%s/resolve/%s/%s/" % (
+                    host, prov, key)
+        self._provider_bases = merged
 
     # ---- Downloads auto-play ----
 
@@ -468,6 +528,9 @@ class StremioDialog(QtWidgets.QDialog):
             self.res_combo.currentData() or "1080"
         self.config.stremio_size_demote_gb = \
             self.size_combo.currentData() or 0
+        self.config.stremio_provider_pref = \
+            self.prov_combo.currentData() or "auto"
+        self.config.stremio_provider_bases = dict(self._provider_bases)
         self.config.stremio_server = self.srv_edit.text()
         self.config.stremio_watch_downloads = \
             self.watch_chk.isChecked()

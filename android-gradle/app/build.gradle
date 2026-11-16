@@ -22,8 +22,8 @@ android {
         targetSdk 34
         // The two version lines below are rewritten from src/config.py
         // APP_VERSION by android-gradle/prepare_core.py — do not edit here.
-        versionCode 2010900  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
-        versionName "2.1.9"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
+        versionCode 2011100  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
+        versionName "2.1.11"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
 
         ndk {
             // 64-bit phones only — halves the APK and the Chaquopy payload.
@@ -56,9 +56,24 @@ android {
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }
+}
 
-    // No androidx dependencies anywhere — plain android.app.Activity +
-    // android.webkit.WebView keep the APK tiny and the build simple.
+dependencies {
+    // Native playback (PlayerActivity).  A WebView <video> element cannot
+    // decode MPEG-TS/HLS live streams or MKV movie files — the formats
+    // providers actually serve — so the app uses ExoPlayer (media3):
+    // progressive/HLS/TS/MKV/MP4/WebM all play in-app.
+    def media3 = "1.2.1"
+    implementation "androidx.media3:media3-exoplayer:$media3"
+    implementation "androidx.media3:media3-exoplayer-hls:$media3"
+    implementation "androidx.media3:media3-ui:$media3"
+    // Chromecast (PlayerActivity).  media3-cast 1.2.1 does NOT pull the
+    // cast framework transitively (its POM is lean), so both are explicit:
+    // CastPlayer + SessionAvailabilityListener from media3-cast, and
+    // CastContext/CastButtonFactory/MediaRouteButton from the framework
+    // (mediarouter and appcompat ride along transitively).
+    implementation "androidx.media3:media3-cast:$media3"
+    implementation "com.google.android.gms:play-services-cast-framework:21.2.0"
 }
 
 // Chaquopy 15 DSL: a top-level chaquopy block (the old python-inside-

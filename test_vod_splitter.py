@@ -1077,6 +1077,34 @@ def main():
           any("late tail" in c[2] for c in tcues2))
     relay_t2.stop()
     time.sleep(0.3)
+
+    # (c) parallel-tail mode (Stremio only — debrid links allow several
+    # ranged GETs): the seek-index tail downloads on its own connection
+    # while the main stream opens. Same fixture, same cues, and the tail
+    # must still never go through the one-stream slot.
+    relay_t3 = VodRelay(parallel_tail=True)
+    tcues3 = []
+    relay_t3.cue.connect(lambda s, e, t: tcues3.append((s, e, t)))
+    local_t3 = relay_t3.start(
+        f"http://127.0.0.1:{prov_t.server_address[1]}/big.mkv",
+        "MichaelTVPlayer/1.0")
+    check("(c) parallel-tail mkv accepted", bool(local_t3))
+    tbody3 = b""
+    deadline = time.time() + 30
+    while time.time() < deadline and (len(tbody3) < len(tailblob)
+                                      or len(tcues3) < 4):
+        app.processEvents()
+        _, tbody3 = get(local_t3)
+        time.sleep(0.2)
+    check("(c) parallel-tail byte fidelity through the relay",
+          tbody3 == tailblob)
+    late3 = {c[2] for c in tcues3 if "late tail" in c[2]}
+    check("(c) parallel tail still taps the tail-region cues",
+          len(late3) >= 3)
+    check("(c) parallel tail keeps the one-provider-stream discipline",
+          relay_t3.provider_opens <= 1)
+    relay_t3.stop()
+    time.sleep(0.3)
     prov_t.shutdown()
 
     print("[6b] unit: _tap_read serves head/tail, refuses holes")

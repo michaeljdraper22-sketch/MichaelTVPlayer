@@ -17,7 +17,8 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 
 from ..dvr import VlcRecorder
 from ..gopindex import GopIndex
-from ..player import VLCPlayer, subtitle_instance_args, USER_AGENT
+from ..player import (VLCPlayer, subtitle_instance_args, USER_AGENT,
+                      _slider_to_vlc_volume, AoutHealGate)
 from .. import profanity as prof_mod
 from ..catchup_relay import CatchupRelay
 from ..live_cc import CCSource, find_ccextractor, probe_tail_pcr, \
@@ -123,6 +124,27 @@ _SEEK_VERIFY_MAX_S = 6.0
 _SEEK_VERIFY_TOL_S = 2.0
 _SEEK_ESC_BACKOFF_S = (5.0, 15.0, 30.0)
 _SEEK_ESC_DECAY_S = 90.0        # clean verifies for this long decay a strike
+# Unseekable-buffer escape: a rotated buffer can come out of the recorder
+# with a PTS discontinuity near its head (2026-11-14 12:10: the fresh
+# sibling held a video jump 22.0 -> 20.5 s). libvlc then refuses to seek in
+# it AT ALL — :start-time is dropped and set_time snaps back — so every
+# rescue reopen lands at 0.0, plays the same couple of seconds, wedges
+# again, and the verify ladder revives into it forever (a 2 s loop every
+# ~11 s). A landing this close to the file start, for a target this far in,
+# is that signature: give the buffer up to the plain-live fallback, which
+# starts a fresh one near the live edge.
+_SEEK_ZERO_LAND_S = 3.0         # a landing below this is "at the file start"
+_SEEK_ZERO_TARGET_MIN_S = 15.0  # only a miss when we asked to be this far in
+_SEEK_ZERO_STRIKES = 3          # this many in a row -> buffer is unseekable
+# Head-pinned reopen: the reopen's VLC-axis landing sits this close to the
+# file head while the CONTENT target is this deep — the axis mapping and
+# GOP anchor can then only land below a discontinuity the demuxer cannot
+# cross, and every rescue reopens just under the poison point, stalls
+# there, and repeats (2026-11-14 noon loop: PTS jump ~22 s into a rotated
+# buffer; verify read CLEAN because the poisoned div made the stall point
+# map back to the target — only the reopen site sees it).
+_SEEK_HEAD_PIN_VLC_S = 30.0
+_SEEK_HEAD_PIN_MIN_CONTENT_S = 60.0
 # Wedge rescue: raw frozen this long while "playing" AND this much REAL
 # content ahead. "Ahead" is measured from the PCR head, not the frontier —
 # the frontier under-credits the cold burst (at the true edge
@@ -806,6 +828,10 @@ class PlayerView(QtWidgets.QWidget):
         self._dvr_tick_t = None    # wall clock of the last _note_dvr_data sample
         self._dvr_last_growth = None  # wall clock of the last growth sighting
         self._stall_ticks = 0      # consecutive not-playing ticks (watchdog)
+        # Audio re-anchor budget for libvlc's own "aout was late" reports
+        # (see src/player.AoutHealGate); reset per media in play_media.
+        self._aout_gate = AoutHealGate()
+        self._aout_heals = 0       # lifetime count (logged, diagnostics)
         self._last_reopen = 0.0    # cooldown for frontier reopens
         self._lag_gov_last = 0.0   # last lag-governor jump (cooldown)
         self._lag_user_seek = False  # user deliberately sits behind live
@@ -838,6 +864,10 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_esc_strikes = 0    # escalation backoff ladder position
         self._seek_esc_ok_at = 0.0    # earliest next escalation (now_s axis)
         self._seek_esc_clean = 0.0    # last clean verify (strike decay)
+        self._seek_zero_landings = 0  # rescues that landed at the file start
+        #                              # (see _SEEK_ZERO_STRIKES)
+        self._reopen_head_pins = 0    # reopens whose VLC landing pinned to
+        #                              # the file head (see _SEEK_HEAD_PIN_*)
         self._gop = None              # GopIndex over the chase buffer (see
         #                              # _GOP_ANCHOR_GUARD_S block) — starts
         #                              # with the buffer, dies with chase
@@ -1067,14 +1097,16 @@ class PlayerView(QtWidgets.QWidget):
         self._look_runner = AsyncRunner()
         self._look_runner.finished.connect(self._on_stremio_lookahead)
         self._look_busy = ""          # fav_key of the in-flight lookahead
-        self._stremio_lookahead = None   # (fav_key, playable|None, when)
+        self._stremio_lookahead = None   # (fav_key, playable|None, when,
+                                         #  prefs fingerprint)
         # the ⏮ twin: a background PREV-episode lookup, so going back is
         # as instant as next (the live-seen prev click ran the whole
         # addon-query chain on demand — ~4-5 s "Finding previous…")
         self._prevlook_runner = AsyncRunner()
         self._prevlook_runner.finished.connect(self._on_stremio_prevlook)
         self._prevlook_busy = ""
-        self._stremio_prevlook = None    # (fav_key, playable|None, when)
+        self._stremio_prevlook = None    # (fav_key, playable|None, when,
+                                         #  prefs fingerprint)
         # next-stream lookups (the S button / stream button: same
         # episode, next source down the list) — its own runner + busy
         # latch so
@@ -1332,6 +1364,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_back10 = ctl_btn(ic.rewind10(), "Rewind 10 seconds")
         self.btn_play = ctl_btn(ic.play(), "Play / Pause (Space)")
         self.btn_fwd10 = ctl_btn(ic.fwd10(), "Forward 10 seconds")
+        self.btn_fwd60 = ctl_btn(ic.fwd60(), "Forward 60 seconds")
         self.sep1 = ctl_sep()
         self.btn_begin = ctl_btn(ic.begin(),
                                  "Jump to the beginning of the stream")
@@ -1390,6 +1423,15 @@ class PlayerView(QtWidgets.QWidget):
             if self.config.autoplay_next
             else "Autoplay next episode — OFF", checkable=True)
         self.btn_auto.setChecked(self.config.autoplay_next)
+        # No blue checked pill here (user call, 2026-11-14): ON is the
+        # button's NORMAL look and OFF carries the state in the glyph
+        # (X-struck, the mute convention). A widget stylesheet beats the
+        # theme's QToolButton:checked for this button only — mute / record
+        # keep their lit-blue ON (recording wants to be unmistakable).
+        self.btn_auto.setStyleSheet(
+            "QToolButton:checked { background: transparent; border: none; }"
+            "QToolButton:checked:hover { background-color: #46464a;"
+            " border-radius: 4px; }")
         # play next: next episode for series, the next recorded program for
         # catch-up, the next channel for live TV (movies get neither)
         self.btn_next = ctl_btn(ic.play_next(), "Play next (N)")
@@ -1398,12 +1440,13 @@ class PlayerView(QtWidgets.QWidget):
         # Live TV keeps next-only (reverse channel-zapping wasn't asked
         # for), movies get neither.
         self.btn_prev = ctl_btn(ic.play_prev(), "Play previous (P)")
-        # next stream: SAME episode/movie on the next source down the
-        # list —
+        # next stream: SAME episode/movie on the next-best source after
+        # the one now playing —
         # the "this one's wrong (foreign audio, no subs, dead)" escape
-        # hatch for Stremio handoffs. Walks autoplay's exact ranking
-        # (language / resolution / size / addon order) past the stream
-        # now playing, so repeated presses keep moving down the list.
+        # hatch for Stremio handoffs. Ordered by the stream preferences
+        # from Settings > Stremio handoff (debrid provider / resolution /
+        # size / language), with Stremio's list order breaking ties, so
+        # repeated presses keep moving down the picks.
         # Stremio only: every other kind plays a single fixed stream.
         self.btn_stream = ctl_btn(
             ic.stream_next(),
@@ -1425,10 +1468,10 @@ class PlayerView(QtWidgets.QWidget):
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(6)
         for w in (self.btn_back60, self.btn_back10, self.btn_play,
-                  self.btn_fwd10, self.sep1, self.btn_begin, self.btn_live,
-                  self.btn_dl, self.btn_win, self.btn_rec, self.sep2,
-                  self.btn_cc, self.btn_audio, self.btn_scale, self.btn_speed,
-                  self.btn_auto, self.btn_prev, self.btn_next,
+                  self.btn_fwd10, self.btn_fwd60, self.sep1, self.btn_begin,
+                  self.btn_live, self.btn_dl, self.btn_win, self.btn_rec,
+                  self.sep2, self.btn_cc, self.btn_audio, self.btn_scale,
+                  self.btn_speed, self.btn_auto, self.btn_prev, self.btn_next,
                   self.btn_stream, self.sep3,
                   self.btn_mute, self.vol_slider):
             rl.addWidget(w)
@@ -1441,8 +1484,8 @@ class PlayerView(QtWidgets.QWidget):
         # to whatever starts playing — see _set_rate).
         # _update_control_state() re-enables per mode once media plays.
         for b in (self.btn_back60, self.btn_back10, self.btn_play,
-                  self.btn_fwd10, self.btn_begin, self.btn_live,
-                  self.btn_rec, self.btn_audio,
+                  self.btn_fwd10, self.btn_fwd60, self.btn_begin,
+                  self.btn_live, self.btn_rec, self.btn_audio,
                   self.btn_next, self.btn_prev, self.btn_stream):
             b.setEnabled(False)
 
@@ -1469,6 +1512,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_back60.clicked.connect(lambda: self._seek_ms(-60000))
         self.btn_back10.clicked.connect(lambda: self._seek_ms(-10000))
         self.btn_fwd10.clicked.connect(lambda: self._seek_ms(10000))
+        self.btn_fwd60.clicked.connect(lambda: self._seek_ms(60000))
         self.btn_play.clicked.connect(self._toggle_pause)
         self.btn_begin.clicked.connect(self._jump_begin)
         self.btn_live.clicked.connect(self._jump_live)
@@ -1998,8 +2042,11 @@ class PlayerView(QtWidgets.QWidget):
     def _fit_ctl(self, avail: int):
         """Progressively compact the control row until it fits ``avail`` px:
         tighter spacing, then no separators, then a shorter volume slider,
-        then hiding the least-important seek buttons. Full layout is kept
-        whenever there is room for it."""
+        then hiding the secondary pickers (audio / scale, then jump-to-end /
+        download). The seek buttons are NEVER hidden — half-screen Stremio
+        viewing lost its rewinds/fast-forwards that way (field-reported
+        2026-11-14); the pickers all have keyboard/menu alternates. Full
+        layout is kept whenever there is room for it."""
         if self._in_fit_ctl:
             return   # _apply_compact re-enters via _apply_button_visibility
         self._in_fit_ctl = True
@@ -2019,9 +2066,9 @@ class PlayerView(QtWidgets.QWidget):
         self._compact_level = level
         hide = set()
         if level >= 4:
-            hide.add("back60")
+            hide.update(("audio", "scale"))
         if level >= 5:
-            hide.update(("back10", "fwd10"))
+            hide.update(("live", "dl"))
         self._compact_hidden = hide
         self.ctl_row.layout().setSpacing(2 if level >= 1 else 6)
         self.vol_slider.setFixedWidth(48 if level >= 3 else 84)
@@ -2174,6 +2221,22 @@ class PlayerView(QtWidgets.QWidget):
                 pass
             return
         self.current = playable
+        # A new media gets a fresh audio re-anchor budget: the previous
+        # stream's libvlc aout complaints say nothing about this one.
+        self._aout_gate.reset()
+        # Learn the debrid pipeline this stream was resolved through, so
+        # the preferred-provider setting can build resolve links without
+        # ever asking for the key: every played resolve URL (handoff,
+        # next episode, S button, autoplay, dead-link advance) teaches
+        # its provider+key prefix. GUI thread; persisted only on change.
+        try:
+            if str(playable.get("kind") or "") == "stremio":
+                from .. import stremio as _stremio
+                if _stremio.note_provider_base(
+                        self.config, playable.get("url", "")):
+                    self.config.save()
+        except Exception:  # noqa: BLE001
+            pass
         # the never-started watchdog's probe dials the PROVIDER when the
         # display watches the local DVR buffer (see VLCPlayer.play_at)
         try:
@@ -2332,6 +2395,8 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_esc_strikes = 0
         self._seek_esc_ok_at = 0.0
         self._seek_esc_clean = 0.0
+        self._seek_zero_landings = 0
+        self._reopen_head_pins = 0
         self._raw_win = []
         self._trickle_hold = False
         self._dvr_status.hide()
@@ -2592,6 +2657,18 @@ class PlayerView(QtWidgets.QWidget):
 
     # ---- stremio: prefetch the next episode while this one plays ----
 
+    def _stremio_prefs_key(self):
+        """Fingerprint of the settings that shape a Stremio pick. A
+        lookahead/prelook result cached under different preferences must
+        never be served — the dialog applies live, and the S button /
+        autoplay read these at pick time."""
+        try:
+            return (self.config.stremio_provider_pref,
+                    self.config.stremio_resolution_pref,
+                    self.config.stremio_size_demote_gb)
+        except Exception:  # noqa: BLE001
+            return ("auto", "1080", 25)
+
     def _begin_stremio_lookahead(self):
         """Kick a background next-episode lookup for the CURRENT stremio
         episode. End-of-episode then switches in well under a second
@@ -2622,7 +2699,8 @@ class PlayerView(QtWidgets.QWidget):
         cur = self.current or {}
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran
-        self._stremio_lookahead = (base, nxt, now_s())
+        self._stremio_lookahead = (base, nxt, now_s(),
+                                   self._stremio_prefs_key())
         if nxt:
             try:
                 log.info("stremio lookahead: next ready — %r",
@@ -2660,7 +2738,8 @@ class PlayerView(QtWidgets.QWidget):
         cur = self.current or {}
         if cur.get("kind") != "stremio" or cur.get("fav_key") != base:
             return          # the user moved on while the lookup ran
-        self._stremio_prevlook = (base, prv, now_s())
+        self._stremio_prevlook = (base, prv, now_s(),
+                                  self._stremio_prefs_key())
         if prv:
             try:
                 log.info("stremio prevlook: previous ready — %r",
@@ -2923,6 +3002,12 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_auto.setIcon(ic.autoplay(on))
         self.btn_auto.setToolTip("Autoplay next episode — ON"
                                  if on else "Autoplay next episode — OFF")
+        # Icon swap on the layered overlay leaves the PREVIOUS glyph's
+        # pixels behind (field report 2026-11-14: turning autoplay off
+        # showed both symbols overlapping) — flush like
+        # _apply_button_visibility does after show/hide swaps.
+        if self.overlay.isVisible():
+            self.overlay.repaint()
 
     def _pn_log(self, msg, *args):
         """Log helper for the play-next/prev machinery — never raises
@@ -3193,7 +3278,9 @@ class PlayerView(QtWidgets.QWidget):
         # identified) usually has it ready — switch instantly
         look = self._stremio_lookahead
         if look and look[0] == cur.get("fav_key") \
-                and now_s() - look[2] < 1800:
+                and now_s() - look[2] < 1800 \
+                and (len(look) < 4
+                     or look[3] == self._stremio_prefs_key()):
             return look[1]
         try:
             from .. import stremio
@@ -3211,7 +3298,9 @@ class PlayerView(QtWidgets.QWidget):
         background prev-lookahead cache first)."""
         look = self._stremio_prevlook
         if look and look[0] == cur.get("fav_key") \
-                and now_s() - look[2] < 1800:
+                and now_s() - look[2] < 1800 \
+                and (len(look) < 4
+                     or look[3] == self._stremio_prefs_key()):
             return look[1]
         try:
             from .. import stremio
@@ -4403,6 +4492,7 @@ class PlayerView(QtWidgets.QWidget):
                               - target) <= _SEEK_VERIFY_TOL_S:
             self._seek_verify = None
             self._seek_esc_clean = now
+            self._seek_zero_landings = 0
             return
         if now < deadline or self._chase_paused:
             return
@@ -4414,6 +4504,27 @@ class PlayerView(QtWidgets.QWidget):
         # player (raw parked at raw_pre) skips this and takes the revive.
         if (not fix_tried and raw >= 0.0 and raw < target - _SEEK_VERIFY_TOL_S
                 and raw > raw_pre + 0.5):
+            # start-time ignored AGAIN (see _SEEK_ZERO_STRIKES): a landing
+            # at the file head for a deep target is the unseekable-buffer
+            # signature in its advancing form (2026-11-14 17:30: every
+            # rescue reopen logged "landed at 0.0s" yet the strike ladder
+            # below never ran — the rescues kept re-arming fresh verifies
+            # with fix_tried cleared). Count it HERE; three in a row hand
+            # the buffer to the plain-live fallback.
+            if raw <= _SEEK_ZERO_LAND_S \
+                    and target > _SEEK_ZERO_TARGET_MIN_S:
+                self._seek_zero_landings += 1
+                if self._seek_zero_landings >= _SEEK_ZERO_STRIKES:
+                    self._seek_zero_landings = 0
+                    try:
+                        log.warning("chase: buffer is unseekable — "
+                                    "play_at landed at %.1fs for %.1fs "
+                                    "%d times; plain live fallback",
+                                    raw, target, _SEEK_ZERO_STRIKES)
+                    except Exception:
+                        pass
+                    self._fallback_from_chase(now - armed_at)
+                    return
             try:
                 log.warning("seek verify: play_at landed at %.1fs, not "
                             "%.1fs — correcting with set_time",
@@ -4426,6 +4537,26 @@ class PlayerView(QtWidgets.QWidget):
             return
         if now < self._seek_esc_ok_at \
                 or now - self._last_reopen < _REOPEN_COOLDOWN_S:
+            return
+        # Unseekable-buffer escape (see _SEEK_ZERO_STRIKES): if the landings
+        # keep coming back at the file start however far ahead we asked
+        # for, reviving into this buffer again only replays its first
+        # seconds — the buffer has to go. Increment-only here: only a
+        # CLEAN verify (or the fallback itself) resets — the advancing
+        # form's deadline read sits past _SEEK_ZERO_LAND_S and must not
+        # clobber the strike the fix branch already counted for it.
+        if raw >= 0.0 and raw <= _SEEK_ZERO_LAND_S \
+                and target > _SEEK_ZERO_TARGET_MIN_S:
+            self._seek_zero_landings += 1
+        if self._seek_zero_landings >= _SEEK_ZERO_STRIKES:
+            self._seek_zero_landings = 0
+            try:
+                log.warning("chase: buffer is unseekable — landed at %.1fs "
+                            "for %.1fs %d times; plain live fallback",
+                            raw, target, _SEEK_ZERO_STRIKES)
+            except Exception:
+                pass
+            self._fallback_from_chase(now - armed_at)
             return
         n = min(self._seek_esc_strikes, len(_SEEK_ESC_BACKOFF_S) - 1)
         self._seek_esc_strikes += 1
@@ -4653,6 +4784,9 @@ class PlayerView(QtWidgets.QWidget):
         self.vlc.set_mute(bool(on))
         self.btn_mute.setIcon(ic.volume(False) if on else ic.volume(True))
         self.btn_mute.setToolTip("Unmute (M)" if on else "Mute (M)")
+        # same layered-overlay ghost-glyph flush as _on_autoplay_toggled
+        if self.overlay.isVisible():
+            self.overlay.repaint()
 
     def _on_wheel(self, delta):
         self._wake()
@@ -4792,6 +4926,8 @@ class PlayerView(QtWidgets.QWidget):
         self._stall_ticks = 0
         self._chase_hold = None
         self._chase_started = False
+        self._seek_zero_landings = 0
+        self._reopen_head_pins = 0
         self._vid_s = 0.0
         self._last_raw = None
         self._set_dvr_status(None)
@@ -4903,6 +5039,32 @@ class PlayerView(QtWidgets.QWidget):
             if gop is not None:
                 vlc_t = gop
                 target = self._cap_content_for_raw(vlc_t)
+            # Head-pinned reopen (see _SEEK_HEAD_PIN_*): the axis mapping
+            # and GOP anchor keep landing near the file HEAD while the
+            # content target is deep — the buffer has a discontinuity the
+            # demuxer cannot cross (2026-11-14 noon: a PTS jump ~22 s in
+            # pinned every rescue at ~20 s VLC; the verify even read CLEAN
+            # because the poisoned div mapped the stall point back to the
+            # target). Only the reopen site sees it. A healthy reopen
+            # lands deep on the VLC axis too and resets the count.
+            if (vlc_t < _SEEK_HEAD_PIN_VLC_S
+                    and target > _SEEK_HEAD_PIN_MIN_CONTENT_S):
+                self._reopen_head_pins += 1
+                if self._reopen_head_pins >= _SEEK_ZERO_STRIKES:
+                    self._reopen_head_pins = 0
+                    try:
+                        log.warning(
+                            "chase: reopens keep landing at the buffer "
+                            "head (vlc=%.1fs) for deep targets (%.1fs) "
+                            "— buffer is unseekable; plain live fallback",
+                            vlc_t, target)
+                    except Exception:
+                        pass
+                    self._fallback_from_chase(now_s()
+                                              - self._last_reopen)
+                    return False
+            else:
+                self._reopen_head_pins = 0
             # a (re)open AT a position is a transport event: it seeds the
             # caption clock and the live-edge backlog by construction
             # (voiding the axis divergence — vlc_t is target itself)
@@ -5277,6 +5439,9 @@ class PlayerView(QtWidgets.QWidget):
     # ---- permanent recording (kept file; still a single connection) ----
     def _on_rec_toggled(self, on):
         self.btn_rec.setIcon(ic.rec(bool(on)))
+        # same layered-overlay ghost-glyph flush as _on_autoplay_toggled
+        if self.overlay.isVisible():
+            self.overlay.repaint()
         if on:
             folder = self.config.record_folder
             if not folder or not os.path.isdir(folder):
@@ -5868,11 +6033,12 @@ class PlayerView(QtWidgets.QWidget):
 
         In normal windowed mode the zen/fullscreen corner buttons stay put
         (sharing the auto-hide cycle made them "randomly disappear"); in
-        fullscreen/zen everything VISIBLE hides — cursor included — and
-        any cursor movement brings it all back. The overlay window itself
-        stays up as the invisible mouse layer (see below). Never hides
-        mid-interaction (scrub drag, open popup, cursor resting on one of
-        the controls)."""
+        fullscreen/zen everything VISIBLE hides. The idle CURSOR blanks
+        in every mode — an arrow parked on the video is never wanted —
+        and any cursor movement brings it all back. The overlay window
+        itself stays up as the invisible mouse layer (see below). Never
+        hides mid-interaction (scrub drag, open popup, cursor resting on
+        one of the controls)."""
         if self._closing:
             return
         if not force and (self._seeking or self._popup_open
@@ -5895,11 +6061,18 @@ class PlayerView(QtWidgets.QWidget):
             self._btn_ovfs.hide()
             self._btn_newwin.hide()
             self._btn_reload.hide()
-            self.setCursor(QtCore.Qt.BlankCursor)
-            # the overlay is a separate native window — the view's blank
-            # cursor never applied there, and its hit plate now covers
-            # the whole video (zen keeps click-to-pause working)
-            self.overlay.setCursor(QtCore.Qt.BlankCursor)
+        # Blank the idle cursor in EVERY mode, not just immersive: an
+        # arrow parked on the video for 4 s must vanish (2026-11-15
+        # two-tiled-windows report — windowed mode never blanked). Safe
+        # by construction: setCursor is per-widget, so the shape only
+        # applies while the cursor is over this view/overlay (channel
+        # list, menus and other apps keep their arrow), and the guards
+        # above already re-arm the timer while the cursor rests on a
+        # visible control. The overlay is a separate native window —
+        # the view's blank cursor never applied there, and its hit
+        # plate covers the whole video (click-to-pause keeps working).
+        self.setCursor(QtCore.Qt.BlankCursor)
+        self.overlay.setCursor(QtCore.Qt.BlankCursor)
         # The overlay window itself STAYS UP even with nothing on it:
         # since 2.1.6 it is the video's mouse layer — hiding it would
         # hand every click back to VLC's vout child HWNDs (which swallow
@@ -6056,6 +6229,13 @@ class PlayerView(QtWidgets.QWidget):
             # volume actually reached the freshly opened audio output
             self._poke_audio()
         self._was_playing = playing
+        # ...and keep it reached: a later/new audio output can adopt another
+        # player's process-wide DirectSound level (see _enforce_volume)
+        self._enforce_volume(playing)
+        # libvlc's aout reports the audio-timeline damage it had to do
+        # (flushed/dropped late audio); re-anchor the output when a real
+        # offset can be left behind — see _maybe_heal_audio_sync.
+        self._maybe_heal_audio_sync(playing)
 
         if self._mode == "chase" and self.dvr:
             gen = self._session   # the watchdog reopen must respect it
@@ -6314,7 +6494,8 @@ class PlayerView(QtWidgets.QWidget):
             # flipped (fallback → successful retry) leaves the transport
             # buttons disabled and the scrubber hidden otherwise.
             for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                      self.btn_begin, self.btn_speed, self.btn_live):
+                      self.btn_fwd60, self.btn_begin, self.btn_speed,
+                      self.btn_live):
                 if not b.isEnabled():
                     b.setEnabled(True)
             if not self._scrub_on:
@@ -6393,7 +6574,7 @@ class PlayerView(QtWidgets.QWidget):
             # stremio counts as vod here (a seekable FILE): speed joins the
             # transport flip so the button tracks the mode honestly
             for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                      self.btn_begin, self.btn_speed):
+                      self.btn_fwd60, self.btn_begin, self.btn_speed):
                 b.setEnabled(vod)
             self.btn_win.setEnabled(
                 vod and self._is_catchup() and not self._downloading)
@@ -6504,6 +6685,96 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:  # noqa: BLE001
             pass
 
+    def _enforce_volume(self, playing: bool) -> None:
+        """Pin this window's audio output to ITS slider.
+
+        The multi-window DirectSound output keeps libvlc's volume
+        PROCESS-WIDE: the last audio_set_volume from ANY player wins, and a
+        player's FIRST audio output adopts that value no matter what was
+        applied around the Playing event (measured 2026-11-11: a window
+        whose bar sat at 100 started at another window's 20 under
+        --aout=directsound). The fixed _poke_audio timers can fire before a
+        slow stream's output even exists, so that alien level could stick
+        for the whole program — field report: 'the volume slider is going
+        down no matter how you adjust it'.
+
+        Comparing the output's ACTUAL percent against the slider's taper
+        and re-applying only on a real mismatch is one cheap call per tick.
+        The wanted value IS the live slider, so a user drag is never
+        fought; a mismatch that refuses to stick is retried at most every
+        1.5 s instead of every tick."""
+        if self._closing or not playing:
+            return
+        try:
+            getter = getattr(self.vlc, "get_vlc_volume", None)
+            got = getter() if getter is not None else None
+            if got is None:
+                return          # audio output not up yet
+            bar = int(self.vol_slider.value())
+            want = _slider_to_vlc_volume(bar)
+            if abs(int(got) - want) <= 2:
+                self._vol_pin_key = None
+                return
+            key = (int(got), want)
+            now = now_s()
+            first = key != getattr(self, "_vol_pin_key", None)
+            if not first and now - getattr(self, "_vol_pin_t", 0.0) < 1.5:
+                return
+            self._vol_pin_key = key
+            self._vol_pin_t = now
+            if first:
+                log.info("volume: output at %d%% but bar %d wants %d%% — "
+                         "re-applying", got, bar, want)
+            self.vlc.set_volume(bar)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _maybe_heal_audio_sync(self, playing: bool) -> None:
+        """Re-anchor the audio output when libvlc reports a real lag.
+
+        Field report 2026-11-13: audio ~1 s behind the picture on a VOD for
+        a whole session; a reload fixes it. libvlc's aout knows when it had
+        to flush/drop late audio and says how much — a LARGE one leaves the
+        sound behind the picture until something restarts the output. That
+        restart is exactly what the user's reload does; heal_audio_sync()
+        does it without touching the picture or the position.
+
+        Only VOD/Stremio/local-file playback goes through the gate: the
+        live chase player's audio belongs to the recorder's buffer and must
+        not be restarted mid-stream. Never heals while paused (VLC
+        re-prerolls on resume anyway)."""
+        evt = None
+        try:
+            evt = self.vlc.take_aout_event()
+        except Exception:  # noqa: BLE001 — stub players in tests
+            return
+        if evt is None:
+            return
+        kind, us = evt
+        try:
+            chase = self._mode == "chase"
+            kind_ok = (self._is_vod() or self._is_stremio()
+                       or self._is_file())
+            if not kind_ok:
+                return
+            paused = self.vlc.state_name() == "paused"
+            if not self._aout_gate.should_heal(
+                    kind, us, playing, paused, chase, now_s()):
+                return
+            if self.vlc.heal_audio_sync():
+                self._aout_heals += 1
+                log.warning("audio sync: libvlc reported %s (%s us) — "
+                            "audio output re-anchored at %s s (heal #%d)",
+                            kind, us, round(self._vid_s, 1),
+                            self._aout_heals)
+                from .. import feedback
+                feedback.stat("aout_heals")
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("audio sync heal skipped: %r", exc)
+            except Exception:
+                pass
+
     def _update_control_state(self):
         """Enable/disable + show/hide controls for the current mode.
 
@@ -6524,7 +6795,7 @@ class PlayerView(QtWidgets.QWidget):
         # — the rewinds and the speed pick apply to them exactly like VOD.
         # Local files are the same shape: a real length, fully seekable.
         for b in (self.btn_back60, self.btn_back10, self.btn_fwd10,
-                  self.btn_begin, self.btn_speed):
+                  self.btn_fwd60, self.btn_begin, self.btn_speed):
             b.setEnabled(chase or vod or stremio or self._is_file()
                          or live_prestream)
         self.btn_live.setEnabled(chase or vod or self._is_file()
@@ -6571,6 +6842,7 @@ class PlayerView(QtWidgets.QWidget):
         widgets = {
             "back60": self.btn_back60, "back10": self.btn_back10,
             "play": self.btn_play, "fwd10": self.btn_fwd10,
+            "fwd60": self.btn_fwd60,
             "begin": self.btn_begin,
             "live": self.btn_live, "rec": self.btn_rec,
             "cc": self.btn_cc, "audio": self.btn_audio,
@@ -6607,9 +6879,13 @@ class PlayerView(QtWidgets.QWidget):
                 # Evaluated end-to-end and deliberately left as the swap.
                 w.setVisible(on and not vod and not stremio
                              and not self._is_file())
-                self.btn_dl.setVisible(on and (vod or stremio)
+                # "dl" hides under narrow-window compaction (see
+                # _apply_compact) together with its catch-up window twin —
+                # same slot, same family
+                dl_on = on and "dl" not in compact
+                self.btn_dl.setVisible(dl_on and (vod or stremio)
                                        and not catchup)
-                self.btn_win.setVisible(on and catchup)
+                self.btn_win.setVisible(dl_on and catchup)
             elif key == "autoplay":
                 # series episodes + catch-up programs + identified Stremio
                 # episodes only (never movies, never live TV — there is no
@@ -6644,7 +6920,8 @@ class PlayerView(QtWidgets.QWidget):
         # separators vanish when the row gets tight (see _apply_compact)
         seps_on = self._compact_level < 2
         self.sep1.setVisible(seps_on and
-                             any_of("back60", "back10", "play", "fwd10")
+                             any_of("back60", "back10", "play", "fwd10",
+                                    "fwd60")
                              and (any_of("begin", "live", "rec")
                                   or any_of("cc", "scale", "speed")
                                   or any_of("mute", "volume")))
@@ -8896,7 +9173,12 @@ class PlayerView(QtWidgets.QWidget):
                 or not vod_splitter.VOD_SPLITTER_READY:
             return url
         try:
-            relay = VodRelay(self)
+            # Stremio/debrid links serve several simultaneous ranged GETs
+            # (only live TV is capped at one connection), so the relay may
+            # overlap its seek-index tail prefetch with the main open/head
+            # parse. IPTV VOD/series keep the proven serial order; resume
+            # sessions do too (VodRelay itself ignores the flag there).
+            relay = VodRelay(self, parallel_tail=(kind == "stremio"))
             local = relay.start(url, USER_AGENT,
                                 prefer_language=self._cap_lang_hint(
                                     self._spu_name) or "eng",
@@ -10027,6 +10309,16 @@ class PlayerView(QtWidgets.QWidget):
                 PlayerView._views.remove(self)
         except Exception:
             pass
+        # Unhook the APPLICATION-level event filter FIRST: it outlives the
+        # view in a multi-window session, and events dispatched into a
+        # half-torn-down instance (attributes already collected) raised
+        # "'PlayerView' object has no attribute 'slider'" and a flaky
+        # teardown segfault in the window-churn test (seen 2026-11-14).
+        try:
+            QtWidgets.QApplication.instance() \
+                .removeEventFilter(self)
+        except Exception:
+            pass
         # (a) timers first — no _tick may observe a half-torn-down player.
         try:
             self.timer.stop()
@@ -10116,6 +10408,8 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_esc_strikes = 0
         self._seek_esc_ok_at = 0.0
         self._seek_esc_clean = 0.0
+        self._seek_zero_landings = 0
+        self._reopen_head_pins = 0
         self._raw_win = []
         self._trickle_hold = False
         self._video_wh = (0, 0)

@@ -154,6 +154,17 @@ def fwd10():
     return _icon("fw10", draw)
 
 
+def fwd60():
+    def draw(p, c):
+        p.translate(24, 0)
+        p.scale(-1, 1)
+        _seek_glyph(p, c)                    # mirrored = clockwise
+        p.scale(-1, 1)
+        p.translate(-24, 0)
+        _seek_text(p, c, "60")
+    return _icon("fw60", draw)
+
+
 # ---- live / dvr / record ----
 def live():
     """Jump to the live edge: a 'skip to end' glyph (bar + right triangle).

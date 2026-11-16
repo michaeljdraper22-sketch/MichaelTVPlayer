@@ -22,6 +22,16 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Native ExoPlayer screen: the WebView <video> element cannot
+             decode what providers serve (MPEG-TS/HLS live, MKV movies),
+             so real playback happens here. -->
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|uiMode"
+            android:theme="@style/AppTheme" />
     </application>
 
 </manifest>

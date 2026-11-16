@@ -241,7 +241,13 @@ def main() -> int:
             feedback.session_end()   # this was a relay, not a session
         except Exception:
             pass
-        return 0
+        # Hard exit: the relay has nothing to flush (session_end ran, log
+        # handlers write through), but SOMETHING on this path outlives
+        # main() — 2026-11-14 saw windowless pythonw strays sit at 0 CPU
+        # for hours after losing the launch race (20:50 and 17:13
+        # double-launches). A lingering relay holds RAM and, if it ever
+        # owns the socket, swallows future handoffs.
+        os._exit(0)
 
     from src.config import Config
     from src.ui.login_dialog import LoginDialog

@@ -24,6 +24,109 @@ _UNBLOCK_GRACE_S = 2.0
 USER_AGENT = "MichaelTVPlayer/1.0"
 
 
+# ---- libvlc audio-timeline observability (2026-11-13 field report) -----
+# "Audio ~1 s behind the picture on a Stremio VOD; a reload fixes it."
+# libvlc KNOWS when its audio output damages the timeline — the aout names
+# the damage and the amount: "buffer too late (%lld us): dropped",
+# "playback too late (%lld): flushing buffers" / "... up-sampling" — but
+# the app never subscribed to its log, so those occurrences left no trace
+# and gave us nothing to fix. Capture is free in steady state (measured at
+# verbosity 1: 314 messages during an open, ZERO during playback), so it
+# is always on; matching lines land in player.log and arm
+# VLCPlayer.take_aout_event() for a quiet audio re-anchor.
+_AOUT_LATE = (
+    "buffer too late",          # a single audio buffer arrived late, dropped
+    "playback too late",        # the aout itself was late → flush / resample
+    "playback way too late",
+)
+_AOUT_DEVICE = (
+    "cannot start playing buffer",
+    "couldn't use hardware sound buffer",
+    "cannot lock buffer",
+    "buffer overrun",
+    "audio output failed",
+)
+
+
+def _log_first_int(args):
+    """First integer argument of a libvlc log message, or None.
+
+    libvlc's log callback hands us the raw va_list (an opaque pointer).
+    On the Win64 ABI a va_list IS a pointer to the 8-byte argument slots,
+    so slot 0 is the first argument — exactly what the aout's timing
+    messages lead with ("playback too late (%lld): flushing buffers").
+    Non-integer first arguments ("%s" messages) read as a pointer-sized
+    value; callers that need a duration range-check it.
+    """
+    try:
+        import ctypes
+        if not args:
+            return None
+        return int(ctypes.cast(args, ctypes.POINTER(ctypes.c_int64))[0])
+    except Exception:  # noqa: BLE001 — diagnosis must never break playback
+        return None
+
+
+def _aout_mark(msg: str):
+    """Classify a libvlc log line, or None when it is not an aout event.
+
+    "late" = the audio output declared data late (flush / resample / drop),
+    "device" = the audio OUTPUT itself failed (buffer allocation, lock,
+    overrun) — the other shape that leaves the sound behind the picture.
+    """
+    low = (msg or "").lower()
+    if any(mark in low for mark in _AOUT_LATE):
+        return "late"
+    if any(mark in low for mark in _AOUT_DEVICE):
+        return "device"
+    return None
+
+
+class AoutHealGate:
+    """Should a libvlc audio-timeline complaint trigger a quiet re-anchor?
+
+    Pure decision logic (no VLC, no Qt) so it is unit-tested offline. The
+    re-anchor is cheap but not free (a brief audio gap), so it stays rare:
+    only a LARGE declared loss counts (a small "buffer too late" is normal
+    jitter), NEVER while paused (VLC re-prerolls on resume) or while the
+    live chase recorder owns the connection.
+    """
+
+    MIN_LATE_US = 300_000      # 0.3 s of audio declared lost — not jitter
+    COOLDOWN_S = 120.0         # at most one re-anchor per 2 min
+    MAX_PER_MEDIA = 3          # and at most 3 for one stream
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        """New media: fresh budget."""
+        self._last = None
+        self._count = 0
+
+    def should_heal(self, kind: str, us, playing: bool, paused: bool,
+                    live: bool, now: float) -> bool:
+        if kind != "late":
+            return False          # device complaints: nothing to re-anchor
+        if not playing or paused:
+            return False
+        if live:
+            return False          # chase/DVR input belongs to the recorder —
+                                  # never restart its audio mid-stream
+        if self._count >= self.MAX_PER_MEDIA:
+            return False
+        try:
+            if int(us) < self.MIN_LATE_US:
+                return False
+        except (TypeError, ValueError):
+            return False          # unparsed amount: can't judge it
+        if self._last is not None and now - self._last < self.COOLDOWN_S:
+            return False
+        self._last = now
+        self._count += 1
+        return True
+
+
 def _slider_to_vlc_volume(slider: int) -> int:
     """Perceptual (dB-linear) volume taper: bar position 0..100 -> VLC
     percent. VLC 3's WASAPI output maps its percent onto the Windows
@@ -198,8 +301,104 @@ class VLCPlayer:
         # wedged player's input thread is blocked reading from (relay client
         # sockets), so a hung stop can finish instead of forcing a swap.
         self.unblock_hook = None
+        # last libvlc audio-timeline complaint (kind, us) — see _AOUT_LATE
+        self._aout_evt = None
+        self._aout_lock = threading.Lock()
+        self._aout_logged = 0       # aout log lines written for this media
+        self.on_aout_event = None   # optional hook; set by the UI
         self._setup_player(self.player)
         self.media = None
+        self._install_vlc_log()
+
+    def _install_vlc_log(self) -> None:
+        """Subscribe to libvlc's own log, filtered to audio-timeline events.
+
+        Verbosity 1 (warnings) costs nothing during playback — measured 0
+        messages in 10 s of steady play, 314 during the open — so this is
+        on for every player. A failed subscription is silent: diagnosis
+        must never break playback."""
+        try:
+            cb = vlc.cb.LogCb(self._on_vlc_log)
+            self.instance.set_log_verbosity(1)
+            self.instance.log_set(cb, None)
+            self._log_cb = cb     # CFUNCTYPE must outlive libvlc's slot
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.debug("vlc log capture unavailable: %r", exc)
+            except Exception:
+                pass
+
+    def _on_vlc_log(self, _data, _level, _ctx, fmt, args) -> None:
+        """VLC thread context: record + log only, never touch Qt or stop."""
+        try:
+            try:
+                msg = (fmt or b"").decode("utf-8", "replace")
+            except Exception:
+                return
+            kind = _aout_mark(msg)
+            if kind is None:
+                return
+            us = _log_first_int(args)
+            # a badly damaged stream can repeat these; keep the log bounded
+            self._aout_logged = getattr(self, "_aout_logged", 0) + 1
+            try:
+                if self._aout_logged <= 20:
+                    log.warning("vlc aout: %s (amount=%s us) state=%s",
+                                msg, us, self.state_name())
+                else:
+                    log.debug("vlc aout: %s (amount=%s us)", msg, us)
+            except Exception:
+                pass
+            with self._aout_lock:
+                self._aout_evt = (kind, us)
+            hook = self.on_aout_event
+            if hook is not None:
+                try:
+                    hook(kind, us)
+                except Exception:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    def take_aout_event(self):
+        """Pop the last audio-timeline complaint (kind, us), or None."""
+        try:
+            with self._aout_lock:
+                evt, self._aout_evt = self._aout_evt, None
+            return evt
+        except Exception:  # noqa: BLE001
+            return None
+
+    def heal_audio_sync(self) -> bool:
+        """Re-anchor the audio output at the current position.
+
+        This is what the user's manual reload does for a ~1 s audio lag,
+        minus the re-buffer: the active track is re-selected, which tears
+        VLC's aout down and rebuilds it against the RUNNING picture clock,
+        so the sound re-anchors to where the video actually is. The
+        same-id call alone is a no-op in libvlc's ES layer, hence the
+        disable/re-enable pair. Picture, position and subtitles untouched.
+        """
+        try:
+            tid = self.active_audio()
+            if tid is None or int(tid) < 1:
+                return False
+            self.player.audio_set_track(-1)
+            self.player.audio_set_track(int(tid))
+            # the rebuilt output adopts VLC's defaults for the session
+            # scalar — re-assert OUR volume + mute (including the profanity
+            # filter's, which only re-applies on a change) so a re-anchor
+            # can never un-mute a muted stream or change the level.
+            self._apply_volume(self.player)
+            self._apply_effective_mute(self.player)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log.warning("heal_audio_sync failed: %r", exc)
+            except Exception:
+                pass
+            return False
+
 
     def _setup_player(self, player) -> None:
         """Bring a (new) media player object into the known state: volume,
@@ -365,6 +564,7 @@ class VLCPlayer:
         # Full teardown of the previous media first (stop + detach): one
         # provider connection at a time, and local buffer files must be closed
         # before the DVR code deletes them.
+        self._aout_logged = 0        # fresh aout-log budget for this media
         self.stop_and_release()
         self.media = self.instance.media_new(url)
         try:
@@ -900,15 +1100,25 @@ class VLCPlayer:
         self._volume = max(0, min(100, int(value)))
         self._apply_volume(self.player)
 
-    def get_volume(self) -> int:
-        """The current BAR position (inverse-mapped from VLC's percent)."""
+    def get_vlc_volume(self):
+        """Raw libvlc percent of the CURRENT player, or None when there is
+        no readable audio output (reads < 0 until the device is up, e.g.
+        mid-open). The UI's volume pin compares this against the slider's
+        taper — see PlayerView._enforce_volume."""
         try:
             vlc_pct = self.player.audio_get_volume()
-            if vlc_pct is None or int(vlc_pct) < 0:
-                return self._volume
-            return _vlc_to_slider_volume(int(vlc_pct))
         except Exception:
+            return None
+        if vlc_pct is None or int(vlc_pct) < 0:
+            return None
+        return int(vlc_pct)
+
+    def get_volume(self) -> int:
+        """The current BAR position (inverse-mapped from VLC's percent)."""
+        vlc_pct = self.get_vlc_volume()
+        if vlc_pct is None:
             return self._volume
+        return _vlc_to_slider_volume(vlc_pct)
 
     def set_mute(self, on: bool) -> None:
         self._mute = bool(on)

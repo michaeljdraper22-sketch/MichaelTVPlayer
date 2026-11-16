@@ -94,6 +94,19 @@ def main():
         MainWindow._instances[-1].close()
         app.processEvents()
 
+    print("[2a] window numbers count the windows OPEN, not a running total")
+    churn = []
+    for _ in range(3):
+        extra = win1.open_new_window()
+        app.processEvents()
+        churn.append(extra.windowTitle())
+        extra.close()
+        app.processEvents()
+    check("open/close churn reuses 'MichaelTV 2' every time (no climbing)",
+          churn == ["MichaelTV 2"] * 3)
+    check("closing a secondary leaves one plain-title window",
+          win1.windowTitle() == "MichaelTV")
+
     print("[2] the second window: registry, sharing, title, vlc instance")
     win2 = win1.open_new_window()
     app.processEvents()
@@ -106,8 +119,7 @@ def main():
     t2 = win2.windowTitle()
     check("titles differ and carry the number",
           t2 != win1.windowTitle()
-          and t2.startswith("MichaelTV ")
-          and t2[len("MichaelTV "):].isdigit())
+          and t2 == "MichaelTV 2")
     check("both PlayerViews are registered",
           win1.player_view in PlayerView._views
           and win2.player_view in PlayerView._views)
@@ -198,9 +210,23 @@ def main():
     win2.play = orig_play
 
     print("[5] File > Quit closes every window")
+    check("after the primary closed, the survivor is plain 'MichaelTV'",
+          win2.windowTitle() == "MichaelTV")
     win3 = win2.open_new_window()
-    check("third window registered", win3 is not None
+    app.processEvents()
+    check("second live window registered", win3 is not None
           and len(MainWindow._instances) == 2)
+    check("second live window is 'MichaelTV 2'", win3.windowTitle()
+          == "MichaelTV 2")
+    win4 = win2.open_new_window()
+    app.processEvents()
+    check("third live window is 'MichaelTV 3'", win4.windowTitle()
+          == "MichaelTV 3")
+    win3.close()
+    app.processEvents()
+    check("closing the middle window renumbers the window after it",
+          win4.windowTitle() == "MichaelTV 2"
+          and win2.windowTitle() == "MichaelTV")
     win2.quit_app()
     app.processEvents()
     check("quit_app closed all windows", MainWindow._instances == [])

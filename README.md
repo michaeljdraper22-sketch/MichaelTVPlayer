@@ -1,6 +1,6 @@
 # MichaelTV
 
-**Current release: v2.1.9** — grab **`MichaelTV.exe`** from the
+**Current release: v2.1.11** — grab **`MichaelTV.exe`** from the
 [Releases](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases)
 page, or build it yourself with `build.bat` (see below).
 An **Android APK** of the same app is published alongside it — see
@@ -51,8 +51,13 @@ through a single VLC connection.
   **Esc** cancels a marker selection.
 - **Now / Next EPG** (TV guide) for the current live channel
 - **Real VLC playback** (libvlc) embedded in the window
-- **Single stream connection** — playback, DVR and recording all
-  run on ONE connection to your provider (works with 1-connection accounts).
+- **Single stream connection for live TV** — live playback, DVR and
+  recording all run on ONE connection to your provider (works with
+  1-connection accounts). Stremio/debrid links allow several simultaneous
+  ranged downloads, so the VOD caption relay briefly prefetches the
+  file's seek-index tail on a second connection there (a plain torrentio
+  addon list still plays through your own debrid provider; the app never
+  joins a swarm).
 - **On-video playback controls** — small white icons that float directly on
   the video (no background boxes at all):
   `⏪60 ⏪10 ⏯ ⏩10 | ⏮ · ⏭ LIVE · ⏺/⬇ | CC · ≋ · ⤢ · ⏱ | 🔊 ▁▁▁`
@@ -225,7 +230,18 @@ MichaelTV take over autoplay — no Stremio needed after the first click.
 - **Next-episode autoplay, ⏮/⏭ episode buttons and the NEXT-STREAM
   button** then run entirely through MichaelTV — Cinemeta for episode
   lists, your stream addons for sources, the same ranked order as the
-  app (English preference, resolution, size, provider order).
+  app (English preference, resolution, size, provider order). The
+  next-stream button follows those same preferences with Stremio's list
+  order as the final tiebreak.
+- **Preferred debrid provider (v2.1.10):** Settings ▸ Stremio handoff
+  can pin Premiumize / TorBox / Real-Debrid / AllDebrid / Debrid-Link
+  for everything MichaelTV picks itself (next episode, next-stream,
+  autoplay, dead-link recovery). The provider's resolve key is learned
+  automatically from played resolve links and the installed Stremio
+  profile's addon URLs — never typed in. If the preferred provider
+  cannot serve a torrent (a lapsed subscription, or a torrent cached
+  only on the other service) that same pick falls back to the other
+  known provider before the candidate is skipped.
 - **Debrid-only switching (v2.1.2):** while playing a debrid/direct
   link, every automatic switch stays on direct links — the built-in
   torrent engine is **never** engaged (the machine never joins a swarm
@@ -279,19 +295,30 @@ signed) from
 the latest [release](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases),
 enable *Install unknown apps* for your browser/file manager, and install.
 
-**What works on Android (v1):** search movies & series (Cinemeta, posters),
-browse a series' seasons/episodes, get the **same ranked stream list as the
-Windows app** (English-preference, resolution, size and provider ordering),
-play debrid/direct links in-app with seek + pause, and **Xtream live TV**
-(categories → channels → play). Stream links are liveness-probed before
-playback; a dedicated button hands a stream to an external player
-(VLC for Android etc.) if the in-app one can't handle it.
+**What works on Android (v2.1.11):** search movies & series (Cinemeta,
+posters), browse a series' seasons/episodes, get the **same ranked stream list
+as the Windows app** (English-preference, resolution, size and provider
+ordering), play debrid/direct links in a **native ExoPlayer screen** (MPEG-TS,
+HLS, MKV, MP4, WebM — not a WebView `<video>`), **cast to a Chromecast/Google
+TV** straight from the player's top bar (the phone becomes the remote; the TV
+decodes with its own codecs, and playback returns to the phone at the same
+position when you disconnect), and **Xtream live TV** with
+country filtering, ★ favorite channels and text search (typing a query and
+pressing Enter only shows matching channels; playback starts only when a
+result is tapped). Stream links are liveness-probed before playback; a
+dedicated button hands a stream to an external player (VLC for Android etc.)
+if the in-app player meets a codec it can't decode.
 
-**Limits (v1):** plain torrent streams (no debrid URL) can't play on-device —
-configure a debrid-keyed addon URL (e.g. torrentio with your Torbox key, set
-up in a desktop browser) and paste it into the app's Settings; then the addon
-returns direct links that play fine. No subtitles, DVR/timeshift, recording,
-catch-up or profanity filter on Android yet.
+**Limits (v2.1.11):** plain torrent streams (no debrid URL) can't play
+on-device — configure a debrid-keyed addon URL (e.g. torrentio with your
+Torbox key, set up in a desktop browser) and paste it into the app's Settings;
+then the addon returns direct links that play fine. Audio in some MKV files
+(AC3/DTS) has no phone decoder — the native player then keeps the picture and
+plays it muted; cast to a TV (its decoders handle AC3/DTS) or use the
+external-player button for full audio. Some providers serve plain-`http://`
+streams that certain cast receivers refuse — those keep playing on the phone.
+No subtitles, DVR/timeshift, recording, catch-up or profanity filter on
+Android yet.
 
 **Building it yourself (Windows, no Android Studio needed):**
 `python android-gradle/build_local.py` — downloads the JDK/Gradle/Android SDK

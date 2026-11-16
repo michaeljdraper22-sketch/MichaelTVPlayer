@@ -19,6 +19,7 @@ import re
 import threading
 
 from michaeltv_core import APP_VERSION, stremio, xtream
+from michaeltv_core.filters import extract_country
 
 DEFAULT_SETTINGS = {
     "addons": [],               # Stremio stream addon base URLs
@@ -27,6 +28,10 @@ DEFAULT_SETTINGS = {
     "xtream_server": "",
     "xtream_username": "",
     "xtream_password": "",
+    # Live TV favorites: [{"stream_id", "name", "logo", "category"}].  The
+    # name/logo/category are stored so the ★ Favorites list paints without
+    # re-fetching every channel row from the provider.
+    "live_favorites": [],
     # Test-only knob (never shown in the Settings UI): when set, the app
     # opens the player on this URL at boot — lets the cloud emulator test
     # exercise the real <video> pipeline with a public sample video,
@@ -70,6 +75,7 @@ class Bridge:
         self._settings = dict(DEFAULT_SETTINGS)
         self._load_settings()
         self._xt = None            # (creds key, XtreamClient) cache
+        self._all_rows = None      # every live channel, session cache
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -136,9 +142,13 @@ class Bridge:
             clean["xtream_password"] = str(args["xtream_password"] or "")
         if "autoplay_test_url" in args:
             clean["autoplay_test_url"] = str(args["autoplay_test_url"] or "")
+        if isinstance(args.get("live_favorites"), list):
+            clean["live_favorites"] = [f for f in args["live_favorites"]
+                                       if isinstance(f, dict)]
         self._settings = clean
         self._save_settings()
         self._xt = None            # creds may have changed
+        self._all_rows = None      # …and so may the provider's channel list
         return {"ok": True, "settings": dict(self._settings)}
 
     # ------------------------------------------------------------------
@@ -245,6 +255,12 @@ class Bridge:
 
     # ------------------------------------------------------------------
     # Xtream live TV
+    #
+    # Country: Xtream has no country field.  Providers organise live
+    # categories by country with a separator ("USA | News", "UK : Sports"),
+    # exactly like the desktop app — filters.extract_country() (the shared
+    # src/filters.py) pulls the leading token, and every channel inherits
+    # its category's token.  The APK therefore filters at category level.
 
     def _xt_client(self):
         s = self._settings
@@ -263,7 +279,55 @@ class Bridge:
             client.session = stremio._session
             client.session.headers["User-Agent"] = "MichaelTVPlayer/1.0"
             self._xt = (key, client)
+            self._all_rows = None      # channel list belongs to old creds
         return self._xt[1]
+
+    @staticmethod
+    def _category_map(categories):
+        """{category_id: category_name} for the channels' category ids."""
+        return {str(c.get("category_id")): str(c.get("category_name") or "")
+                for c in categories or []
+                if c.get("category_id") is not None}
+
+    @staticmethod
+    def _channel_row(stream, cat_names):
+        """One provider stream as a UI row (country via its category)."""
+        cid = stream.get("category_id")
+        cname = cat_names.get(str(cid), "") if cid is not None else ""
+        return {
+            "stream_id": stream.get("stream_id"),
+            "name": str(stream.get("name") or ""),
+            "logo": str(stream.get("stream_icon") or ""),
+            "category_id": cid,
+            "category": cname,
+            "country": (extract_country(cname) or "Other") if cname else "",
+        }
+
+    def _all_channels(self, client, refresh=False):
+        """Every live channel, cached for the app session.
+
+        The whole-library response is multi-MB and can take a minute on a
+        large panel; country filtering and text search walk it, so it is
+        fetched once and reused.  The core client's bulk cache would expire
+        after 120 s, hence the separate session cache here.
+        """
+        if self._all_rows is not None and not refresh:
+            return self._all_rows
+        cat_names = self._category_map(client.live_categories())
+        old = getattr(client, "timeout", 20)
+        try:
+            client.timeout = max(old, 95)   # 20 s is too short for this list
+            raw = client.live_streams(None)
+        finally:
+            client.timeout = old
+        self._all_rows = [self._channel_row(s, cat_names) for s in raw
+                          if s.get("stream_id") is not None]
+        return self._all_rows
+
+    def _favorites(self):
+        favs = self._settings.get("live_favorites")
+        return [f for f in favs if isinstance(f, dict)] \
+            if isinstance(favs, list) else []
 
     def _cmd_xt_auth(self, args):
         client = self._xt_client()
@@ -283,26 +347,98 @@ class Bridge:
         if str(info.is_trial) == "1":
             bits.append("trial")
         return {"ok": True, "username": info.username,
-                "info_summary": " \u00b7 ".join(bits) or "Connected"}
+                "info_summary": " \u00b7 ".join(bits) or "Connected",
+                "favorites": self._favorites()}
 
     def _cmd_xt_categories(self, args):
         client = self._xt_client()
         cats = client.live_categories()
-        return {"ok": True, "categories": [
-            {"id": c.get("category_id"),
-             "name": str(c.get("category_name") or c.get("name") or "")}
-            for c in cats if c.get("category_id") is not None]}
+        out = []
+        for c in cats:
+            if c.get("category_id") is None:
+                continue
+            name = str(c.get("category_name") or c.get("name") or "")
+            out.append({"id": c.get("category_id"), "name": name,
+                        "country": extract_country(name) or "Other"})
+        return {"ok": True, "categories": out}
 
     def _cmd_xt_channels(self, args):
+        """Channels for one category, or (category_id empty) EVERY channel
+        — optionally narrowed to one country.  The every-channel form is
+        what the country filter's "All channels" option and the search use;
+        it is served from the session cache after the first load."""
         client = self._xt_client()
         cat = args.get("category_id")
-        cat = str(cat) if cat is not None else None
-        streams = client.live_streams(cat)
-        return {"ok": True, "channels": [
-            {"stream_id": s.get("stream_id"),
-             "name": str(s.get("name") or ""),
-             "logo": str(s.get("stream_icon") or "")}
-            for s in streams if s.get("stream_id") is not None]}
+        cat = str(cat) if cat not in (None, "") else None
+        country = str(args.get("country") or "").strip()
+        if cat is not None:
+            cat_names = self._category_map(client.live_categories())
+            rows = [self._channel_row(s, cat_names)
+                    for s in client.live_streams(cat)
+                    if s.get("stream_id") is not None]
+        else:
+            rows = list(self._all_channels(client, bool(args.get("refresh"))))
+            if country:
+                rows = [r for r in rows if r["country"] == country]
+        return {"ok": True, "channels": rows, "total": len(rows),
+                "all": cat is None}
+
+    def _cmd_xt_search_channels(self, args):
+        """Case-insensitive multi-word search over every live channel.
+
+        Enter in the search box calls exactly this: it only ever returns
+        results (never starts a stream).  Matching covers the channel name
+        and its category/country name, so "usa news" finds CNN in
+        "USA | News".  `total` is the full match count; `channels` is
+        capped at `limit` so a one-letter query cannot ship the library.
+        """
+        q = " ".join(str(args.get("q") or "").split())
+        if not q:
+            return {"ok": True, "channels": [], "total": 0, "q": ""}
+        try:
+            limit = int(args.get("limit") or 300)
+        except (TypeError, ValueError):
+            limit = 300
+        limit = max(1, min(1000, limit))
+        client = self._xt_client()
+        rows = self._all_channels(client, bool(args.get("refresh")))
+        country = str(args.get("country") or "").strip()
+        needle = q.lower()
+        tokens = needle.split()
+        matches = []
+        total = 0
+        for r in rows:
+            if country and r["country"] != country:
+                continue
+            name = r["name"].lower()
+            hay = name + " " + r["category"].lower()
+            if not all(t in hay for t in tokens):
+                continue
+            total += 1
+            if len(matches) < limit:
+                matches.append(r)
+        # prefix hits first, then alphabetical — predictable and useful
+        matches.sort(key=lambda r: (0 if r["name"].lower().startswith(needle)
+                                    else 1, r["name"].lower()))
+        return {"ok": True, "channels": matches, "total": total, "q": q}
+
+    def _cmd_xt_fav_toggle(self, args):
+        """Star/unstar one live channel; persisted in settings.json."""
+        try:
+            sid = int(args.get("stream_id"))
+        except (TypeError, ValueError):
+            raise BridgeError("stream_id required")
+        favs = self._favorites()
+        kept = [f for f in favs if str(f.get("stream_id")) != str(sid)]
+        added = len(kept) == len(favs)      # it was not starred before
+        if added:
+            kept.append({"stream_id": sid,
+                         "name": str(args.get("name") or ""),
+                         "logo": str(args.get("logo") or ""),
+                         "category": str(args.get("category") or "")})
+        self._settings["live_favorites"] = kept
+        self._save_settings()
+        return {"ok": True, "fav": added, "favorites": list(kept)}
 
     def _cmd_xt_url(self, args):
         client = self._xt_client()
@@ -310,7 +446,12 @@ class Bridge:
             stream_id = int(args.get("stream_id"))
         except (TypeError, ValueError):
             raise BridgeError("stream_id required")
-        return {"ok": True, "url": client.live_url(stream_id, "ts")}
+        # HLS first: the native ExoPlayer screen handles m3u8 (and its TS
+        # segments) far more reliably than a progressive .ts download;
+        # url_ts is the fallback for panels that serve HLS poorly.
+        return {"ok": True,
+                "url": client.live_url(stream_id, "m3u8"),
+                "url_ts": client.live_url(stream_id, "ts")}
 
     # ------------------------------------------------------------------
     # update check (public GitHub release metadata only)

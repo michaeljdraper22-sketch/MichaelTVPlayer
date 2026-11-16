@@ -416,6 +416,30 @@ def provider_from_url(url: str) -> str:
     return ""
 
 
+def provider_keys_from_url(url: str) -> dict:
+    """Every debrid {provider_token: userKey} pair an addon URL carries.
+
+    Torrentio's configured addon URL embeds each configured service's key
+    as a path parameter, e.g.
+    ``https://torrentio.strem.fun/premiumize=KEY|torbox=KEY/manifest.json``
+    — so one installed addon can prove SEVERAL providers at once, while a
+    Stremio handoff only ever reveals the one used for that click.
+    Debridio's base64 config names its provider but carries no key here,
+    so it is skipped. The key is a user credential: callers must never
+    log it (log the provider label instead).
+    """
+    low = unquote(str(url or ""))
+    out = {}
+    for token, _label in _DEBRID_TOKENS:
+        rx = re.compile(r"(?:^|[|/&?])%s=([^|/&#\s]+)" % re.escape(token),
+                        re.IGNORECASE)
+        for m in rx.finditer(low):
+            key = m.group(1).strip()
+            if key:
+                out[token] = key
+    return out
+
+
 def describe_addon(url: str, manifest_name: str = "") -> str:
     """Human label for a list row: the addon's own manifest name when
     it has one, else the familiar host name — plus the bound debrid

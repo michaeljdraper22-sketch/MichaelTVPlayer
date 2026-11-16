@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""VOD splitter: one provider connection, subtitle text for the filter.
+"""VOD splitter: one provider stream, subtitle text for the filter.
 
 Movies & series subtitle tracks are PRE-TIMED (the cue exists before its
 dialogue plays), so — unlike live captions — they need no playback delay.
 But VLC 3 hands the app no subtitle text, never forwards subs through its
-stream output, and the account allows a single stream connection.
+stream output, and the IPTV account allows a single stream connection.
 
 So the app inserts itself as a tiny local relay:
 
@@ -17,12 +17,15 @@ So the app inserts itself as a tiny local relay:
 
 VLC plays http://127.0.0.1:<port>/v — byte-identical to the original
 (seeking works: range requests are served from the cache prefix, or by
-restarting the single provider connection at the new offset — never two
-connections at once). The parser (src.mkv_subs) tails the LOCAL cache and
-emits subtitle cues on the file's own timeline, which is exactly VLC's
-playback clock: the filter sees each cue before its words play. MP4
-inputs (ftyp box) run the same relay with the moov-index tap from
-src.mp4_subs instead.
+restarting the ONE long-lived provider stream at the new offset — never
+two streaming bodies at once). Stremio/debrid links may serve several
+ranged GETs simultaneously, so that path may additionally prefetch the
+seek-index tail on its own short-lived connection (VodRelay
+parallel_tail — see the class docstring). The parser (src.mkv_subs) tails
+the LOCAL cache and emits subtitle cues on the file's own timeline, which
+is exactly VLC's playback clock: the filter sees each cue before its words
+play. MP4 inputs (ftyp box) run the same relay with the moov-index tap
+from src.mp4_subs instead.
 """
 
 import logging
@@ -221,12 +224,17 @@ def _failvid_max_bytes() -> int:
 
 
 class VodRelay(QtCore.QObject):
-    """Owns the single provider connection + the local relay server."""
+    """Owns the provider streams + the local relay server.
+
+    Exactly ONE long-lived provider stream (the ``_stream`` slot) is ever
+    open; ``parallel_tail`` adds a second, short-lived ranged GET for the
+    seek-index tail on Stremio/debrid links (which allow several
+    simultaneous connections)."""
 
     cue = QtCore.pyqtSignal(float, float, str)      # start_s, end_s, text
     failed = QtCore.pyqtSignal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, parallel_tail: bool = False):
         super().__init__(parent)
         self.url = ""
         self.ua = "MichaelTVPlayer/1.0"
@@ -238,6 +246,20 @@ class VodRelay(QtCore.QObject):
         self.cache_gen = 0
         self._tail = b""               # prefetched file tail (cues index)
         self._tail_base = -1           # file offset of the tail
+        # Parallel tail (Stremio/debrid only): the debrid link serves
+        # several ranged GETs at once (only LIVE TV is capped at one
+        # connection), so the seek-index tail can download on its own
+        # connection while the main stream opens and the head parses —
+        # the tail stops gating VLC's first byte. It must NEVER use
+        # _acquire (that is the one-stream slot); it is a bare ranged
+        # GET, and any VLC GET whose range starts inside the tail waits
+        # for it instead of acquiring (see do_GET). Off by default:
+        # IPTV VOD/series keep the proven serial order, and resume
+        # sessions always use it (see _startup).
+        self.parallel_tail = bool(parallel_tail)
+        self._tail_ready = threading.Event()   # tail snapshot final (or
+        #                                       # failed): tail GETs may run
+        self._tail_resp = None         # in-flight parallel tail response
         self.cache_path = None
         self._cache = None             # open file handle (append+read)
         self._cache_lock = threading.Lock()
@@ -335,6 +357,15 @@ class VodRelay(QtCore.QObject):
         self._prefer = (prefer_language or "eng").lower() or "eng"
         self._tap_restart = False
         self._tail_harvested = False
+        # new session: the tail snapshot is not ready until this relay's
+        # own _bootstrap_tail publishes it (stop() latched it open). The
+        # previous session's snapshot is dropped too — a stale _tail served
+        # for a NEW file would be wrong bytes, and in parallel mode it could
+        # match the new tail range while the fresh download is in flight.
+        self._tail = b""
+        self._tail_base = -1
+        self._tail_ready.clear()
+        self._tail_resp = None
         # re-arm the serve gate (stop() above latched it open; a fresh
         # session must gate on its OWN tap)
         with self._tap_gate:
@@ -414,9 +445,19 @@ class VodRelay(QtCore.QObject):
         GET lands the main provider stream exactly where playback
         continues."""
         try:
-            self._bootstrap_tail()
-            if not self._alive:
-                return
+            if self.parallel_tail and not self._start_offset:
+                # Stremio/debrid: the seek-index tail downloads on its own
+                # connection while the main stream opens and the head
+                # parses, so the tail stops gating VLC's first byte. It is
+                # a bare ranged GET behind the one-stream slot (never
+                # _acquire), and do_GET waits out any tail-range request
+                # until _tail_ready instead of rebasing the window.
+                threading.Thread(target=self._bootstrap_tail, daemon=True,
+                                 name="mtp-relay-tail").start()
+            else:
+                self._bootstrap_tail()
+                if not self._alive:
+                    return
             if self._start_offset:
                 # VLC-driven resume engage (see docstring). The previous
                 # design pre-fetched the head AND pre-opened a stream at
@@ -496,6 +537,13 @@ class VodRelay(QtCore.QObject):
         self._alive = False
         self._tap_flush_open()   # un-gate any handler mid-wait
         self._ready.set()        # un-block any handler still waiting
+        self._tail_ready.set()   # ...including one waiting on the tail
+        try:
+            resp = self._tail_resp   # abort a stalled parallel tail read
+            if resp is not None:
+                resp.close()
+        except Exception:  # noqa: BLE001
+            pass
         self.kick()              # VLC's reads must EOF now, not on a
         #                        # handler thread's own provider timeout
         if self._server is not None:
@@ -615,20 +663,34 @@ class VodRelay(QtCore.QObject):
         """VLC's MKV demuxer opens a SECOND connection asking for the
         file END (the seek-index). Serving that from the one live
         connection would rebase away the main stream and kill playback —
-        so prefetch the tail first, sequentially (probe -> tail -> main;
-        never two connections at once)."""
+        so the tail is prefetched, and ONLY then is playback served
+        (serial mode: probe -> tail -> main; never two connections at
+        once).
+
+        parallel_tail mode (Stremio/debrid: several connections allowed)
+        runs this on its own thread while the main stream opens; the tail
+        never touches the one-stream slot. ``_tail_ready`` is the
+        publication point: tail-range VLC GETs wait on it instead of
+        acquiring the provider (see do_GET), and it is set even on
+        failure so a waiter falls back to the old acquire path instead of
+        hanging."""
         if not self.total:
+            self._tail_ready.set()
             return
         try:
             tail_len = min(self.total, _TAIL_PREFETCH)   # cues live in the
-            #                                          # last MBs; 4 MB so
-            #                                          # VLC's whole index
-            #                                          # GET is served from
-            #                                          # the prefetch
+            #                                          # last MBs; 2.5 MB
+            #                                          # covers VLC's whole
+            #                                          # index GET
             with self._provider_urlopen(
                     f"bytes={self.total - tail_len}-", 30) as r:
-                self._tail = r.read()
-            self._tail_base = self.total - len(self._tail)
+                self._tail_resp = r      # stop() can abort a stalled read
+                try:
+                    data = r.read()
+                finally:
+                    self._tail_resp = None
+            self._tail = data            # publish data first, base last:
+            self._tail_base = self.total - len(data)
             try:
                 log.info("vod splitter: tail prefetched %d bytes at %d",
                          len(self._tail), self._tail_base)
@@ -670,6 +732,25 @@ class VodRelay(QtCore.QObject):
                 log.debug("vod splitter: tail prefetch skipped (%r)", exc)
             except Exception:
                 pass
+        finally:
+            # publication point (parallel mode): set even on failure so a
+            # tail-range waiter falls through to the acquire path instead
+            # of blocking until the display stop
+            self._tail_ready.set()
+
+    def _wait_tail(self, timeout_s: float = 30.0) -> bool:
+        """Bounded, stop()-abortable wait for the parallel tail snapshot.
+        True = snapshot final (published, or failed and fell through);
+        False = relay stopped or the deadline passed."""
+        try:
+            deadline = time.monotonic() + max(0.0, float(timeout_s))
+            while not self._tail_ready.is_set():
+                if not self._alive or time.monotonic() >= deadline:
+                    return False
+                self._tail_ready.wait(0.1)
+            return True
+        except Exception:  # noqa: BLE001
+            return self._tail_ready.is_set()
 
     # ---- provider slot ----
     def bump_gen(self) -> int:
@@ -1249,6 +1330,10 @@ class VodRelay(QtCore.QObject):
         tail_tried = bool(self._tail)
         head_tried = True
         while self._alive:
+            # snapshot (parallel tail publishes bytes-then-base, once)
+            tail, tail_base = self._tail, self._tail_base
+            if tail_base < 0:
+                tail = b""
             if self._tap_restart:
                 self._tap_restart = False
                 parser.reselect(self._prefer)
@@ -1257,10 +1342,11 @@ class VodRelay(QtCore.QObject):
                 parser.rewind(base)   # index + selection carried over
             if not parser.have_index:
                 # the startup thread may still be prefetching the tail —
-                # retry both static sources as they land
-                if not tail_tried and self._tail:
+                # retry both static sources as they land (parallel mode
+                # publishes the tail after _ready)
+                if not tail_tried and tail:
                     tail_tried = True
-                    parser.parse_tail(self._tail)
+                    parser.parse_tail(tail)
                 if not parser.have_index and self._head:
                     parser.parse_head_bytes(self._head)
                 if not parser.have_index and self.cache_base == 0:
@@ -1278,7 +1364,7 @@ class VodRelay(QtCore.QObject):
             base_now, size_now = self.cache_base, self.cache_size
             try:
                 made = parser.extract(self._tap_read, base_now, size_now,
-                                      self._tail_base, len(self._tail))
+                                      tail_base, len(tail))
             except Exception as exc:  # noqa: BLE001
                 # a dead tap loses captions, never playback — the UI
                 # falls back to VLC's own rendering
@@ -1386,6 +1472,18 @@ class VodRelay(QtCore.QObject):
                         return
                 a, b = self._range()
                 total = relay.total
+                # Parallel-tail mode: VLC's seek-index GET (a range that
+                # starts inside the tail) must never reach _acquire while
+                # the tail is still downloading — that closes the main
+                # stream and rebases the cache window away from the head
+                # (see _TAIL_PREFETCH). Wait out the snapshot instead; on
+                # failure _tail_ready is still set and the old
+                # acquire-and-serve path runs unchanged below.
+                if (relay.parallel_tail and total and a is not None
+                        and a >= total - _TAIL_PREFETCH
+                        and not relay._tail_ready.is_set()):
+                    tlog("index GET %d: waiting for the parallel tail", a)
+                    relay._wait_tail()
                 if a is None:
                     a = 0
                     if b is None:
@@ -1443,6 +1541,12 @@ class VodRelay(QtCore.QObject):
                 reopens = 0
                 try:
                     while b is None or pos <= b:
+                        # one snapshot per iteration: the parallel tail is
+                        # published bytes-then-base and never mutates
+                        # after, so locals keep this branch self-consistent
+                        tail, tail_base = relay._tail, relay._tail_base
+                        if tail_base < 0:
+                            tail = b""
                         if relay.cache_base <= pos \
                                 < relay.cache_base + relay.cache_size:
                             data = relay.read_cache(
@@ -1481,22 +1585,19 @@ class VodRelay(QtCore.QObject):
                                 relay._head[pos:pos + n])
                             pos += n
                             continue
-                        if relay._tail_base >= 0 \
-                                and pos >= relay._tail_base:
+                        if tail_base >= 0 and pos >= tail_base:
                             # tail (seek-index) region: prefetched bytes
-                            off = pos - relay._tail_base
-                            n = (len(relay._tail) - off) if b is None \
-                                else min(len(relay._tail) - off,
-                                         b - pos + 1)
+                            off = pos - tail_base
+                            n = (len(tail) - off) if b is None \
+                                else min(len(tail) - off, b - pos + 1)
                             if n <= 0:
                                 why = "tail-end"
                                 break
                             if src != "tail":
                                 tlog("serve @%d -> tail @%d +%d",
-                                     pos, relay._tail_base,
-                                     len(relay._tail))
+                                     pos, tail_base, len(tail))
                                 src = "tail"
-                            self.wfile.write(relay._tail[off:off + n])
+                            self.wfile.write(tail[off:off + n])
                             pos += n
                             continue
                         if st is not None and st.gen != relay._gen:

@@ -25,6 +25,7 @@ public plumbing Stremio itself uses —
 """
 
 import concurrent.futures
+import difflib
 import logging
 import os
 import re
@@ -287,6 +288,195 @@ def build_resolve_url(base: str, info_hash: str, file_name: str,
         return "%s%s/%s" % (base, str(info_hash).lower(), name)
     return "%s%s/%s/%d/%s" % (base, str(info_hash).lower(), name,
                               int(file_idx or 0), name)
+
+
+# ---------------------------------------------------------------------------
+# debrid PROVIDER preference
+#
+# MTV-initiated picks (next episode, next-stream button, autoplay, the
+# dead-link advance) used to re-resolve every candidate through whatever
+# provider the CURRENT stream's URL carried (resolve_base). That is wrong
+# in two ways: it cannot obey a user's favourite provider, and when one
+# subscription lapses every re-resolve through that dead provider's key
+# fails, so the automatic recovery can never reach the other provider the
+# user still pays for. The setting names a preferred provider; resolve
+# bases are LEARNED per provider (from every played resolve link and from
+# the Stremio profile's provider-bound addon URLs), never typed in.
+#
+# Tokens match src.stremio_profile._DEBRID_TOKENS ("premiumize" ->
+# "Premiumize"); the key is the user's debrid credential and lives inside
+# the base, so nothing here may log a base — only the provider label.
+_DEBRID_PROVIDERS = ("premiumize", "torbox", "realdebrid", "alldebrid",
+                     "debridlink")
+PROVIDER_LABELS = {
+    "premiumize": "Premiumize",
+    "torbox": "TorBox",
+    "realdebrid": "Real-Debrid",
+    "alldebrid": "AllDebrid",
+    "debridlink": "Debrid-Link",
+}
+
+_PROVIDER_RESOLVE_RE = re.compile(r"/resolve/(?P<p>[a-zA-Z0-9]+)/",
+                                  re.IGNORECASE)
+_PROVIDER_PLAY_RE = re.compile(
+    r"/play/(?:series|movie)/(?P<p>[a-zA-Z0-9]+)/", re.IGNORECASE)
+
+
+def normalize_provider(name: str) -> str:
+    """Provider token ("torbox", "realdebrid", …) from a URL segment or
+    a stremio_profile display label ("TorBox", "Real-Debrid" -> the same
+    token), or "" when it is not one of the known providers. Unknown
+    names must stay EMPTY (neutral), never a wildcard."""
+    token = re.sub(r"[^a-z0-9]+", "", str(name or "").lower())
+    return token if token in _DEBRID_PROVIDERS else ""
+
+
+def provider_of_url(url: str) -> str:
+    """Debrid provider token when ``url`` is a resolve/play link
+    (torrentio /resolve/{provider}/{key}/, debridio
+    /play/{type}/{provider}/…), else "" (neutral: plain addon links and
+    local-server URLs say nothing about a provider)."""
+    u = str(url or "")
+    for rx in (_PROVIDER_RESOLVE_RE, _PROVIDER_PLAY_RE):
+        m = rx.search(u)
+        if m:
+            prov = normalize_provider(m.group("p"))
+            if prov:
+                return prov
+    return ""
+
+
+def provider_of_stream(stream: dict) -> str:
+    """Provider a stream entry is bound to: the resolve link when it
+    carries one, else the provider-bound addon that listed it (the
+    torrentio/premiumize=KEY and torrentio/torbox=KEY addon entries),
+    else "" (neutral)."""
+    prov = provider_of_url((stream or {}).get("url") or "")
+    if prov:
+        return prov
+    base = str((stream or {}).get("_addon") or "")
+    if base:
+        try:
+            from . import stremio_profile
+            return normalize_provider(stremio_profile.provider_from_url(base))
+        except Exception:  # noqa: BLE001
+            return ""
+    return ""
+
+
+def preferred_provider(config) -> str:
+    """The provider preference in effect, or "" when there is nothing to
+    prefer: "auto", or a provider whose resolve key has never been seen
+    (ranking must not prefer what the app cannot resolve through)."""
+    pref = str(getattr(config, "stremio_provider_pref", "auto")
+               or "auto").strip().lower()
+    if pref not in _DEBRID_PROVIDERS:
+        return ""
+    bases = getattr(config, "stremio_provider_bases", None) or {}
+    try:
+        return pref if bases.get(pref) else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def resolve_bases(config, cur: dict) -> list:
+    """Ordered, de-duplicated resolve pipelines for MTV-initiated picks.
+
+    Preferred provider first (when its key is known), then the current
+    stream's own pipeline, then every other learned provider — the
+    fallback chain the next-stream probe walks when the preferred
+    provider cannot serve a torrent (a lapsed subscription, a torrent
+    cached only on the other service). "auto" starts with the current
+    pipeline, preserving the old behaviour, and still appends other
+    learned providers as fallbacks."""
+    out = []
+
+    def add(base):
+        b = str(base or "")
+        if b and b not in out:
+            out.append(b)
+
+    pref = preferred_provider(config)
+    if pref:
+        add((getattr(config, "stremio_provider_bases", None) or {})
+            .get(pref))
+    add(resolve_base((cur or {}).get("url") or ""))
+    bases = getattr(config, "stremio_provider_bases", None) or {}
+    for prov in _DEBRID_PROVIDERS:
+        if prov != pref:
+            add(bases.get(prov))
+    return out
+
+
+def candidate_urls(config, cur: dict, stream: dict) -> list:
+    """Every URL a candidate can be played through, best first.
+
+    A debrid resolve link is rebuilt through the preferred provider
+    (same torrent, different pipeline) and keeps its own URL as the next
+    fallback, then the remaining learned providers. Torrent-only
+    candidates (the keyless-addon case) are built from ``resolve_bases``
+    in order. A non-debrid plain URL is used as-is (nothing to rebuild).
+    """
+    url = str((stream or {}).get("url") or "")
+    if url:
+        resolved = parse_resolve_url(url)
+        if not resolved:
+            return [url]        # not a debrid pipeline — nothing to swap
+        return _chain_for_hash(config, cur, resolved[0], resolved[1],
+                               _resolve_file_name(stream), url)
+    info_hash = str((stream or {}).get("infoHash") or "").lower()
+    if not info_hash:
+        return []
+    return _chain_for_hash(config, cur, info_hash,
+                           int((stream or {}).get("fileIdx") or 0),
+                           _resolve_file_name(stream), "")
+
+
+def _chain_for_hash(config, cur, info_hash, file_idx, file_name,
+                    original="") -> list:
+    """Build the ordered URL chain for one torrent, shared by both
+    candidate shapes above. ``original`` (a resolve link already pointing
+    at the torrent) is preferred over rebuilding its own provider."""
+    out = []
+
+    def add(u):
+        u = str(u or "")
+        if u and u not in out:
+            out.append(u)
+
+    pref = preferred_provider(config)
+    bases = getattr(config, "stremio_provider_bases", None) or {}
+    orig_prov = provider_of_url(original)
+    if pref and bases.get(pref) and pref != orig_prov:
+        add(build_resolve_url(bases[pref], info_hash, file_name, file_idx))
+    add(original)
+    for base in resolve_bases(config, cur):
+        if not original or base != resolve_base(original):
+            add(build_resolve_url(base, info_hash, file_name, file_idx))
+    return out
+
+
+def note_provider_base(config, url: str) -> bool:
+    """Remember the resolve pipeline a played link came through, per
+    provider. Returns True when the stored map changed (caller saves).
+    GUI THREAD ONLY (writes config). Never logs the base: it embeds the
+    user's debrid key."""
+    try:
+        base = resolve_base(url)
+        prov = provider_of_url(url)
+        if not base or not prov:
+            return False
+        bases = dict(getattr(config, "stremio_provider_bases", None) or {})
+        if bases.get(prov) == base:
+            return False
+        bases[prov] = base
+        config.stremio_provider_bases = bases
+        log.info("stremio: learned %s resolve pipeline (%s)",
+                 PROVIDER_LABELS.get(prov, prov),
+                 base.split("//")[-1].split("/")[0])
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -616,9 +806,17 @@ def _movie_queries(text: str) -> list:
     and 'Spider-Man' (2002) ties 'Spider-Man 2' (2004) exactly — search
     order then picked the 2002 original (live-seen 2026-09-08 12:05:
     the handoff retitled Spider-Man 2 as 'Spider-Man (2002)', and the
-    next-stream walk switched to a stream of the WRONG MOVIE)."""
+    next-stream walk switched to a stream of the WRONG MOVIE).
+    The LAST year is the release year, not the first: a title may
+    itself be a year ('1917.2019', '2012.2009', 'Blade Runner
+    2049.2017'), and the first match made the head empty — the title
+    vanished from the query and the year scoping below would look for
+    a 1917 film that cannot exist. Only the last one is metadata."""
     queries = []
-    m = _MOVIE_YEAR_RE.search(text or "")
+    last = None
+    for last in _MOVIE_YEAR_RE.finditer(text or ""):
+        pass
+    m = last
     year = m.group(0) if m else ""
     if m:
         head = text[:m.start()]
@@ -988,6 +1186,38 @@ def _sig_words(text) -> set:
             if len(w) > 2 or w in _SHORT_SIG}
 
 
+_SIM_FLOOR = 0.6          # title-similarity floor for a year-scoped hit
+
+
+def _sim_text(text) -> str:
+    """Punctuation flattened to single spaces, lowercased — the form
+    _title_sim compares ('Santa Claus 1' and 'The Santa Clause')."""
+    return re.sub(r"\s+", " ",
+                  re.sub(r"[^a-z0-9]+", " ",
+                         _fold_apostrophes(str(text or "")).lower())).strip()
+
+
+def _title_sim(a, b) -> float:
+    """Character-level similarity (0..1) between a search query and a
+    catalog title. The word-floor matcher counts WORDS, so a release
+    spelling the title differently loses to a same-year film that
+    merely shares those words — 'Santa Claus 1 (1994) UHDRDV cz en'
+    queried 'Santa Claus', the 1985 film 'Santa Claus' covered both
+    words while the 1994 film it actually is ('The Santa Clause')
+    covered one, and the handoff was retitled 'Santa Claus (1985)'
+    (live-seen 2026-11-13 17:34). TorBox then throttled the link, the
+    guard read that as dead, and the next-stream walk served a stream
+    of the 1985 film — the user asked why Tim Allen's Santa movie
+    opened as 'a weird other santa movie'. Similarity scores
+    'santa claus' vs 'the santa clause' at 0.76 and the 1985 film's
+    exact title at 1.0: scoped to the release year only one of them
+    is left, and this is how the letter-different one wins."""
+    na, nb = _sim_text(a), _sim_text(b)
+    if not na or not nb:
+        return 0.0
+    return difflib.SequenceMatcher(None, na, nb).ratio()
+
+
 def _find_catalog(search, name: str, year: str = ""):
     """Best word-overlapping catalog candidate for a release name, or
     None. Every candidate is SCORED by how many of the query's
@@ -1025,7 +1255,14 @@ def _find_catalog(search, name: str, year: str = ""):
     coin flip on separate nights (live-seen 2026-10-07 13:10 and
     2026-10-13 02:12 — wrong show identified, autoplay and both
     episode buttons dead). A tight candidate carries no outside word,
-    which no such garbage title survives."""
+    which no such garbage title survives.
+    A KNOWN release year scopes the candidate pool to that year before
+    this scoring runs, and a same-year title close enough in TEXT
+    (_title_sim) answers even below the word floor — a release name may
+    spell the title differently ('Santa Claus 1' for 'The Santa
+    Clause'), which the word count can never forgive but which is
+    plainly the same title. The tight fallback still runs for a scoped
+    pool, so a foreign-language release head keeps matching."""
     if not name:
         return None
     year = str(year or "").strip()
@@ -1066,9 +1303,31 @@ def _find_catalog(search, name: str, year: str = ""):
         wanted = _sig_words(query)
         # ceil(60%): 1 word -> 1, 2 -> 2, 3 -> 2, 4 -> 3, 5 -> 3
         need = max(1, (len(wanted) * 3 + 4) // 5)
+        cands = list(search(query))
+        # A KNOWN year narrows the pool to that year's films before any
+        # word counting: the year is the one token a release name and
+        # the catalog always agree on, and it separates a franchise's
+        # installments (remakes share the title outright). Within the
+        # pool the TITLE TEXT has to decide, not the word count — see
+        # _title_sim (the 2026-11-13 'Santa Claus 1 (1994)' handoff,
+        # retitled as the 1985 film). A pool that comes back empty
+        # means the release year is not a catalog year (an off year, or
+        # a date in the name) — the full list then decides as before.
+        scoped = [c for c in cands if year and str(
+            c.get("releaseInfo") or c.get("year") or "")[:4] == year]
+        if scoped:
+            cands = scoped
+            ranked = sorted(
+                scoped, reverse=True,
+                key=lambda c: (_title_sim(query, c.get("name")),
+                               len(_sig_words(c.get("name")) & wanted)))
+            near = ranked[0]
+            if _title_sim(query, near.get("name")) >= _SIM_FLOOR and \
+                    (_sig_words(near.get("name")) & wanted):
+                return near
         best, best_score = None, (0, 0, False)
         tight_best, tight_score = None, (0, 0)   # (ymatch, overlap)
-        for cand in search(query):
+        for cand in cands:
             cand_words = _sig_words(cand.get("name"))
             overlap = len(cand_words & wanted)
             # the release year (when known) must outrank search order:
@@ -1857,10 +2116,13 @@ def rank_streams(config, streams: list, cur: dict = None) -> list:
     demoted below everything — see lang_penalty), then resolution
     preference (match current / auto 4K-first fall-down / a fixed pick),
     then sane size (over stremio_size_demote_gb demoted, never excluded),
-    then addon priority (the stremio_addons order — the same release on
-    two addons goes to the preferred one), then resolution and finally
-    seeders as quiet tie-breaks — debrid cache makes seed counts nearly
-    meaningless, so they never override a resolution choice."""
+    then the preferred debrid provider (a TIE-BREAK only: resolution and
+    size outrank it — see stremio_provider_pref), then addon priority
+    (the stremio_addons order — the same release on two addons goes to
+    the preferred one), then resolution and finally seeders as quiet
+    tie-breaks — debrid cache makes seed counts nearly meaningless, so
+    they never override a resolution choice. Streams with no provider in
+    sight (keyless addon lists, plain URLs) are NEUTRAL, never demoted."""
     if not streams:
         return []
     mode = config.stremio_resolution_pref
@@ -1877,21 +2139,24 @@ def rank_streams(config, streams: list, cur: dict = None) -> list:
     size_max = config.stremio_size_demote_gb
     addon_rank = {base: pos for pos, base
                   in enumerate(_addon_bases(config))}
+    pref_prov = preferred_provider(config)
 
     def score(s):
         res, seeds, size_gb = _stream_parts(s)
         # bucket 0 = the preferred resolution (auto mode: any known one),
         # 1 = below the fixed target, 2 = above it, 3 = unknown; then
-        # sane size, then the preferred addon (unknown addons last)
-        if auto:
-            res_fit = 0 if res else 3
-        else:
-            res_fit = 0 if res == prefer else (1 if 0 < res < prefer
-                                               else 2 if res else 3)
+        # sane size, then the preferred debrid provider (a tie-break
+        # only: resolution and size outrank it), then the preferred
+        # addon (unknown addons last)
+        res_fit = _res_fit_bucket(res, prefer, auto)
         lang_pen = lang_penalty(s)
         size_pen = 1 if 0 < size_max < size_gb else 0
+        prov = provider_of_stream(s)
+        prov_pen = 0 if (not pref_prov or not prov
+                         or prov == pref_prov) else 1
         rank = addon_rank.get(s.get("_addon"), len(addon_rank))
-        return (lang_pen, res_fit, size_pen, rank, -res, -min(seeds, 500))
+        return (lang_pen, res_fit, size_pen, prov_pen, rank, -res,
+                -min(seeds, 500))
 
     return sorted([s for s in streams if _stream_usable(s)], key=score)
 
@@ -1900,6 +2165,61 @@ def best_stream(config, streams: list, cur: dict = None):
     """The stream autoplay picks: the head of rank_streams."""
     ranked = rank_streams(config, streams, cur)
     return ranked[0] if ranked else None
+
+
+def _res_fit_bucket(res: int, prefer: int, auto: bool) -> int:
+    """Resolution bucket: 0 preferred (auto: any known one), 1 below a
+    fixed target, 2 above it, 3 unknown."""
+    if auto:
+        return 0 if res else 3
+    return 0 if res == prefer else (1 if 0 < res < prefer
+                                    else 2 if res else 3)
+
+
+def walk_order(config, streams: list, cur: dict = None) -> list:
+    """``streams`` in the NEXT-STREAM button's order: preference first,
+    the addon's own list position as the FINAL tiebreak.
+
+    The S button used to walk the exact list Stremio displays (that rule
+    was hard-won — after a dead resolve, the next VISIBLE row is the one
+    the user can verify), so this ordering deliberately keeps list
+    position as its last term: with auto resolution, any size and auto
+    provider the result is byte-identical to the addon's order. A
+    configured resolution / size / provider preference reorders it — the
+    user asked for the S button to follow the same preferences as
+    autoplay. No resolution/seed tie-breaks are added (those would
+    destroy list order even when every preference is neutral)."""
+    if not streams:
+        return []
+    mode = str(getattr(config, "stremio_resolution_pref", "1080")
+               or "1080")
+    if mode == "match":
+        prefer, auto = _cur_resolution(cur) or 1080, False
+    elif mode == "auto":
+        prefer, auto = 0, True
+    else:
+        try:
+            prefer = int(mode)
+        except ValueError:
+            prefer = 1080
+        auto = False
+    try:
+        size_max = int(getattr(config, "stremio_size_demote_gb", 25) or 0)
+    except (TypeError, ValueError):
+        size_max = 25
+    pref_prov = preferred_provider(config)
+
+    def score(item):
+        idx, s = item
+        res, _seeds, size_gb = _stream_parts(s)
+        size_pen = 1 if 0 < size_max < size_gb else 0
+        prov = provider_of_stream(s)
+        prov_pen = 0 if (not pref_prov or not prov
+                         or prov == pref_prov) else 1
+        return (lang_penalty(s), _res_fit_bucket(res, prefer, auto),
+                size_pen, prov_pen, idx)
+
+    return [s for _idx, s in sorted(enumerate(streams), key=score)]
 
 
 # ---------------------------------------------------------------------------
@@ -2270,25 +2590,22 @@ def _adjacent_playable(config, cur: dict, step: int):
     if _wants_debrid_only(cur):
         # debrid/direct context: torrent-only candidates would land
         # autoplay on the local-server torrent engine — never (see
-        # _wants_debrid_only). But when the current playable is a
-        # torrentio resolve link, its provider+key prefix is a reusable
-        # resolve pipeline: RE-RESOLVE each torrent-only candidate
-        # through the user's own debrid instead of dropping it. The
-        # drop-only shape dead-ended every autoplay at "no usable
-        # stream" on plain-torrentio addon lists (live-seen 2026-09-19
-        # 10:06: S07E04 22/22 skipped, 0 candidates, while the episode
-        # had two dozen streams listed).
-        rbase = resolve_base(cur.get("url") or "")
+        # _wants_debrid_only). Every candidate is RE-RESOLVED through a
+        # debrid pipeline instead of dropped: the preferred provider's
+        # when its key is known (stremio_provider_pref), else the
+        # current link's, else any other learned one. The drop-only
+        # shape dead-ended every autoplay at "no usable stream" on
+        # plain-torrentio addon lists (live-seen 2026-09-19 10:06:
+        # S07E04 22/22 skipped, 0 candidates, while the episode had two
+        # dozen streams listed).
         direct = []
         for st in streams:
-            if st.get("url"):
-                direct.append(st)
-            elif rbase and st.get("infoHash"):
-                st = dict(st)
-                st["url"] = build_resolve_url(
-                    rbase, st["infoHash"], _resolve_file_name(st),
-                    int(st.get("fileIdx") or 0))
-                direct.append(st)
+            chain = candidate_urls(config, cur, st)
+            if not chain:
+                continue
+            st = dict(st)
+            st["url"] = chain[0]      # preferred provider first
+            direct.append(st)
         if len(direct) != len(streams):
             log.info("stremio: debrid context — skipping %d of %d "
                      "torrent-only streams for S%02dE%02d (no resolve "
@@ -2449,17 +2766,19 @@ def _click_context_reanchor(config, cur: dict):
 def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
                          reanchor_click=False, wrap=False):
     """Worker-thread backend of the NEXT-STREAM button: the SAME episode
-    (or movie) on the stream listed AFTER the one now playing, walking
-    the ADDON's own list order — the exact order Stremio displays — top
-    to bottom. (NOT the autoplay ranking: live-seen 2026-09-27 22:31,
-    Alone S13E11 — the first torbox resolve died, and the rank order's
-    next picks, auto mode = 4K-first, burned two more dead re-resolves
-    while the LIST's own #2, a lower-res cached copy, played fine in
-    Stremio. The displayed order is the one the user verifies against,
-    so the button steps down it.) Re-asks the configured addons and
-    walks past the current stream — matched by info hash (the same
-    torrent on two addons is the SAME release and must not be re-served)
-    or by exact URL. Identity is resolved on demand like
+    (or movie) on the next-best stream after the one now playing, in the
+    order the stream PREFERENCES define (provider / resolution / size /
+    language) with the ADDON's own list position as the FINAL tiebreak —
+    see walk_order. (The historical rule was the addon's displayed order
+    alone: live-seen 2026-09-27 22:31, Alone S13E11 — the first torbox
+    resolve died, and the rank order's next picks, auto mode = 4K-first,
+    burned two more dead re-resolves while the LIST's own #2, a lower-res
+    cached copy, played fine in Stremio. The user later asked for the
+    button to follow their stream preferences, so the preferences lead
+    and list order still breaks every remaining tie.) Re-asks the
+    configured addons and walks past the current stream — matched by info
+    hash (the same torrent on two addons is the SAME release and must not
+    be re-served) or by exact URL. Identity is resolved on demand like
     _adjacent_playable. Returns the playable, or None (no other usable
     stream / unidentifiable).
     The playable keeps the current one's fav_key and identity fields:
@@ -2527,9 +2846,10 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
         streams = addon_streams(config, imdb,
                                 int(cur.get("season") or 0),
                                 int(cur.get("episode") or 0))
-    # The walk list: the addon's own order (what Stremio displays),
-    # filtered to playable entries — NOT rank_streams (see docstring).
-    walk = [s for s in streams if _stream_usable(s)]
+    # The walk list: every playable entry ordered by the stream
+    # preferences (provider / resolution / size / language), with the
+    # addon's own list position as the FINAL tiebreak — see walk_order.
+    walk = walk_order(config, [s for s in streams if _stream_usable(s)], cur)
     if not walk:
         log.info("stremio: no usable stream list for %s (%d candidates)",
                  imdb, len(streams))
@@ -2537,10 +2857,11 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
 
     cur_hash = str(cur.get("info_hash") or "").lower()
     cur_url = str(cur.get("url") or "")
-    # a torrentio resolve handoff proves a debrid pipeline keyed to the
-    # user's OWN account — torrent-only candidates below re-resolve
-    # through it instead of dead-ending the debrid-only walk
-    rbase = resolve_base(cur_url)
+    # Every learned debrid pipeline, preferred provider first — the
+    # fallback chain the probe below walks when the preferred provider
+    # cannot serve a torrent (a lapsed subscription, or a torrent cached
+    # only on the other service).
+    bases = resolve_bases(config, cur)
 
     def is_cur(s):
         if cur_hash and str(s.get("infoHash") or "").lower() == cur_hash:
@@ -2582,7 +2903,8 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
             streams = addon_streams(config, imdb,
                                     int(cur.get("season") or 0),
                                     int(cur.get("episode") or 0))
-            walk = [s for s in streams if _stream_usable(s)]
+            walk = walk_order(
+                config, [s for s in streams if _stream_usable(s)], cur)
             cur_idx = -1
             for i, s in enumerate(walk):
                 if is_cur(s):
@@ -2661,7 +2983,6 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
                         or (ex_url and ex_url in exclude):
                     continue    # already tried dead in this chain
             if nxt.get("url"):
-                url = nxt["url"]
                 # keep the torrent identity for the NEXT press's skip-match
                 # (and the dead-debrid advance): the addon's own infoHash
                 # first — torrentio debrid entries carry it alongside the
@@ -2669,13 +2990,14 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
                 info_hash = str(nxt.get("infoHash") or "").lower()
                 file_idx = nxt.get("fileIdx")
                 if not info_hash:
-                    resolved = parse_resolve_url(url)
+                    resolved = parse_resolve_url(nxt["url"])
                     if resolved:
                         info_hash, file_idx = resolved
                 if info_hash and file_idx is None:
                     file_idx = 0
+                chain = candidate_urls(config, cur, nxt)
             else:
-                if debrid_only and not rbase:
+                if debrid_only and not bases:
                     continue    # never auto-advance onto the local engine
                 info_hash = str(nxt["infoHash"]).lower()
                 file_idx = int(nxt.get("fileIdx") or 0)
@@ -2687,12 +3009,17 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
                     # (EVERY candidate torrent-only) dead-ended the walk at
                     # "no other stream" while dozens sat listed (live-seen
                     # 2026-09-19 10:06, Adventure Time S07E03 — 19
-                    # candidates, 0 served).
-                    url = build_resolve_url(rbase, info_hash,
-                                            _resolve_file_name(nxt),
-                                            file_idx)
+                    # candidates, 0 served). The chain below starts with
+                    # the preferred provider and falls back through the
+                    # others when it cannot serve THIS torrent.
+                    chain = candidate_urls(config, cur, nxt)
+                    if not chain:
+                        continue
                     log.info("stremio: next-stream — re-resolving %s through "
-                             "the debrid provider", info_hash[:12])
+                             "%s", info_hash[:12],
+                             PROVIDER_LABELS.get(
+                                 provider_of_url(chain[0]),
+                                 "the debrid provider"))
                 else:
                     if not server_ok:
                         continue
@@ -2702,12 +3029,20 @@ def next_stream_playable(config, cur: dict, exclude=None, debrid_only=None,
                                     "candidate", info_hash[:12])
                         server_ok = False
                         continue
-                    url = server.play_url(info_hash, file_idx)
+                    chain = [server.play_url(info_hash, file_idx)]
 
-            if not _probe_walk_url(url):
-                log.info("stremio: next-stream — skipping %s: the debrid "
-                         "probe says the link is dead",
-                         (info_hash or str(url))[:60])
+            url = None
+            for cand_url in chain:
+                if _probe_walk_url(cand_url):
+                    url = cand_url
+                    break
+                log.info("stremio: next-stream — %s dead through this "
+                         "provider, trying the next one",
+                         (info_hash or str(cand_url))[:60])
+            if url is None:
+                log.info("stremio: next-stream — skipping %s: every debrid "
+                         "provider says the link is dead",
+                         (info_hash or str(chain[0]))[:60])
                 continue
 
             nxt_playable = {

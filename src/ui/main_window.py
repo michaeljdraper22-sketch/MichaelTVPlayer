@@ -127,15 +127,11 @@ class MainWindow(QtWidgets.QMainWindow):
     # playlist.m3u events go to the most recently ACTIVE window.
     _instances = []
     _last_active = None      # most recently activated MainWindow, or None
-    _seq = 1                 # monotonic window number for secondary titles
 
     def __init__(self, config: Config, client=None, secondary=False):
         super().__init__()
         self.config = config
         self._secondary = secondary
-        if secondary:
-            MainWindow._seq += 1
-            self._win_no = MainWindow._seq
         self._set_title("MichaelTV")
         # Which list the live-TV ⏭/⏮ buttons walk for the channel now
         # playing: "favorites" when it was launched from the ★ Favorites
@@ -259,6 +255,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.fav_tab.refresh()
         self._restore_state()
         MainWindow._instances.append(self)
+        MainWindow._renumber()      # this window's number is its live position
 
     def _on_tab_changed(self, idx):
         if not self._secondary:   # only the primary remembers the tab
@@ -494,7 +491,7 @@ class MainWindow(QtWidgets.QMainWindow):
             # again restores them, and the floating chevron on the
             # video's left edge brings it back. Already hidden means the
             # user hid it themselves — keep THEIR saved sizes.
-            self._splitter_saved = self.splitter.sizes()
+            self._save_splitter_sizes()
             self._channels_hidden = True
             self._apply_channels()
         # remember where this was launched from so the live-TV ⏭/⏮ walk
@@ -998,10 +995,20 @@ class MainWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+    def _save_splitter_sizes(self):
+        """Memorize the current column width for the next show — skipped
+        when the column already sits collapsed at its floor: a degenerate
+        capture would make the chevron / corner button "restore" an
+        invisible sliver (field report 2026-11-14: the button seemed dead
+        until the splitter handle was dragged out by hand)."""
+        sizes = self.splitter.sizes()
+        if len(sizes) == 2 and sizes[0] > 170:
+            self._splitter_saved = sizes
+
     def toggle_channels(self):
         """Hide/show the channel list panel (corner button / Ctrl+L)."""
         if not self._channels_hidden:
-            self._splitter_saved = self.splitter.sizes()
+            self._save_splitter_sizes()
         self._channels_hidden = not self._channels_hidden
         try:
             log.info("chrome: channel list %s",
@@ -1024,7 +1031,14 @@ class MainWindow(QtWidgets.QMainWindow):
             else "Hide channel list (Ctrl+L)")
         if not hidden and getattr(self, "_splitter_saved", None):
             try:
-                self.splitter.setSizes(self._splitter_saved)
+                sizes = list(self._splitter_saved)
+                # heal a degenerate capture made before the guard above
+                # existed (0/minimum width memorized while collapsed):
+                # restoring it would show nothing, so fall back to the
+                # standard column width
+                if len(sizes) == 2 and sizes[0] <= 170:
+                    sizes = [460, max(280, sizes[1])]
+                self.splitter.setSizes(sizes)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1344,13 +1358,35 @@ class MainWindow(QtWidgets.QMainWindow):
             w.close()
 
     def _set_title(self, base: str):
+        self._base_title = base
+        self._apply_title()
+
+    def _apply_title(self):
         # taskbar thumbnails show the title: number the extra windows so
-        # the previews are distinguishable at a glance
-        if self._secondary:
+        # the previews are distinguishable at a glance.  The number is the
+        # window's position among the windows open RIGHT NOW (the first is
+        # plain "MichaelTV"), so it can never climb past the number of
+        # windows actually on screen — opening and closing windows reuses
+        # the numbers instead of handing out ever higher ones.
+        base = getattr(self, "_base_title", "MichaelTV")
+        try:
+            idx = MainWindow._instances.index(self)
+        except ValueError:
+            idx = 0
+        if idx > 0:
             head, sep, tail = base.partition(" — ")
-            self.setWindowTitle(f"{head} {self._win_no}{sep}{tail}")
+            self.setWindowTitle(f"{head} {idx + 1}{sep}{tail}")
         else:
             self.setWindowTitle(base)
+
+    @classmethod
+    def _renumber(cls):
+        """Re-apply every live window's title after one opens or closes."""
+        for w in list(cls._instances):
+            try:
+                w._apply_title()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---- window state persistence ----
     def _restore_state(self):
@@ -1362,7 +1398,13 @@ class MainWindow(QtWidgets.QMainWindow):
         # session; the geometry above is still applied first so restore-down
         # returns to the last windowed size/position.
         self.showMaximized()
-        self.splitter.setSizes(self.config.splitter_sizes or [460, 880])
+        sizes = list(self.config.splitter_sizes or [460, 880])
+        # heal settings poisoned by sessions that closed with the panel
+        # hidden (they stored the 170px floor or 0): open with the
+        # standard column instead of an invisible sliver
+        if len(sizes) == 2 and 0 <= sizes[0] <= 170:
+            sizes = [460, max(280, sizes[1])]
+        self.splitter.setSizes(sizes)
         idx = self.config.last_tab
         if 0 <= idx < self.tabs.count():
             self.tabs.setCurrentIndex(idx)
@@ -1382,12 +1424,20 @@ class MainWindow(QtWidgets.QMainWindow):
             geo = [g.x(), g.y(), g.width(), g.height()]
         self.config.window_geometry = geo
         self.config.window_state = state
-        sizes = self.splitter.sizes()
-        if len(sizes) == 2:
-            # clamp so a restored list width is always sane for the window size
-            sizes[0] = max(170, min(sizes[0], geo[2] - 300))
-            sizes[1] = max(280, geo[2] - sizes[0])
-        self.config.splitter_sizes = sizes
+        # While the channel panel is hidden (Stremio/file takeover, Ctrl+L,
+        # zen) the splitter reports its width as 0 — saving that floors to
+        # the 170px minimum and the NEXT session opens with an invisible
+        # sliver instead of the user's column (field report 2026-11-14:
+        # "the search panel is gone by default"). Keep the last remembered
+        # VISIBLE widths instead.
+        if not (self._channels_hidden or self.tabs.isHidden()):
+            sizes = self.splitter.sizes()
+            if len(sizes) == 2:
+                # clamp so a restored list width is always sane for the
+                # window size
+                sizes[0] = max(170, min(sizes[0], geo[2] - 300))
+                sizes[1] = max(280, geo[2] - sizes[0])
+            self.config.splitter_sizes = sizes
         self.config.last_tab = self.tabs.currentIndex()
         self.config.save()
 
@@ -1407,6 +1457,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 MainWindow._instances.remove(self)
             if MainWindow._last_active is self:
                 MainWindow._last_active = None
+            MainWindow._renumber()    # remaining windows close the gap
         except Exception:
             pass
         try:

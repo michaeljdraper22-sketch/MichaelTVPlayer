@@ -70,7 +70,7 @@ APP_NAME = "MichaelTVPlayer"
 # (dB-linear) volume taper so the bar isn't silent for 80% of its travel
 # (stored volume migrated to the same curve), and quiet background
 # subtitle hunts + moviehash-wait for the online sub search.
-APP_VERSION = "2.1.9"
+APP_VERSION = "2.1.11"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -178,6 +178,12 @@ DEFAULTS = {
     "stremio_server": "http://127.0.0.1:11470",
     "stremio_resolution_pref": "1080",
     "stremio_size_demote_gb": 25,
+    # Debrid provider every MTV-initiated pick resolves through ("auto" =
+    # follow the provider of the stream now playing). The provider's
+    # resolve base is LEARNED from played resolve links and the installed
+    # Stremio profile — see stremio.resolve_bases; it is stored in
+    # stremio_provider_bases below, never typed in by the user.
+    "stremio_provider_pref": "auto",
     "stremio_watch_downloads": True,   # auto-play Stremio's playlist.m3u
                                        # the moment it lands in Downloads
     # When a stream's embedded subtitles can't be restyled (bitmap PGS-only,
@@ -192,6 +198,12 @@ DEFAULTS = {
 # stream being watched, "auto" = 4K-first fall-down, rest = fixed target)
 _STREMIO_RES_PREFS = ("match", "auto", "2160", "1440", "1080", "720",
                       "480")
+
+# valid stremio_provider_pref values: "auto" plus the debrid provider
+# tokens Stremio's Torrentio/Debridio instances use in resolve links (the
+# same tokens src.stremio_profile._DEBRID_TOKENS maps to display labels).
+_STREMIO_PROVIDER_PREFS = ("auto", "premiumize", "torbox", "realdebrid",
+                           "alldebrid", "debridlink")
 
 
 def _data_dir() -> Path:
@@ -725,6 +737,55 @@ class Config:
         except (TypeError, ValueError):
             val = 25
         self.data["stremio_size_demote_gb"] = max(0, min(500, val))
+
+    @property
+    def stremio_provider_pref(self) -> str:
+        """Debrid provider MTV-initiated picks resolve through; "auto" =
+        follow the provider of the stream now playing."""
+        val = str(self.data.get("stremio_provider_pref", "") or "").strip()
+        return val.lower() if val.lower() in _STREMIO_PROVIDER_PREFS \
+            else "auto"
+
+    @stremio_provider_pref.setter
+    def stremio_provider_pref(self, value: str) -> None:
+        val = str(value or "").strip().lower()
+        self.data["stremio_provider_pref"] = \
+            val if val in _STREMIO_PROVIDER_PREFS else "auto"
+
+    @property
+    def stremio_provider_bases(self) -> dict:
+        """Learned resolve bases per debrid provider:
+        {provider_token: "https://host/resolve/{provider}/{userKey}/"}.
+
+        Written by stremio.note_provider_base from every played resolve
+        link and by the Stremio dialog's profile import — a LAN key, so
+        callers must never log the base itself (use the provider name).
+        Unknown/garbage entries are dropped; the stored dict is never
+        handed out directly."""
+        raw = self.data.get("stremio_provider_bases")
+        if not isinstance(raw, dict):
+            return {}
+        out = {}
+        for prov, base in raw.items():
+            token = str(prov or "").strip().lower()
+            url = str(base or "").strip()
+            if token in _STREMIO_PROVIDER_PREFS[1:] \
+                    and url.startswith(("http://", "https://")):
+                out[token] = url
+        return out
+
+    @stremio_provider_bases.setter
+    def stremio_provider_bases(self, value: dict) -> None:
+        clean = {}
+        if not isinstance(value, dict):
+            value = {}
+        for prov, base in value.items():
+            token = str(prov or "").strip().lower()
+            url = str(base or "").strip()
+            if token in _STREMIO_PROVIDER_PREFS[1:] \
+                    and url.startswith(("http://", "https://")):
+                clean[token] = url
+        self.data["stremio_provider_bases"] = clean
 
     @property
     def stremio_watch_downloads(self) -> bool:

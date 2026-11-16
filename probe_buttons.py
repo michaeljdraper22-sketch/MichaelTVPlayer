@@ -59,6 +59,7 @@ def main():
     print("[1] pre-stream button states")
     for name, want in (("btn_play", False), ("btn_back60", False),
                        ("btn_back10", False), ("btn_fwd10", False),
+                       ("btn_fwd60", False),
                        ("btn_rec", False), ("btn_audio", False),
                        ("btn_speed", True), ("btn_cc", True),
                        ("btn_scale", True), ("btn_mute", True),

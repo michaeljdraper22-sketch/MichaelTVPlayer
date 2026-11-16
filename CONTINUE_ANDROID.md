@@ -22,28 +22,37 @@ Two Android app variants live in this repo; **only the second one ships**:
 
 2. **`android-gradle/`** — **THE SHIPPING APP.** Gradle + Chaquopy 15.0.1
    (MIT, free) + AGP 8.1.4 + Gradle 8.4 + JDK 17 + Python 3.11 + WebView
-   UI (no androidx). Embeds the Windows app's pure core verbatim:
+   UI (AndroidX is enabled ONLY for media3; AppCompat is still absent).
+   Embeds the Windows app's pure core verbatim:
    `prepare_core.py` copies `src/stremio.py`, `src/xtream.py`,
-   `src/models.py` into `app/src/main/python/michaeltv_core/` at build
-   time (git-ignored; the single source of truth stays `src/`).
+   `src/models.py`, `src/filters.py` into
+   `app/src/main/python/michaeltv_core/` at build time (git-ignored; the
+   single source of truth stays `src/`).
 
    - UI: `app/src/main/assets/www/index.html` — one file, screens:
      Home/search, Detail (seasons/episodes), Streams (ranked list, same
-     English-preference ordering as Windows), Player (`<video>` + external
-     -player button), Settings (addon URLs, resolution pref, size demote,
-     Xtream creds), Live TV (Xtream categories → channels).
+     English-preference ordering as Windows), Settings (addon URLs,
+     resolution pref, size demote, Xtream creds), Live TV (Xtream
+     categories → channels, **country filter**, **★ favorites** and a
+     **channel text search** — Enter only renders results, never plays).
+     Playback does NOT use a `<video>` element: `openPlayer()` calls the
+     native bridge (`py.playNative`), which opens `PlayerActivity`.
    - Java: `MainActivity.java` — WebView + `JavaBridge`; every Python call
      goes through a **dedicated single-thread executor** (NOT the WebView
      JavaBridge thread — calls died there) and is wrapped in a Throwable
      catch that returns a diagnostic `{"error": "java <class>: <msg>"}`
-     so failures NAME their cause on screen.
+     so failures NAME their cause on screen. `PlayerActivity.java` is the
+     native ExoPlayer (media3) screen: MPEG-TS, HLS (m3u8), MKV, MP4 and
+     WebM play in-app; on error it retries the .ts fallback, then plays
+     video-only (phones often lack AC3/DTS decoders), then offers VLC.
    - Python: `app/src/main/python/bridge.py` — `Bridge.rpc(cmd, argsJson)`
      returns JSON always, never raises. Commands: ping, get/set_settings,
      search, detail, streams_movie, streams_series, probe, xt_auth,
-     xt_categories, xt_channels, xt_url.
-   - Settings live in `getFilesDir()/settings.json`; the test-only
-     `autoplay_test_url` key makes the app open the player on that URL at
-     boot (used by CI; never shown in Settings UI).
+     xt_categories, xt_channels (category or whole library + country),
+     xt_search_channels, xt_fav_toggle, xt_url (m3u8 + ts fallback).
+   - Settings live in `getFilesDir()/settings.json`; `live_favorites` is
+     the persisted ★ list. The test-only `autoplay_test_url` key makes the
+     app open the NATIVE player on that URL at boot (used by CI).
 
 ## Key commands
 
@@ -67,21 +76,32 @@ allow "Install unknown apps", open. Same signing key (`michaeltv-release.jks`
 + `keystore.properties`, both git-ignored, generated on first build) means
 updates install over the old copy — **never lose those two files**.
 
-## Current release state (tag v2.1.9, published 2026-11-08)
+## Current release state (tag v2.1.11, published 2026-11-16)
 
-- `MichaelTV-2.1.9.apk` — versionName 2.1.9, versionCode **2010900**,
-  release-signed with the same key as 2.1.1–2.1.3.1, core = committed
-  HEAD (the desktop 2.1.9 tree). sha256
-  `98f983da2cd8d2db13f23bc561a5f3776a8b3edf9ebe1dbcf34068ac927455dc`.
-  **versionCode formula changed** in `prepare_core.py`: the old
-  "digits with dots stripped" rule produced 2131 for the 4-part
-  "2.1.3.1", so plain "2.1.9" would have computed **219** — lower than
-  the shipped 2131, and Android silently refuses to install a lower
-  versionCode over an existing app. It now uses fixed 3-digit slots
-  (major*10^6 + minor*10^4 + patch*10^2 + build), so 2.1.9 → 2010900 and
-  2.1.10 → 2011000, plus a hard failure if a build would go backwards.
-  Same release carries the Windows zip (the desktop updater ignores the
-  .apk; never upload an .apk.sha256 alongside it).
+- **`MichaelTV-2.1.11.apk` — PUBLISHED on tag v2.1.11** with the Windows
+  zip + zip.sha256 (never an .apk.sha256 — the desktop updater would pick
+  it as the zip's checksum).  versionName 2.1.11, versionCode **2011100**,
+  release-signed with the same key.  sha256
+  `de0ec6a18e64a55554d5c70b853eade54a0b9e2f22e1725caec13488715dcac6`.
+  Adds over 2.1.9: the native player (media3/ExoPlayer), Live TV country
+  filter, ★ favorites and channel text search (the unreleased 2.1.10
+  work), and **Chromecast**: `CastPlayer` (media3-cast 1.2.1) +
+  explicit `play-services-cast-framework:21.2.0` (media3-cast's POM is
+  lean — the framework is NOT transitive) + a `MediaRouteButton` wired
+  via `CastButtonFactory` in the PlayerActivity top bar (media3 1.2.1 has
+  no CastButton yet; the listener is the TOP-LEVEL
+  `androidx.media3.cast.SessionAvailabilityListener`, and the CastPlayer
+  ctor takes the FRAMEWORK CastContext, not a Context).  Every cast
+  touchpoint is catch-Throwable-guarded: on GMS-less devices the button
+  is never added and local playback is byte-for-byte the old path.  Cast
+  keeps playing through onStop; the position transfers both ways (live
+  streams restart at the head, not the DVR window).  Offline proof:
+  `test_android_bridge.py` (35 checks).
+- Prior: tag **v2.1.9** (2026-11-08) — APK versionCode 2010900 + Windows
+  zip; **versionCode formula** in `prepare_core.py` uses fixed 3-digit
+  slots (major*10^6 + minor*10^4 + patch*10^2 + build) and hard-fails a
+  backwards build.  `MichaelTV-2.1.10.apk` (versionCode 2011000, built
+  2026-11-11) was never published — its features all ship in 2.1.11.
 - Prior state: tag **v2.1.3.1** (2026-10-11) — `MichaelTV-2.1.3.1.apk`,
   versionCode 2131 (stamped from a WORKTREE-only `src/config.py` bump to
   "2.1.3.1"), release-signed with the same key as 2.1.1/2.1.2, core =
@@ -157,9 +177,11 @@ has needed ZERO src/ changes; keep it that way where possible.
    a. FLAGSHIP: config export from the Windows app (QR code / share text
       with addon URLs sourced from discover_stream_addons + settings) —
       requires src/ changes, a build.bat run, and the user's go-ahead.
-   b. Playback failures on real-device WebViews (mkv/HLS support varies):
-      the external-player button covers this; consider detecting error
-      events and prompting it automatically.
+   b. Playback: ADDRESSED in 2.1.10 — in-app playback moved from the
+      WebView `<video>` element (which cannot decode MPEG-TS/HLS/MKV) to
+      a native ExoPlayer screen with a .ts fallback, a video-only retry
+      for AC3/DTS audio and a VLC button.  Verify on the real phone; if a
+      stream still fails, the error panel names the codec/error.
    c. Real-device verification (adb logcat from the user's phone) — the
       emulator path is now fully green, so any remaining failure is
       device-specific.
@@ -255,8 +277,10 @@ has needed ZERO src/ changes; keep it that way where possible.
 | Path | Role |
 |---|---|
 | `android-gradle/app/src/main/java/org/michaeltv/app/MainActivity.java` | WebView + JavaBridge + executor |
-| `android-gradle/app/src/main/python/bridge.py` | 12-command JSON bridge over the shared core |
+| `android-gradle/app/src/main/java/org/michaeltv/app/PlayerActivity.java` | Native ExoPlayer screen (TS/HLS/MKV/MP4) |
+| `android-gradle/app/src/main/python/bridge.py` | JSON bridge over the shared core (live search/favorites) |
 | `android-gradle/app/src/main/assets/www/index.html` | The whole UI (single file, inline JS/CSS) |
+| `test_android_bridge.py` | Offline bridge suite: country/search/favorites/native bridge |
 | `android-gradle/build_local.py` | One-command Windows build (tools, keystore, gradle, APK) |
 | `android-gradle/prepare_core.py` | Copies src core + stamps version |
 | `.github/workflows/android-test.yml` | Cloud emulator smoke + playback test |

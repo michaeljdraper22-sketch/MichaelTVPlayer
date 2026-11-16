@@ -98,14 +98,20 @@ try:
           dlg.watch_lbl.text())
     fake_win = QtWidgets.QWidget()
     fake_win._downloads_watcher = object()
-    dlg2 = make_dlg(cfg, fake_win)
-    check("watcher running: green check names the folder",
-          dlg2.watch_lbl.text().startswith("\u2713")
-          and DL_DIR in dlg2.watch_lbl.text(), dlg2.watch_lbl.text())
-    dlg2.watch_chk.setChecked(False)
-    check("toggle off -> Off line, no check",
-          dlg2.watch_lbl.text().startswith("Off"),
-          dlg2.watch_lbl.text())
+    # the watcher registry moved to the QApplication (process-global,
+    # app-parented in v2.1.9) — the window attribute alone proves nothing
+    app._downloads_watcher = object()
+    try:
+        dlg2 = make_dlg(cfg, fake_win)
+        check("watcher running: green check names the folder",
+              dlg2.watch_lbl.text().startswith("\u2713")
+              and DL_DIR in dlg2.watch_lbl.text(), dlg2.watch_lbl.text())
+        dlg2.watch_chk.setChecked(False)
+        check("toggle off -> Off line, no check",
+              dlg2.watch_lbl.text().startswith("Off"),
+              dlg2.watch_lbl.text())
+    finally:
+        app._downloads_watcher = None
 
     print("[3] patch row: one toggle button, three states")
     check("patched: green status names MichaelTV",
@@ -192,6 +198,62 @@ try:
           dd2.size_combo.currentData() == 33
           and dd2.size_combo.currentText() == "33 GB",
           dd2.size_combo.currentText())
+
+    print("[5b] debrid provider: default, round-trip, key seeding")
+    ptmp = Path(new_tmp("mtp_probe_sdlg_")) / "settings.json"
+    pcfg = Config(dict(DEFAULTS), ptmp)
+    pd = make_dlg(pcfg)
+    check("provider combo defaults to Auto",
+          pd.prov_combo.currentData() == "auto", pd.prov_combo.currentData())
+    pd.prov_combo.setCurrentIndex(pd.prov_combo.findData("torbox"))
+    pd.accept()
+    check("accept persists the provider pref",
+          pcfg.stremio_provider_pref == "torbox",
+          pcfg.stremio_provider_pref)
+    pdisk = json.loads(ptmp.read_text(encoding="utf-8"))
+    check("provider pref lands on disk",
+          pdisk.get("stremio_provider_pref") == "torbox")
+    reopen = dict(DEFAULTS)
+    reopen.update(pdisk)
+    pd2 = make_dlg(Config(reopen, ptmp))
+    check("reopen reflects the saved provider",
+          pd2.prov_combo.currentData() == "torbox",
+          pd2.prov_combo.currentData())
+
+    # one installed Torrentio instance can carry BOTH provider keys —
+    # opening the dialog seeds them without any handoff having to be
+    # played first. Read-only until accept.
+    from src import stremio_profile as sp_mod
+    real_disc = sp_mod.discover_stream_addons
+    sp_mod.discover_stream_addons = lambda: [
+        {"url": "https://torrentio.strem.fun/premiumize=PMK|torbox=TBK",
+         "name": "Torrentio", "provider": "TorBox",
+         "manifest_name": "Torrentio"}]
+    try:
+        stmp = Path(new_tmp("mtp_probe_sdlg_")) / "settings.json"
+        scfg = Config(dict(DEFAULTS), stmp)
+        sd = make_dlg(scfg)
+        check("seeding learns both providers from one addon url",
+              sd._provider_bases.get("premiumize") ==
+              "https://torrentio.strem.fun/resolve/premiumize/PMK/"
+              and sd._provider_bases.get("torbox") ==
+              "https://torrentio.strem.fun/resolve/torbox/TBK/",
+              sd._provider_bases)
+        sd.prov_combo.setCurrentIndex(sd.prov_combo.findData("torbox"))
+        check("a known provider is labelled 'key found'",
+              "key found" in sd.prov_combo.currentText(),
+              sd.prov_combo.currentText())
+        check("Cancel changes nothing (bases stay in memory)",
+              scfg.stremio_provider_bases == {})
+        sd.accept()
+        sdisk = json.loads(stmp.read_text(encoding="utf-8"))
+        check("accept persists the seeded bases (TorBox + Premiumize)",
+              sdisk.get("stremio_provider_bases", {}).get("torbox") ==
+              "https://torrentio.strem.fun/resolve/torbox/TBK/"
+              and sdisk.get("stremio_provider_bases", {}).get("premiumize")
+              == "https://torrentio.strem.fun/resolve/premiumize/PMK/")
+    finally:
+        sp_mod.discover_stream_addons = real_disc
 
     print("[6] fetch_online_subs checkbox: default on, full round-trip")
     sd = make_dlg(Config(dict(DEFAULTS), None))

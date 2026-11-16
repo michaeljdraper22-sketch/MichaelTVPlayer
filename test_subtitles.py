@@ -142,12 +142,16 @@ def main():
     check("current track is checked", checked == ["Spanish"])
     view._ctl_panel.close_panel()
 
-    print("[9] narrow-window compaction hides the seek buttons")
+    print("[9] narrow-window compaction hides the pickers, not the seeks")
     view._in_fit_ctl = True   # hold the ladder still, as _fit_ctl itself does
     try:
         view._apply_compact(5)
-        check("btn_back10 hidden at compaction level 5",
-              view.btn_back10.isHidden())
+        check("btn_back10 STILL visible at compaction level 5",
+              not view.btn_back10.isHidden())
+        check("btn_scale hidden at compaction level 5",
+              view.btn_scale.isHidden())
+        check("btn_live hidden at compaction level 5",
+              view.btn_live.isHidden())
         view._apply_compact(0)
         check("btn_back10 back at compaction level 0",
               not view.btn_back10.isHidden())

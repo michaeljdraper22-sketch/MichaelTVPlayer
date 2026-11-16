@@ -226,32 +226,43 @@ def main():
 
     print("[8d] the SAME button toggles the card closed (click-outside "
           "press on the opener is ignored)")
-    view._audio_menu()
-    check("first click opens", view._ctl_panel.isVisible()
-          and view._ctl_panel_btn is view.btn_audio)
-    # a press ON the opener button must NOT be treated as click-outside
-    # (its click toggles); synthesize one and deliver it through the app
-    gp = view.btn_audio.mapToGlobal(QtCore.QPoint(3, 3))
-    ev = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
-                           QtCore.QPointF(3, 3), QtCore.QPointF(gp),
-                           QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
-                           QtCore.Qt.NoModifier)
-    QtWidgets.QApplication.sendEvent(view.btn_audio, ev)
-    check("press on the opener leaves the card open",
-          view._ctl_panel.isVisible())
-    view._audio_menu()                      # the button's own click
-    check("second click on the same button closes the card",
-          not view._ctl_panel.isVisible() and not view._popup_open)
-    # a press elsewhere (another button) still closes it
-    view._audio_menu()
-    gp2 = view.btn_cc.mapToGlobal(QtCore.QPoint(3, 3))
-    ev2 = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
-                            QtCore.QPointF(3, 3), QtCore.QPointF(gp2),
-                            QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
-                            QtCore.Qt.NoModifier)
-    QtWidgets.QApplication.sendEvent(view.btn_cc, ev2)
-    check("press outside (not the opener) closes the card",
-          not view._ctl_panel.isVisible())
+    # hold the ladder at level 0 for this section: the offscreen view is
+    # born at compaction level 5 (tiny default surface geometry), which
+    # now hides btn_audio itself — and the closer ignores opener presses
+    # only while the anchor is VISIBLE, so the toggle checks below need a
+    # full-width row (in a real window the button only hides when the user
+    # asked for a compact row)
+    view._in_fit_ctl = True
+    view._apply_compact(0)
+    try:
+        view._audio_menu()
+        check("first click opens", view._ctl_panel.isVisible()
+              and view._ctl_panel_btn is view.btn_audio)
+        # a press ON the opener button must NOT be treated as click-outside
+        # (its click toggles); synthesize one and deliver it through the app
+        gp = view.btn_audio.mapToGlobal(QtCore.QPoint(3, 3))
+        ev = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                               QtCore.QPointF(3, 3), QtCore.QPointF(gp),
+                               QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                               QtCore.Qt.NoModifier)
+        QtWidgets.QApplication.sendEvent(view.btn_audio, ev)
+        check("press on the opener leaves the card open",
+              view._ctl_panel.isVisible())
+        view._audio_menu()                  # the button's own click
+        check("second click on the same button closes the card",
+              not view._ctl_panel.isVisible() and not view._popup_open)
+        # a press elsewhere (another button) still closes it
+        view._audio_menu()
+        gp2 = view.btn_cc.mapToGlobal(QtCore.QPoint(3, 3))
+        ev2 = QtGui.QMouseEvent(QtCore.QEvent.MouseButtonPress,
+                                QtCore.QPointF(3, 3), QtCore.QPointF(gp2),
+                                QtCore.Qt.LeftButton, QtCore.Qt.LeftButton,
+                                QtCore.Qt.NoModifier)
+        QtWidgets.QApplication.sendEvent(view.btn_cc, ev2)
+        check("press outside (not the opener) closes the card",
+              not view._ctl_panel.isVisible())
+    finally:
+        view._in_fit_ctl = False
     reset_pick(view)
 
     print("[8e] scale + speed popups are cards too")
@@ -298,15 +309,26 @@ def main():
           == ["Auto", "English"])
     view._ctl_panel.close_panel()
 
-    print("[10] narrow-window compaction hides the seek buttons")
+    print("[10] narrow-window compaction hides the pickers, not the seeks")
     view._in_fit_ctl = True   # hold the ladder still, as _fit_ctl itself does
     try:
-        view._apply_compact(5)
-        check("btn_back10 hidden at compaction level 5",
-              view.btn_back10.isHidden())
-        view._apply_compact(0)
-        check("btn_back10 back at compaction level 0",
+        view._apply_compact(4)
+        check("btn_audio hidden at compaction level 4",
+              view.btn_audio.isHidden())
+        check("btn_scale hidden at compaction level 4",
+              view.btn_scale.isHidden())
+        check("btn_back10 stays visible at level 4",
               not view.btn_back10.isHidden())
+        view._apply_compact(5)
+        check("btn_back10 STILL visible at compaction level 5",
+              not view.btn_back10.isHidden())
+        check("btn_fwd10 STILL visible at compaction level 5",
+              not view.btn_fwd10.isHidden())
+        check("btn_live hidden at compaction level 5",
+              view.btn_live.isHidden())
+        view._apply_compact(0)
+        check("btn_audio back at compaction level 0",
+              not view.btn_audio.isHidden())
     finally:
         view._in_fit_ctl = False
 

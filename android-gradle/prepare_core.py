@@ -40,23 +40,26 @@ APP_GRADLE = AG_DIR / "app" / "build.gradle"
 CONFIG_PY = SRC_DIR / "config.py"
 
 # xtream.py needs models.py (top-level ``from .models import ...``);
-# stremio.py is fully self-contained besides requests.  Nothing else in
-# src/ is imported by either (xtream's ``from . import feedback`` sits
-# inside try/except and degrades silently when feedback is absent).
-CORE_MODULES = ("stremio.py", "xtream.py", "models.py")
+# stremio.py is fully self-contained besides requests.  filters.py is the
+# country-token helper the Live TV country filter shares with the desktop
+# app (pure stdlib, no dependencies).  Nothing else in src/ is imported by
+# them (xtream's ``from . import feedback`` sits inside try/except and
+# degrades silently when feedback is absent).
+CORE_MODULES = ("stremio.py", "xtream.py", "models.py", "filters.py")
 
 INIT_TEMPLATE = '''"""MichaelTV core — verbatim copy of the Windows app's src/ modules.
 
 Synced from ../../../src by android-gradle/prepare_core.py; never edit
 these files here, edit src/ and re-run the script.  stremio.py needs
 only the stdlib + requests; xtream.py additionally imports models (same
-package).  The ``feedback`` import inside xtream is optional and absent
-here.  GENERATED — do not commit.
+package); filters.py is the shared country-token helper.  The
+``feedback`` import inside xtream is optional and absent here.
+GENERATED — do not commit.
 """
 
 APP_VERSION = "%s"
 
-from . import models, stremio, xtream  # noqa: F401
+from . import filters, models, stremio, xtream  # noqa: F401
 '''
 
 

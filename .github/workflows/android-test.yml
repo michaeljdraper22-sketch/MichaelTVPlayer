@@ -265,15 +265,28 @@ jobs:
 
           # --- playback legs: public sample videos, no credentials.
           # Two codecs: H.264 mp4 (what debrid/Torrentio actually
-          # serves) and VP9 webm (open codec every chromium supports).
-          # Either advancing proves the pipeline (autoplay_test_url →
-          # <video> → frames on screen); if only webm advances, the
-          # image's WebView lacks proprietary codecs — real phones'
-          # updatable WebViews have both. ---
+          # serves) and VP9 webm. Either advancing proves the pipeline
+          # (autoplay_test_url -> native PlayerActivity -> frames).
+          #
+          # Playback is NATIVE now (ExoPlayer, media3): a WebView <video>
+          # element cannot decode MPEG-TS/HLS/MKV, which is why in-app
+          # playback never worked for real streams. So do NOT wait on
+          # uiautomator text here — a continuously-playing video keeps
+          # the UI non-idle and dumps can come back empty. Poll the
+          # resumed activity instead. ---
           "$ADB" root > /dev/null 2>&1; sleep 3
+          wait_player() {
+            local i
+            for i in $(seq 1 15); do
+              "$ADB" shell dumpsys activity activities 2>/dev/null \
+                | grep -q "mResumedActivity.*PlayerActivity" && return 0
+              sleep 2
+            done
+            return 1
+          }
           playback_probe() {
             # playback_probe <label> <url>: relaunch the app on the URL
-            # via autoplay_test_url, wait for the player screen, grab
+            # via autoplay_test_url, wait for the NATIVE player, grab
             # two frames 12 s apart
             local label="$1" url="$2"
             "$ADB" shell am force-stop org.michaeltv.app
@@ -285,12 +298,18 @@ jobs:
             "xtream_server": "",
             "xtream_username": "",
             "xtream_password": "",
+            "live_favorites": [],
             "autoplay_test_url": "$url"
           }
           JSON
             "$ADB" push /tmp/settings.json /data/data/org.michaeltv.app/files/settings.json
             "$ADB" shell am start -n org.michaeltv.app/.MainActivity
-            wait_text "05_$label" "external player"
+            if ! wait_player; then
+              echo "ASSERT FAIL: native player never opened for $label"
+              dump "05_${label}_missing"
+              exit 1
+            fi
+            sleep 4
             shot "05_${label}_a"
             # frame b only once the player is confirmed STILL up ~12 s
             # later — a GMS kill mid-playback would otherwise compare a
@@ -298,8 +317,7 @@ jobs:
             # falsely "advance"
             for d in 1 2 3; do
               sleep 12
-              dump "05_${label}_check"
-              grep -q "external player" "artifacts/05_${label}_check.xml" && break
+              if wait_player; then break; fi
               echo "playback $label: player gone mid-flight, relaunching (autoplay reopens it)"
               focus
             done

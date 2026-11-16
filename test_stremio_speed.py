@@ -1219,6 +1219,162 @@ def main():
                   b == base
                   and stremio.parse_resolve_url(r) == (H["b"], want_idx))
 
+        # ---- debrid PROVIDER preference (2026-11-12) ------------------
+        # MTV-initiated picks must resolve through the chosen provider
+        # and fall back to the other one when it cannot serve a torrent
+        # (a lapsed Premiumize subscription must not dead-end recovery
+        # through that dead pipeline). Resolution still outranks the
+        # provider; the S button follows the same preferences with the
+        # addon's list order as the FINAL tiebreak.
+        H["p"] = "1" * 40
+        H["q"] = "2" * 40
+        TB_BASE = "https://torrentio.strem.fun/resolve/torbox/%s/" % TBK
+        PM_BASE = "https://torrentio.strem.fun/resolve/premiumize/%s/" % PM
+        RU_TB = (TB_BASE + H["p"] + "/Show.S09E10.1080p.mkv/0/"
+                 "Show.S09E10.1080p.mkv")
+
+        def pstream(tag, base, title, res="1080p"):
+            s = dict(s_url(tag, title, res))
+            s["url"] = "%s%s/%s/0/%s" % (base, H[tag], title, title)
+            return s
+
+        T1080 = pstream("p", TB_BASE, "Show.S09E10.1080p.WEB-DL.x264.mkv")
+        P1080 = pstream("q", PM_BASE, "Show.S09E10.1080p.WEB-DL.x264.mkv")
+        T720 = pstream("p", TB_BASE, "Show.S09E10.720p.WEB-DL.x264.mkv",
+                       "720p")
+        cfg_tb = Config({"stremio_provider_pref": "torbox",
+                         "stremio_provider_bases": {"torbox": TB_BASE,
+                                                    "premiumize": PM_BASE}},
+                        None)
+        cfg_auto = Config({"stremio_provider_pref": "auto"}, None)
+
+        check("provider_of_url: torrentio, debridio, neutral urls",
+              stremio.provider_of_url(T1080["url"]) == "torbox"
+              and stremio.provider_of_url(P1080["url"]) == "premiumize"
+              and stremio.provider_of_url(DB + H["c"] + "/x.mkv")
+              == "torbox"
+              and stremio.provider_of_url(
+                  "http://127.0.0.1:11470/%s/0" % H["g"]) == ""
+              and stremio.provider_of_url("https://torbox.app/a/b.mkv") == "")
+        check("provider_of_stream: resolve url first, provider-bound "
+              "addon second, hash-only neutral",
+              stremio.provider_of_stream(T1080) == "torbox"
+              and stremio.provider_of_stream(
+                  {"infoHash": H["p"],
+                   "_addon": "https://torrentio.strem.fun/premiumize=%s"
+                             % PM}) == "premiumize"
+              and stremio.provider_of_stream({"infoHash": H["p"]}) == "")
+
+        check("provider pref: default auto, bases empty",
+              Config({}, None).stremio_provider_pref == "auto"
+              and Config({}, None).stremio_provider_bases == {})
+        bad = Config({"stremio_provider_pref": "Bogus",
+                      "stremio_provider_bases": {"torbox": TB_BASE,
+                                                 "nope": "https://x/",
+                                                 "premiumize": "ftp://x/"}},
+                     None)
+        check("provider pref: whitelist + base cleanup",
+              bad.stremio_provider_pref == "auto"
+              and bad.stremio_provider_bases == {"torbox": TB_BASE})
+        no_key = Config({"stremio_provider_pref": "premiumize"}, None)
+        check("preferred_provider: a provider with no learned key is "
+              "neutral (never preferred)", stremio.preferred_provider(
+                  no_key) == "" and stremio.preferred_provider(cfg_tb)
+              == "torbox")
+
+        ranked = stremio.rank_streams(cfg_tb, [P1080, T1080], cur_of(T1080))
+        check("rank: preferred provider breaks an otherwise exact tie",
+              ranked[0] is T1080)
+        ranked = stremio.rank_streams(cfg_tb, [T720, P1080], cur_of(T1080))
+        check("rank: resolution still outranks the provider "
+              "(1080p Premiumize beats 720p TorBox)",
+              ranked[0] is P1080)
+        ranked = stremio.rank_streams(cfg_auto, [T1080, P1080], cur_of(T1080))
+        check("rank: auto is provider-neutral (list order preserved)",
+              ranked[0] is T1080)
+
+        walk = [P1080, T1080, T720]
+        check("walk_order: preferred provider first at equal resolution, "
+              "list order inside the rest",
+              stremio.walk_order(cfg_tb, walk, cur_of(T1080))
+              == [T1080, P1080, T720])
+        cfg_neutral = Config({"stremio_resolution_pref": "auto"}, None)
+        check("walk_order: neutral prefs reproduce the addon order "
+              "(the old S-button contract)",
+              stremio.walk_order(cfg_neutral, walk, cur_of(T1080)) == walk)
+
+        cur_pm = cur_of(P1080)
+        check("resolve_bases: preferred, then current, then the other",
+              stremio.resolve_bases(cfg_tb, cur_pm) == [TB_BASE, PM_BASE])
+        check("resolve_bases: auto starts with the current pipeline",
+              stremio.resolve_bases(cfg_auto, cur_pm) == [PM_BASE])
+
+        hash_only = {"name": "Addon 1080p",
+                     "title": "Show.S09E10.1080p.WEB-DL.x264.mkv",
+                     "infoHash": H["p"], "fileIdx": 0}
+        ch = stremio.candidate_urls(cfg_tb, cur_pm, hash_only)
+        check("candidate_urls: hash-only -> preferred first, fallback next",
+              len(ch) == 2 and ch[0].startswith(TB_BASE)
+              and ch[1].startswith(PM_BASE))
+        ch = stremio.candidate_urls(cfg_tb, cur_pm, P1080)
+        check("candidate_urls: a Premiumize link is rebuilt through "
+              "TorBox, original kept as the fallback",
+              ch[0].startswith(TB_BASE) and ch[1] == P1080["url"])
+
+        nc = Config({}, None)
+        check("note_provider_base: learns TorBox from a played link, "
+              "idempotent, ignores non-debrid urls",
+              stremio.note_provider_base(nc, RU_TB)
+              and nc.stremio_provider_bases.get("torbox") == TB_BASE
+              and not stremio.note_provider_base(nc, RU_TB)
+              and not stremio.note_provider_base(
+                  nc, "http://127.0.0.1:11470/%s/0" % H["g"]))
+
+        # the fallback itself: the preferred provider's probe says dead,
+        # the SAME torrent on the other provider still serves it.
+        saved_meta3 = stremio.series_meta
+        saved_qa3 = stremio._query_addon
+        saved_probe3 = stremio.probe_debrid
+        stremio.series_meta = lambda imdb: {
+            "name": "Show",
+            "videos": [{"season": 9, "episode": 10, "name": "E10"}]}
+        S1 = {"name": "Addon \U0001F464 9 \U0001F4BE 2 GB 1080p",
+              "title": "Show.S09E10.1080p.WEB-DL.x264.mkv",
+              "url": "%s%s/Show.S09E10.1080p.WEB-DL.x264.mkv/0/"
+                     "Show.S09E10.1080p.WEB-DL.x264.mkv" % (TB_BASE, H["p"]),
+              "infoHash": H["p"]}
+        S2 = {"name": "Addon \U0001F464 9 \U0001F4BE 2 GB 1080p",
+              "title": "Show.S09E10.1080p.WEB-DL.x264.mkv",
+              "url": "%s%s/Show.S09E10.1080p.WEB-DL.x264.mkv/0/"
+                     "Show.S09E10.1080p.WEB-DL.x264.mkv" % (TB_BASE, H["q"]),
+              "infoHash": H["q"]}
+        try:
+            stremio._query_addon = \
+                lambda base, url: [dict(S1), dict(S2)]
+            stremio._streams_cache.clear()
+            stremio.probe_debrid = \
+                lambda url, timeout_s=3.0, report=None: True
+            nxt = stremio.next_stream_playable(cfg_tb, cur_of(S1))
+            check("next-stream: the preferred pipeline is used when alive",
+                  nxt is not None and nxt["url"].startswith(TB_BASE)
+                  and nxt["info_hash"] == H["q"])
+
+            stremio._streams_cache.clear()
+            # TorBox cannot serve it; Premiumize can
+            stremio.probe_debrid = \
+                lambda url, timeout_s=3.0, report=None: \
+                "/resolve/torbox/" not in url
+            nxt = stremio.next_stream_playable(cfg_tb, cur_of(S1))
+            check("next-stream: a TorBox-dead torrent falls back to "
+                  "Premiumize instead of being skipped",
+                  nxt is not None and nxt["url"].startswith(PM_BASE)
+                  and nxt["info_hash"] == H["q"])
+        finally:
+            stremio.series_meta = saved_meta3
+            stremio._query_addon = saved_qa3
+            stremio.probe_debrid = saved_probe3
+            stremio._streams_cache.clear()
+
         # ---- mkv_head_duration_s: the online-sub SYNC gate's clock ----
         def _vid(v):
             L = (v.bit_length() + 5) // 7
