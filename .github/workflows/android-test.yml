@@ -278,8 +278,14 @@ jobs:
           wait_player() {
             local i
             for i in $(seq 1 15); do
-              "$ADB" shell dumpsys activity activities 2>/dev/null \
-                | grep -q "mResumedActivity.*PlayerActivity" && return 0
+              # API 34 spells it topResumedActivity (older images used
+              # mResumedActivity) — match any spelling of *ResumedActivity
+              # naming PlayerActivity, and fall back to the focused window
+              # (covers every dumpsys format change either way).
+              if "$ADB" shell dumpsys activity activities 2>/dev/null \
+                   | grep -q "ResumedActivity.*PlayerActivity"; then return 0; fi
+              if "$ADB" shell dumpsys window windows 2>/dev/null \
+                   | grep -q "mCurrentFocus.*PlayerActivity"; then return 0; fi
               sleep 2
             done
             return 1
