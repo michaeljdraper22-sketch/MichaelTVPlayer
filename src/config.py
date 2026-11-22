@@ -70,7 +70,16 @@ APP_NAME = "MichaelTVPlayer"
 # (dB-linear) volume taper so the bar isn't silent for 80% of its travel
 # (stored volume migrated to the same curve), and quiet background
 # subtitle hunts + moviehash-wait for the online sub search.
-APP_VERSION = "2.1.11"
+# 2.1.12: live TV's provider delivers MPEG-TS in exact 5 s batches (5 s of
+# data, then 5 s of silence — measured 2026-11-22), so a 5 s chase reached
+# the write head at every seam and froze 4-6 s; live now keeps a two-batch
+# (10 s) cushion, plain live reads with a 10 s VLC cache, LIVE lands 10 s
+# behind the edge, and an ENDED recorder (the provider caps a live body at
+# ~15 min) restarts in 8 s instead of waiting out the 65 s stall patience.
+# Android: the native player opens live with a 10 s ExoPlayer cushion,
+# reconnects a cleanly-ended body (HLS -> progressive .ts, then retries),
+# and releases its connection before handing the same URL to VLC.
+APP_VERSION = "2.1.12"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC
@@ -135,10 +144,11 @@ DEFAULTS = {
     "series_countries_configured": False,
     "record_folder": "",          # where permanent recordings are saved
     "download_folder": "",        # where catch-up window / VOD downloads go
-    # Seconds behind live the always-on DVR chase keeps live TV. 5 is the
-    # floor: the caption cushion (profanity filter / app-rendered captions)
-    # cannot mute/render in time with less.
-    "chase_delay": 5,
+    # Seconds behind live the always-on DVR chase keeps live TV. 10 is the
+    # floor: the caption cushion needs >=5 s, and the panel delivers live
+    # MPEG-TS in 5 s batches, so anything under two batches freezes at
+    # every batch seam (player_view._LIVE_MIN_CHASE_DELAY_S).
+    "chase_delay": 10,
     "favorites": [],              # list of "playable" dicts
     "recents": [],                # list of "playable" dicts (most-recent first)
     "custom_channels": [],        # user-defined stream URLs
@@ -245,13 +255,27 @@ class Config:
             data["subtitle_appearance"] = sub
         data["_sub_size_migrated"] = True
         # one-time migration: live TV is ALWAYS in DVR chase mode now, and
-        # the user approved trading ~5 s of latency for unified captions —
-        # configs still on the old 15 s default come down to 5 (an explicit
-        # other value is kept; the floor is 5 either way).
+        # the user approved trading a few seconds of latency for unified
+        # captions — configs still on the old 15 s default come down to the
+        # original 5 (an explicit other value is kept; the floor is 10 now,
+        # see the next migration).
         if not data.get("_chase_delay_migrated"):
-            if int(data.get("chase_delay", 5) or 5) == 15:
+            if int(data.get("chase_delay", 10) or 10) == 15:
                 data["chase_delay"] = 5
             data["_chase_delay_migrated"] = True
+        # one-time migration: the provider delivers each live batch as 5 s
+        # of MPEG-TS then 5 s of silence, so the old 5 s chase landed on
+        # the write head at every seam and froze there. The player floors
+        # the delay at two batches (player_view._LIVE_MIN_CHASE_DELAY_S);
+        # raise a stored value below it so the setting says what playback
+        # actually does.
+        if not data.get("_chase_delay_floor10"):
+            try:
+                if int(data.get("chase_delay", 10) or 10) < 10:
+                    data["chase_delay"] = 10
+            except (TypeError, ValueError):
+                data["chase_delay"] = 10
+            data["_chase_delay_floor10"] = True
         # one-time migration: the Catch-Up tab was inserted after Series,
         # which shifts the stored Favorites/Custom tab indices by one.
         if not data.get("_catchup_tab_migrated"):
@@ -259,6 +283,15 @@ class Config:
             if isinstance(lt, int) and lt >= 3:
                 data["last_tab"] = lt + 1
             data["_catchup_tab_migrated"] = True
+        # one-time migration: the Stremio Series / Stremio Movies tabs
+        # were inserted after Series, shifting every tab from Catch-Up on
+        # by two. Runs AFTER the Catch-Up migration so a fresh old config
+        # passes through both (old 3 -> 4 by catch-up -> 6 here).
+        if not data.get("_stremio_tabs_migrated"):
+            lt = data.get("last_tab")
+            if isinstance(lt, int) and lt >= 3:
+                data["last_tab"] = lt + 2
+            data["_stremio_tabs_migrated"] = True
         # one-time migration: autoplay stream picking grew from a single
         # preferred-resolution int into full preferences (match current /
         # auto fall-down / a fixed pick). 2160 and the legacy 0 both meant
@@ -624,11 +657,11 @@ class Config:
 
     @property
     def chase_delay(self) -> int:
-        return int(self.data.get("chase_delay", 5))
+        return int(self.data.get("chase_delay", 10))
 
     @chase_delay.setter
     def chase_delay(self, value: int) -> None:
-        self.data["chase_delay"] = max(5, min(120, int(value)))
+        self.data["chase_delay"] = max(10, min(120, int(value)))
 
     # ---- opt-in diagnostics (Settings ▸ "Help improve MichaelTV…") ----
 

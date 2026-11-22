@@ -6,6 +6,7 @@ import android.content.Intent;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -27,7 +28,10 @@ import androidx.media3.common.MediaMetadata;
 import androidx.media3.common.PlaybackException;
 import androidx.media3.common.Player;
 import androidx.media3.common.util.UnstableApi;
+import androidx.media3.exoplayer.DefaultLoadControl;
 import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy;
 import androidx.media3.ui.PlayerView;
 import androidx.mediarouter.app.MediaRouteButton;
 
@@ -64,6 +68,7 @@ public class PlayerActivity extends Activity {
     public static final String EXTRA_URL = "url";
     public static final String EXTRA_ALT_URL = "alt_url";
     public static final String EXTRA_TITLE = "title";
+    public static final String EXTRA_LIVE = "live";
 
     private ExoPlayer player;
     private PlayerView playerView;
@@ -78,11 +83,32 @@ public class PlayerActivity extends Activity {
     private String altUrl = "";
     private String title = "";
     private String currentUrl = "";
+    private boolean live = false;
 
     // 0 = primary, 1 = alternate URL, 2 = audio disabled
     private int attempt = 0;
     private boolean videoOnly = false;
     private boolean casting = false;
+
+    // Live streams are opened with a two-batch cushion in ExoPlayer's
+    // load control: the panel pushes each 5 s of MPEG-TS as one burst and
+    // then goes silent for 5 s (measured 2026-11-22), so a player that
+    // starts on the first 2.5 s of data starves at the first seam. The
+    // deeper start gate costs ~10 s of spinner once and rides the cadence.
+    private static final int LIVE_MIN_BUFFER_MS = 50_000;   // keep 50 s
+    private static final int LIVE_MAX_BUFFER_MS = 60_000;
+    private static final int LIVE_START_MS = 10_000;        // two batches
+    private static final int LIVE_REBUFFER_MS = 15_000;
+    private static final int LIVE_RETRIES = 8;
+    private static final int LIVE_RECONNECT_MAX = 6;        // within the window
+    private static final long LIVE_STABLE_MS = 60_000;      // resets the count
+
+    // Live EOF recovery: a provider session cap/load balancer closes the
+    // HTTP body cleanly, which ExoPlayer reports as ENDED (not an error),
+    // so the normal error ladder never runs and the picture sits dead.
+    private boolean handingOff = false;
+    private int liveReconnects = 0;
+    private long lastReadyAt = 0L;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -93,6 +119,7 @@ public class PlayerActivity extends Activity {
         primaryUrl = safe(intent.getStringExtra(EXTRA_URL));
         altUrl = safe(intent.getStringExtra(EXTRA_ALT_URL));
         title = safe(intent.getStringExtra(EXTRA_TITLE));
+        live = intent.getBooleanExtra(EXTRA_LIVE, false);
         if (TextUtils.isEmpty(primaryUrl)) {
             finish();
             return;
@@ -117,7 +144,26 @@ public class PlayerActivity extends Activity {
 
         setContentView(root);
 
-        player = new ExoPlayer.Builder(this).build();
+        // Live gets the two-batch cushion (see LIVE_START_MS); VOD keeps
+        // the stock start gate so a movie does not wait for 10 s.
+        DefaultLoadControl loadControl = new DefaultLoadControl.Builder()
+                .setBufferDurationsMs(
+                        LIVE_MIN_BUFFER_MS,
+                        live ? LIVE_MAX_BUFFER_MS : LIVE_MIN_BUFFER_MS,
+                        live ? LIVE_START_MS : 2_500,
+                        live ? LIVE_REBUFFER_MS : 5_000)
+                .build();
+        player = new ExoPlayer.Builder(this)
+                .setLoadControl(loadControl)
+                // A live provider drops/ends bodies more often than a VOD
+                // CDN; the default 3 retries give up while the stream is
+                // only having a bad batch. media3 1.2.1 puts this on the
+                // media-source factory, not the player builder.
+                .setMediaSourceFactory(new DefaultMediaSourceFactory(this)
+                        .setLoadErrorHandlingPolicy(
+                                new DefaultLoadErrorHandlingPolicy(
+                                        live ? LIVE_RETRIES : 3)))
+                .build();
         player.setAudioAttributes(new AudioAttributes.Builder()
                 .setContentType(C.AUDIO_CONTENT_TYPE_MOVIE)
                 .setUsage(C.USAGE_MEDIA)
@@ -127,6 +173,16 @@ public class PlayerActivity extends Activity {
             @Override
             public void onPlayerError(PlaybackException error) {
                 handlePlaybackError(error);
+            }
+
+            @Override
+            public void onPlaybackStateChanged(int state) {
+                if (state == Player.STATE_READY) {
+                    lastReadyAt = SystemClock.elapsedRealtime();
+                } else if (state == Player.STATE_ENDED && live
+                        && !casting && !handingOff) {
+                    onLiveEnded();
+                }
             }
         });
         playerView.setPlayer(player);
@@ -337,6 +393,43 @@ public class PlayerActivity extends Activity {
         errorPanel.setVisibility(View.VISIBLE);
     }
 
+    /**
+     * A live body ended CLEANLY. Providers cap connection age / rebalance
+     * the CDN, and ExoPlayer reads the clean EOF as end-of-media: no
+     * onPlayerError, so the format ladder below never runs and the screen
+     * sits black. Try the alternate feed once (HLS ended -> progressive
+     * .ts), then reconnect the same URL with the reconnect budget. The
+     * count resets after a minute of real playback so a long stable
+     * session gets a fresh budget after the panel drops it.
+     */
+    private void onLiveEnded() {
+        long now = SystemClock.elapsedRealtime();
+        if (lastReadyAt > 0 && now - lastReadyAt >= LIVE_STABLE_MS) {
+            liveReconnects = 0;
+        }
+        if (liveReconnects >= LIVE_RECONNECT_MAX) {
+            errorText.setText("This live stream keeps ending.\n\nThe "
+                    + "provider is dropping the connection — try again "
+                    + "later or open it in an external player.");
+            errorPanel.setVisibility(View.VISIBLE);
+            return;
+        }
+        liveReconnects++;
+        if (attempt == 0 && !altUrl.isEmpty()) {
+            attempt = 1;
+            toast("Live stream ended \u2014 trying the alternate feed\u2026");
+            play(altUrl);
+            return;
+        }
+        toast("Reconnecting live stream\u2026");
+        root.postDelayed(() -> {
+            if (!isFinishing() && !isDestroyed() && live && player != null
+                    && !casting && !handingOff) {
+                play(currentUrl);
+            }
+        }, 1200);
+    }
+
     private void toast(String message) {
         Toast.makeText(this, message, Toast.LENGTH_SHORT).show();
     }
@@ -349,7 +442,25 @@ public class PlayerActivity extends Activity {
             startActivity(i);
         } catch (ActivityNotFoundException e) {
             toast("No external player installed");
+            return;
         }
+        // A provider account normally allows ONE live connection. The
+        // native player keeps its HTTP body open while paused, so handing
+        // the same URL to VLC with the local player still attached gives
+        // the provider two viewers of one account — its throttle/kick is
+        // exactly the "VLC stutters even worse than the app" report
+        // (2026-11-22). Release the local stream before VLC opens it.
+        handingOff = true;
+        if (player != null) {
+            try {
+                player.pause();
+                player.stop();
+                player.clearMediaItems();
+            } catch (Throwable ignored) {
+                // player already released / activity tearing down
+            }
+        }
+        toast("Paused here so the external player has the stream");
     }
 
     // --------------------------------------------------------------- cast
@@ -444,11 +555,27 @@ public class PlayerActivity extends Activity {
     // ----------------------------------------------------------- lifecycle
 
     @Override
+    protected void onResume() {
+        super.onResume();
+        // Returning from the external player: the local stream was closed
+        // for the handoff (see openExternal), so pick it back up. VLC may
+        // still be alive in the background; if it is, stopping it is the
+        // user's business — but the app must not present a dead player.
+        if (handingOff) {
+            handingOff = false;
+            if (player != null && !casting && player.getMediaItemCount() == 0
+                    && !TextUtils.isEmpty(currentUrl)) {
+                play(currentUrl);
+            }
+        }
+    }
+
+    @Override
     protected void onStop() {
         // Leaving the screen (home button, external player) stops the
         // audio instead of continuing in the background — unless the TV is
         // playing: the receiver keeps going and the phone stays the remote.
-        if (!casting && player != null) player.pause();
+        if (!casting && player != null && !handingOff) player.pause();
         super.onStop();
     }
 

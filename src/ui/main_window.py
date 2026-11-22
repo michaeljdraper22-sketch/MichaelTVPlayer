@@ -21,6 +21,7 @@ from .browsers import (
 from .countries_dialog import CountriesDialog
 from .login_dialog import LoginDialog
 from .player_view import PlayerView
+from .stremio_browse import TAB_MOVIES, TAB_SERIES, StremioCatalogBrowser
 from .worker import AsyncRunner
 
 log = logging.getLogger("mtp")
@@ -200,6 +201,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.live_tab = LiveBrowser(config, self.client, "live")
         self.vod_tab = VodBrowser(config, self.client, "vod")
         self.series_tab = SeriesBrowser(config, self.client, "series")
+        # Stremio catalog search — right after Series, the two tabs it
+        # mirrors. These need no IPTV account: they search Cinemeta and
+        # play with the same ranked-stream preference the handoff uses.
+        self.stremio_series_tab = StremioCatalogBrowser(config, "series")
+        self.stremio_movie_tab = StremioCatalogBrowser(config, "movie")
         self.catchup_tab = CatchupBrowser(config, self.client, "catchup")
         self.fav_tab = FavoritesTab(config)
         self.custom_tab = CustomTab(config)
@@ -207,6 +213,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(self.live_tab, "Live TV")
         self.tabs.addTab(self.vod_tab, "Movies")
         self.tabs.addTab(self.series_tab, "Series")
+        idx = self.tabs.addTab(self.stremio_series_tab, TAB_SERIES)
+        self.tabs.setTabToolTip(idx, "Search Stremio for shows")
+        idx = self.tabs.addTab(self.stremio_movie_tab, TAB_MOVIES)
+        self.tabs.setTabToolTip(idx, "Search Stremio for movies")
         self.tabs.addTab(self.catchup_tab, "Catch-Up")
         self.tabs.addTab(self.fav_tab, "★ Favorites")
         self.tabs.addTab(self.custom_tab, "➕ Custom")
@@ -233,6 +243,8 @@ class MainWindow(QtWidgets.QMainWindow):
                     self.catchup_tab):
             tab.media_activated.connect(self.play)
             tab.favorite_changed.connect(self.fav_tab.refresh)
+        self.stremio_series_tab.media_activated.connect(self.play)
+        self.stremio_movie_tab.media_activated.connect(self.play)
         self.fav_tab.media_activated.connect(self._play_from_favorites)
         self.custom_tab.media_activated.connect(self.play)
         self.countries_dialog = CountriesDialog(config, self.client, self)
@@ -344,6 +356,12 @@ class MainWindow(QtWidgets.QMainWindow):
         # QShortcut like N/P so it works in zen/fullscreen too.
         QtWidgets.QShortcut(QtGui.QKeySequence("S"), self,
                             activated=self.player_view._next_stream_clicked)
+        # the FULL source list for what is playing (Stremio only, same
+        # drop rule). Shift+S rather than a new letter: it is the same
+        # idea as S (another source), one modifier up — S walks blindly,
+        # Shift+S shows every row and plays the one clicked.
+        QtWidgets.QShortcut(QtGui.QKeySequence("Shift+S"), self,
+                            activated=self.player_view._choose_stream_clicked)
         # open a local video file — window-level so it works over the
         # player too (zen/fullscreen), like VLC's Ctrl+O
         QtWidgets.QShortcut(QtGui.QKeySequence("Ctrl+O"), self,
@@ -892,6 +910,9 @@ class MainWindow(QtWidgets.QMainWindow):
         for tab in (self.live_tab, self.vod_tab, self.series_tab,
                     self.catchup_tab):
             tab._reload_categories(force=True)
+        # the Stremio tabs have no provider library — re-run their query
+        for tab in (self.stremio_series_tab, self.stremio_movie_tab):
+            tab.reload()
 
     def add_custom(self):
         self.custom_tab.add_channel_dialog(self)
@@ -1198,8 +1219,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self, "Live delay",
             "Live TV always plays this many seconds behind the live edge\n"
             "(the pause/rewind buffer and the caption cushion).\n"
-            "Higher = smoother playback on bad links; lower = closer to live.",
-            value=self.config.chase_delay, min=5, max=120, step=5,
+            "Higher = smoother playback on bad links; lower = closer to live.\n"
+            "Minimum 10 s: the provider sends live in 5 s batches.",
+            value=max(10, self.config.chase_delay), min=10, max=120, step=5,
         )
         if ok:
             self.config.chase_delay = value
@@ -1510,6 +1532,9 @@ class MainWindow(QtWidgets.QMainWindow):
             "  S  ................. Next stream (Stremio): same episode/movie,\n"
             "                       next-ranked source — for when the current\n"
             "                       one is wrong (foreign audio, no subs)\n"
+            "  Shift+S  .......... All streams (Stremio): the full ranked list\n"
+            "                       for this movie/episode — click a row to\n"
+            "                       play it from where you are\n"
             "  Mouse wheel ....... Volume (over the video)\n"
             "  Double-click video  Toggle fullscreen\n"
             "  ● LIVE button ..... Jump to the live edge / end of the movie\n"

@@ -2223,6 +2223,276 @@ def walk_order(config, streams: list, cur: dict = None) -> list:
 
 
 # ---------------------------------------------------------------------------
+# in-app catalog browse (the "Stremio Series" / "Stremio Movies" tabs)
+#
+# Everything below serves a pick the user made IN MichaelTV (search ->
+# title -> episode). The rules are the handoff path's rules on purpose:
+# the playables carry the same identity fields _adjacent_playable /
+# next_stream_playable produce, so the player's identity skip, the ⏭/⏮
+# lookaheads, autoplay and the dead-link advance all work without a
+# single special case.
+
+def search_catalog(kind: str, query: str) -> list:
+    """Cinemeta top/search for the browse tabs -> ``[{id, name, year,
+    poster}]`` best first. ``kind`` is "movie" or "series".
+
+    search_series/search_movies stay as they are (the handoff matcher
+    consumes them); the tabs need the YEAR for BOTH catalogs: Cinemeta
+    lists four different shows all called "The Office", and in a
+    text-only results list the year is the only thing telling them
+    apart."""
+    catalog = "movie" if str(kind).lower() == "movie" else "series"
+    out = []
+    for m in _catalog_search(catalog, query):
+        if m.get("type") not in (None, catalog) or not m.get("id") \
+                or not m.get("name"):
+            continue
+        info = str(m.get("releaseInfo") or m.get("year") or "")
+        ym = re.match(r"(?:19|20)\d{2}", info)
+        out.append({
+            "id": str(m["id"]),
+            "name": str(m["name"]),
+            # "2005-2013" for series, "1992" for movies
+            "year": ym.group(0) if ym else "",
+            "poster": str(m.get("poster") or ""),
+            "type": catalog,
+        })
+    return out
+
+
+def episode_map(imdb_id: str) -> list:
+    """The browse tabs' season/episode tree for a series:
+    ``[(season, [(episode, title), ...]), ...]``.
+
+    Seasons ascend, episodes ascend, and Cinemeta's season 0 (webisodes
+    and extras) goes LAST so opening a show lands on Season 1 instead of
+    "Specials" — which reads as a broken tab. Videos without a usable
+    season/episode number are skipped (Cinemeta carries a few)."""
+    imdb = str(imdb_id or "")
+    if not imdb:
+        return []
+    meta = series_meta(imdb)
+    seasons = {}
+    for v in meta.get("videos") or []:
+        try:
+            season = int(v.get("season", -1))
+            episode = int(v.get("episode", -1))
+        except (TypeError, ValueError):
+            continue
+        if season < 0 or episode < 0:
+            continue
+        seasons.setdefault(season, []).append(
+            (episode, str(v.get("name") or v.get("title") or "")))
+    rows = [(season, sorted(seasons[season], key=lambda t: t[0]))
+            for season in sorted(seasons)]
+    # (season == 0) sorts False before True: real seasons first
+    rows.sort(key=lambda row: (row[0] == 0, row[0]))
+    return rows
+
+
+def catalog_pick(kind: str, hit: dict, season: int = 0,
+                 episode: int = 0, meta: dict = None) -> dict:
+    """Identity dict for a pick made in a browse tab.
+
+    Deliberately the same FIELD SHAPE _adjacent_playable builds: the
+    playable that comes out of stream_playable is then indistinguishable
+    from a handoff's, so every downstream consumer (identity skip,
+    lookaheads, autoplay, dead-link advance, recents) keeps working.
+    ``fav_key`` matches _adjacent_playable for episodes
+    ("stremio:{imdb}:{s}:{e}") and is stable per movie so replaying a
+    movie from search never piles up recents entries."""
+    hit = hit or {}
+    imdb = str(hit.get("id") or "")
+    name = str(hit.get("name") or "Stremio")
+    poster = str(hit.get("poster") or "")
+    if str(kind).lower() == "movie":
+        year = str(hit.get("year") or "")
+        title = name + (" (%s)" % year if year else "")
+        return {
+            "movie": True,
+            "stremio_imdb": imdb,
+            "movie_name": name,
+            "year": year,
+            "icon": poster,
+            "title": title,
+            "fav_key": "stremio:%s" % imdb,
+        }
+    season = int(season or 0)
+    episode = int(episode or 0)
+    if meta is None:
+        meta = series_meta(imdb) if imdb else {}
+    ep_title = _episode_title(meta or {}, season, episode)
+    title = "%s \u2014 S%02dE%02d" % (name, season, episode)
+    if ep_title:
+        title += " %s" % ep_title
+    return {
+        "stremio_imdb": imdb,
+        "series_name": name,
+        "season": season,
+        "episode": episode,
+        "episode_name": ep_title,
+        "icon": poster,
+        "title": title,
+        "fav_key": "stremio:%s:%d:%d" % (imdb, season, episode),
+    }
+
+
+def ranked_streams(config, cur: dict, meta: dict = None) -> list:
+    """Every play-ready stream for ``cur`` (a catalog_pick), in the same
+    preference order Enter/autoplay use — rank_streams' order, so the
+    list the user sees starts with the stream that would have been
+    picked for them.
+
+    The season-pack veto autoplay applies is applied here too: a pack
+    file titled as a DIFFERENT episode is a lie about what it plays, and
+    a manual picker must not offer it either."""
+    if not cur:
+        return []
+    imdb = cur.get("stremio_imdb")
+    if not imdb:
+        return []
+    movie = bool(cur.get("movie"))
+    season = int(cur.get("season") or 0)
+    episode = int(cur.get("episode") or 0)
+    try:
+        if movie:
+            streams = addon_movie_streams(config, imdb)
+        else:
+            streams = addon_streams(config, imdb, season, episode)
+    except Exception as exc:  # noqa: BLE001
+        log.info("stremio: browse — stream fetch failed: %r", exc)
+        return []
+    if streams and not movie and season >= 1:
+        if meta is None:
+            meta = series_meta(imdb)
+        series_name = cur.get("series_name") or (meta or {}).get("name") or ""
+        clean = [st for st in streams
+                 if not _file_is_other_episode(
+                     _resolve_file_name(st), meta or {}, season, episode,
+                     str(series_name))]
+        if len(clean) != len(streams):
+            log.info("stremio: browse — skipped %d of %d streams for "
+                     "S%02dE%02d whose pack files are titled as OTHER "
+                     "episodes", len(streams) - len(clean), len(streams),
+                     season, episode)
+        streams = clean
+    return rank_streams(config, streams, cur)
+
+
+def _url_provable(url: str) -> bool:
+    """True when a one-byte probe can say anything about this URL. The
+    local streaming engine serves its own torrents (a probe would race
+    the create it just accepted); non-http shapes can only be handed on."""
+    u = str(url or "")
+    return (u.startswith(("http://", "https://"))
+            and "//127.0.0.1" not in u and "//localhost" not in u)
+
+
+def probe_pick(url: str, timeout_s: float = 3.0) -> bool:
+    """Liveness of a URL the user just PICKED by hand. False means every
+    debrid pipeline said dead (502, the ~120 KB failure video, refused,
+    hang) — the picker then keeps its list up instead of starting a
+    stream that cannot play. Unprovable (non-http, local engine) and
+    throttled (429) count as alive, exactly like the S-button walk."""
+    if not _url_provable(url):
+        return True
+    try:
+        return bool(probe_debrid(url, timeout_s=timeout_s))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def stream_playable(config, cur: dict, stream: dict,
+                    server=None, probe: bool = False) -> dict:
+    """A playable for ONE chosen stream (a browse Enter, or a single
+    click in the full stream list).
+
+    URL resolution mirrors the autoplay path: a learned debrid resolve
+    pipeline when there is one (preferred provider first — the machine
+    never joins the swarm), the stream's own URL otherwise, and the
+    local Stremio streaming server only when no pipeline can serve it
+    (a non-debrid setup). Returns None when nothing can play it.
+
+    ``probe=False`` (the Enter / best-pick path) hands the URL straight
+    to VLC: a pick must START now, and the player's own dead-link guard
+    walks on if it 502s. ``probe=True`` (a row the user CLICKED in the
+    list) checks the first two candidates of the chain first — a dead
+    debrid resolve is common on uncached torrents, and a manual picker
+    that silently starts a failure video is worse than one extra ranged
+    GET. Each candidate is verified in order, so a torrent the preferred
+    provider cannot serve still plays through the other one."""
+    if not stream or not cur:
+        return None
+    info_hash = str(stream.get("infoHash") or "").lower()
+    file_idx = stream.get("fileIdx")
+    try:
+        chain = candidate_urls(config, cur, stream)
+    except Exception as exc:  # noqa: BLE001
+        log.info("stremio: browse — candidate build failed: %r", exc)
+        chain = []
+    url = chain[0] if chain else ""
+    if probe and chain:
+        # best first; stop at the first one that proves alive
+        alive = None
+        for cand in chain[:2]:
+            if probe_pick(cand):
+                alive = cand
+                break
+            log.info("stremio: browse — %s is dead through this provider, "
+                     "trying the next one",
+                     (info_hash or str(cand))[:60])
+        if alive is None:
+            log.info("stremio: browse — skipping %s: every debrid provider "
+                     "says the link is dead", (info_hash or "")[:60])
+            return None
+        url = alive
+    if not url:
+        url = str(stream.get("url") or "")
+    if url and not info_hash:
+        # keep the torrent identity for the dead-chain exclusion and the
+        # next press's skip-match (same rule as _adjacent_playable)
+        resolved = parse_resolve_url(url)
+        if resolved:
+            info_hash, file_idx = resolved
+    if not url:
+        # no direct link and no learned pipeline: the local streaming
+        # engine is the only way left (non-debrid setups — see
+        # _wants_debrid_only for why a debrid context never lands here)
+        if not info_hash:
+            return None
+        if server is None:
+            server = StreamingServer(
+                (config.data.get("stremio_server") if config else None) or "")
+        if not server.create(info_hash):
+            log.warning("stremio: browse — streaming server refused "
+                        "create for %s", info_hash[:12])
+            return None
+        url = server.play_url(info_hash, int(file_idx or 0))
+    if info_hash and file_idx is None:
+        file_idx = 0
+    playable = dict(cur)      # identity fields ride along verbatim
+    playable["kind"] = "stremio"
+    playable["url"] = url
+    if info_hash:
+        playable["info_hash"] = info_hash
+        playable["file_idx"] = file_idx
+    return playable
+
+
+def best_playable(config, cur: dict, meta: dict = None, tries: int = 3):
+    """The playable for the TOP-ranked stream — what Enter/double-click
+    uses. Walks a couple of candidates only so one refused torrent
+    create cannot dead-end a pick that has usable streams below it;
+    it is NOT the dead-link walk (the player owns that)."""
+    ranked = ranked_streams(config, cur, meta)
+    for stream in ranked[:max(1, int(tries or 1))]:
+        playable = stream_playable(config, cur, stream)
+        if playable:
+            return playable
+    return None
+
+
+# ---------------------------------------------------------------------------
 # identity + playables
 
 def _movie_identity(file_name: str, torrent_name: str):

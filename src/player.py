@@ -586,12 +586,19 @@ class VLCPlayer:
                 # --network-caching for this one input (the same mechanism
                 # as per-entry :network-caching in .m3u playlists). VOD
                 # gets a deep buffer so a CDN dip is absorbed invisibly;
-                # live TV keeps the instance value — its distance from the
-                # live edge must not grow. This is a fill-behind target,
-                # not a gate: playback starts on the first decoded frames
-                # while the cache fills during playback.
+                # plain live (timeshift) gets the two-batch floor from
+                # player_view, because batched delivery drains a 1.5 s
+                # cache at every seam. This is a fill-behind target, not a
+                # gate: playback starts on the first decoded frames while
+                # the cache fills during playback.
                 self.media.add_option(
                     f":network-caching={int(network_caching_ms)}")
+                if timeshift:
+                    # --live-caching is the live-specific knob VLC reads;
+                    # the per-media override must set BOTH or the instance
+                    # default (1.5 s) can still win for a live input.
+                    self.media.add_option(
+                        f":live-caching={int(network_caching_ms)}")
             except Exception as exc:  # noqa: BLE001
                 try:
                     log.warning("play_at: add network-caching failed: %r",

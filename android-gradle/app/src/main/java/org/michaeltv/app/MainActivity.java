@@ -137,11 +137,13 @@ public class MainActivity extends Activity {
         /**
          * In-app playback (the WebView cannot decode MPEG-TS/HLS/MKV):
          * open the native ExoPlayer screen.  altUrl is the progressive .ts
-         * fallback for live channels; an empty string means none.
+         * fallback for live channels; an empty string means none.  isLive
+         * selects the live load-control cushion and the clean-EOF
+         * reconnect (see PlayerActivity).
          */
         @JavascriptInterface
         public void playNative(final String url, final String altUrl,
-                               final String title) {
+                               final String title, final boolean isLive) {
             if (url == null || url.isEmpty()) return;
             runOnUiThread(new Runnable() {
                 @Override
@@ -155,6 +157,7 @@ public class MainActivity extends Activity {
                     if (title != null) {
                         i.putExtra(PlayerActivity.EXTRA_TITLE, title);
                     }
+                    i.putExtra(PlayerActivity.EXTRA_LIVE, isLive);
                     startActivity(i);
                 }
             });

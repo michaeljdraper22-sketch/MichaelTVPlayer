@@ -12,6 +12,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,6 +32,21 @@ def write(path, size=1024):
         f.write(b"x" * size)
 
 
+OLD = 3600.0        # an hour old: leftovers from a previous run
+
+
+def backdate(path, age_s=OLD):
+    """Age an artifact (and its children) so the sweep treats it as stale."""
+    t = time.time() - age_s
+    try:
+        if os.path.isdir(path):
+            for name in os.listdir(path):
+                os.utime(os.path.join(path, name), (t, t))
+        os.utime(path, (t, t))
+    except OSError:
+        pass
+
+
 def main():
     root = tempfile.mkdtemp(prefix="mtp_sweeptest_")
     try:
@@ -46,6 +62,14 @@ def main():
         write(keep, 32)
         locked = os.path.join(root, "mtp_split_inuse.mkv")
         write(locked, 512)
+        # a LIVE session's DVR dir: freshly written, must survive the sweep
+        # (2026-11-16: a relay launch deleted a running app's 232 MB buffer)
+        live = os.path.join(root, "mtp_dvr_runrning")
+        os.makedirs(live)
+        write(os.path.join(live, "buffer.ts"), 8192)
+
+        for p in (dvr, cap, split):
+            backdate(p)
 
         fh = open(locked, "r+b")        # Windows: holds the file locked
         try:
@@ -57,15 +81,21 @@ def main():
         check("caption tap dir removed", not os.path.exists(cap))
         check("splitter cache file removed", not os.path.exists(split))
         check("unrelated files untouched", os.path.exists(keep))
+        check("fresh DVR dir (live session) survives",
+              os.path.exists(os.path.join(live, "buffer.ts")))
         if sys.platform == "win32":
             check("in-use cache survives the pass (locked)",
                   os.path.exists(locked))
         else:
             print("  (skip locked-file check: not Windows)")
 
+        backdate(locked)
         cleanup_stale_temp_files(root=root)
         check("released cache removed on the next pass",
               not os.path.exists(locked))
+        # ...and the still-fresh live buffer is STILL untouched
+        check("fresh DVR dir still survives the second pass",
+              os.path.exists(os.path.join(live, "buffer.ts")))
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

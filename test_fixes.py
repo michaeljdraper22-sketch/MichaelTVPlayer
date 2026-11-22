@@ -207,8 +207,8 @@ def main():
     view._chase_paused = True
     real.state = "ended"
     view._jump_live()
-    check("LIVE from paused+dead resumes at frontier-safety",
-          saw("play_at", 195.0) and not view._chase_paused)
+    check("LIVE from paused+dead resumes at the live cushion (two batches)",
+          saw("play_at", 190.0) and not view._chase_paused)
     view._chase_paused = False
     real.state = "playing"
     view.current = {"kind": "live", "title": "t", "url": "u"}  # media loaded
@@ -246,18 +246,18 @@ def main():
           hasattr(view, "btn_begin")
           and view.btn_live.x() > view.btn_begin.x() >= view.sep1.x())
 
-    print("[9] chase entry is fast (no runway wait)")
+    print("[9] chase entry waits for the live cushion (and explains a fill)")
     sig = inspect.signature(view._wait_and_enter_chase)
     check("tries default is 'compute' (-1)", sig.parameters["tries_left"].default == -1)
     view._session += 1
     view._wait_and_enter_chase(view._session - 5)   # stale -> silent no-op
     check("stale wait call is a silent no-op", True)
     src = inspect.getsource(pv_mod.PlayerView._wait_and_enter_chase)
-    check("entry needs only buffer-ready + 2.5s",
-          "waited >= 2.5" in src)
+    check("entry needs the wall-time gate AND the live cushion",
+          "waited >= 2.5" in src and "frontier >= delay" in src)
     body = src.split('"""', 2)[-1]      # drop the docstring
-    check("no countdown or buffering pill text", "s buffered" not in body
-          and "Buffering" not in body)
+    check("a long fill explains itself on the DVR pill",
+          "Buffering" in body)
 
     print("[10] watchdog gated on playback start")
     check("_chase_started defaults False", view._chase_started is False)

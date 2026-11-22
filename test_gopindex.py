@@ -301,13 +301,14 @@ if gi is not None:
           v is not None and abs(v[0] - want) < 0.02,
           f"verify target={v[0] if v else None}")
 
-    # jump-to-live anchors too (target = edge - 5 = 195 -> IDR 194.9xx
-    # does not exist in a 100s file: falls back EXACT, no wrong anchor)
+    # jump-to-live anchors too (target = edge - 10 = 190 -> IDR 189.9xx
+    # does not exist in the recording's range: falls back EXACT, no wrong
+    # anchor). 10 s is the two-batch live cushion (2026-11-22).
     view.vlc.commanded.clear()
     view._chase_seek(0.0, jump_live=True)
     got = [c for c in view.vlc.commanded if c[0] in ("set_time", "play_at")]
     check("jump-to-live beyond indexed range stays exact",
-          got and abs(got[0][1] - 195.0) < 0.01,
+          got and abs(got[0][1] - 190.0) < 0.01,
           f"commanded={got[0][1] if got else None}")
 
     # no index -> legacy behavior byte-for-byte (exact target)

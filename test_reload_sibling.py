@@ -99,6 +99,9 @@ check("no sout-file-append option is issued (it never worked on 3.0.24)",
 check("the sout chain targets the sibling",
       any(opt.startswith(":sout=") and "buffer_2.ts" in opt
           for _, opt in MEDIA_OPTIONS))
+check("the recorder heals a cut HTTP stream itself (:http-continuous)",
+      any(opt.strip(":") == "http-continuous"
+          for _, opt in MEDIA_OPTIONS))
 check("the temp dir is preserved for the rotation (delete=False path)",
       rec._dir == td)
 
@@ -323,10 +326,14 @@ check("CC reader re-pointed onto the sibling (not the retired file)",
       bool(CCStarts) and CCStarts[0][0] == sibling2
       and isinstance(view._cc_source, StubCC))
 
-# the chase re-entry waits for the young sibling, then joins near the NEW
-# write head — pump past the 2.5 s gate. The freeze snapshot at reload
-# time is frontier-1 = 1221.3 s; the join sits chase_delay (5 s) behind
-# it — the NEW head's axis, never the retired 1225.8 s position.
+# the chase re-entry waits for the young sibling, then joins behind the
+# NEW write head — pump past the 2.5 s gate. The freeze snapshot at reload
+# time is frontier-1 = 1221.3 s and the young sibling holds only that
+# generation (~3 s), so "behind the new head" is a FILE-LOCAL position
+# near 0 s. It used to be handed the content number (~1216 s) instead:
+# inside a 3 s file that is past EOF, which is the very wedge the reload
+# path exists to avoid (2026-11-02 ESPN, ~23 s of black). The axis
+# mapping now converts it (see _axis_div / _dvr_gen_base).
 t0 = time.time()
 while time.time() - t0 < 3.4:
     app.processEvents()
@@ -334,8 +341,12 @@ while time.time() - t0 < 3.4:
 check("chase re-entered on the sibling buffer",
       any(c[0] == "play_at" and c[1] != live_buf for c in fake.calls))
 join = [c for c in fake.calls if c[0] == "play_at" and c[1] != live_buf]
-check("the fresh join targets the new head's axis (~1216 s, not 1225.8)",
-      join and 1213.0 <= join[-1][2] <= 1221.5)
+print("   [join play_at = %s]" % (join[-1][2] if join else None))
+check("the fresh join is FILE-LOCAL near the new head (not the retired "
+      "position, not a past-EOF content number)",
+      bool(join) and 0.0 <= join[-1][2] <= 6.0)
+check("...and the content-axis number is never passed to VLC",
+      bool(join) and join[-1][2] < 1213.0)
 
 print()
 print("reload-sibling: %d passed, %d failed" % (len(PASS), len(FAIL)))

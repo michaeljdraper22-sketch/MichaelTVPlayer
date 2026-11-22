@@ -75,24 +75,64 @@ def _setup_bundled_vlc() -> None:
         pass
 
 
-def cleanup_stale_temp_files(root: str = None) -> None:
-    """Best-effort: delete EVERY leftover mtp_* temp artifact from previous
-    runs (a crashed or wedged exit strands multi-GB DVR buffers and VOD
-    splitter caches) — mtp_dvr_* / mtp_cap_* buffer DIRECTORIES and
-    mtp_split_* relay cache FILES.
+# An artifact touched this recently may belong to a LIVE session: the DVR
+# buffer file is written continuously, so its directory mtime stays fresh.
+# The 2026-11-16 21:11 wipe (232 MB buffer deleted under the running player,
+# ESPN dead until the user switched channels) proved the "Windows keeps an
+# in-use file locked" assumption WRONG for the DVR directory — libVLC opens
+# the buffer with delete sharing, so a relay launch removed it outright.
+_STALE_MIN_AGE_S = 120.0
 
-    Artifacts belonging to a STILL-RUNNING instance are held open on
-    Windows and simply survive this pass; the next launch sweeps again.
-    Never raises; everything is logged.
+
+def _newest_mtime(path: str) -> float:
+    """Newest mtime under ``path`` (the file itself, or any child of a
+    directory). A live DVR buffer dir's OWN mtime freezes when the folder is
+    created — only the buffer file inside it keeps being written."""
+    try:
+        newest = os.path.getmtime(path)
+    except OSError:
+        return 0.0
+    try:
+        if os.path.isdir(path):
+            for entry in os.scandir(path):
+                try:
+                    newest = max(newest, entry.stat().st_mtime)
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return newest
+
+
+def cleanup_stale_temp_files(root: str = None) -> None:
+    """Best-effort: delete leftover mtp_* temp artifacts from previous runs
+    (a crashed or wedged exit strands multi-GB DVR buffers and VOD splitter
+    caches) — mtp_dvr_* / mtp_cap_* buffer DIRECTORIES and mtp_split_*
+    relay cache FILES.
+
+    MUST only run in the instance that owns the session (main() calls it
+    after the single-instance handoff check): a relay launch that forwarded
+    its args to the running app used to sweep first and delete that app's
+    live DVR buffer. As a second line of defence anything modified within
+    ``_STALE_MIN_AGE_S`` is left alone. Never raises; everything is logged.
     """
     count = 0
     freed = 0
+    cutoff = time.time() - _STALE_MIN_AGE_S
     try:
         root = root or tempfile.gettempdir()
         for prefix in ("mtp_dvr_", "mtp_cap_", "mtp_split_",
                        "MichaelTV-update-", "MichaelTV-swap-"):
             for path in glob.glob(os.path.join(root, prefix + "*")):
                 try:
+                    try:
+                        if _newest_mtime(path) > cutoff:
+                            log.info("startup cleanup: %s is recent — left "
+                                     "for the next sweep (may be in use)",
+                                     path)
+                            continue
+                    except Exception:  # noqa: BLE001
+                        continue
                     if os.path.isdir(path):
                         shutil.rmtree(path, ignore_errors=True)
                     else:
@@ -189,8 +229,11 @@ def main() -> int:
     except Exception:
         pass
     # A crashed previous run can strand GB-sized DVR buffers and VOD
-    # splitter caches in %TEMP%.
-    cleanup_stale_temp_files()
+    # splitter caches in %TEMP%. NEVER sweep before the single-instance
+    # check below: a relay launch used to wipe the RUNNING app's live DVR
+    # buffer (2026-11-16 21:11 — 232 MB gone, the ESPN stream dead until
+    # the user switched channels). Only the instance that owns the session
+    # cleans up (see the call after forward_if_running).
     # Consumed Stremio playlist handoffs (*.mtpdone in Downloads) are
     # tiny but immortal — trim the week-old ones.
     try:
@@ -248,6 +291,10 @@ def main() -> int:
         # double-launches). A lingering relay holds RAM and, if it ever
         # owns the socket, swallows future handoffs.
         os._exit(0)
+
+    # This process OWNS the session from here on — safe to sweep a crashed
+    # run's leftovers (a relay never reaches this point, see above).
+    cleanup_stale_temp_files()
 
     from src.config import Config
     from src.ui.login_dialog import LoginDialog

@@ -506,6 +506,22 @@ def stream_next():
     return _icon("stream_next2", draw)
 
 
+def stream_list():
+    """Pick a source yourself: three stacked rows (the list) with a solid
+    play triangle hanging off the TOP row — 'the row you choose plays'.
+    Deliberately different from stream_next's ring + triangle ('some other
+    one, blindly'): this one is the whole list, Stremio's own source
+    picker."""
+    def draw(p, c):
+        p.setPen(QtCore.Qt.NoPen)
+        p.setBrush(c)
+        for y in (5.0, 10.0, 15.0):
+            p.drawRoundedRect(QtCore.QRectF(4.0, y, 8.4, 2.2), 1.1, 1.1)
+        p.drawPolygon(QtGui.QPolygonF(
+            [_F(14.2, 3.6), _F(14.2, 8.6), _F(19.0, 6.1)]))
+    return _icon("stream_list", draw)
+
+
 def check():
     """Checkmark — the selected row marker in the track picker panel."""
     def draw(p, c):

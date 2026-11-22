@@ -15,7 +15,7 @@ from datetime import datetime
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
-from ..dvr import VlcRecorder
+from ..dvr import VlcRecorder, BufferTapeCopier
 from ..gopindex import GopIndex
 from ..player import (VLCPlayer, subtitle_instance_args, USER_AGENT,
                       _slider_to_vlc_volume, AoutHealGate)
@@ -162,6 +162,29 @@ _RAW_MOVE_FRAC = 0.5            # raw "moved" if |d| > max(0.02 s, this
 # The budget resets on every channel change (play_media).
 _CHASE_RETRY_DELAYS = (10.0, 30.0)
 
+# Live delivery is BATCHED, not trickled: a headless probe of this panel's
+# own `live/.../<id>.ts` body (2026-11-22) measured each batch as exactly
+# 5.0 s of MPEG-TS arriving in one burst, followed by a silent 5.0 s
+# (repeated for the whole connection; the same cadence showed up as the
+# 4-6 s "tail-hold" freezes in player.log). A chase sitting only
+# config.chase_delay (5 s) behind the write head therefore reaches the
+# head at every batch seam and freezes there until the next batch lands.
+# Two batches of cushion is the smallest depth that rides one late batch
+# plus scheduler/disk jitter, so live playback is never started closer to
+# the head than this. The user's chase_delay stays the preference; this
+# is its floor (an explicit larger delay is honoured).
+_LIVE_MIN_CHASE_DELAY_S = 10.0
+# How long the fill screen waits before saying WHY it is filling: a fast
+# (or backlog-seeded) provider reaches the cushion in 2-4 s and the user
+# sees the normal fast start; a batched one takes ~10-13 s and the pill
+# keeps that from reading as a hang.
+_CHASE_FILL_PILL_S = 4.0
+# Plain-live fallback (no DVR buffer) reads the network directly, so VLC
+# needs the same two-batch cushion in its OWN cache. The 1.5 s instance
+# default drains at the first 5 s seam and the picture stutters every
+# batch; 10 s rides two batches, an occasional 9 s gap and CDN jitter.
+_LIVE_READAHEAD_MS = 10000
+
 # Tail-hold at the write head: when the display player eats forward into
 # the end of the growing DVR buffer (the provider trickles, the viewer at
 # the live edge catches up, VLC hits the file's end and parks in "ended"),
@@ -196,6 +219,19 @@ _HOLD_GIVE_UP_S = 45.0
 # gets reopened at the tracked position (the same-anchor loop-breaker
 # then escalates if it keeps failing).
 _CHASE_OPEN_DEAD_S = 10.0
+# Dead-OPEN ladder: a reopen that never produces a playing tick is a dead
+# open. One or two can be a transient (a rotation landing mid-GOP); a
+# streak means the BUFFER or the provider connection itself is finished —
+# reopening again changes nothing. 2026-11-16 (ESPN): every 8 s rescue
+# reopened into a rotated buffer at a content time the file never held,
+# libvlc landed at 0.0, the player ended, and the loop ran for 18 minutes
+# until the user switched channels and back. After this many dead opens in
+# a row the transport reproduces that manual fix by itself: drop the
+# buffer, close the provider connection, dial again (see _hard_reload).
+_REOPEN_DEAD_LIMIT = 3
+_HARD_RELOAD_MIN_GAP_S = 30.0   # never re-dial in a tight loop
+_HARD_RELOAD_MAX = 2            # per channel; then plain live holds the
+#                               # picture and the fallback ladder retries
 
 # ---- 2026-10-19 field cluster (issues #12/#13: the missed game ending) ----
 # Lag governor: every bridged provider cut freezes the decoder 1-3 s while
@@ -237,8 +273,27 @@ _EDGE_COLLAPSE_S = 30.0
 # 13 s into a scripted 30 s stall). 65 s: quiet through the worst
 # modeled weather, still well inside the 75 s incident.
 _REC_STALL_RESTART_S = 65.0
+# A buffer file that VANISHED (deleted, or truncated to zero bytes) is not
+# provider weather: no burst can ever arrive at that path again, so the
+# stall watchdog's 65 s patience only buys dead air. Restart the recorder
+# as soon as the loss is unambiguous (2026-11-16 21:11: a relay launch's
+# startup sweep deleted a 232 MB live buffer; the display player sat dead
+# for 65 s until this watchdog fired).
+_REC_GONE_RESTART_S = 8.0
+# An ENDED recorder is the other unambiguous loss: the provider closed the
+# live body (~15 min session cap / CDN rebalance — 2026-11-22 14:15,
+# vlc=State.Ended) and no burst can arrive on that input again. Waiting
+# the 65 s stall patience froze the picture for a full minute before the
+# recorder rotated; one batch of patience after the last growth is enough
+# to tell "the body ended" from "the next 5 s batch is late".
+_REC_ENDED_RESTART_S = 8.0
 _REC_RESTART_MIN_GAP_S = 20.0
 _REC_RESTART_MAX_GAP_S = 60.0
+# Retained DVR buffer generations (one per recorder restart). Seeking back
+# across a provider cut must still find the content: each entry keeps the
+# file that holds it. Bounded because the files share the session temp dir
+# and only the last few restarts are ever scrubbed into.
+_BUF_GENS_MAX = 12
 # Rescue reopen nudge: a play_at lands on the nearest PRIOR keyframe, so
 # reopening AT the stall point replays the damaged GOP the viewer just
 # watched ("time looping", once per cut on 2026-10-19). Nudge the anchor
@@ -330,6 +385,10 @@ _CC_EDGE_ALPHA = 0.50       # edge pull toward the PCR head (this CDN
 #                              # anchor; the PCR head is the truth)
 _CC_EDGE_SNAP_S = 2.5       # hard edge resync when the PCR head says we're off
 _CC_EDGE_PROBE_MS = 2000    # periodic head probe (caption-silent stretches)
+_PCR_REANCHOR_S = 120.0    # PCR head vs frontier gap that proves the PCR
+#                           # axis was renumbered (splice / HTTP reconnect
+#                           # restarting the encoder clock): re-pin the join.
+#                           # Delivery weather stays under ~35 s.
 _CC_D_ALPHA = 0.30          # EWMA of (raw - clock) — the axis divergence
 # (c) freeze-aware clock: a 0.2x-delivery night feeds sub-6-s freeze/thaw
 # cycles (the continuous-freeze stall branch never engages) while wall time
@@ -623,6 +682,7 @@ class VideoSurface(QtWidgets.QWidget):
 
     double_clicked = QtCore.pyqtSignal()
     single_clicked = QtCore.pyqtSignal()
+    single_cancelled = QtCore.pyqtSignal()
     wheel_changed = QtCore.pyqtSignal(int)
     hovered = QtCore.pyqtSignal()
 
@@ -636,28 +696,43 @@ class VideoSurface(QtWidgets.QWidget):
         self.setPalette(pal)
         self.setMinimumSize(160, 90)
         self.setMouseTracking(True)
-        # Single vs double click must be told apart BEFORE acting: a left
-        # press arms a one-shot timer, and Qt's double-click event (which
-        # REPLACES the second press) cancels it. Only a press not followed
-        # by a second click fires single_clicked -> pause/play, so a
-        # double-click never pauses on its way to fullscreen. The interval
+        # A single click acts IMMEDIATELY (2026-11-17). It used to wait
+        # out the OS double-click interval before firing single_clicked,
+        # so click-to-pause trailed the pause button by up to 500 ms+.
+        # The timer now only classifies what FOLLOWS: the second press
+        # of a double-click arrives as mouseDoubleClickEvent (Qt
+        # REPLACES that press), and while the window is still open it
+        # emits single_cancelled so the toggle the first click already
+        # ran is undone, then double_clicked -> fullscreen. The interval
         # IS the OS double-click window, so our classification and Qt's
         # can never disagree.
+        self._single_pending = False
         self._click_timer = QtCore.QTimer(self)
         self._click_timer.setSingleShot(True)
         self._click_timer.setInterval(
             QtWidgets.QApplication.doubleClickInterval())
-        self._click_timer.timeout.connect(self.single_clicked.emit)
+        self._click_timer.timeout.connect(self._expire_single)
+
+    def _expire_single(self):
+        # the double-click window closed unanswered: the single action
+        # stands, nothing left to undo
+        self._single_pending = False
 
     def mousePressEvent(self, ev):
         if ev.button() == QtCore.Qt.LeftButton:
+            self._single_pending = True
             self._click_timer.start()
+            self.single_clicked.emit()
             ev.accept()
             return
         super().mousePressEvent(ev)
 
     def mouseDoubleClickEvent(self, event):
         self._click_timer.stop()
+        if self._single_pending:
+            # the first press of this pair already ran the single action
+            self._single_pending = False
+            self.single_cancelled.emit()
         self.double_clicked.emit()
 
     def wheelEvent(self, event):
@@ -694,6 +769,7 @@ class VideoInputOverlay(QtWidgets.QWidget):
     """
 
     single_clicked = QtCore.pyqtSignal()
+    single_cancelled = QtCore.pyqtSignal()
     double_clicked = QtCore.pyqtSignal()
     wheel_changed = QtCore.pyqtSignal(int)
     hovered = QtCore.pyqtSignal()
@@ -704,15 +780,18 @@ class VideoInputOverlay(QtWidgets.QWidget):
         super().__init__(parent, flags)
         self.setAttribute(QtCore.Qt.WA_TranslucentBackground, True)
         self.setMouseTracking(True)
-        # Single vs double click told apart BEFORE acting — the same
-        # contract as VideoSurface: the interval IS the OS double-click
-        # window, so a double-click cancels the pending single and only
-        # the fullscreen toggle runs.
+        # Same contract as VideoSurface (see its __init__): the single
+        # click acts at once; the timer only guards an incoming
+        # double-click, which undoes it via single_cancelled.
+        self._single_pending = False
         self._click_timer = QtCore.QTimer(self)
         self._click_timer.setSingleShot(True)
         self._click_timer.setInterval(
             QtWidgets.QApplication.doubleClickInterval())
-        self._click_timer.timeout.connect(self.single_clicked.emit)
+        self._click_timer.timeout.connect(self._expire_single)
+
+    def _expire_single(self):
+        self._single_pending = False
 
     def paintEvent(self, _ev):
         p = QtGui.QPainter(self)
@@ -720,13 +799,18 @@ class VideoInputOverlay(QtWidgets.QWidget):
 
     def mousePressEvent(self, ev):
         if ev.button() == QtCore.Qt.LeftButton:
+            self._single_pending = True
             self._click_timer.start()
+            self.single_clicked.emit()
             ev.accept()
             return
         super().mousePressEvent(ev)
 
     def mouseDoubleClickEvent(self, _event):
         self._click_timer.stop()
+        if self._single_pending:
+            self._single_pending = False
+            self.single_cancelled.emit()
         self.double_clicked.emit()
 
     def wheelEvent(self, event):
@@ -812,6 +896,19 @@ class PlayerView(QtWidgets.QWidget):
         self._last_epg = ""
         self.dvr = None
         self._rec_path = None
+        self._rec_copier = None   # BufferTapeCopier: the kept recording
+        #                           # tails the DVR buffer bytes (append-only,
+        #                           # independent of the display player and of
+        #                           # recorder restarts — see src/dvr.py)
+        self._buf_gens = []       # [(path, content_base)] of every DVR buffer
+        #                           # file still on disk this session; a
+        #                           # recorder restart rotates to a fresh
+        #                           # sibling (VLC cannot append) and the
+        #                           # content axis keeps counting across them
+        self._disp_gen = None     # (path, content_base) of the buffer file the
+        #                           # DISPLAY player actually has open — may be
+        #                           # a RETIRED generation while the recorder
+        #                           # writes a newer one (see _axis_div)
         self._mode = "live"        # "live" (direct stream) | "chase" (watch buffer)
         self._chase_paused = False
         self._dvr_t0 = None        # wall clock of current DVR session (logs/wait)
@@ -822,6 +919,9 @@ class PlayerView(QtWidgets.QWidget):
         self._pending_media = None # play_media() queued before attach finished
         self._pending_media_start = 0.0  # its start_at, kept through the deferral
         self._dvr_base = 0.0       # content-seconds written by earlier recorder runs
+        self._dvr_gen_base = 0.0   # content position where the ACTIVE buffer
+        #                           # file starts (see _axis_div) — equal to
+        #                           # _dvr_base right after a rotation
         self._dvr_first_data = None  # wall clock when current run first wrote data
         self._dvr_content_s = 0.0  # CONFIRMED content-seconds this run (see _note_dvr_data)
         self._dvr_size = -1        # last seen buffer file size (drift guard)
@@ -868,6 +968,10 @@ class PlayerView(QtWidgets.QWidget):
         #                              # (see _SEEK_ZERO_STRIKES)
         self._reopen_head_pins = 0    # reopens whose VLC landing pinned to
         #                              # the file head (see _SEEK_HEAD_PIN_*)
+        self._reopen_dead = 0         # reopens in a row that never produced
+        #                              # playback (see _REOPEN_DEAD_LIMIT)
+        self._hard_reload_t = 0.0     # last full re-dial (rate limit)
+        self._hard_reloads = 0        # full re-dials this channel
         self._gop = None              # GopIndex over the chase buffer (see
         #                              # _GOP_ANCHOR_GUARD_S block) — starts
         #                              # with the buffer, dies with chase
@@ -881,6 +985,9 @@ class PlayerView(QtWidgets.QWidget):
         #                              # (fold expectation baseline)
         self._tick_t = None           # wall clock of the previous _tick
         self._live_paused = False     # paused in plain LIVE mode (timeshift)
+        self._surface_click_toggled = False  # last video click paused/played:
+        #                              # a following double-click undoes it
+        #                              # (see _on_surface_click_cancelled)
         self._scale_mode = config.scale_mode   # fit | stretch | crop
         self._video_wh = (0, 0)  # decoded video size (see _poll_video_size)
         self._downloading = False     # a VOD download is in flight
@@ -1043,9 +1150,19 @@ class PlayerView(QtWidgets.QWidget):
         #                              # fresh probe stamp with a frozen
         #                              # value means a stalled stream
         self._cc_join_byte = 0        # buffer byte CCExtractor joined at
-        self._cc_join_app_s = 0.0     # content-axis position of that byte
-        #                              # (refined from PCR+bytes for
-        #                              # mid-session joins; 0 for cold ones)
+        self._cc_join_app_s = 0.0     # CONTENT position of that byte inside
+        #                              # its buffer file (refined from
+        #                              # PCR+bytes for mid-session joins;
+        #                              # 0 for cold ones)
+        self._pcr_join_base = 0.0     # content base of that buffer file —
+        #                              # the PCR edge math is segment-local,
+        #                              # so every head estimate derived from
+        #                              # it must add this generation base
+        #                              # (2026-11-17: omitting it collapsed
+        #                              # the live edge by 9 590 s after a
+        #                              # recorder restart — every scrub was
+        #                              # clamped to where the viewer already
+        #                              # was, then reopens landed at 0.0)
         # caption-stopped watchdog (see _caption_tick)
         self._cc_last_arrival = 0.0   # wall time ANY live cue arrived
         self._cc_last_active = 0.0    # wall time a window last hit the clock
@@ -1451,6 +1568,15 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_stream = ctl_btn(
             ic.stream_next(),
             "Try the next stream for this episode / movie (S)")
+        # choose stream: the FULL ranked source list for whatever is
+        # playing — Stremio's own source picker. The S button beside it
+        # walks that list blindly, one press at a time; this one SHOWS it
+        # (quality, seeds, size, debrid provider) and plays the row
+        # clicked, resuming where playback stands. Stremio only, and only
+        # once the identity is known — the list is keyed on the imdb id.
+        self.btn_stream_list = ctl_btn(
+            ic.stream_list(),
+            "Choose from all streams for this movie / episode (Shift+S)")
         self.sep3 = ctl_sep()
         self.btn_mute = ctl_btn(ic.volume(True), "Mute (M)", checkable=True)
         # JumpSlider = click anywhere on the bar to set the volume directly
@@ -1472,7 +1598,7 @@ class PlayerView(QtWidgets.QWidget):
                   self.btn_live, self.btn_dl, self.btn_win, self.btn_rec,
                   self.sep2, self.btn_cc, self.btn_audio, self.btn_scale,
                   self.btn_speed, self.btn_auto, self.btn_prev, self.btn_next,
-                  self.btn_stream, self.sep3,
+                  self.btn_stream, self.btn_stream_list, self.sep3,
                   self.btn_mute, self.vol_slider):
             rl.addWidget(w)
         ctl_lay.addWidget(row)
@@ -1486,7 +1612,8 @@ class PlayerView(QtWidgets.QWidget):
         for b in (self.btn_back60, self.btn_back10, self.btn_play,
                   self.btn_fwd10, self.btn_fwd60, self.btn_begin,
                   self.btn_live, self.btn_rec, self.btn_audio,
-                  self.btn_next, self.btn_prev, self.btn_stream):
+                  self.btn_next, self.btn_prev, self.btn_stream,
+                  self.btn_stream_list):
             b.setEnabled(False)
 
         # DVR start-up pill ("DVR 12s / 20s buffered…"), centered on the
@@ -1524,6 +1651,7 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_next.clicked.connect(self._play_next_clicked)
         self.btn_prev.clicked.connect(self._play_prev_clicked)
         self.btn_stream.clicked.connect(self._next_stream_clicked)
+        self.btn_stream_list.clicked.connect(self._choose_stream_clicked)
         self.btn_mute.toggled.connect(self._on_mute)
         self.btn_dl.clicked.connect(self._start_download)
         self.btn_win.clicked.connect(self._on_win_btn)
@@ -1535,12 +1663,16 @@ class PlayerView(QtWidgets.QWidget):
         self.vol_slider.sliderReleased.connect(self._on_volume_released)
         self.surface.double_clicked.connect(self.request_fullscreen.emit)
         self.surface.single_clicked.connect(self._on_surface_clicked)
+        self.surface.single_cancelled.connect(
+            self._on_surface_click_cancelled)
         self.surface.wheel_changed.connect(self._on_wheel)
         self.surface.hovered.connect(self._on_hover)
         # the overlay is the REAL mouse layer while video renders (VLC's
         # child HWNDs eat clicks on the surface itself) — same handlers
         self.overlay.double_clicked.connect(self.request_fullscreen.emit)
         self.overlay.single_clicked.connect(self._on_surface_clicked)
+        self.overlay.single_cancelled.connect(
+            self._on_surface_click_cancelled)
         self.overlay.wheel_changed.connect(self._on_wheel)
         self.overlay.hovered.connect(self._on_hover)
 
@@ -2344,6 +2476,7 @@ class PlayerView(QtWidgets.QWidget):
         self._cc_head_adv_t = 0.0
         self._cc_join_byte = 0
         self._cc_join_app_s = 0.0
+        self._pcr_join_base = 0.0
         self._cc_last_arrival = 0.0
         self._cc_last_active = 0.0
         self._cc_last_watchfire = 0.0
@@ -2374,6 +2507,9 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_paused = False
         self._dvr_t0 = None
         self._dvr_base = 0.0
+        self._dvr_gen_base = 0.0
+        self._buf_gens = []
+        self._disp_gen = None
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0
@@ -2397,6 +2533,9 @@ class PlayerView(QtWidgets.QWidget):
         self._seek_esc_clean = 0.0
         self._seek_zero_landings = 0
         self._reopen_head_pins = 0
+        self._reopen_dead = 0
+        self._hard_reload_t = 0.0
+        self._hard_reloads = 0
         self._raw_win = []
         self._trickle_hold = False
         self._dvr_status.hide()
@@ -3135,6 +3274,54 @@ class PlayerView(QtWidgets.QWidget):
 
     # ---- next stream: same episode/movie, next source down the list ----
 
+    def _choose_stream_clicked(self):
+        """The source LIST while playing: every ranked stream for what is
+        on, in the same order Enter/autoplay uses, with the row clicked
+        starting immediately at the current position.
+
+        This is Stremio's own source picker (Stremio web shows the list
+        when you open a movie). The S button beside it is the one-press
+        blind walk through that same list; this one is the "try a
+        different stream" choice — including the ones BELOW too many dead
+        links for S to reach. Dialog work (the addon fetch) runs on its
+        own thread inside StremioStreamsDialog."""
+        cur = self.current
+        if self._closing or not cur:
+            return
+        if cur.get("kind") != "stremio":
+            self._pn_log("streamlist: click dropped \u2014 kind=%r",
+                         cur.get("kind"))
+            return
+        if not cur.get("stremio_imdb"):
+            # the list is keyed on the imdb id; a handoff's identity is
+            # still resolving in the background
+            self.show_info("Still identifying this stream \u2014 "
+                           "try again in a moment")
+            return
+        try:
+            from .stremio_browse import StremioStreamsDialog
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stream list dialog unavailable: %r", exc)
+            return
+        # grab the resume position on the GUI thread BEFORE the dialog
+        # runs (get_time() walks into libvlc)
+        pos_s = self._stream_resume_s()
+        dlg = StremioStreamsDialog(self.config, dict(cur),
+                                   parent=self.window())
+        picked = []
+        dlg.media_activated.connect(picked.append)
+        dlg.exec_()
+        if not picked:
+            return
+        nxt = picked[0]
+        self._pn_log("streamlist: picked %r for %r",
+                     str(nxt.get("url", ""))[:70], cur.get("fav_key"))
+        # same episode/movie -> keep the position; a different one -> start
+        # it from the top (the dialog only ever lists the one item, but a
+        # future episode list would not)
+        same = nxt.get("fav_key") == cur.get("fav_key")
+        self._start_next(nxt, start_at=pos_s if same else 0.0)
+
     def _next_stream_clicked(self):
         try:
             self._next_stream_core()
@@ -3672,16 +3859,33 @@ class PlayerView(QtWidgets.QWidget):
     def _on_surface_clicked(self):
         """Single left click on the video. Click-away for an open control
         popup (audio/scale/speed card); otherwise pause/play — the VLC /
-        YouTube convention. Nothing loaded pre-stream: _toggle_pause's
-        guard quietly ignores it."""
+        YouTube convention. The click acts AT ONCE (the widgets no longer
+        wait out the double-click interval): if this turns out to be the
+        first half of a double-click, _on_surface_click_cancelled runs
+        before fullscreen and undoes it. Nothing loaded pre-stream:
+        _toggle_pause's guard quietly ignores it."""
         if self._ctl_panel.isVisible():
             self._ctl_panel.close_panel("video-click")
+            self._surface_click_toggled = False
             return
+        self._surface_click_toggled = self._toggle_pause()
+
+    def _on_surface_click_cancelled(self):
+        """The click that already ran was the first half of a
+        double-click: put the transport back so a double-click means
+        fullscreen only. The widget times this to the OS double-click
+        window, so a deliberate second click is never misread."""
+        if not self._surface_click_toggled:
+            return
+        self._surface_click_toggled = False
         self._toggle_pause()
 
-    def _toggle_pause(self):
+    def _toggle_pause(self) -> bool:
+        """Pause/play. Returns True when the call toggled the transport
+        (so a second call undoes it) — False when nothing was loaded or
+        a dead-edge player was revived (nothing sensible to undo)."""
         if not self.current:
-            return          # nothing loaded (pre-stream Space key)
+            return False    # nothing loaded (pre-stream Space key)
         if self._mode == "chase":
             # Watching the buffer: a plain file pause — the recorder keeps
             # filling the file, so this is a flawless pause of live TV.
@@ -3697,9 +3901,9 @@ class PlayerView(QtWidgets.QWidget):
                     at = max(0.0, self._cap_content_for_raw(cur / 1000.0)) \
                         if cur >= 0 else self._frontier_s()
                     self._chase_seek(at, resume=True)
-                else:
-                    self._chase_paused = False
-                    self.vlc.resume()
+                    return False    # revived via seek: no undo toggle
+                self._chase_paused = False
+                self.vlc.resume()
             elif down:
                 # stalled at the edge (not user-paused): play revives it
                 self._sync_transport("revive-resume")
@@ -3707,6 +3911,7 @@ class PlayerView(QtWidgets.QWidget):
                 at = max(0.0, self._cap_content_for_raw(cur / 1000.0)) \
                     if cur >= 0 else self._frontier_s()
                 self._chase_seek(at, resume=True)
+                return False        # revived via seek: no undo toggle
             else:
                 self._sync_transport("pause")
                 self._chase_paused = True
@@ -3719,12 +3924,13 @@ class PlayerView(QtWidgets.QWidget):
                 # force-skipped the content the user paused on.
                 self._lag_user_seek = True
                 self.vlc.pause()
-            return
+            return True
         # Live / VOD: remember the paused state so the LIVE button can be
         # enabled to jump back to the edge (timeshift pause works here too)
         self._live_paused = not self._live_paused
         self.vlc.toggle_pause()
         self._update_control_state()
+        return True
 
     def toggle_pause(self):
         self._toggle_pause()
@@ -3772,6 +3978,59 @@ class PlayerView(QtWidgets.QWidget):
         if size <= 0:
             return
         now = now_s()
+        if self._dvr_size > 0 and size < self._dvr_size:
+            # The writer TRUNCATED the file under the player: libVLC's sout
+            # file access re-opens its destination with O_TRUNC when the
+            # input reconnects, and the same access object is reused for the
+            # same destination — so a provider cut can wipe the whole buffer
+            # in one go (2026-11-16 21:11: 232 MB -> 0). Everything already
+            # written is gone; the file's timeline restarts at the content
+            # position we had reached, exactly like a rotation onto a fresh
+            # sibling. Rebase before anything reads the clock again (the
+            # rescue ladder reopens on this axis).
+            was = self._dvr_size
+            self._dvr_base = max(0.0, self._frontier_s() - 1.0)
+            self._reset_dvr_clock()
+            self._dvr_gen_base = self._dvr_base
+            # The same PATH now starts at the new content base. Update the
+            # generation table (and the display mapping when the viewer is
+            # watching this file) so nothing keeps mapping through the old
+            # base, and re-pin the PCR edge at byte 0: the old join byte
+            # and its content offset died with the truncated bytes.
+            try:
+                p = self.dvr.file_path
+            except Exception:  # noqa: BLE001
+                p = None
+            if p:
+                self._buf_gens = [(q, b) for (q, b) in self._buf_gens
+                                  if q != p]
+                self._buf_gens.append((p, self._dvr_gen_base))
+                if self._disp_gen is not None and self._disp_gen[0] == p:
+                    self._set_disp_gen(p, self._dvr_gen_base)
+                else:
+                    self._cap_div_s = -self._disp_base()
+                    self._cap_div_ok = self._cap_div_s != 0.0
+            self._sync_pcr_join = None
+            self._sync_pcr_join_tries = 0
+            self._cc_join_byte = 0
+            self._cc_join_app_s = 0.0
+            self._cap_renum_pend = None
+            try:
+                log.warning("dvr buffer truncated under the player (%d -> %d "
+                            "bytes) — content clock rebased at %.1fs",
+                            was, size, self._dvr_base)
+                from .. import feedback
+                feedback.stat("dvr_truncations")
+                feedback.crumb("dvr buffer truncated %d -> %d"
+                               % (was, size))
+            except Exception:
+                pass
+            self._dvr_first_data = now
+            self._dvr_content_s = 0.0
+            self._dvr_size = size
+            self._dvr_tick_t = now
+            self._dvr_last_growth = now
+            return
         if self._dvr_first_data is None:
             self._dvr_first_data = now
             self._dvr_content_s = 0.0
@@ -3837,7 +4096,8 @@ class PlayerView(QtWidgets.QWidget):
         if head is not None and self._sync_pcr_join is not None \
                 and self._cc_join_app_s is not None:
             head_rel = head[0] - self._sync_pcr_join[1]
-            return (head_rel + self._cc_join_app_s) - current
+            return (self._pcr_join_base + head_rel
+                    + self._cc_join_app_s) - current
         return self._frontier_s() - current
 
     def _trickle_test(self, now: float, playing: bool) -> bool:
@@ -3938,6 +4198,13 @@ class PlayerView(QtWidgets.QWidget):
         pid, pcr = probe_first_pcr_at(buf, join)
         if pcr is not None:
             self._sync_pcr_join = (pid, pcr)
+            # The pin is PCR-relative; the content axis is per-generation.
+            # Remember the base of the file this pin belongs to so head
+            # estimates can be lifted onto the absolute axis.
+            try:
+                self._pcr_join_base = float(self._dvr_gen_base)
+            except Exception:  # noqa: BLE001
+                self._pcr_join_base = 0.0
             if _SYNC_ON:
                 synclog.info("PCRJOIN byte=%d pid=%s pcr=%.3f",
                              join, pid, pcr)
@@ -4041,16 +4308,128 @@ class PlayerView(QtWidgets.QWidget):
             return self._cap_clock_s + self._cap_backlog_s
         return self._frontier_s()
 
+    def _disp_base(self) -> float:
+        """Content position where the DISPLAY player's buffer file starts.
+
+        The viewer may deliberately be left on a RETIRED generation when
+        the recorder rotates (they rewound into the part of the show from
+        before a provider cut). Mapping their position with the ACTIVE
+        file's base is what produced the 2026-11-17 dead loop: every
+        rescue asked a 40-second-old sibling for content 9 590 s in, landed
+        at 0.0, and ended."""
+        if self._disp_gen is not None:
+            try:
+                return float(self._disp_gen[1])
+            except Exception:  # noqa: BLE001
+                pass
+        return float(getattr(self, "_dvr_gen_base", 0.0))
+
+    def _set_disp_gen(self, path: str, base: float):
+        """Record which buffer file the display player has open.
+
+        The axis mapping is NOT touched here: a measured PTS renumber for
+        that file must survive repeated reopens (the unseekable-buffer
+        ladder depends on seeing the poisoned mapping), and the transport
+        seed / file switch below own the reset."""
+        self._disp_gen = (str(path), float(base))
+
+    def _switch_axis_to(self, path: str, base: float):
+        """The display is (re)opening a DIFFERENT buffer file: its media
+        timeline starts at that file's content base. A measured divergence
+        from the old file must not leak into the new one (2026-11-17: the
+        ~10 000 s generation base was applied to a retired file's raw
+        clock, opening every rescue at 0.0)."""
+        prev = self._disp_gen
+        self._set_disp_gen(path, base)
+        if prev is None or (abs(prev[1] - float(base)) < 0.001
+                            and prev[0] == str(path)):
+            return       # same file (or first open): keep the measurement
+        self._cap_div_s = -float(base)
+        self._cap_div_ok = float(base) != 0.0
+        self._cap_renum_pend = None
+
+    def _active_buf_path(self):
+        """Path of the buffer file the recorder is writing now."""
+        try:
+            if self.dvr is not None and self.dvr.file_path:
+                return self.dvr.file_path
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            return self.dvr.buffer_file() if self.dvr is not None else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _live_gen(self):
+        """(path, content_base) of the generation being written now."""
+        p = self._active_buf_path()
+        if p:
+            return (p, float(self._dvr_gen_base))
+        return None
+
+    def _gen_for_content(self, target: float):
+        """Pick the retained buffer generation that holds ``target``.
+
+        Generations are consecutive slices of the content axis: gen i runs
+        from its base to gen i+1's base (the frontier at the rotation). A
+        target past the newest base belongs to the live generation; one
+        below the oldest base lands at that file's head — the oldest
+        content still on disk. Without this, any seek across a recorder
+        restart mapped onto the wrong file (2026-11-17: the DWTS replay
+        from 0:00)."""
+        gens = []
+        try:
+            for path, base in self._buf_gens:
+                if path and os.path.exists(path):
+                    gens.append((path, float(base)))
+        except Exception:  # noqa: BLE001
+            gens = []
+        live = self._live_gen()
+        if live is not None and (not gens or gens[-1][0] != live[0]):
+            gens.append(live)
+        if not gens:
+            return live
+        if target < gens[0][1]:
+            return gens[0]
+        for i, (path, base) in enumerate(gens):
+            end = gens[i + 1][1] if i + 1 < len(gens) else float("inf")
+            # Within a hair of the next base means the NEXT file's head —
+            # picking the retired file's last second reopens into instant
+            # EOF and the rescue ladder loops there forever.
+            if target < end - 1.0:
+                return (path, base)
+        return gens[-1]
+
+    def _axis_div(self) -> float:
+        """Content axis -> VLC set_time offset for the DISPLAY's buffer file.
+
+        The content axis is cumulative across recorder generations
+        (``_dvr_base`` carries what earlier runs wrote); every new sibling
+        file (VLC cannot append) restarts its own media timeline at ~0.
+        So the offset for a fresh generation is exactly ``-base`` of the
+        file the DISPLAY has open — which is not necessarily the ACTIVE
+        one (see _disp_base). A measured divergence (broadcast PTS
+        renumbering inside one file) takes over once a fold is observed.
+
+        Seeding the offset with the generation base — instead of 0 — is
+        what stops a reopen after a rotation from asking VLC for a time
+        past the new file's end (2026-11-16 ESPN: content 361.7 s into a
+        freshly rotated ~25 s buffer; libvlc landed at 0.0, the player
+        ended, and the rescue ladder reopened there forever)."""
+        if self._cap_div_ok:
+            return self._cap_div_s
+        return -self._disp_base()
+
     def _cap_vlc_time_for(self, content_s: float) -> float:
         """Content-axis position -> VLC set_time NUMBER. When the raw axis
         has diverged from the dead-reckoned clock (broadcast PTS
         renumbering), the same content lives at a different number inside
         VLC; seeks must use that number or they land in the wrong place."""
-        return content_s + self._cap_div_s if self._cap_div_ok else content_s
+        return content_s + self._axis_div()
 
     def _cap_content_for_raw(self, raw_s: float) -> float:
         """VLC get_time number -> content-axis position (inverse map)."""
-        return raw_s - self._cap_div_s if self._cap_div_ok else raw_s
+        return raw_s - self._axis_div()
 
     def _cap_seed_transport(self, target_s: float, jump_live: bool = False):
         """A transport event defines the caption clock BY CONSTRUCTION:
@@ -4095,8 +4474,19 @@ class PlayerView(QtWidgets.QWidget):
         # start 1495->2991). A genuinely offset file re-measures its div
         # from the landing within a reading or two (the fold below
         # captures the absolute offset once deltas agree).
-        self._cap_div_s = 0.0
-        self._cap_div_ok = False
+        # ...EXCEPT the generation base: a sibling buffer file's timeline
+        # starts at its own base on the content axis (VLC cannot append, so
+        # every recorder restart opens a new file). Seeding 0 there is what
+        # let a rotated buffer's seeks/reopens ask for a content number
+        # inside a file that never held it (2026-11-16, ESPN dead-loop),
+        # and clamped the caption clock to the file-local number through
+        # the anti-lead check. The base is the DISPLAY's file, not the
+        # recorder's newest one: a rotation leaves a time-shifted viewer on
+        # the retired file (2026-11-17 DWTS: raw 6481 was mapped with the
+        # NEW file's -9590 base and landed at 0).
+        base = self._disp_base()
+        self._cap_div_s = -base
+        self._cap_div_ok = base != 0.0
         self._cap_renum_pend = None
         self._cap_wall = now_s()
 
@@ -4154,7 +4544,8 @@ class PlayerView(QtWidgets.QWidget):
                              self._cc_join_byte, self._cc_join_app_s,
                              seg_s, seg_b)
 
-    def _cc_calibrate_edge(self, head_rel: float) -> float:
+    def _cc_calibrate_edge(self, head_rel: float,
+                           head_pcr: float = None) -> float:
         """Keep the dead-reckoned live edge honest: the PCR head plus the
         join byte's content position IS the write head, so pull the edge
         toward it — gently for drift (wall dead-reckoning error, provider
@@ -4171,7 +4562,30 @@ class PlayerView(QtWidgets.QWidget):
             return 0.0    # mid-session join not yet placed — wait for the
             #               # join-app refinement (a wrong constant here would
             #               # drag every anchor with it)
-        target = head_rel + self._cc_join_app_s
+        target = self._pcr_join_base + head_rel + self._cc_join_app_s
+        # Splice / reconnect guard: the join->head PCR delta only measures
+        # content while the PCR axis is continuous. A broadcast splice or
+        # an HTTP reconnect that restarts the encoder clock shifts every
+        # later PCR by a constant, so the delta (and the edge derived from
+        # it) would be wrong FOREVER, not just for a few seconds. The
+        # frontier is confirmed bytes on disk and never leads the write
+        # position; when the PCR head estimate disagrees with it by more
+        # than delivery weather can explain, re-pin the join AT the write
+        # head so the next probes measure from here.
+        fr = self._frontier_s()
+        if (head_pcr is not None and fr > 30.0
+                and abs(target - fr) > _PCR_REANCHOR_S
+                and self._sync_pcr_join is not None):
+            try:
+                log.warning("PCR axis re-pinned at the write head "
+                            "(head estimate %.1fs vs frontier %.1fs — "
+                            "splice or provider reconnect)",
+                            target, fr)
+            except Exception:
+                pass
+            self._sync_pcr_join = (self._sync_pcr_join[0], float(head_pcr))
+            self._cc_join_app_s = max(0.0, fr - self._pcr_join_base)
+            return 0.0
         if self._cap_backlog_s is None:
             self._cap_backlog_s = max(_CHASE_SAFETY_S,
                                       target - self._cap_clock_s)
@@ -4212,10 +4626,19 @@ class PlayerView(QtWidgets.QWidget):
         if self._closing or not (self._mode == "chase" and self.dvr):
             return
         head_pcr = self._cc_probe_head_pcr()
-        if head_pcr is None or self._sync_pcr_join is None:
+        if head_pcr is None:
+            return
+        if self._sync_pcr_join is None:
+            # No pin yet (a rotation's CC restart, or the pin byte was not
+            # flushed when it was first probed): retry here instead of
+            # leaving the edge on pure dead-reckoning for the session.
+            if self._sync_pcr_join_tries < 20:
+                self._sync_pcr_join_tries += 1
+                self._sync_probe_join_at(self._cc_join_byte)
             return
         self._cc_refine_join_app(head_pcr)
-        self._cc_calibrate_edge(head_pcr - self._sync_pcr_join[1])
+        self._cc_calibrate_edge(head_pcr - self._sync_pcr_join[1],
+                                head_pcr)
 
     def _seek_ms(self, ms):
         if self._mode == "chase" and self.dvr:
@@ -4380,7 +4803,12 @@ class PlayerView(QtWidgets.QWidget):
         self._clear_stall_note()  # ...and must not leave its pill up
         target_s = float(target_s)
         if jump_live:
-            back = _chase_jump_back_s(self._cc_lag)
+            # Never land closer than the live cushion: a batched provider
+            # delivers a whole batch at once, so landing at the old 5 s
+            # caption cushion reaches the write head at the next seam and
+            # freezes there (2026-11-22).
+            back = max(_chase_jump_back_s(self._cc_lag),
+                       self._live_delay_s())
             edge = self._cap_edge_s()
             # Collapsed-edge guard (same rule as _safe_seek_target): a
             # re-seeded clock can leave the dead-reckoned edge far below
@@ -4396,13 +4824,27 @@ class PlayerView(QtWidgets.QWidget):
                                   self._frontier_s() + 120.0))
         else:
             target = self._safe_seek_target(target_s)
+        # A target in a DIFFERENT buffer file cannot be reached by
+        # set_time (a retired sibling from before a recorder restart holds
+        # the older part of the show). Reopen that file at the position —
+        # this is what makes scrubbing back across a provider cut work
+        # instead of clamping to the live file's head.
+        gen = self._gen_for_content(target)
+        cross = bool(gen is not None and self._disp_gen is not None
+                     and gen[0] != self._disp_gen[0])
         vlc_t = 0.0 if target <= 0.0 else self._cap_vlc_time_for(target)
         # GOP-anchored landing: snap down to just before the IDR at/below
         # the target so the decoder starts on a keyframe (see the
         # _GOP_ANCHOR_GUARD_S block). The seek/verify/caption seed below
         # all use the ANCHORED numbers — playback, the clock and the
-        # scrubber must agree on where the viewer actually landed.
-        gop = self._gop_anchor_vlc(vlc_t)
+        # scrubber must agree on where the viewer actually landed. The
+        # index covers the ACTIVE file only, so a retired-generation seek
+        # (or a cross-file jump) goes un-anchored.
+        # The index belongs to the file it was built over (the ACTIVE
+        # one); a retired-generation target must not be anchored with it.
+        index_here = bool(not cross and gen is not None
+                          and gen[0] == self._gop_path)
+        gop = (self._gop_anchor_vlc(vlc_t) if index_here else None)
         if gop is not None and target > 0.0:
             log_anchor = gop
             vlc_t = gop
@@ -4427,6 +4869,18 @@ class PlayerView(QtWidgets.QWidget):
                              % (target, vlc_t, resume,
                                 "" if log_anchor is None
                                 else " gop=%.2f" % log_anchor))
+        if cross:
+            try:
+                log.info("chase seek: %.1fs lives in %s — reopen there "
+                         "(set_time cannot cross buffer files)",
+                         target, os.path.basename(gen[0]))
+            except Exception:
+                pass
+            self._reopen_display(at=target)
+            if resume and self._chase_paused:
+                self._chase_paused = False
+                self.vlc.resume()
+            return
         try:
             down = self.vlc.state_name() in ("ended", "stopped", "error")
         except Exception:  # noqa: BLE001
@@ -4476,11 +4930,19 @@ class PlayerView(QtWidgets.QWidget):
                              float(raw_pre), bool(fix_tried),
                              bool(from_open))
 
-    def _verify_seek(self, now: float, raw: float):
+    def _verify_seek(self, now: float, raw: float, alive: bool = None):
         """Verify the armed set_time/play_at landed; escalate on a
         confirmed miss. Escalations are backoff-gated (a flaky verify must
         never reopen-loop) and share the reopen cooldown. Clean verifies
-        decay the strike ladder."""
+        decay the strike ladder.
+
+        ``alive`` is whether the player is actually PLAYING (the tick
+        already knows). A dead player's get_time can still report the
+        commanded number after a failed open — 2026-11-16 ESPN: every
+        reopen landed at 0.0, the corrective set_time moved the clock to
+        the target while the player stayed ENDED, and this "clean" read
+        reset the unseekable-buffer strike ladder forever. A landing at
+        the file HEAD from a dead player therefore keeps its strikes."""
         v = self._seek_verify
         if v is None:
             if self._seek_esc_strikes \
@@ -4490,9 +4952,17 @@ class PlayerView(QtWidgets.QWidget):
         target, vlc_t, deadline, armed_at, raw_pre, fix_tried, from_open = v
         if raw >= 0.0 and abs(self._cap_content_for_raw(raw)
                               - target) <= _SEEK_VERIFY_TOL_S:
+            if alive is None:
+                try:
+                    alive = bool(self.vlc.is_playing())
+                except Exception:  # noqa: BLE001
+                    alive = True
             self._seek_verify = None
             self._seek_esc_clean = now
-            self._seek_zero_landings = 0
+            if alive:
+                # Only a landing the viewer could actually SEE clears the
+                # unseekable-buffer ladder (see the docstring).
+                self._seek_zero_landings = 0
             return
         if now < deadline or self._chase_paused:
             return
@@ -4575,12 +5045,24 @@ class PlayerView(QtWidgets.QWidget):
         _chase_seek's down-revive, the seek-verify escalation, and
         available to the wedge rescue. A revive always resumes: the
         intent is to get playback going again."""
-        buf = self.dvr.buffer_file() if self.dvr else None
-        if not buf:
+        if not (self.dvr and self.dvr.buffer_file()):
             return False
+        # Revive in the FILE THAT HOLDS the position (see _gen_for_content):
+        # after a recorder rotation the viewer may be an hour behind the
+        # active sibling, and mapping their position through the active
+        # file's base opened every rescue at 0.0.
+        target = float(target)
+        gen = self._gen_for_content(target)
+        if not gen:
+            return False
+        buf, base = gen
+        if target < base:
+            target = base
+        self._switch_axis_to(buf, base)
         try:
             log.warning("chase revive (%s): player wedged/down — "
-                        "play_at %.1fs", why, target)
+                        "play_at %.1fs (%s)", why, target,
+                        os.path.basename(buf))
         except Exception:
             pass
         self._chase_paused = False
@@ -4589,8 +5071,14 @@ class PlayerView(QtWidgets.QWidget):
         self._last_reopen = now_s()
         # GOP-anchor the reopen too: a fresh open at a mid-GOP :start-time
         # shows a smeared GOP (see _GOP_ANCHOR_GUARD_OPEN_S) — reopens land
-        # +0.2..0.7 s past the requested time, so the deeper guard.
-        gop = self._gop_anchor_vlc(vlc_t, guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+        # +0.2..0.7 s past the requested time, so the deeper guard. The
+        # index only covers the ACTIVE file (it is rebuilt on rotation), so
+        # a retired-generation open goes un-anchored.
+        vlc_t = max(0.0, self._cap_vlc_time_for(target))
+        active = (buf == self._active_buf_path())
+        gop = (self._gop_anchor_vlc(
+                   vlc_t, guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+               if active else None)
         if gop is not None:
             vlc_t = gop
             target = self._cap_content_for_raw(vlc_t)
@@ -4663,7 +5151,7 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         if self._mode == "chase" and self.dvr:
-            self._restart_recorder(record=self.btn_rec.isChecked())
+            self._restart_recorder()
             # The restart began a NEW buffer file (see VlcRecorder.start —
             # VLC cannot append); the pre-reload position lives in the
             # retired file, and the seek machinery maps only the ACTIVE
@@ -4818,9 +5306,19 @@ class PlayerView(QtWidgets.QWidget):
             return
         try:
             if self._mode == "chase" and self.dvr:
-                content = self._cap_content_for_raw(val / 1000.0)
-                vlc_t = self._cap_vlc_time_for(
-                    self._safe_seek_target(content))
+                # The scrubber runs on the CONTENT axis (see _set_scrub),
+                # not VLC's raw number: mapping it through the axis div a
+                # second time shifted every drag by the buffer generation
+                # base — harmless at ~10 s, catastrophic after a recorder
+                # restart (~10 000 s: any drag jumped to the live edge).
+                content = val / 1000.0
+                safe = self._safe_seek_target(content)
+                gen = self._gen_for_content(safe)
+                if gen is not None and self._disp_gen is not None                         and gen[0] != self._disp_gen[0]:
+                    # Cross-file preview: set_time cannot reach the other
+                    # sibling; the release does the real reopen there.
+                    return
+                vlc_t = self._cap_vlc_time_for(safe)
                 if vlc_t <= 0.0:
                     return
                 gop = self._gop_anchor_vlc(vlc_t)
@@ -4847,8 +5345,9 @@ class PlayerView(QtWidgets.QWidget):
                 # content axis before clamping. A deliberate drag also
                 # exempts the viewer from the lag governor.
                 self._lag_user_seek = True
-                self._chase_seek(
-                    self._cap_content_for_raw(self.slider.value() / 1000.0))
+                # CONTENT axis (the scrubber's range is the frontier); see
+                # _on_slider_moved.
+                self._chase_seek(self.slider.value() / 1000.0)
             elif self._is_catchup():
                 # indexless TS: the byte-fraction axis is the reliable one
                 self._catchup_seek_to(self.slider.value())
@@ -4869,14 +5368,14 @@ class PlayerView(QtWidgets.QWidget):
     def _engage_chase(self):
         """Start the always-on live pipeline: the recorder opens the single
         provider connection and playback watches the DVR buffer a few
-        seconds behind the frontier (config.chase_delay, floor 5 s).
+        seconds behind the frontier (config.chase_delay, floored at two
+        provider batches — see _LIVE_MIN_CHASE_DELAY_S).
 
         ONE connection, strict handoff order:
-          1) the DISPLAY player stops the network URL first (when REC was
-             on in fallback-live mode this also stops its record output),
-          2) the recorder opens the single connection — with the kept
-             recording file as a second output when REC is on (dual
-             output), so no second vlc.play(url) is ever issued,
+          1) the DISPLAY player stops the network URL first,
+          2) the recorder opens the single connection (a live REC tapes
+             the buffer bytes separately — BufferTapeCopier — so no
+             second vlc.play(url) and no second sout branch is involved),
           3) once the buffer holds data the display player switches to
              watching the buffer file behind the live edge.
         The display player never plays the network URL while the recorder
@@ -4886,6 +5385,9 @@ class PlayerView(QtWidgets.QWidget):
             return            # already chasing (e.g. REC engaged it)
         self._dvr_t0 = now_s()
         self._dvr_base = 0.0
+        self._dvr_gen_base = 0.0
+        self._buf_gens = []
+        self._disp_gen = None
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0
@@ -4893,8 +5395,7 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_started = False
         self.vlc.stop_and_release()                 # (1)
         self._ensure_dvr_stopped()                  # drop any stale buffer
-        record = self.btn_rec.isChecked()
-        self._restart_recorder(record=record)       # (2)
+        self._restart_recorder()                    # (2)
         # Caption reader starts NOW, in parallel with the chase fill wait:
         # CCExtractor's spawn + first chew of the young buffer overlap the
         # ~2.5 s buffer wait, so the first caption text is ready about when
@@ -4922,6 +5423,9 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_paused = False
         self._dvr_t0 = None
         self._dvr_base = 0.0
+        self._dvr_gen_base = 0.0
+        self._buf_gens = []
+        self._disp_gen = None
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._chase_hold = None
@@ -4936,6 +5440,82 @@ class PlayerView(QtWidgets.QWidget):
         self.vlc.stop_and_release()
         self._ensure_dvr_stopped()
         self._reopen_display()
+
+    def _hard_reload(self, gen: int, reason: str) -> bool:
+        """Reproduce the user's own fix — switch channel and back — without
+        leaving the channel.
+
+        The rescue ladder only ever reopens the LOCAL buffer file: it can
+        never heal a buffer whose timeline is wrong (a rotation the axis
+        mapping missed), a file the writer truncated, or a provider
+        connection that delivered a dead capture. Those all look identical
+        from inside chase mode: every reopen opens, lands nowhere and ends.
+        A fresh dial + fresh buffer does heal them, which is why switching
+        channels always worked.
+
+        Order matters (one provider connection at a time): display player
+        stops → recorder and its temp dir go → a cold chase engagement
+        re-dials. Rate-limited per channel; after ``_HARD_RELOAD_MAX``
+        attempts the DVR is handed to the chase retry budget (plain live
+        NOW, chase retried on its own backoff), so the screen is never
+        left dead."""
+        if self._closing or gen != self._session:
+            return False
+        cur = self.current or {}
+        if not cur.get("url") or self._mode not in ("chase", "live"):
+            return False
+        if self._is_vod() or self._is_stremio() or self._is_file():
+            return False
+        now = now_s()
+        if self._hard_reload_t and now - self._hard_reload_t \
+                < _HARD_RELOAD_MIN_GAP_S:
+            return False
+        self._hard_reload_t = now
+        self._hard_reloads += 1
+        try:
+            log.warning("stream reset #%d: %s — dropping the buffer and "
+                        "re-dialing the channel", self._hard_reloads, reason)
+        except Exception:
+            pass
+        try:
+            from .. import feedback
+            feedback.stat("hard_reloads")
+            feedback.crumb("stream reset #%d %r: %s"
+                           % (self._hard_reloads,
+                              cur.get("title", ""), reason))
+        except Exception:
+            pass
+        # Chase state is void with the buffer; clear every latch that would
+        # otherwise carry the dead session into the fresh one.
+        self._chase_hold = None
+        self._chase_paused = False
+        self._seek_verify = None
+        self._seek_zero_landings = 0
+        self._reopen_head_pins = 0
+        self._reopen_dead = 0
+        self._reopen_last_at = -1e9
+        self._reopen_last_t = 0.0
+        self._reopen_repeats = 0
+        self._stall_ticks = 0
+        self._chase_started = False
+        self._vid_s = 0.0
+        self._last_raw = None
+        self._cap_backlog_s = None
+        self._dvr_base = 0.0
+        self._dvr_gen_base = 0.0
+        self._buf_gens = []
+        self._disp_gen = None
+        self._mode = "live"          # lets _engage_chase() start a new run
+        self.vlc.stop_and_release()
+        self._ensure_dvr_stopped()
+        if self._hard_reloads > _HARD_RELOAD_MAX:
+            # Repeated resets in one channel: plain live NOW, and the
+            # project's own chase retry backoff takes the DVR from here.
+            self._fallback_from_chase(0.0)
+            return True
+        self._chase_note("Stream reset \u2014 reconnecting", clear_after_ms=8000)
+        self._engage_chase()
+        return True
 
     def _fallback_from_chase(self, waited_s: float):
         """A chase engagement gave up: play plain live NOW (never a dead
@@ -4966,6 +5546,31 @@ class PlayerView(QtWidgets.QWidget):
                 "Timeshift unavailable on this channel \u2014 rewind "
                 "disabled; retries when you change channels",
                 clear_after_ms=10000)
+            # The DVR is gone for this channel: a live REC has no source
+            # left. Finalize the tape and unset REC instead of leaving a
+            # lit red button over a file that will never grow again.
+            if self._rec_copier is not None:
+                try:
+                    self._rec_copier.stop()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("recording finalize on DVR give-up "
+                                "failed: %r", exc)
+                self._rec_copier = None
+                self._rec_path = None
+                if self.btn_rec.isChecked():
+                    self.btn_rec.blockSignals(True)
+                    self.btn_rec.setChecked(False)
+                    self.btn_rec.setIcon(ic.rec(False))
+                    self.btn_rec.blockSignals(False)
+                self._chase_note(
+                    "Recording stopped \u2014 live buffer unavailable",
+                    clear_after_ms=10000)
+                try:
+                    from .. import feedback
+                    feedback.stat("recording_failures")
+                    feedback.crumb("record stopped: DVR unavailable")
+                except Exception:  # noqa: BLE001
+                    pass
 
     def _retry_chase_after_fallback(self, gen: int):
         """Backed-off automatic chase re-engagement (see
@@ -5014,17 +5619,39 @@ class PlayerView(QtWidgets.QWidget):
 
     def _reopen_display(self, at: float = None) -> bool:
         """(Re)open whatever the display player should be showing right now —
-        the DVR buffer in chase mode, otherwise the current URL — with the
-        record output attached when active. ``at"
-        re-enters a chase buffer at a content position (so the playback
-        position is preserved instead of jumping to live).
+        the DVR buffer in chase mode (the generation that holds ``at``),
+        otherwise the current URL. ``at`` re-enters a chase buffer at a
+        content position (so the playback position is preserved instead of
+        jumping to live). Live REC is NOT attached here: it is an
+        append-only tape over the buffer bytes (BufferTapeCopier), so
+        reopens and seeks cannot touch the recording. The legacy record
+        output below exists for the VOD safety net only.
         """
         rec = self._rec_path if (self._rec_path and self._is_vod()) else None
         if self._mode == "chase" and self.dvr:
-            buf = self.dvr.buffer_file()
-            if not buf:
+            if not self.dvr.buffer_file():
                 return False
             target = self._vid_s if at is None else float(at)
+            # Open the FILE THAT HOLDS the position, not necessarily the one
+            # the recorder writes now. The viewer is routinely time-shifted
+            # by an hour; a recorder restart rotates the buffer to a fresh
+            # sibling and the older file remains valid, readable history.
+            # Mapping a retired position through the active file's base was
+            # the 2026-11-17 DWTS bug: every reopen asked a minutes-old
+            # sibling for content ~9 590 s in, landed at 0.0 and ended.
+            gen = self._gen_for_content(target)
+            if not gen:
+                return False
+            buf, base = gen
+            if target < base:
+                try:
+                    log.info("reopen: %.1fs is before the retained "
+                             "buffers — landing at %s's head (%.1fs)",
+                             target, os.path.basename(buf), base)
+                except Exception:
+                    pass
+                target = base
+            self._switch_axis_to(buf, base)
             self._chase_started = False
             self._stall_ticks = 0
             self._last_reopen = now_s()
@@ -5033,9 +5660,11 @@ class PlayerView(QtWidgets.QWidget):
             # the _GOP_ANCHOR_GUARD_S block. The seed/verify below use the
             # ANCHORED target: the clock must say where playback really
             # starts, or the tick's verify reads a false miss.
-            vlc_t = self._cap_vlc_time_for(target)
-            gop = self._gop_anchor_vlc(vlc_t,
-                                       guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+            vlc_t = max(0.0, self._cap_vlc_time_for(target))
+            active = (buf == self._active_buf_path())
+            gop = (self._gop_anchor_vlc(
+                       vlc_t, guard_s=_GOP_ANCHOR_GUARD_OPEN_S)
+                   if active else None)
             if gop is not None:
                 vlc_t = gop
                 target = self._cap_content_for_raw(vlc_t)
@@ -5047,7 +5676,7 @@ class PlayerView(QtWidgets.QWidget):
             # because the poisoned div mapped the stall point back to the
             # target). Only the reopen site sees it. A healthy reopen
             # lands deep on the VLC axis too and resets the count.
-            if (vlc_t < _SEEK_HEAD_PIN_VLC_S
+            if (active and vlc_t < _SEEK_HEAD_PIN_VLC_S
                     and target > _SEEK_HEAD_PIN_MIN_CONTENT_S):
                 self._reopen_head_pins += 1
                 if self._reopen_head_pins >= _SEEK_ZERO_STRIKES:
@@ -5081,25 +5710,44 @@ class PlayerView(QtWidgets.QWidget):
         url = self.current.get("url", "") if self.current else ""
         if not url:
             return False
+        self._disp_gen = None    # the display is leaving the buffer files
         live = (self.current or {}).get("kind") == "live"
         referer = (self.current or {}).get("http_referrer") or None
+        # Plain live has no DVR file between it and the provider, so VLC's
+        # own cache is the only cushion: two batches (see
+        # _LIVE_READAHEAD_MS) or every 5 s seam stutters. VOD keeps its
+        # deeper per-open read-ahead (see player_view's _VOD_READAHEAD_MS
+        # call site); local files ignore the option.
+        live_cache = 0
+        if live:
+            live_cache = max(_LIVE_READAHEAD_MS,
+                             int(getattr(self.config, "network_caching", 0)
+                                 or 0))
         if rec:
             self.vlc.play_at(url, record_path=rec, timeshift=live,
-                             http_referer=referer)
+                             http_referer=referer,
+                             network_caching_ms=live_cache)
         else:
-            self.vlc.play(url, timeshift=live, http_referer=referer)
+            self.vlc.play(url, timeshift=live, http_referer=referer,
+                          network_caching_ms=live_cache)
         self._poke_audio()
         return True
 
-    def _restart_recorder(self, record: bool):
+    def _restart_recorder(self):
         """(Re)start the single-connection recorder on the current buffer.
 
         A restart on an existing buffer begins a FRESH SIBLING file in the
         same temp dir (VlcRecorder.start — VLC cannot append); the retired
         file stays readable for the display player. Timeline continuity
         across the stop → reconnect gap comes from the content-clock freeze
-        below plus the stream's own PTS. The recording file is added as a
-        second output when requested.
+        below plus the stream's own PTS.
+
+        The kept RECORDING no longer rides this recorder at all: it is an
+        append-only tape copier over the buffer bytes (BufferTapeCopier),
+        so a restart just points it at the new sibling — the file it has
+        already written is never reopened by VLC and can therefore never
+        be truncated (2026-11-17 DWTS: two restarts truncated 2 h 40 m of
+        kept video to 137 s).
 
         A restart creates a gap in the data (stop → reconnect), so the
         content clock is frozen here: what the current run has written so far
@@ -5107,7 +5755,11 @@ class PlayerView(QtWidgets.QWidget):
         again. Wall-clock time across the gap never counts, so the frontier
         can't overshoot the real write position.
         """
-        if self.dvr and self.dvr.running and self._dvr_first_data is not None:
+        # Freeze the content clock for the generation that is ending — also
+        # when the recorder had already died on its own (running False but
+        # data WAS written): the new file's timeline starts at whatever the
+        # last run reached, and the axis mapping needs that number.
+        if self.dvr and self._dvr_first_data is not None:
             self._dvr_base = max(0.0, self._frontier_s() - 1.0)
             self._reset_dvr_clock()
             try:
@@ -5124,8 +5776,8 @@ class PlayerView(QtWidgets.QWidget):
         buf = self.dvr.buffer_file() if self.dvr else None
         url = self.current.get("url", "") if self.current else ""
         try:
-            log.info("_restart_recorder record=%s reuse_buffer=%s",
-                     bool(record), bool(buf and os.path.exists(buf)))
+            log.info("_restart_recorder reuse_buffer=%s",
+                     bool(buf and os.path.exists(buf)))
         except Exception:
             pass
         old_dir_keep = self.dvr._dir if self.dvr else None
@@ -5135,14 +5787,47 @@ class PlayerView(QtWidgets.QWidget):
             self.dvr = None
         self.dvr = VlcRecorder(network_caching=self.config.network_caching,
                                instance=self.vlc.instance)
-        rec_path = self._rec_path if record else None
         if buf and os.path.exists(buf):
-            self.dvr.start(url, output_path=rec_path, buffer_path=buf)
+            self.dvr.start(url, buffer_path=buf)
         else:
-            self.dvr.start(url, output_path=rec_path)
+            self.dvr.start(url)
         if old_dir_keep and not self.dvr._dir:
             self.dvr._dir = old_dir_keep
         new_buf_path = self.dvr.file_path if self.dvr else None
+        # A new buffer file's media timeline starts at the content position
+        # the previous run reached — the content axis keeps counting across
+        # the rotation, the file's own numbers do not.
+        self._dvr_gen_base = float(self._dvr_base)
+        if new_buf_path:
+            self._buf_gens.append((new_buf_path, self._dvr_gen_base))
+            # Bound the history: each entry stays readable only until the
+            # recorder's temp dir dies with the channel.
+            if len(self._buf_gens) > _BUF_GENS_MAX:
+                self._buf_gens = self._buf_gens[-_BUF_GENS_MAX:]
+        # The axis mapping belongs to the file the DISPLAY player actually
+        # has open. A rotation while the viewer is time-shifted keeps them
+        # in the retired file, so re-seeding the offset with the NEW base
+        # is what made every rescue ask the new sibling for a position it
+        # never held and land at 0.0 (2026-11-17). Only a fresh engagement
+        # (no display generation yet) seeds from the active file.
+        if self._disp_gen is not None:
+            self._cap_div_s = -self._disp_base()
+            self._cap_div_ok = self._cap_div_s != 0.0
+        else:
+            self._cap_div_s = -self._dvr_gen_base
+            self._cap_div_ok = self._dvr_gen_base != 0.0
+        self._cap_renum_pend = None
+        try:
+            log.info("buffer generation: %s starts at content %.1fs "
+                     "(display file base %.1fs)",
+                     os.path.basename(new_buf_path or "?"),
+                     self._dvr_gen_base, self._disp_base())
+        except Exception:
+            pass
+        # The tape copier follows the recorder's file, not its timeline: a
+        # new sibling is read from byte 0 and APPENDED to the kept file.
+        if self._rec_copier is not None and new_buf_path:
+            self._rec_copier.retarget(new_buf_path, at_end=False)
         if old_buf_path and new_buf_path \
                 and os.path.normcase(os.path.abspath(old_buf_path)) \
                 != os.path.normcase(os.path.abspath(new_buf_path)):
@@ -5170,6 +5855,15 @@ class PlayerView(QtWidgets.QWidget):
         except Exception:
             pass
         self._gop_teardown()     # no buffer -> no IDR index to keep
+        if self._rec_copier is not None:
+            # The tape copier reads the buffer file this teardown is about
+            # to delete: copy what is already on disk and close the handle
+            # FIRST (the copier itself lives on — a re-engage retargets it).
+            try:
+                self._rec_copier.detach()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("_ensure_dvr_stopped: copier detach failed: %r",
+                            exc)
         if self.dvr:
             d = self.dvr
             self.dvr = None
@@ -5193,17 +5887,33 @@ class PlayerView(QtWidgets.QWidget):
             self._dvr_status.hide()
         self._layout_overlays()
 
-    def _wait_and_enter_chase(self, gen: int, tries_left: int = -1):
-        """Wait until the fresh buffer holds its first seconds, then start
-        watching it from (frontier - chase_delay) — which clamps to 0, i.e.
-        a couple of seconds behind live, and the gap grows naturally.
+    def _live_delay_s(self) -> float:
+        """Seconds behind the write head that live playback should keep.
 
-        This is the original fast entry (~2-4 s): waiting for the full live
-        delay first ("DVR 0s/20s buffered…") made users stare at a dead
-        screen; VLC reads a growing file at its own pace just fine, and the
-        frontier clock keeps every seek clamped to data that exists.  If the
-        recorder never produces data at all, give up gracefully and fall
-        back to the plain live stream.
+        The viewer's ``chase_delay`` is the preference; a batched provider
+        (see _LIVE_MIN_CHASE_DELAY_S) makes anything under two batches
+        guarantee a tail-hold at every seam, so the floor wins. An explicit
+        larger delay is always honoured."""
+        try:
+            want = float(self.config.chase_delay)
+        except Exception:  # noqa: BLE001
+            want = 5.0
+        return max(want, _LIVE_MIN_CHASE_DELAY_S)
+
+    def _wait_and_enter_chase(self, gen: int, tries_left: int = -1):
+        """Wait until the fresh buffer holds the live cushion, then start
+        watching it from (frontier - effective delay).
+
+        The cushion is two provider batches (see _LIVE_MIN_CHASE_DELAY_S):
+        starting with less is what made a batched feed freeze at the write
+        head every 5 s — the original fast entry only required ~2.5 s of
+        wall time and landed with 0-2 s of real data ahead of the player
+        (NFL RedZone 2026-11-22: tail-hold 22 s after every engagement).
+        A provider that seeds the connection with a backlog still starts
+        in the old 2-4 s; a batched one shows the pill after
+        _CHASE_FILL_PILL_S instead of a silent black screen. If the
+        recorder never produces the cushion, give up gracefully and fall
+        back to the plain live stream (with its own two-batch read-ahead).
 
         ``gen`` is the session generation captured when the engagement
         started. If the channel changed or the view stopped in the meantime,
@@ -5214,16 +5924,24 @@ class PlayerView(QtWidgets.QWidget):
             self._set_dvr_status(None)
             return
         self._note_dvr_data()
+        delay = self._live_delay_s()
         if tries_left < 0:
-            tries_left = 50          # ~20 s: provider throttling recovery
+            # ~20 s at the 10 s floor; an explicitly deeper delay gets the
+            # fill time it needs instead of falling back one tick before
+            # the cushion completes.
+            tries_left = max(50, int((delay + 10.0) / 0.4))
         waited = 0.0 if self._dvr_t0 is None else (now_s() - self._dvr_t0)
-        ready = self.dvr.buffer_file() is not None and waited >= 2.5
+        frontier = self._frontier_s()
+        ready = (self.dvr.buffer_file() is not None and waited >= 2.5
+                 and frontier >= delay)
         if ready:
             self._set_dvr_status(None)
             self._start_chase_now(gen)
             return
-        # no fill pill: the info banner already names the channel, and the
-        # brief fill (chase_delay ~5 s) reads as normal startup
+        if waited >= _CHASE_FILL_PILL_S:
+            self._set_dvr_status(
+                "Buffering live TV\u2026 (%.0f of %.0f s)"
+                % (min(frontier, delay), delay))
         if tries_left > 0:
             QtCore.QTimer.singleShot(
                 400, lambda: self._wait_and_enter_chase(gen, tries_left - 1)
@@ -5233,10 +5951,12 @@ class PlayerView(QtWidgets.QWidget):
             # the plain live stream instead of hanging on a black screen;
             # _fallback_from_chase then re-engages chase automatically.
             try:
-                log.warning("chase wait: gave up after %.1fs -- back to "
-                            "direct live", waited)
+                log.warning("chase wait: gave up after %.1fs (cushion "
+                            "%.1fs of %.1fs) -- back to direct live",
+                            waited, frontier, delay)
             except Exception:
                 pass
+            self._set_dvr_status(None)
             self._fallback_from_chase(waited)
 
     def _start_chase_now(self, gen: int):
@@ -5275,11 +5995,14 @@ class PlayerView(QtWidgets.QWidget):
             self._cc_edge_timer.start()
         except Exception:  # noqa: BLE001
             pass
-        delay = self.config.chase_delay
-        target = self._safe_seek_target(self._frontier_s() - delay)
+        delay = self._live_delay_s()
+        frontier = self._frontier_s()
+        target = self._safe_seek_target(frontier - delay)
         try:
-            log.info("chase start: delay=%.1fs target=%.1fs frontier=%.1fs",
-                     delay, target, self._frontier_s())
+            log.info("chase start: delay=%.1fs (config %.1fs) target=%.1fs "
+                     "frontier=%.1fs cushion=%.1fs",
+                     delay, self.config.chase_delay, target, frontier,
+                     max(0.0, frontier - target))
         except Exception:
             pass
         # are on (the wav then logs the buffered audio as it is displayed)
@@ -5300,6 +6023,23 @@ class PlayerView(QtWidgets.QWidget):
             return
         if not (self._mode == "chase" and self.dvr and self.dvr.buffer_file()):
             return
+        # ---- dead-open ladder (see _REOPEN_DEAD_LIMIT) ----
+        # _chase_started is cleared by every (re)open and set by the first
+        # playing tick, so reaching here with it clear means the PREVIOUS
+        # open never produced playback: another reopen into the same buffer
+        # cannot help. After a streak, hand over to the full re-dial.
+        if not self._chase_started and self._last_reopen > 0.0:
+            self._reopen_dead += 1
+            if self._reopen_dead >= _REOPEN_DEAD_LIMIT:
+                n = self._reopen_dead
+                self._reopen_dead = 0
+                if self._hard_reload(
+                        gen, "%d buffer reopens in a row never produced "
+                        "playback" % n):
+                    return
+                # refused (rate limit / not reloadable) -> keep reopening
+        else:
+            self._reopen_dead = 0
         # revive where the viewer actually WAS. The caption clock is the
         # display truth when it is LIVE (it holds through VLC freezes via
         # its stall detection), but a caption pipeline that died with the
@@ -5347,7 +6087,7 @@ class PlayerView(QtWidgets.QWidget):
         if self._reopen_repeats >= 3:
             self._reopen_repeats = 0
             at = self._safe_seek_target(self._frontier_s()
-                                        - self.config.chase_delay)
+                                        - self._live_delay_s())
             try:
                 log.warning("chase reopen: same-anchor loop broken — "
                             "jumping near live edge (%.1fs)", at)
@@ -5479,50 +6219,110 @@ class PlayerView(QtWidgets.QWidget):
                     self._rec_path))
             except Exception:
                 pass
-            if self.dvr and self.dvr.running:
-                # Recorder already owns the single connection (chase mode):
-                # restart it with the recording file as a second output
-                # (the chase pipeline keeps recording into a fresh
-                # sibling buffer).
-                self._restart_recorder(record=True)
-            elif self.current.get("kind") == "live":
-                # Fallback direct-live mode (the recorder gave up earlier):
-                # recording re-engages the single-connection chase pipeline
-                # so the timeline is scrubbable/seekable.
-                self._engage_chase()
-            else:
-                # VOD: unreachable from the UI (REC is swapped for Download
-                # on movies/series — see _apply_button_visibility for why)
-                # and kept only as a safety net. It re-dials the RAW url
-                # and restarts from 0, so it must never run while the
-                # caption relay holds the provider connection.
+            live_kind = (self.current or {}).get("kind") == "live"
+            if self._is_vod() or self._is_stremio():
+                # VOD / Stremio: unreachable from the UI (REC is swapped
+                # for Download on movies/series — see
+                # _apply_button_visibility for why) and kept only as a
+                # safety net. It re-dials the RAW url and restarts from 0,
+                # so it must never run while the caption relay holds the
+                # provider connection.
                 self.vlc.play_at(self.current["url"],
                                  record_path=self._rec_path,
                                  http_referer=(self.current or {}).get(
                                      "http_referrer") or None)
+            elif not self._start_rec_copier():
+                # No recording file / stream: refuse the press instead of
+                # claiming a recording that does not exist.
+                self._rec_path = None
+                self.btn_rec.blockSignals(True)
+                self.btn_rec.setChecked(False)
+                self.btn_rec.setIcon(ic.rec(False))
+                self.btn_rec.blockSignals(False)
+                self._set_dvr_status("Recording could not start")
+                QtCore.QTimer.singleShot(
+                    4000, lambda: self._set_dvr_status(""))
+                return
+            elif live_kind and not (self.dvr and self.dvr.running):
+                # Plain live (the recorder gave up earlier): recording
+                # re-engages the single-connection chase pipeline. The
+                # copier is retargeted at the fresh buffer by
+                # _restart_recorder.
+                self._engage_chase()
         else:
             self._stop_recording()
+
+    def _start_rec_copier(self) -> bool:
+        """Attach the append-only tape copier to the DVR buffer.
+
+        REC no longer adds a second sout output to the recorder: a
+        recorder restart re-opens that destination and libVLC truncates it
+        (2026-11-17 DWTS: 2 h 40 m -> 0 twice). The copier reads the
+        buffer bytes and appends them to a file VLC never opens, so
+        display seeks, rewinds, rescue reopens and recorder restarts
+        cannot touch the recording at all.
+        """
+        if not self._rec_path:
+            return False
+        if self._rec_copier is not None:
+            try:
+                self._rec_copier.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._rec_copier = None
+        cp = BufferTapeCopier(self._rec_path)
+        buf = None
+        try:
+            if self.dvr and self.dvr.running:
+                buf = self.dvr.file_path
+        except Exception:  # noqa: BLE001
+            buf = None
+        # A young buffer (REC pressed right after tuning) is recorded
+        # from its head; a mature one (REC pressed an hour into the show)
+        # starts at the live moment — pressing REC must not dump the whole
+        # DVR history into the file.
+        young = (self._dvr_first_data is not None
+                 and now_s() - self._dvr_first_data < 60.0)
+        if not cp.start(source=buf, at_end=(buf is not None and not young)):
+            self._set_dvr_status("Recording could not start")
+            log.error("recording failed to start: %s", cp.error)
+            try:
+                from .. import feedback
+                feedback.stat("recording_failures")
+                feedback.crumb("record failed: %s" % cp.error)
+            except Exception:
+                pass
+            return False
+        self._rec_copier = cp
+        return True
 
     def _stop_recording(self, stopping: bool = False):
         """Finalize a permanent recording (the file is kept on disk).
 
-        ``stopping=True`` (channel change / stop / shutdown): never restart or
-        reconfigure playback — just release the record output.
+        The recorder is NOT restarted and the display player is NOT
+        reopened for a live recording: the tape copier is a separate,
+        append-only reader of the buffer, so stopping it cannot disturb
+        playback (and restarting the recorder to "drop a sout branch"
+        would rotate the buffer and truncate anything on it).
+
+        ``stopping=True`` (channel change / stop / shutdown): same release,
+        nothing else.
         """
+        if self._rec_copier is not None:
+            try:
+                self._rec_copier.stop()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("recording finalize failed: %r", exc)
+            self._rec_copier = None
         self._rec_path = None
         if stopping:
             return
-        if self.dvr and self.dvr.running:
-            # Chase needs the single-connection recorder regardless: drop
-            # only the recording output — the chase buffer keeps recording
-            # (into a fresh sibling) and the display player stays where it
-            # is. NEVER play the network URL
-            # here: that would open a second connection.
-            self._restart_recorder(record=False)
-        elif self.current and self.current.get("url") and self._mode == "live":
-            # Fallback direct-live / VOD mode: the display player carried
-            # the record output, restart it as a plain viewer (still one
-            # connection).
+        # Only the legacy direct-live/VOD safety net carried the record
+        # output inside the display player itself; a live chase session
+        # never does (see _start_rec_copier).
+        if not (self.dvr and self.dvr.running) \
+                and self.current and self.current.get("url") \
+                and self._mode == "live" and self._is_vod():
             self._reopen_display()
         if self.btn_rec.isChecked():
             self.btn_rec.blockSignals(True)
@@ -6188,6 +6988,31 @@ class PlayerView(QtWidgets.QWidget):
             return
         self._poll_video_size()
         playing = self.vlc.is_playing()
+        # A tape copier that hit a fatal write error (disk full, folder
+        # removed) must stop CLAIMING to record: release it, unset REC and
+        # say why. Read-side hiccups are transient and never set failed.
+        if self._rec_copier is not None and self._rec_copier.failed:
+            err = self._rec_copier.error
+            try:
+                self._rec_copier.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            self._rec_copier = None
+            self._rec_path = None
+            try:
+                log.error("recording stopped: %s", err)
+                from .. import feedback
+                feedback.stat("recording_failures")
+                feedback.crumb("record stopped: %s" % err)
+            except Exception:  # noqa: BLE001
+                pass
+            if self.btn_rec.isChecked():
+                self.btn_rec.blockSignals(True)
+                self.btn_rec.setChecked(False)
+                self.btn_rec.setIcon(ic.rec(False))
+                self.btn_rec.blockSignals(False)
+            self._chase_note("Recording stopped — disk error",
+                             clear_after_ms=8000)
         # Latch REAL playback for this media (state, not is_playing —
         # that also reads True while VLC is merely opening a dead link).
         # Autoplay's dead-open veto below keys on it.
@@ -6255,21 +7080,56 @@ class PlayerView(QtWidgets.QWidget):
             # the recorder in the SAME temp dir (a fresh sibling file —
             # VLC cannot append, see VlcRecorder.start) once the stall is
             # confirmed, with growing backoff; resumed growth resets it.
+            # A buffer that VANISHED (deleted / zero bytes) is a different
+            # animal: no provider burst can ever land at that path again,
+            # so it is restarted after a short grace instead of the full
+            # stall patience (see _REC_GONE_RESTART_S).
+            stalled_s = (None if self._dvr_last_growth is None
+                         else now - self._dvr_last_growth)
+            buf_lost = False
+            try:
+                buf_lost = bool(self._dvr_first_data is not None
+                                and not self.dvr.buffer_file())
+            except Exception:  # noqa: BLE001
+                buf_lost = False
+            try:
+                rec_state = str(self.dvr.state_name() or "").lower()
+            except Exception:  # noqa: BLE001
+                rec_state = ""
+            rec_dead = rec_state in ("ended", "error", "stopped")
+            restart_due = (stalled_s is not None
+                           and (stalled_s > _REC_STALL_RESTART_S
+                                or (buf_lost
+                                    and stalled_s > _REC_GONE_RESTART_S)
+                                or (rec_dead
+                                    and stalled_s > _REC_ENDED_RESTART_S)))
             if (self.dvr.running and self._dvr_first_data is not None
                     and self._dvr_last_growth is not None
-                    and now - self._dvr_last_growth
-                    > _REC_STALL_RESTART_S
+                    and restart_due
                     and now - self._rec_restart_t
                     > self._rec_restart_gap):
                 self._rec_restart_t = now
                 self._rec_restart_gap = min(
                     _REC_RESTART_MAX_GAP_S, self._rec_restart_gap * 1.5)
                 try:
-                    log.warning("recorder watchdog: no buffer growth for "
-                                "%.1fs — restarting recorder on a fresh "
-                                "sibling buffer (next retry in %.0fs)",
-                                now - self._dvr_last_growth,
-                                self._rec_restart_gap)
+                    st = "?"
+                    try:
+                        st = self.dvr.state_name()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    gap = ""
+                    if self._rec_copier is not None:
+                        try:
+                            gap = " [rec tape: %.0fs behind]"
+                            gap = gap % self._rec_copier.silent_s()
+                        except Exception:  # noqa: BLE001
+                            gap = ""
+                    log.warning("recorder watchdog: %s for %.1fs (vlc=%s) "
+                                "— restarting recorder on a fresh sibling "
+                                "buffer (next retry in %.0fs)%s",
+                                "buffer file lost" if buf_lost
+                                else "no buffer growth",
+                                stalled_s, st, self._rec_restart_gap, gap)
                 except Exception:
                     pass
                 try:
@@ -6277,9 +7137,14 @@ class PlayerView(QtWidgets.QWidget):
                     feedback.stat("recorder_restarts")
                 except Exception:
                     pass
-                self._restart_recorder(record=self.btn_rec.isChecked())
+                self._restart_recorder()
             if playing:
                 self._chase_started = True   # arm the watchdog from now on
+                self._reopen_dead = 0        # the last open was not dead
+                # ...and a reopen near the head that DID play was not the
+                # poisoned mapping the head-pin ladder hunts for (a legit
+                # reopen right after a rotation is file-local and small).
+                self._reopen_head_pins = 0
             # ---- tracked playback position ----
             # VLC's timestamps on these streams are often garbage broadcast
             # PTS (huge / jumping / frozen), so keep our own position: snap
@@ -6419,7 +7284,7 @@ class PlayerView(QtWidgets.QWidget):
                 self._reopen_chase(gen)
                 return
             # (a) verify the last set_time landed; escalate on a no-op
-            self._verify_seek(now, raw)
+            self._verify_seek(now, raw, playing)
             # ---- lag governor (2026-10-19, issue #13) ----
             # Every bridged provider cut freezes the decoder 1-3 s while
             # the write head advances; over a flappy evening (164 cuts)
@@ -6456,18 +7321,16 @@ class PlayerView(QtWidgets.QWidget):
                     self._cc_probe_head_pcr()   # ~20 ms, throttled 4/s
                 ahead = self._head_ahead_s(current)
                 if ahead is not None:
-                    if ahead <= self.config.chase_delay \
-                            + _LAG_GOV_TRIGGER_S / 2:
+                    live_delay = self._live_delay_s()
+                    if ahead <= live_delay + _LAG_GOV_TRIGGER_S / 2:
                         # back near the live distance — the exemption
                         # from the last deliberate rewind is spent
                         self._lag_user_seek = False
-                    elif (ahead - self.config.chase_delay
-                              > _LAG_GOV_TRIGGER_S
+                    elif (ahead - live_delay > _LAG_GOV_TRIGGER_S
                           and now - self._lag_gov_last
                               > _LAG_GOV_COOLDOWN_S):
                         self._lag_gov_last = now
-                        behind = max(self.config.chase_delay,
-                                     _LAG_GOV_LAND_BEHIND_S)
+                        behind = max(live_delay, _LAG_GOV_LAND_BEHIND_S)
                         target = max(0.0, current + ahead - behind)
                         try:
                             log.warning("lag governor: %.1fs behind the "
@@ -6816,6 +7679,13 @@ class PlayerView(QtWidgets.QWidget):
         self.btn_prev.setEnabled(kind in ("live", "series", "catchup",
                                           "stremio"))
         self.btn_stream.setEnabled(kind == "stremio")
+        # the source LIST is keyed on the imdb id, so it needs the identity:
+        # a handoff's identity lands seconds later and this state refresh
+        # runs again from _on_stremio_identity — a pick made from the
+        # Stremio tabs already carries it, so the button is live at once
+        self.btn_stream_list.setEnabled(
+            kind == "stremio"
+            and bool((self.current or {}).get("stremio_imdb")))
         self.btn_rec.setEnabled(chase or self.btn_rec.isChecked())
         self.btn_dl.setEnabled((vod or stremio) and not self._downloading)
         self.btn_win.setEnabled(self._is_catchup() and not self._downloading)
@@ -6851,6 +7721,7 @@ class PlayerView(QtWidgets.QWidget):
             "volume": self.vol_slider,
             "autoplay": self.btn_auto, "playnext": self.btn_next,
             "playprev": self.btn_prev, "stream": self.btn_stream,
+            "streamlist": self.btn_stream_list,
         }
         kind = (self.current or {}).get("kind")
         # a Stremio handoff is "kind=stremio" for movies too — the episode
@@ -6911,6 +7782,12 @@ class PlayerView(QtWidgets.QWidget):
                 # or not (the worker resolves identity on demand). Every
                 # other kind plays a single fixed stream.
                 w.setVisible(on and stremio)
+            elif key == "streamlist":
+                # the FULL source list needs the identity the ranks are
+                # keyed on, so it appears once it is known (a tab pick has
+                # it from the start; a handoff shortly after)
+                w.setVisible(on and stremio and bool(
+                    (self.current or {}).get("stremio_imdb")))
             else:
                 w.setVisible(on)
 
@@ -10398,6 +11275,9 @@ class PlayerView(QtWidgets.QWidget):
         self._chase_paused = False
         self._dvr_t0 = None
         self._dvr_base = 0.0
+        self._dvr_gen_base = 0.0
+        self._buf_gens = []
+        self._disp_gen = None
         self._reset_dvr_clock()
         self._stall_ticks = 0
         self._last_reopen = 0.0

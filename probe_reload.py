@@ -177,9 +177,10 @@ pv._vid_s = 42.0
 
 class FakeDvr:
     running = True
+    file_path = "C:/buf.ts"
 
     def buffer_file(self):
-        return "C:/buf.ts"
+        return self.file_path
 
 
 def set_rec(on):
@@ -192,7 +193,7 @@ def set_rec(on):
 
 pv.dvr = FakeDvr()
 rec_calls, open_calls = [], []
-pv._restart_recorder = lambda record: rec_calls.append(record)
+pv._restart_recorder = lambda *a, **k: rec_calls.append(True)
 set_rec(True)
 pv._reopen_display = lambda at=None: open_calls.append(at) or True
 pv._reload_stream()
@@ -210,7 +211,8 @@ set_rec(False)
 rec_calls.clear()
 open_calls.clear()
 pv._reload_stream()
-check("REC state carried through the reload", rec_calls == [False])
+check("reload restarts the recorder regardless of REC state",
+      rec_calls == [True])
 pv._cap_clock_s = 0.0
 pv.dvr = None
 pv._mode = "live"

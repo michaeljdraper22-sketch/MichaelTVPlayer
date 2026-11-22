@@ -120,7 +120,7 @@ class FakeVLC:
         self.state = "playing"
         self.paused = False
 
-    def play_at(self, url, t, record_path=None, timeshift=False):
+    def play_at(self, url, t, record_path=None, timeshift=False, **kw):
         self.commanded.append(("play_at", t))
         self.t = float(t)
 
@@ -170,9 +170,10 @@ class FakeVLC:
     def get_length(self):
         return 0
 
-    def play(self, url, timeshift=False, http_referer=None):
-        # http_referer: the app grew the call signature for referer-locked
-        # CDNs (see test_always_chase's stub) — accepted and ignored here
+    def play(self, url, timeshift=False, http_referer=None, **kw):
+        # http_referer/network_caching_ms: the app grew the call signature
+        # for referer-locked CDNs and the live read-ahead (see
+        # test_always_chase's stub) — accepted and ignored here
         self.commanded.append(("play", url))
         self.state = "playing"
 

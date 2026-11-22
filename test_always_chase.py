@@ -52,9 +52,10 @@ import json
 import src.config as cfg_mod
 
 cfg = temp_config()
-check("default chase delay is 5 s", cfg.chase_delay == 5)
+check("default chase delay is 10 s (two provider batches)",
+      cfg.chase_delay == 10)
 cfg.chase_delay = 2
-check("chase delay clamped at a 5 s floor", cfg.chase_delay == 5)
+check("chase delay clamped at a 10 s floor", cfg.chase_delay == 10)
 
 with tempfile.TemporaryDirectory() as td:
     from pathlib import Path as _P
@@ -64,8 +65,8 @@ with tempfile.TemporaryDirectory() as td:
     cfg_mod._data_dir = lambda: _P(td)
     try:
         legacy = Config.load()
-        check("legacy 15 s default migrates down to 5 s once",
-              legacy.chase_delay == 5)
+        check("legacy 15 s default migrates down, then up to the 10 s floor",
+              legacy.chase_delay == 10)
     finally:
         cfg_mod._data_dir = orig_dir
     (_P(td) / "settings.json").write_text(
@@ -117,6 +118,7 @@ class FakeVLC:
         self.instance = object()
         self.t = -1
         self.state = "playing"
+        self.last_play_cache = None
 
     # playback
     def play(self, url, timeshift=None, start_seconds=0.0,
@@ -125,8 +127,9 @@ class FakeVLC:
         # start_wait_s/sub_file/network_caching_ms/http_referer: later
         # versions grew the call signature (stremio open wait, external
         # subs, the VOD read-ahead depth, referer-locked CDNs) — the stub
-        # accepts and ignores them
+        # accepts and ignores them, except the live read-ahead depth.
         self.calls.append(("play", url, timeshift, start_seconds))
+        self.last_play_cache = int(network_caching_ms)
 
     def play_at(self, url, start_seconds=0.0, record_path=None,
                 append=False, timeshift=None, http_referer=None):
@@ -210,10 +213,30 @@ check("no buffer-filling pill while waiting (quiet start)",
       view._dvr_status.isHidden()
       or not view._dvr_status.text())
 
-# chase entry: age the start clock so the 2.5 s gate passes
+# The live cushion is TWO provider batches (2026-11-22: the panel's .ts
+# delivers 5.0 s of MPEG-TS instantly, then 5.0 s of silence). A buffer
+# holding a single batch must not start playback — that is exactly the
+# shape that froze at every seam.
+check("effective live delay floors at 10 s (two batches)",
+      pv_mod._LIVE_MIN_CHASE_DELAY_S == 10.0
+      and view._live_delay_s() == 10.0)
 view._dvr_t0 = time.time() - 3.0
-view._dvr_content_s = 6.0
+view._dvr_content_s = 6.0                   # one batch
 view._dvr_first_data = time.time() - 6.0
+fake.calls.clear()
+view._wait_and_enter_chase(view._session, tries_left=10)
+app.processEvents()
+check("no chase start with a one-batch cushion (6 s)",
+      view._mode == "live"
+      and not [c for c in fake.calls if c[0] in ("play", "play_at")])
+view._session += 1          # cancel the scheduled fill retry
+
+# chase entry: age the start clock so the 2.5 s gate passes, and give the
+# buffer the full two-batch cushion
+view._dvr_t0 = time.time() - 3.0
+view._dvr_content_s = 12.0
+view._dvr_first_data = time.time() - 12.0
+fake.calls.clear()
 view._wait_and_enter_chase(view._session)
 app.processEvents()
 check("chase entered: mode flips", view._mode == "chase")
@@ -221,7 +244,8 @@ check("display player watches the buffer file",
       fake.calls and fake.calls[-1][0] == "play_at"
       and fake.calls[-1][1] == "X:/buffer.ts")
 tgt = fake.calls[-1][2]
-check(f"chase starts behind the frontier (target {tgt:.1f}s)", 0.0 <= tgt <= 6.0)
+check(f"chase starts 10 s behind the frontier (target {tgt:.1f}s)",
+      abs(tgt - 2.0) <= 0.5)
 
 print("[2b] caption reader starts IN PARALLEL with the chase fill wait")
 CCStarts = []
@@ -281,6 +305,10 @@ check("give-up reverts to plain live mode", view._mode == "live")
 check("display player re-dials the live URL",
       any(c[0] == "play" and c[1] == "http://x/live.ts"
           for c in fake.calls))
+check("plain live fallback gets a two-batch network cache",
+      fake.last_play_cache is not None
+      and fake.last_play_cache >= pv_mod._LIVE_READAHEAD_MS
+      and pv_mod._LIVE_READAHEAD_MS == 10000)
 check("give-up counts against the chase retry budget",
       view._chase_fail_count == 1)
 check("pill announces the automatic retry",
@@ -355,7 +383,7 @@ pv_mod._CHASE_RETRY_DELAYS = orig_delays
 print("[4] the DVR button is gone")
 check("no btn_dvr on the view", not hasattr(view, "btn_dvr"))
 
-print("[5] jump-to-live keeps the caption cushion")
+print("[5] jump-to-live keeps the live cushion")
 view._mode = "chase"
 view.dvr = StubRecorder()
 view.dvr.running = True
@@ -371,9 +399,9 @@ fake.state = "ended"                # revive path reopens AT the target
 view._chase_started = True
 view._jump_live()
 app.processEvents()
-check("LIVE lands edge - 5 s (frontier fallback: no transport seeded yet)",
+check("LIVE lands edge - 10 s (two-batch live cushion)",
       fake.calls and fake.calls[-1][0] == "play_at"
-      and abs(fake.calls[-1][2] - 95.0) < 0.5)
+      and abs(fake.calls[-1][2] - 90.0) < 0.5)
 
 print("[5b] while chasing, _tick keeps every transport control usable")
 view._mode = "chase"
@@ -404,21 +432,63 @@ check("scrubber self-heals on while chasing",
 check("scrubber spans the buffer frontier",
       view.slider.maximum() == 100_000)
 
-print("[6] REC rides the always-on chase pipeline")
+print("[6] REC tapes the DVR buffer (no recorder restart, no sout branch)")
 cfg.data["record_folder"] = tempfile.mkdtemp()
 REC.clear()
+buf_dir = tempfile.mkdtemp()
+buf_path = os.path.join(buf_dir, "buffer.ts")
+# a mature buffer (REC pressed an hour into the show) whose current write
+# frontier sits exactly on a TS packet boundary
+OLD = b"O" * (188 * 20)
+with open(buf_path, "wb") as f:
+    f.write(OLD)
 view._mode = "chase"
 view.dvr = StubRecorder()
 view.dvr.running = True
-view.dvr.file_path = "X:/buffer.ts"
+view.dvr.file_path = buf_path
+view._dvr_first_data = time.time() - 600.0
+view._rec_path = None
 view._on_rec_toggled(True)
-check("REC restarts the recorder with the recording output",
-      REC and REC[-1][1] is not None)
+check("REC does not restart/rotate the recorder",
+      not REC)
 check("REC keeps chase mode", view._mode == "chase")
+cp = view._rec_copier
+check("REC starts the append-only tape copier", cp is not None)
+PAY = bytes(range(256)) * 40
+with open(buf_path, "ab") as f:
+    f.write(PAY)
+deadline = time.time() + 5.0
+while time.time() < deadline and cp.written < len(PAY):
+    time.sleep(0.02)
+rec_path = view._rec_path
+try:
+    got = open(rec_path, "rb").read()
+except OSError:
+    got = b""
+check("the recording starts at the REC press (no DVR history replayed)",
+      got == PAY)
+# a recorder rotation (fresh sibling) must APPEND across the seam
+buf2 = os.path.join(buf_dir, "buffer_2.ts")
+open(buf2, "wb").close()
+cp.retarget(buf2, at_end=False)
+PAY2 = b"2" * (188 * 5)
+with open(buf2, "ab") as f:
+    f.write(PAY2)
+deadline = time.time() + 5.0
+while time.time() < deadline and cp.written < len(PAY) + len(PAY2):
+    time.sleep(0.02)
+check("a recorder restart appends to the SAME recording (nothing truncated)",
+      open(rec_path, "rb").read() == PAY + PAY2)
+check("the recording never goes through VLC's sout",
+      cp.output_path == rec_path and not cp.failed)
 REC.clear()
 view._stop_recording()
-check("REC off keeps the chase pipeline (recorder restarts alone)",
-      view._mode == "chase" and REC and REC[-1][1] is None)
+check("REC off does not restart the recorder either", not REC)
+check("REC off keeps the chase pipeline", view._mode == "chase")
+check("REC off finalizes the file (all bytes flushed)",
+      open(rec_path, "rb").read() == PAY + PAY2)
+check("recording bookkeeping cleared", view._rec_copier is None
+      and view._rec_path is None)
 
 print("[7] VOD never starts a recorder")
 REC.clear()

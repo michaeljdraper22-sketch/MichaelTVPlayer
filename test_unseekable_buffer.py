@@ -94,8 +94,11 @@ class _Harness:
         v._chase_paused = False
         v._seek_esc_strikes = 0
 
-    def verify(self, raw):
-        self.view._verify_seek(pv_mod.now_s(), raw)
+    def verify(self, raw, alive=True):
+        # alive=True: these harness cycles model a player the tick reports
+        # as PLAYING. A dead player's landing no longer clears the ladder
+        # (see _verify_seek), and case [8] covers that side.
+        self.view._verify_seek(pv_mod.now_s(), raw, alive)
 
 
 def main():
@@ -231,6 +234,21 @@ def main():
           not h.fallbacks and view._reopen_head_pins == 0,
           f"fallbacks={len(h.fallbacks)} "
           f"pins={view._reopen_head_pins}")
+
+    print("\n[8] a DEAD player's landing never clears the ladder "
+          "(2026-11-16 ESPN:\n    the corrective set_time parked the clock on "
+          "the target while the player\n    stayed ENDED, so every verify read "
+          "'clean' and the reopen loop ran forever)")
+    view._seek_zero_landings = _SEEK_ZERO_STRIKES - 1
+    h.arm(890.0, fix_tried=True)
+    h.verify(890.0, alive=False)        # clock ON target, but nothing plays
+    check("dead player's clean-looking landing keeps the strikes",
+          view._seek_zero_landings == _SEEK_ZERO_STRIKES - 1,
+          str(view._seek_zero_landings))
+    h.arm(890.0, fix_tried=True)
+    h.verify(890.0, alive=True)         # a landing the viewer could see
+    check("a live clean landing still clears the strikes",
+          view._seek_zero_landings == 0, str(view._seek_zero_landings))
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

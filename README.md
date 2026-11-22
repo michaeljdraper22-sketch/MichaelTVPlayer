@@ -38,6 +38,11 @@ through a single VLC connection.
 - **Dark mode by default** (theme applied on every launch) and a **black
   title bar** on Windows 10/11
 - **Live TV, Movies (VOD) and Series** browsing with categories + live search
+- **📺 Stremio Series / 🎬 Stremio Movies tabs** — search Stremio's own
+  catalog (Cinemeta) from the channel panel and play the result without
+  opening Stremio: one search, ranked streams, the same debrid pipelines a
+  handoff uses. Text-only (no posters), so a pick costs one search plus
+  one addon call. See *Stremio search* below.
 - **Catch-Up tab** — the provider's archived broadcasts: channels with
   `tv_archive` enabled, grouped by category, showing the archive depth
   (`(3d)` etc.). Activating a channel opens a day-grouped program picker
@@ -164,9 +169,11 @@ through a single VLC connection.
   data (blocked provider, network), playback falls back to the direct live
   stream for that channel.
 - **Record (⏺)** — the red button — saves the current stream to a folder of
-  your choice (Settings ▸ Recording folder). Runs through the same single
-  connection as the live buffer — and live recordings are
-  scrubbable while they record. Recordings are kept on disk.
+  your choice (Settings ▸ Recording folder). The recording is an
+  independent, append-only copy of the live buffer's bytes: pressing it
+  restarts nothing, watching/scrubbing the DVR never reaches the file, and
+  a provider drop or buffer restart only leaves a gap — it can never
+  truncate or rewind the recording. Recordings are kept on disk.
 - **Profanity filter** (Settings ▸ Profanity filter…, off by default) —
   mutes the audio during profanity, and when the app-rendered captions are
   showing, masks the matched words on screen too (`hell` → `****`) — one
@@ -253,6 +260,47 @@ MichaelTV take over autoplay — no Stremio needed after the first click.
   torrent stream you picked by hand in Stremio still plays as before.
   Setup, live status and diagnostics for all of this: Settings ▸ Stremio
   handoff.
+
+## Stremio search (📺 Stremio Series / 🎬 Stremio Movies tabs)
+Search Stremio's catalog from inside the channel panel — Stremio itself
+does not have to be open, and **no Stremio account is involved** (the
+catalog comes from Cinemeta; streams come from your configured addons and
+the debrid pipelines MichaelTV has already learned).
+
+- **Type in the Search box** (2+ characters, debounced). Results are
+  plain text — name and year — with no poster downloads, so a search
+  answers in well under a second even on a cold start.
+- **Enter / double-click a movie** plays it with the *ranked best stream*
+  — exactly the pick autoplay would make (English preference, your
+  resolution preference, size, provider order — Settings ▸ Stremio
+  handoff).
+- **Enter / double-click a show** opens the **two-pane picker**: Cinemeta's
+  seasons/episodes on the left, the highlighted episode's **full ranked
+  stream list on the right** (Stremio web's own series flow). Highlighting
+  an episode loads its streams; a single click on a stream plays it, or
+  Enter on an episode plays its best pick. Nothing plays until you do one
+  of those.
+- **Right-click a movie ▸ Show all streams…**, or right-click a show ▸
+  **Episodes & streams…**: the whole ranked list instead of autoplay. The
+  first row (marked ★) is what Enter would have picked; **a single click on
+  any row starts that stream**. Rows show the release name, seeds/size, and
+  the debrid provider the row would resolve through. A clicked row is
+  liveness-checked first (one ranged GET, ~0.5–1.5 s) through the resolve
+  chain — preferred provider, then the others — so a dead debrid link says
+  "try another one" instead of starting a failure video.
+- **While a Stremio movie/episode is playing**, the control bar carries a
+  second stream button next to the next-stream one (`S`): the **all-streams
+  list** for what is on (`Shift+S`), with the row clicked starting at the
+  position you had reached. `S` stays the one-press walk down that list.
+- **Playback is the handoff path**, not a copy of it: the same debrid
+  resolve chains (preferred provider first, then the others), the same
+  dead-link guard (a stream that 502s advances to the next-ranked one),
+  the same ⏭/⏮ episode lookaheads, autoplay, and the same channel-panel
+  takeover a Stremio stream gets. Nothing joins a swarm while a debrid
+  pipeline can serve the pick; the local Stremio streaming server is used
+  only when no provider key has been learned.
+- The tabs are added after **Series**; the saved tab position is migrated
+  once, so the app reopens on the tab you left it on.
 
 ## Requirements
 - **Windows 10/11**
@@ -395,8 +443,10 @@ head). The buffer is deleted when you leave the channel or close the app
 (buffers stranded by a crash are cleaned out on the next launch); if the
 recorder can't get data at all, playback falls back to the direct live
 stream for that channel.
-**REC** is unchanged: it saves a permanent recording (kept on disk)
-through the same single connection.
+**REC** writes an independent, append-only copy of the buffer bytes to the
+recording folder, so pausing, rewinding, rescue reopens and even a provider
+reconnect or buffer restart cannot disturb the file (a drop leaves a gap,
+never a truncated recording).
 
 ## Adding your own channels
 Channels ▸ **Add custom channel…** lets you add any stream URL

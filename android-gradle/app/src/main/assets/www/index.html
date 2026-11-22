@@ -640,11 +640,12 @@ function playStream(i) {
 // stream used to need VLC.  The WebView player below is only a fallback
 // for an APK whose bridge lacks playNative.
 
-function openPlayer(url, title, altUrl) {
-  state.player = { url: url, title: title || "", altUrl: altUrl || "" };
+function openPlayer(url, title, altUrl, isLive) {
+  state.player = { url: url, title: title || "", altUrl: altUrl || "",
+                   isLive: !!isLive };
   if (window.py && window.py.playNative) {
     try {
-      window.py.playNative(url, altUrl || "", title || "");
+      window.py.playNative(url, altUrl || "", title || "", !!isLive);
       return;
     } catch (e) { /* fall through to the WebView player */ }
   }
@@ -1084,7 +1085,7 @@ function favToggleAt(i) {
 function playChannel(c) {
   rpc("xt_url", { stream_id: c.stream_id }, function (out) {
     if (out.error) { toast(out.error); return; }
-    openPlayer(out.url, c.name, out.url_ts);
+    openPlayer(out.url, c.name, out.url_ts, true);
   });
 }
 

@@ -56,8 +56,11 @@ class Win(QtWidgets.QMainWindow):
     uses for _restore_state. isHidden() (not isVisible()) is asserted
     below because the window is never shown offscreen."""
 
-    # the REAL panel applier, unbound — the code under test
+    # the REAL panel applier, unbound — the code under test. play() also
+    # memorizes the column width before folding it away, so the shim
+    # carries that helper too (it only needs self.splitter).
     _apply_channels = MainWindow._apply_channels
+    _save_splitter_sizes = MainWindow._save_splitter_sizes
 
     def __init__(self):
         super().__init__()
