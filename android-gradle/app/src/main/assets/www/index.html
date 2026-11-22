@@ -640,12 +640,20 @@ function playStream(i) {
 // stream used to need VLC.  The WebView player below is only a fallback
 // for an APK whose bridge lacks playNative.
 
-function openPlayer(url, title, altUrl, isLive) {
+function openPlayer(url, title, altUrl, isLive, castUrl, directUrl,
+                     castDvr, castBg, relaySession) {
   state.player = { url: url, title: title || "", altUrl: altUrl || "",
-                   isLive: !!isLive };
+                   isLive: !!isLive, castUrl: castUrl || "",
+                   directUrl: directUrl || "",
+                   castDvr: castDvr !== false,
+                   castBg: castBg !== false,
+                   session: relaySession || "" };
   if (window.py && window.py.playNative) {
     try {
-      window.py.playNative(url, altUrl || "", title || "", !!isLive);
+      window.py.playNative(url, altUrl || "", title || "", !!isLive,
+                           castUrl || "", directUrl || "",
+                           castDvr !== false, castBg !== false,
+                           relaySession || "");
       return;
     } catch (e) { /* fall through to the WebView player */ }
   }
@@ -723,6 +731,17 @@ function renderSettings() {
       (String(s.resolution_pref) === RES_OPTIONS[i][0] ? " selected" : "") +
       ">" + RES_OPTIONS[i][1] + "</option>";
   }
+  var dvrVals = [[15, "15 minutes"], [30, "30 minutes (recommended)"],
+                 [60, "60 minutes"],
+                 [0, "Whole channel session (more storage)"]];
+  var dvrOpts = "";
+  var wantDvr = (s.dvr_minutes === 0) ? 0
+    : (parseInt(s.dvr_minutes, 10) || 30);
+  for (var j = 0; j < dvrVals.length; j++) {
+    dvrOpts += '<option value="' + dvrVals[j][0] + '"' +
+      (String(wantDvr) === String(dvrVals[j][0]) ? " selected" : "") +
+      ">" + dvrVals[j][1] + "</option>";
+  }
   el.innerHTML =
     topbarHtml("Settings") +
     '<div class="content">' +
@@ -740,6 +759,19 @@ function renderSettings() {
     "<label>Demote streams larger than (GB, 0 = off)</label>" +
     '<input id="set-size" type="number" min="0" step="0.5" value="' +
     esc(s.size_demote_gb || 0) + '">' +
+
+    "<label>Live DVR length (phone + casting)</label>" +
+    '<select id="set-dvr">' + dvrOpts + "</select>" +
+    '<label><input id="set-castdvr" type="checkbox"' +
+    (s.cast_with_dvr !== false ? " checked" : "") +
+    "> Cast with the phone DVR (rewind while casting)</label>" +
+    '<label><input id="set-castbg" type="checkbox"' +
+    (s.cast_bg_buffer !== false ? " checked" : "") +
+    "> Keep buffering in the background while casting</label>" +
+    '<div class="hint">Casting uses Chromecast / Google TV. The phone and ' +
+    "TV must be on the same Wi-Fi. The TV plays the phone's original " +
+    "HLS segments (no quality loss) and can use the same DVR window. " +
+    "AirPlay is not supported from Android.</div>" +
 
     "<label>Xtream server URL</label>" +
     '<input id="set-xtserver" type="url" placeholder="http://provider.example:8080" value="' +
@@ -764,6 +796,9 @@ function saveSettings() {
     addons: addons,
     resolution_pref: document.getElementById("set-res").value,
     size_demote_gb: parseFloat(document.getElementById("set-size").value || "0") || 0,
+    dvr_minutes: parseInt(document.getElementById("set-dvr").value || "30", 10),
+    cast_with_dvr: document.getElementById("set-castdvr").checked,
+    cast_bg_buffer: document.getElementById("set-castbg").checked,
     xtream_server: document.getElementById("set-xtserver").value.trim(),
     xtream_username: document.getElementById("set-xtuser").value.trim(),
     xtream_password: document.getElementById("set-xtpass").value
@@ -790,15 +825,25 @@ function saveSettings() {
 var LIVE_ROWS_CAP = 800;      // huge providers: render at most this many
 
 function enterLive() {
+  if (!state.settings) {
+    rpc("get_settings", {}, function (out) {
+      state.settings = (out && out.settings) ? out.settings : {};
+      enterLive();
+    });
+    return;
+  }
+  var s = state.settings || {};
   state.live = {
     authed: false, info: "", error: "",
-    cats: [], country: "", cat: "",
+    cats: [], country: s.live_country || "",
+    cat: s.live_category || "",
     channels: null, channelsTotal: 0,
-    mode: "browse",            // browse | favs
+    mode: (s.live_mode === "favs" ? "favs" : "browse"),  // browse | favs
     q: "", results: null, resultsTotal: 0,
     favorites: [],
     view: []                   // rows currently on screen (tap/★ indexes)
   };
+  var savedMode = state.live.mode;
   push("livetv", renderLive);
   rpc("xt_auth", {}, function (out) {
     if (out.error || !out.ok) {
@@ -812,13 +857,45 @@ function enterLive() {
     rpc("xt_categories", {}, function (o2) {
       if (o2.error) { state.live.error = o2.error; rerender(); return; }
       state.live.cats = o2.categories || [];
-      if (state.live.cats.length) {
-        loadChannels(state.live.cats[0].id);
-      } else {
+      if (!state.live.cats.length) {
         state.live.error = "Provider has no live categories.";
         rerender();
+        return;
       }
+      // Restore the saved filter, but only if the provider still has
+      // that country/category — a provider reshuffle must not leave the
+      // screen empty.
+      var pool = liveCatsFor(state.live.country);
+      if (!pool.length) {
+        state.live.country = "";
+        pool = state.live.cats;
+      }
+      var cat = null;
+      for (var i = 0; i < pool.length; i++) {
+        if (String(pool[i].id) === String(state.live.cat)) {
+          cat = pool[i];
+          break;
+        }
+      }
+      if (!cat) cat = pool[0];
+      loadChannels(cat.id);
+      // loadChannels starts a browse; put the saved Favorites tab back on
+      // top of it (the channel list still loads underneath).
+      if (savedMode === "favs") state.live.mode = "favs";
+      rerender();
     });
+  });
+}
+
+function saveLivePrefs() {
+  var live = state.live;
+  if (!live) return;
+  rpc("set_settings", {
+    live_country: live.country || "",
+    live_category: live.cat || "",
+    live_mode: live.mode || "browse"
+  }, function (out) {
+    if (!out.error && out.settings) state.settings = out.settings;
   });
 }
 
@@ -872,6 +949,12 @@ function liveCountryChanged(country) {
   } else {
     loadChannels("");          // no categories: the whole filtered list
   }
+  saveLivePrefs();             // the choice survives app restart/update
+}
+
+function pickCategory(catId) {
+  loadChannels(catId);
+  saveLivePrefs();
 }
 
 function showBrowse() {
@@ -879,11 +962,13 @@ function showBrowse() {
   state.live.q = "";           // leave any search behind
   state.live.results = null;
   renderLive();
+  saveLivePrefs();
 }
 
 function showFavs() {
   state.live.mode = "favs";
   renderLive();
+  saveLivePrefs();
 }
 
 // Enter / Search button: fetch matches and render them.  There is no code
@@ -1015,7 +1100,7 @@ function catSelectHtml() {
       (String(cats[i].id) === String(live.cat) ? " selected" : "") + ">" +
       esc(cats[i].name || cats[i].id) + "</option>";
   }
-  return '<select id="live-cat" onchange="loadChannels(this.value)">' +
+  return '<select id="live-cat" onchange="pickCategory(this.value)">' +
     opts + "</select>";
 }
 
@@ -1083,9 +1168,21 @@ function favToggleAt(i) {
 }
 
 function playChannel(c) {
-  rpc("xt_url", { stream_id: c.stream_id }, function (out) {
+  // The bridge starts the phone-side HLS DVR relay (one provider
+  // connection, original segments) before the native player opens.  If
+  // the relay cannot run, it returns the direct provider URL instead and
+  // playback still starts — without rewind for that channel.
+  toast("Buffering live TV\u2026", 3000);
+  rpc("xt_live_start", { stream_id: c.stream_id }, function (out) {
     if (out.error) { toast(out.error); return; }
-    openPlayer(out.url, c.name, out.url_ts, true);
+    if (!out.relay) {
+      toast("DVR unavailable \u2014 playing live", 3000);
+    }
+    openPlayer(out.url, c.name, out.url_ts, true,
+               out.cast_url || "", out.direct || "",
+               out.cast_with_dvr !== false,
+               out.cast_bg_buffer !== false,
+               out.session || "");
   });
 }
 

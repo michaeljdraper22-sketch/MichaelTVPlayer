@@ -50,6 +50,18 @@ def now_s() -> float:
     return time.time()
 
 
+def _recorder_state_is_dead(state_name) -> bool:
+    """True when the headless recorder's libVLC state is terminal.
+
+    python-vlc renders these as "State.Ended" / "State.Error" (the log
+    lines always printed that spelling), while tests and other wrappers
+    may return the bare "Ended" — match the suffix, never an exact
+    string (the exact compare silently disabled the fast restart on
+    2026-11-22 16:28 and the picture waited the full 65 s)."""
+    s = str(state_name or "").lower()
+    return any(tok in s for tok in ("ended", "error", "stopped"))
+
+
 def _chase_jump_back_s(lag_ewma):
     """D1 adaptive jump-to-live: how far behind the head LIVE lands. While
     the measured CCX lag L is large, the newest caption is ~L behind the
@@ -7096,7 +7108,7 @@ class PlayerView(QtWidgets.QWidget):
                 rec_state = str(self.dvr.state_name() or "").lower()
             except Exception:  # noqa: BLE001
                 rec_state = ""
-            rec_dead = rec_state in ("ended", "error", "stopped")
+            rec_dead = _recorder_state_is_dead(rec_state)
             restart_due = (stalled_s is not None
                            and (stalled_s > _REC_STALL_RESTART_S
                                 or (buf_lost

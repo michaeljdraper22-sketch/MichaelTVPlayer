@@ -1,11 +1,16 @@
 package org.michaeltv.app;
 
+import android.Manifest;
 import android.app.Activity;
 import android.content.ActivityNotFoundException;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.net.Uri;
+import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.SystemClock;
 import android.text.TextUtils;
 import android.util.TypedValue;
@@ -19,6 +24,9 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.OptIn;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.app.ActivityCompat;
+import androidx.core.content.ContextCompat;
 import androidx.media3.cast.CastPlayer;
 import androidx.media3.cast.SessionAvailabilityListener;
 import androidx.media3.common.AudioAttributes;
@@ -47,48 +55,74 @@ import com.google.android.gms.cast.framework.CastContext;
  * needed VLC.  ExoPlayer plays MPEG-TS, HLS (m3u8), MKV, MP4 and WebM in
  * the app itself.
  *
- * Fallback ladder on a playback error (each step is tried once):
- *   1. the primary URL (HLS for live channels)
- *   2. the alternate URL (progressive .ts for live channels)
- *   3. the last URL with the audio track disabled — keeps the PICTURE for
- *      files whose audio codec (AC3/DTS) the phone has no decoder for
- *   4. an error panel: Retry / Open in external player / Back
+ * Live channels are opened on the phone-side DVR relay (live_relay.py):
+ * the provider's original HLS segments are buffered locally and served as
+ * a seekable live playlist, so the transport row below can rewind/jump
+ * within the configured window.  The same playlist is handed to a Cast
+ * receiver, which is why casting keeps the DVR and full quality (the
+ * segments are never decoded/transcoded on the phone).
  *
- * Chromecast: when Google Play Services is available, a CastButton sits in
- * the top bar; picking a TV hands the current stream to the receiver (which
- * decodes AC3/DTS natively, so "video-only" streams regain audio) and the
- * phone becomes the remote.  When the session ends, playback returns to
- * the phone at the same position.  Cast is strictly optional — on devices
- * without cast-capable GMS (emulators, de-Googled ROMs) every cast touch-
- * point is guarded and local playback proceeds exactly as before.
+ * Fallback ladder on a playback error (each step is tried once):
+ *   1. the primary URL (the DVR relay for live, HLS otherwise)
+ *   2. the direct provider HLS (live only; no DVR)
+ *   3. the alternate URL (progressive .ts for live channels)
+ *   4. the last URL with the audio track disabled — keeps the PICTURE for
+ *      files whose audio codec (AC3/DTS) the phone has no decoder for
+ *   5. an error panel: Retry / Open in external player / Back
+ *
+ * Chromecast: CastOptionsProvider + the manifest metadata make
+ * CastContext usable; this Activity is an AppCompatActivity so the
+ * MediaRouteButton device chooser (an AppCompat dialog) can open.  The
+ * receiver plays the relay's HLS playlist at the original quality and the
+ * phone stays the remote; if the TV cannot reach the phone (AP isolation),
+ * casting falls back to the direct provider HLS.
  */
 @OptIn(markerClass = UnstableApi.class)
-public class PlayerActivity extends Activity {
+public class PlayerActivity extends AppCompatActivity {
 
-    public static final String EXTRA_URL = "url";
-    public static final String EXTRA_ALT_URL = "alt_url";
+    public static final String EXTRA_URL = "url";           // phone source
+    public static final String EXTRA_ALT_URL = "alt_url";   // direct .ts
     public static final String EXTRA_TITLE = "title";
     public static final String EXTRA_LIVE = "live";
+    public static final String EXTRA_CAST_URL = "cast_url";     // LAN relay
+    public static final String EXTRA_DIRECT_URL = "direct_url";  // provider HLS
+    public static final String EXTRA_CAST_DVR = "cast_dvr";
+    public static final String EXTRA_CAST_BG = "cast_bg";
+    public static final String EXTRA_RELAY_SESSION = "relay_session";
 
     private ExoPlayer player;
     private PlayerView playerView;
     private CastContext castContext;  // null = device cannot cast
     private CastPlayer castPlayer;
     private FrameLayout root;
+    private LinearLayout chrome;
     private LinearLayout topBar;
+    private LinearLayout controlsRow;
     private LinearLayout errorPanel;
     private TextView errorText;
+    private TextView dvrLabel;
+    private Button btnPlayPause;
+    private Button btnLive;
 
     private String primaryUrl = "";
     private String altUrl = "";
+    private String directUrl = "";
+    private String castUrl = "";
+    private String relaySession = "";
     private String title = "";
     private String currentUrl = "";
+    private String localUrl = "";      // what the PHONE should play
     private boolean live = false;
+    private boolean castWithDvr = true;
+    private boolean castBgBuffer = true;
 
-    // 0 = primary, 1 = alternate URL, 2 = audio disabled
+    // 0 = primary, 1 = direct HLS, 2 = alternate .ts, 3 = audio disabled
     private int attempt = 0;
     private boolean videoOnly = false;
     private boolean casting = false;
+    private boolean castFallbackTried = false;
+    private boolean castUsedRelay = false;   // cast timeline == relay timeline
+    private boolean dvrServiceOn = false;
 
     // Live streams are opened with a two-batch cushion in ExoPlayer's
     // load control: the panel pushes each 5 s of MPEG-TS as one burst and
@@ -102,13 +136,22 @@ public class PlayerActivity extends Activity {
     private static final int LIVE_RETRIES = 8;
     private static final int LIVE_RECONNECT_MAX = 6;        // within the window
     private static final long LIVE_STABLE_MS = 60_000;      // resets the count
+    // The HLS DVR playlist is live; 10 s behind its edge matches the
+    // Windows cushion and leaves the whole buffered window to rewind into.
+    private static final long LIVE_TARGET_OFFSET_MS = 10_000L;
 
-    // Live EOF recovery: a provider session cap/load balancer closes the
-    // HTTP body cleanly, which ExoPlayer reports as ENDED (not an error),
-    // so the normal error ladder never runs and the picture sits dead.
     private boolean handingOff = false;
     private int liveReconnects = 0;
     private long lastReadyAt = 0L;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private final Runnable transportTick = new Runnable() {
+        @Override
+        public void run() {
+            updateTransportUi();
+            ui.postDelayed(this, 1000);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -118,8 +161,14 @@ public class PlayerActivity extends Activity {
         Intent intent = getIntent();
         primaryUrl = safe(intent.getStringExtra(EXTRA_URL));
         altUrl = safe(intent.getStringExtra(EXTRA_ALT_URL));
+        directUrl = safe(intent.getStringExtra(EXTRA_DIRECT_URL));
+        castUrl = safe(intent.getStringExtra(EXTRA_CAST_URL));
+        relaySession = safe(intent.getStringExtra(EXTRA_RELAY_SESSION));
         title = safe(intent.getStringExtra(EXTRA_TITLE));
         live = intent.getBooleanExtra(EXTRA_LIVE, false);
+        castWithDvr = intent.getBooleanExtra(EXTRA_CAST_DVR, true);
+        castBgBuffer = intent.getBooleanExtra(EXTRA_CAST_BG, true);
+        localUrl = primaryUrl;
         if (TextUtils.isEmpty(primaryUrl)) {
             finish();
             return;
@@ -139,7 +188,20 @@ public class PlayerActivity extends Activity {
                 FrameLayout.LayoutParams.MATCH_PARENT));
         root.addView(playerView);
 
-        root.addView(buildTopBar());
+        chrome = new LinearLayout(this);
+        chrome.setOrientation(LinearLayout.VERTICAL);
+        FrameLayout.LayoutParams clp = new FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.WRAP_CONTENT);
+        clp.gravity = Gravity.TOP;
+        chrome.setLayoutParams(clp);
+        chrome.addView(buildTopBar(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        chrome.addView(buildControlsRow(), new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT));
+        root.addView(chrome);
         root.addView(buildErrorPanel());
 
         setContentView(root);
@@ -192,7 +254,7 @@ public class PlayerActivity extends Activity {
         // needed: PlayerView has two overloaded visibility listeners.
         playerView.setControllerVisibilityListener(
                 (PlayerView.ControllerVisibilityListener) visibility ->
-                        topBar.setVisibility(visibility));
+                        chrome.setVisibility(visibility));
 
         setupCast();
         play(primaryUrl);
@@ -210,11 +272,6 @@ public class PlayerActivity extends Activity {
         topBar.setGravity(Gravity.CENTER_VERTICAL);
         topBar.setPadding(dp(8), dp(6), dp(8), dp(6));
         topBar.setBackgroundColor(0xCC000000);
-        FrameLayout.LayoutParams lp = new FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT,
-                FrameLayout.LayoutParams.WRAP_CONTENT);
-        lp.gravity = Gravity.TOP;
-        topBar.setLayoutParams(lp);
 
         Button back = makeButton("\u25C0");
         back.setOnClickListener(v -> finish());
@@ -232,21 +289,20 @@ public class PlayerActivity extends Activity {
         topBar.addView(t, new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
 
-        // Cast entry point (media3 1.2.1 has no CastButton yet — the
-        // classic MediaRouteButton + CastButtonFactory wiring drives the
-        // same CastPlayer session).  Only added when the cast context
-        // probe succeeded; setUpMediaRouteButton can still throw on
-        // broken GMS images, so keep it guarded either way.
+        // Cast entry point.  Only added when CastContext initialized; the
+        // SDK's device chooser needs this AppCompat host (see the class
+        // doc) and setUpMediaRouteButton can still throw on broken GMS
+        // images, so keep it guarded either way.
         if (castContext != null) {
             try {
                 MediaRouteButton castButton = new MediaRouteButton(this);
                 CastButtonFactory.setUpMediaRouteButton(this, castButton);
                 castButton.setPadding(dp(6), 0, dp(6), 0);
-                LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams cbp = new LinearLayout.LayoutParams(
                         LinearLayout.LayoutParams.WRAP_CONTENT,
                         LinearLayout.LayoutParams.MATCH_PARENT);
-                clp.gravity = Gravity.CENTER_VERTICAL;
-                topBar.addView(castButton, clp);
+                cbp.gravity = Gravity.CENTER_VERTICAL;
+                topBar.addView(castButton, cbp);
             } catch (Throwable ignored) {
                 // No cast UI on this device.
             }
@@ -258,6 +314,56 @@ public class PlayerActivity extends Activity {
                 LinearLayout.LayoutParams.WRAP_CONTENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT));
         return topBar;
+    }
+
+    /**
+     * The DVR transport row.  It acts on whichever player currently owns
+     * playback — the local ExoPlayer or the CastPlayer — so the same
+     * buttons rewind the TV stream while casting.  The PlayerView's own
+     * seek bar is still there; these are the large, always-visible jumps.
+     */
+    private View buildControlsRow() {
+        controlsRow = new LinearLayout(this);
+        controlsRow.setOrientation(LinearLayout.HORIZONTAL);
+        controlsRow.setGravity(Gravity.CENTER_VERTICAL);
+        controlsRow.setPadding(dp(6), dp(2), dp(6), dp(2));
+        controlsRow.setBackgroundColor(0xB3000000);
+
+        Button r60 = makeSmallButton("\u00AB60");
+        r60.setOnClickListener(v -> seekBy(-60_000L));
+        Button r10 = makeSmallButton("\u00AB10");
+        r10.setOnClickListener(v -> seekBy(-10_000L));
+        Button f10 = makeSmallButton("10\u00BB");
+        f10.setOnClickListener(v -> seekBy(10_000L));
+        btnLive = makeSmallButton("LIVE");
+        btnLive.setOnClickListener(v -> goLive());
+        btnPlayPause = makeSmallButton("Pause");
+        btnPlayPause.setOnClickListener(v -> togglePlay());
+
+        controlsRow.addView(r60, controlParams());
+        controlsRow.addView(r10, controlParams());
+        controlsRow.addView(f10, controlParams());
+        controlsRow.addView(btnLive, controlParams());
+        controlsRow.addView(btnPlayPause, controlParams());
+
+        dvrLabel = new TextView(this);
+        dvrLabel.setTextColor(0xFFD0D0D8);
+        dvrLabel.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        dvrLabel.setSingleLine(true);
+        dvrLabel.setEllipsize(TextUtils.TruncateAt.END);
+        dvrLabel.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        dvrLabel.setPadding(dp(6), 0, dp(2), 0);
+        controlsRow.addView(dvrLabel, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        return controlsRow;
+    }
+
+    private LinearLayout.LayoutParams controlParams() {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT);
+        lp.setMargins(dp(2), 0, dp(2), 0);
+        return lp;
     }
 
     private View buildErrorPanel() {
@@ -317,11 +423,103 @@ public class PlayerActivity extends Activity {
         return b;
     }
 
+    private Button makeSmallButton(String label) {
+        Button b = makeButton(label);
+        b.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12);
+        b.setPadding(dp(6), 0, dp(6), 0);
+        b.setMinWidth(0);
+        b.setMinimumWidth(0);
+        return b;
+    }
+
     private int dp(int v) {
         return Math.round(v * getResources().getDisplayMetrics().density);
     }
 
+    // -------------------------------------------------------- transport
+
+    private Player activePlayer() {
+        if (casting && castPlayer != null) {
+            return castPlayer;
+        }
+        return player;
+    }
+
+    private void seekBy(long deltaMs) {
+        Player p = activePlayer();
+        if (p == null) return;
+        long pos = Math.max(0L, p.getCurrentPosition());
+        long target = Math.max(0L, pos + deltaMs);
+        long dur = p.getDuration();
+        if (dur != C.TIME_UNSET && dur > 0
+                && !p.isCurrentMediaItemLive()) {
+            target = Math.min(target, dur);
+        }
+        p.seekTo(target);
+    }
+
+    private void goLive() {
+        Player p = activePlayer();
+        if (p == null) return;
+        if (p.isCurrentMediaItemLive()) {
+            // The default live position honours the 10 s target offset and
+            // is always inside the receiver's/player's seekable window.
+            p.seekToDefaultPosition();
+            p.setPlayWhenReady(true);
+        } else if (p.getDuration() != C.TIME_UNSET && p.getDuration() > 0) {
+            p.seekTo(p.getDuration());
+        }
+    }
+
+    private void togglePlay() {
+        Player p = activePlayer();
+        if (p != null) {
+            p.setPlayWhenReady(!p.getPlayWhenReady());
+        }
+    }
+
+    private void updateTransportUi() {
+        Player p = activePlayer();
+        if (p == null || btnPlayPause == null || dvrLabel == null) return;
+        btnPlayPause.setText(p.getPlayWhenReady() ? "Pause" : "Play");
+        boolean isLive = p.isCurrentMediaItemLive();
+        if (btnLive != null) btnLive.setEnabled(isLive || live);
+        long pos = Math.max(0L, p.getCurrentPosition());
+        long dur = p.getDuration();
+        if (dur != C.TIME_UNSET && dur > 0) {
+            dvrLabel.setText((isLive ? "DVR " : "")
+                    + fmtMs(pos) + " / " + fmtMs(dur));
+        } else if (live) {
+            dvrLabel.setText("DVR " + fmtMs(pos));
+        } else {
+            dvrLabel.setText("");
+        }
+    }
+
+    private static String fmtMs(long ms) {
+        long total = Math.max(0L, ms) / 1000L;
+        long h = total / 3600L;
+        long m = (total % 3600L) / 60L;
+        long s = total % 60L;
+        if (h > 0) {
+            return String.format("%d:%02d:%02d", h, m, s);
+        }
+        return String.format("%d:%02d", m, s);
+    }
+
     // ---------------------------------------------------------- playback
+
+    private MediaItem mediaItem(String url) {
+        MediaItem.Builder b = new MediaItem.Builder().setUri(url);
+        if (live) {
+            // Matches the Windows cushion; the relay playlist keeps the
+            // whole configured window behind this position.
+            b.setLiveConfiguration(new MediaItem.LiveConfiguration.Builder()
+                    .setTargetOffsetMs(LIVE_TARGET_OFFSET_MS)
+                    .build());
+        }
+        return b.build();
+    }
 
     private void play(String url) {
         currentUrl = url;
@@ -331,15 +529,18 @@ public class PlayerActivity extends Activity {
             castPlayer.prepare();
             castPlayer.setPlayWhenReady(true);
         } else {
-            player.setMediaItem(MediaItem.fromUri(url));
+            localUrl = url;
+            player.setMediaItem(mediaItem(url));
             player.prepare();
             player.setPlayWhenReady(true);
         }
+        updateTransportUi();
     }
 
     private void retryFromStart() {
         attempt = 0;
         videoOnly = false;
+        castFallbackTried = false;
         player.setTrackSelectionParameters(player.getTrackSelectionParameters()
                 .buildUpon()
                 .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, false)
@@ -348,20 +549,30 @@ public class PlayerActivity extends Activity {
     }
 
     private void handlePlaybackError(PlaybackException error) {
-        // 1 -> 2: live channels have a progressive .ts fallback URL
-        if (attempt == 0 && !altUrl.isEmpty()) {
+        // 1 -> 2: the relay failed; try the provider HLS directly (live
+        // picture, but no DVR window on this device).
+        if (attempt == 0 && !directUrl.isEmpty()
+                && !directUrl.equals(currentUrl)) {
             attempt = 1;
+            toast("DVR buffer failed \u2014 playing the direct feed");
+            play(directUrl);
+            return;
+        }
+        // 2 -> 3: live channels have a progressive .ts fallback URL
+        if (attempt <= 1 && !altUrl.isEmpty()
+                && !altUrl.equals(currentUrl)) {
+            attempt = 2;
             toast("Trying alternate stream\u2026");
             play(altUrl);
             return;
         }
-        // 2 -> 3: keep the picture when the phone lacks the audio codec
+        // 3 -> 4: keep the picture when the phone lacks the audio codec
         // (AC3/EAC3/DTS are common in debrid MKV files).  Only codec
         // failures qualify — a network/parse failure must not silently
         // mute a stream that would have played fine.
         if (!videoOnly && looksLikeCodecFailure(error)) {
             videoOnly = true;
-            attempt = 2;
+            attempt = 3;
             player.setTrackSelectionParameters(player.getTrackSelectionParameters()
                     .buildUpon()
                     .setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
@@ -397,10 +608,10 @@ public class PlayerActivity extends Activity {
      * A live body ended CLEANLY. Providers cap connection age / rebalance
      * the CDN, and ExoPlayer reads the clean EOF as end-of-media: no
      * onPlayerError, so the format ladder below never runs and the screen
-     * sits black. Try the alternate feed once (HLS ended -> progressive
-     * .ts), then reconnect the same URL with the reconnect budget. The
-     * count resets after a minute of real playback so a long stable
-     * session gets a fresh budget after the panel drops it.
+     * sits black. The DVR relay re-resolves the provider every poll, so
+     * this normally only fires if the relay itself stopped; try direct
+     * HLS/.ts once, then reconnect the relay URL with the reconnect
+     * budget. The count resets after a minute of real playback.
      */
     private void onLiveEnded() {
         long now = SystemClock.elapsedRealtime();
@@ -415,8 +626,16 @@ public class PlayerActivity extends Activity {
             return;
         }
         liveReconnects++;
-        if (attempt == 0 && !altUrl.isEmpty()) {
+        if (attempt == 0 && !directUrl.isEmpty()
+                && !directUrl.equals(currentUrl)) {
             attempt = 1;
+            toast("Live stream ended \u2014 trying the direct feed\u2026");
+            play(directUrl);
+            return;
+        }
+        if (attempt <= 1 && !altUrl.isEmpty()
+                && !altUrl.equals(currentUrl)) {
+            attempt = 2;
             toast("Live stream ended \u2014 trying the alternate feed\u2026");
             play(altUrl);
             return;
@@ -444,12 +663,10 @@ public class PlayerActivity extends Activity {
             toast("No external player installed");
             return;
         }
-        // A provider account normally allows ONE live connection. The
-        // native player keeps its HTTP body open while paused, so handing
-        // the same URL to VLC with the local player still attached gives
-        // the provider two viewers of one account — its throttle/kick is
-        // exactly the "VLC stutters even worse than the app" report
-        // (2026-11-22). Release the local stream before VLC opens it.
+        // The external player gets the same URL.  For live that is the
+        // local relay playlist, so VLC reads the phone's DVR (and the
+        // provider still sees exactly ONE connection).  Release the local
+        // ExoPlayer so it does not compete for the relay socket.
         handingOff = true;
         if (player != null) {
             try {
@@ -489,9 +706,7 @@ public class PlayerActivity extends Activity {
             castPlayer.addListener(new Player.Listener() {
                 @Override
                 public void onPlayerError(PlaybackException error) {
-                    // No .ts/video-only ladder on the receiver — the TV has
-                    // its own decoders; just surface the panel.
-                    showError(error);
+                    handleCastError(error);
                 }
             });
             castPlayer.setSessionAvailabilityListener(
@@ -511,6 +726,19 @@ public class PlayerActivity extends Activity {
         }
     }
 
+    private String castTargetUrl() {
+        // Full quality + DVR needs the TV to fetch the phone's relay.  If
+        // the user disabled it or the phone has no LAN address, cast the
+        // provider HLS directly (still no transcode, but no TV DVR).
+        if (castWithDvr && !castUrl.isEmpty()) {
+            return castUrl;
+        }
+        if (!directUrl.isEmpty()) {
+            return directUrl;
+        }
+        return currentUrl;
+    }
+
     private MediaItem castMediaItem(String url) {
         // The receiver shows the metadata on the "now playing" screen while
         // the phone is the remote.
@@ -524,32 +752,100 @@ public class PlayerActivity extends Activity {
     }
 
     private void switchToCast() {
-        if (casting || castPlayer == null || player == null || playerView == null) return;
+        if (casting || castPlayer == null || player == null
+                || playerView == null) {
+            return;
+        }
         casting = true;
-        // Hand the position over for VOD; a live stream is restarted at
-        // the head of its window (seeking a fresh live position on the
-        // receiver can land outside the DVR window and error out).
-        boolean live = player.isCurrentMediaItemLive();
-        long pos = live ? 0 : player.getCurrentPosition();
+        long pos = Math.max(0L, player.getCurrentPosition());
         player.pause();
         playerView.setPlayer(castPlayer);
-        castPlayer.setMediaItem(castMediaItem(currentUrl));
+        String target = castTargetUrl();
+        castPlayer.setMediaItem(castMediaItem(target));
         castPlayer.prepare();
-        if (pos > 0) castPlayer.seekTo(pos);
+        // The relay playlist is the SAME session/timeline on both devices,
+        // so hand the DVR position over exactly.  A direct fallback has a
+        // different timeline; let the receiver start at its live edge.
+        if (pos > 0 && !castUrl.isEmpty() && target.equals(castUrl)) {
+            castPlayer.seekTo(pos);
+        }
         castPlayer.setPlayWhenReady(true);
-        toast("Playing on TV");
+        castFallbackTried = false;
+        castUsedRelay = !castUrl.isEmpty() && target.equals(castUrl);
+        maybeStartDvrService();
+        toast(target.equals(castUrl)
+                ? "Casting with DVR"
+                : "Casting live \u2014 TV rewind unavailable");
     }
 
     private void switchToLocal() {
         if (!casting || player == null || playerView == null) return;
         casting = false;
-        long pos = castPlayer != null ? castPlayer.getCurrentPosition() : 0;
+        long pos = castPlayer != null ? castPlayer.getCurrentPosition() : 0L;
+        stopDvrService();
         playerView.setPlayer(player);
-        player.setMediaItem(MediaItem.fromUri(currentUrl));
-        if (pos > 0) player.seekTo(pos);
+        String target = TextUtils.isEmpty(localUrl) ? primaryUrl : localUrl;
+        player.setMediaItem(mediaItem(target));
+        // Only the relay timeline is shared with the receiver.  A direct
+        // cast starts a different provider playlist; mapping its position
+        // onto the relay would land minutes away, so start at the live
+        // edge instead (the DVR window is still fully available).
+        if (pos > 0 && castUsedRelay) player.seekTo(pos);
+        castUsedRelay = false;
         player.prepare();
         player.setPlayWhenReady(true);
         toast("Back on phone");
+    }
+
+    /**
+     * The TV could not fetch the phone's relay (wrong LAN, AP isolation,
+     * receiver limits).  Cast the provider HLS directly instead of dying:
+     * picture/audio stay full quality, but the TV's rewind window is the
+     * provider's short live playlist.  The phone's own DVR (localUrl) is
+     * untouched for switchToLocal.
+     */
+    private void handleCastError(PlaybackException error) {
+        if (!castFallbackTried && !castUrl.isEmpty()
+                && !directUrl.isEmpty()) {
+            castFallbackTried = true;
+            toast("TV can't reach the phone DVR \u2014 casting direct");
+            play(directUrl);
+            return;
+        }
+        showError(error);
+    }
+
+    private void maybeStartDvrService() {
+        if (!live || !castWithDvr || castUrl.isEmpty()) return;
+        if (Build.VERSION.SDK_INT >= 33
+                && ContextCompat.checkSelfPermission(
+                        this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            try {
+                ActivityCompat.requestPermissions(this,
+                        new String[]{Manifest.permission.POST_NOTIFICATIONS},
+                        41);
+            } catch (Throwable ignored) {
+                // notification still optional
+            }
+        }
+        try {
+            ContextCompat.startForegroundService(
+                    this, new Intent(this, DvrRelayService.class));
+            dvrServiceOn = true;
+        } catch (Throwable t) {
+            toast("Background DVR unavailable");
+        }
+    }
+
+    private void stopDvrService() {
+        if (!dvrServiceOn) return;
+        dvrServiceOn = false;
+        try {
+            stopService(new Intent(this, DvrRelayService.class));
+        } catch (Throwable ignored) {
+            // service already gone
+        }
     }
 
     // ----------------------------------------------------------- lifecycle
@@ -565,9 +861,17 @@ public class PlayerActivity extends Activity {
             handingOff = false;
             if (player != null && !casting && player.getMediaItemCount() == 0
                     && !TextUtils.isEmpty(currentUrl)) {
-                play(currentUrl);
+                play(TextUtils.isEmpty(localUrl) ? currentUrl : localUrl);
             }
         }
+        ui.removeCallbacks(transportTick);
+        ui.post(transportTick);
+    }
+
+    @Override
+    protected void onPause() {
+        ui.removeCallbacks(transportTick);
+        super.onPause();
     }
 
     @Override
@@ -581,6 +885,25 @@ public class PlayerActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacks(transportTick);
+        stopDvrService();
+        // The relay owns the provider's single live connection and the
+        // segment cache; leaving the player (or switching channels) must
+        // release it.  The bridge's relay is a module singleton, so this
+        // works even if MainActivity was recreated.
+        if (live) {
+            // Stop only THIS player's relay: a late teardown must not kill
+            // the relay the next channel just started.  stop() joins the
+            // relay threads for a moment, so never block the UI thread.
+            final String stopArgs = TextUtils.isEmpty(relaySession)
+                    ? "{}"
+                    : "{\"session\":\"" + relaySession + "\"}";
+            Thread stopper = new Thread(
+                    () -> AppBridge.rpc("xt_live_stop", stopArgs),
+                    "mtp-relay-stop");
+            stopper.setDaemon(true);
+            stopper.start();
+        }
         if (castPlayer != null) {
             try {
                 castPlayer.setSessionAvailabilityListener(null);

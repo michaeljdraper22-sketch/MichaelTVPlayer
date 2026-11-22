@@ -53,8 +53,12 @@ public class MainActivity extends Activity {
         if (!Python.isStarted()) {
             Python.start(new AndroidPlatform(this));
         }
+        // files_dir holds settings.json (must survive updates); the cache
+        // dir holds the live DVR segments (disposable, system-evictable).
         bridge = Python.getInstance().getModule("bridge")
-                .callAttr("Bridge", getFilesDir().getPath());
+                .callAttr("Bridge", getFilesDir().getPath(),
+                        getCacheDir().getPath());
+        AppBridge.set(bridge);
 
         webView = new WebView(this);
         WebSettings s = webView.getSettings();
@@ -137,13 +141,18 @@ public class MainActivity extends Activity {
         /**
          * In-app playback (the WebView cannot decode MPEG-TS/HLS/MKV):
          * open the native ExoPlayer screen.  altUrl is the progressive .ts
-         * fallback for live channels; an empty string means none.  isLive
-         * selects the live load-control cushion and the clean-EOF
-         * reconnect (see PlayerActivity).
+         * fallback; castUrl is the LAN address of the phone's DVR relay
+         * (empty when the relay failed or there is no LAN address);
+         * directUrl is the provider HLS used when the TV cannot reach the
+         * phone or the relay dies.  isLive selects the live load-control
+         * cushion and the clean-EOF reconnect (see PlayerActivity).
          */
         @JavascriptInterface
         public void playNative(final String url, final String altUrl,
-                               final String title, final boolean isLive) {
+                               final String title, final boolean isLive,
+                               final String castUrl, final String directUrl,
+                               final boolean castDvr, final boolean castBg,
+                               final String relaySession) {
             if (url == null || url.isEmpty()) return;
             runOnUiThread(new Runnable() {
                 @Override
@@ -157,7 +166,19 @@ public class MainActivity extends Activity {
                     if (title != null) {
                         i.putExtra(PlayerActivity.EXTRA_TITLE, title);
                     }
+                    if (castUrl != null && !castUrl.isEmpty()) {
+                        i.putExtra(PlayerActivity.EXTRA_CAST_URL, castUrl);
+                    }
+                    if (directUrl != null && !directUrl.isEmpty()) {
+                        i.putExtra(PlayerActivity.EXTRA_DIRECT_URL, directUrl);
+                    }
                     i.putExtra(PlayerActivity.EXTRA_LIVE, isLive);
+                    i.putExtra(PlayerActivity.EXTRA_CAST_DVR, castDvr);
+                    i.putExtra(PlayerActivity.EXTRA_CAST_BG, castBg);
+                    if (relaySession != null && !relaySession.isEmpty()) {
+                        i.putExtra(PlayerActivity.EXTRA_RELAY_SESSION,
+                                relaySession);
+                    }
                     startActivity(i);
                 }
             });

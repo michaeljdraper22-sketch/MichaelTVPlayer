@@ -4,6 +4,11 @@
     <!-- Streams are frequently plain http:// (debrid links, Xtream panels). -->
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Casting DVR: keep the relay buffering with the screen off. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:label="@string/app_name"
@@ -11,6 +16,12 @@
         android:usesCleartextTraffic="true"
         android:hardwareAccelerated="true"
         android:theme="@style/AppTheme">
+
+        <!-- Cast SDK configuration.  Without this metadata CastContext
+             throws, which is why v2.1.11/2.1.12 had no cast button. -->
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="org.michaeltv.app.CastOptionsProvider" />
 
         <activity
             android:name=".MainActivity"
@@ -25,13 +36,23 @@
 
         <!-- Native ExoPlayer screen: the WebView <video> element cannot
              decode what providers serve (MPEG-TS/HLS live, MKV movies),
-             so real playback happens here. -->
+             so real playback happens here.  AppCompat + PlayerTheme are
+             required for the Cast device-chooser dialog. -->
         <activity
             android:name=".PlayerActivity"
             android:exported="false"
             android:screenOrientation="fullSensor"
             android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|density|uiMode"
-            android:theme="@style/AppTheme" />
+            android:theme="@style/PlayerTheme" />
+
+        <!-- Keeps the phone-side DVR relay runnable while casting with the
+             screen off.  mediaPlayback is the correct type: the phone is
+             continuing live media delivery to the Cast receiver. -->
+        <service
+            android:name=".DvrRelayService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false" />
     </application>
 
 </manifest>

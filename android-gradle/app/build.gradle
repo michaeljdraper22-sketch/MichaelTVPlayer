@@ -22,8 +22,8 @@ android {
         targetSdk 34
         // The two version lines below are rewritten from src/config.py
         // APP_VERSION by android-gradle/prepare_core.py — do not edit here.
-        versionCode 2011200  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
-        versionName "2.1.12"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
+        versionCode 2011300  // MTP_VERSION_CODE (managed by prepare_core.py — do not edit)
+        versionName "2.1.13"  // MTP_VERSION_NAME (managed by prepare_core.py — do not edit)
 
         ndk {
             // 64-bit phones only — halves the APK and the Chaquopy payload.
@@ -67,13 +67,14 @@ dependencies {
     implementation "androidx.media3:media3-exoplayer:$media3"
     implementation "androidx.media3:media3-exoplayer-hls:$media3"
     implementation "androidx.media3:media3-ui:$media3"
-    // Chromecast (PlayerActivity).  media3-cast 1.2.1 does NOT pull the
-    // cast framework transitively (its POM is lean), so both are explicit:
-    // CastPlayer + SessionAvailabilityListener from media3-cast, and
-    // CastContext/CastButtonFactory/MediaRouteButton from the framework
-    // (mediarouter and appcompat ride along transitively).
+    // Chromecast (PlayerActivity).  media3-cast brings CastPlayer +
+    // SessionAvailabilityListener; the Cast SDK itself supplies
+    // CastContext/CastButtonFactory/MediaRouteButton and the device
+    // chooser.  The chooser requires an AppCompatActivity + AppCompat
+    // theme host, hence the explicit appcompat dependency (PlayerTheme).
     implementation "androidx.media3:media3-cast:$media3"
-    implementation "com.google.android.gms:play-services-cast-framework:21.2.0"
+    implementation "com.google.android.gms:play-services-cast-framework:21.3.0"
+    implementation "androidx.appcompat:appcompat:1.6.1"
 }
 
 // Chaquopy 15 DSL: a top-level chaquopy block (the old python-inside-

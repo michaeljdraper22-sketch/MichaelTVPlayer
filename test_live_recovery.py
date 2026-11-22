@@ -362,6 +362,13 @@ def main():
           _REC_ENDED_RESTART_S < _REC_STALL_RESTART_S
           and "_REC_ENDED_RESTART_S" in src
           and 'rec_dead' in src)
+    check("python-vlc's 'State.Ended' spelling is recognized",
+          pv._recorder_state_is_dead("State.Ended")
+          and pv._recorder_state_is_dead("Ended")
+          and pv._recorder_state_is_dead("State.Error")
+          and pv._recorder_state_is_dead("Stopped")
+          and not pv._recorder_state_is_dead("Playing")
+          and not pv._recorder_state_is_dead(""))
 
     print()
     print(f"{len(PASS)} passed, {len(FAIL)} failed")

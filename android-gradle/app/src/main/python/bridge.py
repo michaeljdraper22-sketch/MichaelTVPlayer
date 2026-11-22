@@ -21,6 +21,8 @@ import threading
 from michaeltv_core import APP_VERSION, stremio, xtream
 from michaeltv_core.filters import extract_country
 
+import live_relay
+
 DEFAULT_SETTINGS = {
     "addons": [],               # Stremio stream addon base URLs
     "resolution_pref": "match",  # match | auto | 2160|1440|1080|720|480
@@ -32,12 +34,24 @@ DEFAULT_SETTINGS = {
     # name/logo/category are stored so the ★ Favorites list paints without
     # re-fetching every channel row from the provider.
     "live_favorites": [],
+    # Live TV UI state (the channel filter): restored on every launch and
+    # preserved across APK updates because this file lives in files_dir.
+    "live_country": "",
+    "live_category": "",
+    "live_mode": "browse",       # browse | favs
+    # Phone DVR / casting.  dvr_minutes 0 = the whole channel session
+    # (pruned only when free storage drops below the relay's floor).
+    "dvr_minutes": 30,           # 15 | 30 | 60 | 0
+    "cast_with_dvr": True,       # cast the local seekable relay
+    "cast_bg_buffer": True,      # foreground service while casting
     # Test-only knob (never shown in the Settings UI): when set, the app
     # opens the player on this URL at boot — lets the cloud emulator test
     # exercise the real <video> pipeline with a public sample video,
     # no credentials involved.
     "autoplay_test_url": "",
 }
+
+_DVR_MINUTES = (0, 15, 30, 60)
 
 _RESOLUTIONS = ("match", "auto", "2160", "1440", "1080", "720", "480")
 
@@ -50,6 +64,24 @@ _GH_LATEST = ("https://api.github.com/repos/michaeljdraper22-sketch/"
 
 class BridgeError(Exception):
     """A command failed in an expected, user-presentable way."""
+
+
+def _as_bool(value, default=False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return default
+
+
+def _as_dvr_minutes(value):
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return 30
+    return minutes if minutes in _DVR_MINUTES else 30
 
 
 class _ConfigFacade:
@@ -69,8 +101,14 @@ class _ConfigFacade:
 
 class Bridge:
 
-    def __init__(self, files_dir):
+    def __init__(self, files_dir, cache_dir=None):
         self._files_dir = str(files_dir)
+        self._cache_dir = str(cache_dir or os.path.join(self._files_dir,
+                                                        "cache"))
+        try:
+            os.makedirs(self._cache_dir, exist_ok=True)
+        except OSError:
+            pass
         self._settings_path = os.path.join(self._files_dir, "settings.json")
         self._settings = dict(DEFAULT_SETTINGS)
         self._load_settings()
@@ -109,6 +147,20 @@ class Bridge:
                     self._settings[key] = stored.get(key, default)
         except (OSError, ValueError):
             pass
+        # Normalize values a hand-edited/old file could carry.  This is
+        # also what keeps the live filter usable after an update.
+        self._settings["live_mode"] = (
+            self._settings.get("live_mode")
+            if self._settings.get("live_mode") in ("browse", "favs")
+            else "browse")
+        self._settings["dvr_minutes"] = _as_dvr_minutes(
+            self._settings.get("dvr_minutes", 30))
+        self._settings["cast_with_dvr"] = _as_bool(
+            self._settings.get("cast_with_dvr"), True)
+        self._settings["cast_bg_buffer"] = _as_bool(
+            self._settings.get("cast_bg_buffer"), True)
+        for key in ("live_country", "live_category"):
+            self._settings[key] = str(self._settings.get(key) or "")
 
     def _save_settings(self):
         tmp = self._settings_path + ".tmp"
@@ -145,10 +197,27 @@ class Bridge:
         if isinstance(args.get("live_favorites"), list):
             clean["live_favorites"] = [f for f in args["live_favorites"]
                                        if isinstance(f, dict)]
+        if "live_country" in args:
+            clean["live_country"] = str(args["live_country"] or "")[:80]
+        if "live_category" in args:
+            clean["live_category"] = str(args["live_category"] or "")[:64]
+        if "live_mode" in args:
+            mode = str(args["live_mode"] or "")
+            clean["live_mode"] = mode if mode in ("browse", "favs") else "browse"
+        if "dvr_minutes" in args:
+            clean["dvr_minutes"] = _as_dvr_minutes(args["dvr_minutes"])
+        if "cast_with_dvr" in args:
+            clean["cast_with_dvr"] = _as_bool(args["cast_with_dvr"], True)
+        if "cast_bg_buffer" in args:
+            clean["cast_bg_buffer"] = _as_bool(args["cast_bg_buffer"], True)
+        creds_changed = any(
+            key in args for key in ("xtream_server", "xtream_username",
+                                    "xtream_password"))
         self._settings = clean
         self._save_settings()
-        self._xt = None            # creds may have changed
-        self._all_rows = None      # …and so may the provider's channel list
+        if creds_changed:
+            self._xt = None        # the provider login actually changed
+            self._all_rows = None  # …so its channel list may have too
         return {"ok": True, "settings": dict(self._settings)}
 
     # ------------------------------------------------------------------
@@ -452,6 +521,71 @@ class Bridge:
         return {"ok": True,
                 "url": client.live_url(stream_id, "m3u8"),
                 "url_ts": client.live_url(stream_id, "ts")}
+
+    def _cmd_xt_live_start(self, args):
+        """Start the phone-side DVR relay for one live channel.
+
+        Returns the local (phone) playlist URL plus the LAN URL the Cast
+        receiver must fetch.  The relay is best-effort: any failure
+        returns the direct provider URL and ``relay: False`` so playback
+        still starts (without DVR) instead of dead-ending on a spinner.
+        """
+        client = self._xt_client()
+        try:
+            stream_id = int(args.get("stream_id"))
+        except (TypeError, ValueError):
+            raise BridgeError("stream_id required")
+        hls = client.live_url(stream_id, "m3u8")
+        ts = client.live_url(stream_id, "ts")
+        minutes = _as_dvr_minutes(self._settings.get("dvr_minutes", 30))
+        window_s = minutes * 60 if minutes > 0 else 0
+        base = {
+            "ok": True,
+            "direct": hls,
+            "url_ts": ts,
+            "dvr_minutes": minutes,
+            "cast_with_dvr": _as_bool(
+                self._settings.get("cast_with_dvr"), True),
+            "cast_bg_buffer": _as_bool(
+                self._settings.get("cast_bg_buffer"), True),
+        }
+        try:
+            relay = live_relay.start(hls, self._cache_dir,
+                                     window_s=window_s, timeout_s=20.0)
+            st = relay.status()
+            base.update({
+                "relay": True,
+                "session": relay.token,
+                "url": relay.local_url,
+                "cast_url": relay.cast_url,
+                "buffered_s": st.get("buffered_s", 0),
+                "window_s": st.get("window_s", window_s),
+            })
+            return base
+        except live_relay.RelayError as exc:
+            base.update({"relay": False, "url": hls, "cast_url": "",
+                         "error": str(exc)})
+            return base
+        except Exception as exc:  # noqa: BLE001 — never block playback
+            base.update({"relay": False, "url": hls, "cast_url": "",
+                         "error": "%s: %s" % (type(exc).__name__, exc)})
+            return base
+
+    def _cmd_xt_live_stop(self, args):
+        """Stop this player's relay and release the provider connection.
+
+        ``session`` is optional for backward compatibility; when present
+        only that relay is stopped, so a late teardown from the previous
+        channel cannot kill the new channel's relay."""
+        session = str(args.get("session") or "").strip() or None
+        live_relay.stop_current(session)
+        return {"ok": True, "status": live_relay.status()}
+
+    def _cmd_xt_live_status(self, args):
+        try:
+            return {"ok": True, "status": live_relay.status()}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": repr(exc)}
 
     # ------------------------------------------------------------------
     # update check (public GitHub release metadata only)

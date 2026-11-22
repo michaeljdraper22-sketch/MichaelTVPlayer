@@ -79,7 +79,17 @@ APP_NAME = "MichaelTVPlayer"
 # Android: the native player opens live with a 10 s ExoPlayer cushion,
 # reconnects a cleanly-ended body (HLS -> progressive .ts, then retries),
 # and releases its connection before handing the same URL to VLC.
-APP_VERSION = "2.1.12"
+# 2.1.13: Android casting actually works (CastOptionsProvider + the
+# AppCompat PlayerActivity host the SDK's device chooser needs), live TV
+# gets a phone-side HLS DVR relay (configurable 15/30/60 min or the whole
+# session; original segments, no transcode), the player has -60/-10/+10/
+# LIVE/pause transport acting on the phone OR the cast session, and the
+# live country/category/favorite-tab plus DVR/cast settings persist across
+# restarts and APK updates. AirPlay is not supported from Android; the
+# cast target is Chromecast / Google TV. Desktop: the recorder fast-restart
+# now recognizes python-vlc's "State.Ended" spelling (the exact compare
+# never fired and the picture still waited the full 65 s).
+APP_VERSION = "2.1.13"
 
 # Subtitle appearance. Values map 1:1 onto a libvlc option (see
 # player.subtitle_instance_args) so an untouched config emits NO extra VLC

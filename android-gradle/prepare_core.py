@@ -36,6 +36,8 @@ REPO_ROOT = AG_DIR.parent
 SRC_DIR = REPO_ROOT / "src"
 CORE_DIR = AG_DIR / "app" / "src" / "main" / "python" / "michaeltv_core"
 BRIDGE_PY = AG_DIR / "app" / "src" / "main" / "python" / "bridge.py"
+LIVE_RELAY_PY = (AG_DIR / "app" / "src" / "main" / "python"
+                 / "live_relay.py")
 APP_GRADLE = AG_DIR / "app" / "build.gradle"
 CONFIG_PY = SRC_DIR / "config.py"
 
@@ -170,7 +172,8 @@ def rewrite_gradle_version(version: str, numeric: int) -> None:
 def compile_all() -> list:
     """py_compile every generated core module + bridge.py; fail on error."""
     compiled = []
-    targets = sorted(CORE_DIR.glob("*.py")) + [BRIDGE_PY]
+    targets = sorted(CORE_DIR.glob("*.py")) + [BRIDGE_PY,
+                                                LIVE_RELAY_PY]
     for path in targets:
         if not path.is_file():
             fail("missing python file: %s" % path)

@@ -343,21 +343,32 @@ signed) from
 the latest [release](https://github.com/michaeljdraper22-sketch/MichaelTVPlayer/releases),
 enable *Install unknown apps* for your browser/file manager, and install.
 
-**What works on Android (v2.1.11):** search movies & series (Cinemeta,
+**What works on Android (v2.1.13):** search movies & series (Cinemeta,
 posters), browse a series' seasons/episodes, get the **same ranked stream list
 as the Windows app** (English-preference, resolution, size and provider
 ordering), play debrid/direct links in a **native ExoPlayer screen** (MPEG-TS,
 HLS, MKV, MP4, WebM — not a WebView `<video>`), **cast to a Chromecast/Google
 TV** straight from the player's top bar (the phone becomes the remote; the TV
 decodes with its own codecs, and playback returns to the phone at the same
-position when you disconnect), and **Xtream live TV** with
-country filtering, ★ favorite channels and text search (typing a query and
-pressing Enter only shows matching channels; playback starts only when a
-result is tapped). Stream links are liveness-probed before playback; a
-dedicated button hands a stream to an external player (VLC for Android etc.)
-if the in-app player meets a codec it can't decode.
+position when you disconnect), and **Xtream live TV** with country filtering,
+★ favorite channels and text search (typing a query and pressing Enter only
+shows matching channels; playback starts only when a result is tapped).
+Stream links are liveness-probed before playback; a dedicated button hands a
+stream to an external player (VLC for Android etc.) if the in-app player
+meets a codec it can't decode.
 
-**Limits (v2.1.11):** plain torrent streams (no debrid URL) can't play
+**Live TV DVR + casting (v2.1.13):** opening a live channel now starts a
+phone-side DVR relay — the provider's original HLS segments are kept in the
+app cache (15/30/60 min or the whole session, Settings ▸ Live DVR length) and
+served as a seekable playlist. The native player's control row gives
+**-60 / -10 / +10 / LIVE / pause**, and the same playlist is handed to the
+Cast receiver, so **casting keeps the DVR and the full bitrate** (no
+transcode). The phone and TV must be on the same Wi-Fi; if the TV cannot
+reach the phone the cast falls back to the provider's direct HLS (no TV
+rewind). The live country/category/favorite-tab and DVR/cast settings are
+saved in the app's `settings.json` and survive restarts and APK updates.
+
+**Limits (v2.1.13):** plain torrent streams (no debrid URL) can't play
 on-device — configure a debrid-keyed addon URL (e.g. torrentio with your
 Torbox key, set up in a desktop browser) and paste it into the app's Settings;
 then the addon returns direct links that play fine. Audio in some MKV files
@@ -365,8 +376,9 @@ then the addon returns direct links that play fine. Audio in some MKV files
 plays it muted; cast to a TV (its decoders handle AC3/DTS) or use the
 external-player button for full audio. Some providers serve plain-`http://`
 streams that certain cast receivers refuse — those keep playing on the phone.
-No subtitles, DVR/timeshift, recording, catch-up or profanity filter on
-Android yet.
+**AirPlay is not supported from Android** (the supported cast target is
+Chromecast / Google TV). No subtitles, recording, catch-up or profanity
+filter on Android yet.
 
 **Building it yourself (Windows, no Android Studio needed):**
 `python android-gradle/build_local.py` — downloads the JDK/Gradle/Android SDK

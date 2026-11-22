@@ -41,9 +41,10 @@ PASS = []
 FAIL = []
 
 
-def check(name, cond):
+def check(name, cond, detail=""):
     (PASS if cond else FAIL).append(name)
-    print(("  ok   " if cond else "  FAIL ") + name)
+    print(("  ok   " if cond else "  FAIL ") + name
+          + (("   [%s]" % detail) if detail else ""))
 
 
 CATS = [
@@ -211,6 +212,73 @@ def main():
     check("primary URL is HLS (m3u8)", u["url"].endswith("/101.m3u8"))
     check("progressive .ts fallback is supplied",
           u["url_ts"].endswith("/101.ts"))
+
+    print("[6b] live filter + DVR settings persist across relaunch")
+    call(b, "set_settings", {"live_country": "USA", "live_category": "2",
+                             "live_mode": "favs", "dvr_minutes": 60,
+                             "cast_with_dvr": False,
+                             "cast_bg_buffer": False})
+    s = call(b, "get_settings")["settings"]
+    check("live country/category/mode saved",
+          s["live_country"] == "USA" and s["live_category"] == "2"
+          and s["live_mode"] == "favs", str(
+              (s["live_country"], s["live_category"], s["live_mode"])))
+    check("DVR/cast settings saved",
+          s["dvr_minutes"] == 60 and s["cast_with_dvr"] is False
+          and s["cast_bg_buffer"] is False, str(
+              (s["dvr_minutes"], s["cast_with_dvr"], s["cast_bg_buffer"])))
+    b3, _ = fresh(tmp)
+    s3 = call(b3, "get_settings")["settings"]
+    check("all of it survives an app relaunch",
+          s3["live_country"] == "USA" and s3["live_category"] == "2"
+          and s3["live_mode"] == "favs" and s3["dvr_minutes"] == 60
+          and s3["cast_with_dvr"] is False
+          and s3["cast_bg_buffer"] is False, str(s3))
+    call(b3, "set_settings", {"resolution_pref": "720"})
+    s4 = call(b3, "get_settings")["settings"]
+    check("a Settings save keeps the live filter/DVR choices",
+          s4["resolution_pref"] == "720" and s4["live_country"] == "USA"
+          and s4["live_mode"] == "favs" and s4["dvr_minutes"] == 60)
+    call(b3, "set_settings", {"dvr_minutes": 7})
+    check("an invalid DVR window falls back to 30 min",
+          call(b3, "get_settings")["settings"]["dvr_minutes"] == 30)
+
+    print("[6c] relay start maps local/cast URLs; failures fall back direct")
+    class FakeRelay:
+        token = "tok"
+        local_url = "http://127.0.0.1:1/s/t/live.m3u8"
+        cast_url = "http://192.168.1.20:1/s/t/live.m3u8"
+        def status(self):
+            return {"buffered_s": 20.0, "window_s": 1800}
+
+    orig_start = apk_bridge.live_relay.start
+    apk_bridge.live_relay.start = lambda *a, **k: FakeRelay()
+    try:
+        out = call(b, "xt_live_start", {"stream_id": 101})
+        check("relay URLs are handed to the player",
+              out.get("relay") is True
+              and out["url"].startswith("http://127.0.0.1:")
+              and out["cast_url"].startswith("http://192.168.1.20:"),
+              str(out))
+        check("direct HLS + .ts fallbacks travel with the relay URL",
+              out["direct"].endswith("/101.m3u8")
+              and out["url_ts"].endswith("/101.ts"))
+        check("cast/DVR preferences travel too",
+              out["cast_with_dvr"] is False
+              and out["cast_bg_buffer"] is False)
+        check("the relay session token is returned for safe teardown",
+              out.get("session") == "tok", str(out))
+
+        def boom(*a, **k):
+            raise apk_bridge.live_relay.RelayError("no HLS for this panel")
+        apk_bridge.live_relay.start = boom
+        out = call(b, "xt_live_start", {"stream_id": 101})
+        check("a relay failure still starts direct live",
+              out.get("relay") is False
+              and out["url"].endswith("/101.m3u8")
+              and "no HLS" in out.get("error", ""), str(out))
+    finally:
+        apk_bridge.live_relay.start = orig_start
 
     print("[7] Enter in the live search box can only render results")
     html = open(INDEX_HTML, encoding="utf-8").read()
